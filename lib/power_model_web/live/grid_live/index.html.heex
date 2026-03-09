@@ -1,0 +1,312 @@
+<div class="grid-container" id="grid-app">
+  <div id="grid-map" phx-hook="GridMap" phx-update="ignore" class="grid-map"></div>
+
+  <div class="top-bar">
+    <div class="view-controls">
+      <select phx-change="change_view_mode" name="mode" class="view-select">
+        <option value="voltage_level" selected={@view_mode == "voltage_level"}>Voltage Level</option>
+        <option value="loading" selected={@view_mode == "loading"}>Loading %</option>
+        <option value="fuel_type" selected={@view_mode == "fuel_type"}>Fuel Type</option>
+        <option value="failure_state" selected={@view_mode == "failure_state"}>Failure State</option>
+      </select>
+    </div>
+
+    <form phx-submit="lookup_component" class="lookup-form">
+      <select name="type" class="lookup-type-select">
+        <option value="generator">Gen</option>
+        <option value="transmission_line">Line</option>
+        <option value="substation">Sub</option>
+        <option value="transformer">Xfmr</option>
+        <option value="water_facility">Water</option>
+      </select>
+      <input
+        type="text"
+        name="component_id"
+        placeholder="ID #"
+        class="lookup-input"
+        inputmode="numeric"
+        autocomplete="off"
+      />
+      <button type="submit" class="lookup-btn">Go</button>
+    </form>
+
+    <div class="solver-badge">
+      <span class={"status-dot " <> solver_status_class(@solver_status)}></span>
+      <span><%= solver_status_text(@solver_status) %></span>
+    </div>
+  </div>
+
+  <.live_component
+    module={PowerModelWeb.GridLive.SystemMetrics}
+    id="system-metrics"
+    metrics={@system_metrics}
+  />
+
+  <.live_component
+    module={PowerModelWeb.GridLive.FailureControls}
+    id="failure-controls"
+  />
+
+  <%= if @selected_component do %>
+    <.live_component
+      module={PowerModelWeb.GridLive.InfoPanel}
+      id="info-panel"
+      component={@selected_component}
+      cascade_active={@cascade_active}
+    />
+  <% end %>
+
+  <%= if @cascade_steps != [] or @compensating_lines != [] do %>
+    <.live_component
+      module={PowerModelWeb.GridLive.AffectedList}
+      id="affected-list"
+      events={get_cascade_events(@cascade_steps)}
+      compensating_lines={@compensating_lines}
+    />
+  <% end %>
+
+  <%= if @cascade_steps != [] do %>
+    <.live_component
+      module={PowerModelWeb.GridLive.CascadeTimeline}
+      id="cascade-timeline"
+      steps={@cascade_steps}
+      active={@cascade_active}
+    />
+  <% end %>
+
+  <%= if @cascade_steps != [] do %>
+    <button phx-click="reset_simulation" class="reset-btn">
+      Reset Grid
+    </button>
+  <% end %>
+
+  <div class="map-legend" id="map-legend">
+    <button class="legend-toggle" phx-click={JS.toggle_class("collapsed", to: "#map-legend")}>
+      <span class="legend-toggle-label">Legend</span>
+      <span class="legend-toggle-icon"></span>
+    </button>
+    <div class="legend-body">
+    <%= if @view_mode == "voltage_level" do %>
+      <div class="legend-section">
+        <div class="legend-title">Lines &amp; Substations</div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: rgb(100, 149, 237);"></span>
+          <span>69 kV</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: rgb(64, 224, 208);"></span>
+          <span>138 kV</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: rgb(50, 205, 50);"></span>
+          <span>230 kV</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: rgb(255, 165, 0);"></span>
+          <span>345 kV</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: rgb(255, 69, 0);"></span>
+          <span>500 kV</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: rgb(220, 20, 60);"></span>
+          <span>765 kV</span>
+        </div>
+      </div>
+      <div class="legend-divider"></div>
+      <div class="legend-section">
+        <div class="legend-title">Generators</div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(65, 131, 215);"></span>
+          <span>Natural Gas</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(100, 100, 100);"></span>
+          <span>Coal</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(155, 89, 182);"></span>
+          <span>Nuclear</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(52, 152, 219);"></span>
+          <span>Hydro</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(46, 204, 113);"></span>
+          <span>Wind</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(241, 196, 15);"></span>
+          <span>Solar</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(230, 126, 34);"></span>
+          <span>Geothermal</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(0, 255, 255);"></span>
+          <span>Import (Intl)</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(150, 150, 150);"></span>
+          <span>Other</span>
+        </div>
+      </div>
+    <% end %>
+    <%= if @view_mode == "fuel_type" do %>
+      <div class="legend-section">
+        <div class="legend-title">Generators</div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(65, 131, 215);"></span>
+          <span>Natural Gas</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(100, 100, 100);"></span>
+          <span>Coal</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(155, 89, 182);"></span>
+          <span>Nuclear</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(52, 152, 219);"></span>
+          <span>Hydro</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(46, 204, 113);"></span>
+          <span>Wind</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(241, 196, 15);"></span>
+          <span>Solar</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(230, 126, 34);"></span>
+          <span>Geothermal</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(0, 255, 255);"></span>
+          <span>Import (Intl)</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(150, 150, 150);"></span>
+          <span>Other</span>
+        </div>
+      </div>
+    <% end %>
+    <%= if @view_mode == "loading" do %>
+      <div class="legend-section">
+        <div class="legend-title">Line Loading</div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: rgb(46, 204, 113);"></span>
+          <span>&lt; 50%</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: rgb(241, 196, 15);"></span>
+          <span>50–75%</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: rgb(230, 126, 34);"></span>
+          <span>75–90%</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: rgb(231, 76, 60);"></span>
+          <span>90–100%</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: rgb(192, 57, 43);"></span>
+          <span>&gt; 100%</span>
+        </div>
+      </div>
+      <div class="legend-divider"></div>
+      <div class="legend-section">
+        <div class="legend-title">Generators</div>
+        <div class="legend-item">
+          <svg class="legend-icon" viewBox="0 0 20 20"><path d="M10 2 Q14 6 14.5 10 Q15 14 13 16 Q12 16.5 11 15 Q10 13.5 9 15 Q8 16.5 7 16 Q5 14 5.5 10 Q6 6 10 2Z" fill="rgb(65,131,215)"/></svg>
+          <span>Natural Gas</span>
+        </div>
+        <div class="legend-item">
+          <svg class="legend-icon" viewBox="0 0 20 20"><rect x="4" y="9" width="12" height="9" rx="1" fill="rgb(100,100,100)"/><rect x="7" y="3" width="3" height="7" fill="rgb(100,100,100)"/><circle cx="8.5" cy="2" r="1.3" fill="rgb(100,100,100)" opacity="0.7"/></svg>
+          <span>Coal</span>
+        </div>
+        <div class="legend-item">
+          <svg class="legend-icon" viewBox="0 0 20 20"><circle cx="10" cy="6" r="3.5" fill="rgb(155,89,182)"/><circle cx="5.5" cy="13" r="3.5" fill="rgb(155,89,182)"/><circle cx="14.5" cy="13" r="3.5" fill="rgb(155,89,182)"/><circle cx="10" cy="10" r="1.5" fill="rgb(155,89,182)"/></svg>
+          <span>Nuclear</span>
+        </div>
+        <div class="legend-item">
+          <svg class="legend-icon" viewBox="0 0 20 20"><path d="M3 7 L7 17 L13 17 L17 7Z" fill="rgb(52,152,219)"/></svg>
+          <span>Hydro</span>
+        </div>
+        <div class="legend-item">
+          <svg class="legend-icon" viewBox="0 0 20 20"><circle cx="10" cy="10" r="1.5" fill="rgb(46,204,113)"/><ellipse cx="10" cy="5" rx="1.8" ry="4.5" fill="rgb(46,204,113)"/><ellipse cx="14.3" cy="12.5" rx="1.8" ry="4.5" fill="rgb(46,204,113)" transform="rotate(120 14.3 12.5)"/><ellipse cx="5.7" cy="12.5" rx="1.8" ry="4.5" fill="rgb(46,204,113)" transform="rotate(240 5.7 12.5)"/></svg>
+          <span>Wind</span>
+        </div>
+        <div class="legend-item">
+          <svg class="legend-icon" viewBox="0 0 20 20"><circle cx="10" cy="10" r="4" fill="rgb(241,196,15)"/><rect x="9" y="2" width="2" height="3" fill="rgb(241,196,15)"/><rect x="9" y="15" width="2" height="3" fill="rgb(241,196,15)"/><rect x="2" y="9" width="3" height="2" fill="rgb(241,196,15)"/><rect x="15" y="9" width="3" height="2" fill="rgb(241,196,15)"/><rect x="4" y="4" width="2" height="2" fill="rgb(241,196,15)" transform="rotate(45 5 5)"/><rect x="14" y="4" width="2" height="2" fill="rgb(241,196,15)" transform="rotate(45 15 5)"/><rect x="4" y="14" width="2" height="2" fill="rgb(241,196,15)" transform="rotate(45 5 15)"/><rect x="14" y="14" width="2" height="2" fill="rgb(241,196,15)" transform="rotate(45 15 15)"/></svg>
+          <span>Solar</span>
+        </div>
+      </div>
+    <% end %>
+    <div class="legend-divider"></div>
+    <div class="legend-section">
+      <div class="legend-title">Water Facilities</div>
+      <div class="legend-item">
+        <svg class="legend-icon" viewBox="0 0 20 20"><path d="M10 3 Q12 7 13.5 11 Q14.5 15 12 17 Q10.5 18 10 18 Q9.5 18 8 17 Q5.5 15 6.5 11 Q8 7 10 3Z" fill="rgb(0,191,255)"/></svg>
+        <span>Desalination</span>
+      </div>
+      <div class="legend-item">
+        <svg class="legend-icon" viewBox="0 0 20 20"><path d="M6 6 Q10 3 14 6" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M14 6 L13 9" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round" marker-end="none"/><path d="M14 10 Q10 13 6 10" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M6 10 L7 13" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M6 14 Q10 17 14 14" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
+        <span>Wastewater</span>
+      </div>
+      <div class="legend-item">
+        <svg class="legend-icon" viewBox="0 0 20 20"><rect x="8" y="2" width="4" height="7" fill="rgb(0,200,150)"/><path d="M8 9 L5 18 L15 18 L12 9Z" fill="rgb(0,200,150)"/><rect x="7" y="1.5" width="6" height="1.5" fill="rgb(0,200,150)"/></svg>
+        <span>Treatment</span>
+      </div>
+      <div class="legend-item">
+        <svg class="legend-icon" viewBox="0 0 20 20"><path d="M4 14 L10 8 L16 14" stroke="rgb(147,51,234)" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 10 L10 4 L16 10" stroke="rgb(147,51,234)" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Pump Station</span>
+      </div>
+      <div class="legend-item">
+        <svg class="legend-icon" viewBox="0 0 20 20"><path d="M2 7 Q6 4 10 7 Q14 10 18 7" stroke="rgb(0,100,180)" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M2 12 Q6 9 10 12 Q14 15 18 12" stroke="rgb(0,100,180)" stroke-width="2.5" fill="none" stroke-linecap="round"/></svg>
+        <span>Reservoir</span>
+      </div>
+    </div>
+    <%= if @view_mode == "failure_state" or @cascade_active or length(@cascade_steps) > 0 do %>
+      <div class="legend-divider"></div>
+      <div class="legend-section">
+        <div class="legend-title">Failure Impact</div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(46, 204, 113);"></span>
+          <span>Normal</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(255, 140, 0);"></span>
+          <span>Rerouted Flow</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(245, 166, 35);"></span>
+          <span>Stressed (75-100%)</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(231, 76, 60);"></span>
+          <span>Overloaded (>100%)</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(155, 89, 182);"></span>
+          <span>Load Shed</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(52, 73, 94);"></span>
+          <span>Islanded</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-dot" style="background: rgb(40, 40, 40);"></span>
+          <span>Tripped / Dead</span>
+        </div>
+      </div>
+    <% end %>
+    </div>
+  </div>
+</div>
