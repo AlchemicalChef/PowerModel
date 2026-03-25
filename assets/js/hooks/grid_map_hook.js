@@ -65,6 +65,13 @@ const GridMapHook = {
       }
     };
 
+    window.__toggleLayer = (el) => {
+      const layer = el.dataset.layer;
+      if (!layer) return;
+      el.classList.toggle("active");
+      this.mapManager.toggleLayer(layer);
+    };
+
     this.mapManager.onComponentClick = (type, id, details) => {
       this.mapManager.setSelectedComponent(type, id);
       this.pushEvent("select_component", { type, id: String(id), ...details });
@@ -76,6 +83,7 @@ const GridMapHook = {
   },
 
   destroyed() {
+    window.__toggleLayer = null;
     if (this.mapManager) {
       this.mapManager.destroy();
     }

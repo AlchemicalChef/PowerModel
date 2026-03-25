@@ -1,4 +1,11 @@
 defmodule PowerModel.Grid.Load do
+  @moduledoc """
+  Electrical load connected to a bus.
+
+  Load type determines ZIP model coefficients used by the AC power flow
+  solver for voltage-dependent load behavior.
+  """
+
   use Ecto.Schema
   import Ecto.Changeset
 

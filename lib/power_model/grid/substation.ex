@@ -1,4 +1,11 @@
 defmodule PowerModel.Grid.Substation do
+  @moduledoc """
+  Electrical substation housing transformers and switching equipment.
+
+  Sourced from HIFLD, Rutgers mirror, OpenStreetMap, or derived from
+  transmission line endpoints.
+  """
+
   use Ecto.Schema
   import Ecto.Changeset
 

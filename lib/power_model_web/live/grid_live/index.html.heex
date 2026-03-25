@@ -18,6 +18,7 @@
         <option value="substation">Sub</option>
         <option value="transformer">Xfmr</option>
         <option value="water_facility">Water</option>
+        <option value="critical_facility">Facility</option>
       </select>
       <input
         type="text"
@@ -252,26 +253,60 @@
     <div class="legend-divider"></div>
     <div class="legend-section">
       <div class="legend-title">Water Facilities</div>
-      <div class="legend-item">
+      <div class="legend-item layer-toggle active" data-layer="wf_desal" onclick="window.__toggleLayer && window.__toggleLayer(this)">
         <svg class="legend-icon" viewBox="0 0 20 20"><path d="M10 3 Q12 7 13.5 11 Q14.5 15 12 17 Q10.5 18 10 18 Q9.5 18 8 17 Q5.5 15 6.5 11 Q8 7 10 3Z" fill="rgb(0,191,255)"/></svg>
         <span>Desalination</span>
       </div>
-      <div class="legend-item">
+      <div class="legend-item layer-toggle active" data-layer="wf_waste" onclick="window.__toggleLayer && window.__toggleLayer(this)">
         <svg class="legend-icon" viewBox="0 0 20 20"><path d="M6 6 Q10 3 14 6" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M14 6 L13 9" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round" marker-end="none"/><path d="M14 10 Q10 13 6 10" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M6 10 L7 13" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M6 14 Q10 17 14 14" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
         <span>Wastewater</span>
       </div>
-      <div class="legend-item">
+      <div class="legend-item layer-toggle active" data-layer="wf_treat" onclick="window.__toggleLayer && window.__toggleLayer(this)">
         <svg class="legend-icon" viewBox="0 0 20 20"><rect x="8" y="2" width="4" height="7" fill="rgb(0,200,150)"/><path d="M8 9 L5 18 L15 18 L12 9Z" fill="rgb(0,200,150)"/><rect x="7" y="1.5" width="6" height="1.5" fill="rgb(0,200,150)"/></svg>
         <span>Treatment</span>
       </div>
-      <div class="legend-item">
+      <div class="legend-item layer-toggle active" data-layer="wf_pump" onclick="window.__toggleLayer && window.__toggleLayer(this)">
         <svg class="legend-icon" viewBox="0 0 20 20"><path d="M4 14 L10 8 L16 14" stroke="rgb(147,51,234)" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 10 L10 4 L16 10" stroke="rgb(147,51,234)" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Pump Station</span>
       </div>
-      <div class="legend-item">
+      <div class="legend-item layer-toggle active" data-layer="wf_reservoir" onclick="window.__toggleLayer && window.__toggleLayer(this)">
         <svg class="legend-icon" viewBox="0 0 20 20"><path d="M2 7 Q6 4 10 7 Q14 10 18 7" stroke="rgb(0,100,180)" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M2 12 Q6 9 10 12 Q14 15 18 12" stroke="rgb(0,100,180)" stroke-width="2.5" fill="none" stroke-linecap="round"/></svg>
         <span>Reservoir</span>
       </div>
+    </div>
+    <div class="legend-divider"></div>
+    <div class="legend-section">
+      <div class="legend-title">Critical Infrastructure</div>
+      <div class="legend-item layer-toggle active" data-layer="ci_hospital" onclick="window.__toggleLayer && window.__toggleLayer(this)">
+        <span class="legend-dot" style="background: rgb(220, 50, 50);"></span>
+        <span>Hospital</span>
+      </div>
+      <div class="legend-item layer-toggle active" data-layer="ci_fire" onclick="window.__toggleLayer && window.__toggleLayer(this)">
+        <span class="legend-dot" style="background: rgb(255, 140, 0);"></span>
+        <span>Fire Station</span>
+      </div>
+      <div class="legend-item layer-toggle active" data-layer="ci_police" onclick="window.__toggleLayer && window.__toggleLayer(this)">
+        <span class="legend-dot" style="background: rgb(50, 100, 220);"></span>
+        <span>Police</span>
+      </div>
+      <div class="legend-item layer-toggle active" data-layer="ci_ems" onclick="window.__toggleLayer && window.__toggleLayer(this)">
+        <span class="legend-dot" style="background: rgb(50, 200, 50);"></span>
+        <span>EMS</span>
+      </div>
+    </div>
+    <div class="legend-divider"></div>
+    <div class="legend-section">
+      <div class="legend-title">Layers</div>
+      <div class="legend-item layer-toggle active" data-layer="generators" onclick="window.__toggleLayer && window.__toggleLayer(this)">
+        <span class="legend-dot" style="background: rgb(65, 131, 215);"></span>
+        <span>Generators</span>
+      </div>
+      <div class="legend-item layer-toggle active" data-layer="substations" onclick="window.__toggleLayer && window.__toggleLayer(this)">
+        <span class="legend-dot" style="background: rgb(180, 180, 200);"></span>
+        <span>Substations</span>
+      </div>
+
+
     </div>
     <%= if @view_mode == "failure_state" or @cascade_active or length(@cascade_steps) > 0 do %>
       <div class="legend-divider"></div>

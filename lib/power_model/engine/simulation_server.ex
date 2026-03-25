@@ -7,10 +7,11 @@ defmodule PowerModel.Engine.SimulationServer do
 
   use GenServer
   require Logger
+  import Ecto.Query, only: [from: 2]
 
   alias PowerModel.Grid
   alias PowerModel.Solver.{DCPowerFlow, NewtonRaphson}
-  alias PowerModel.Failure.Cascade
+  alias PowerModel.Failure.{Cascade, MonteCarlo}
 
   defstruct [
     :sim_id,
@@ -21,7 +22,8 @@ defmodule PowerModel.Engine.SimulationServer do
     :ac_solution,
     :base_mva,
     :base_overloaded,
-    :base_line_loading
+    :base_line_loading,
+    :cascade_opts
   ]
 
   def start_link(opts) do
@@ -30,19 +32,27 @@ defmodule PowerModel.Engine.SimulationServer do
   end
 
   def trip_branch(sim_id, line_id) do
-    GenServer.call(via(sim_id), {:trip_branch, line_id}, 30_000)
+    GenServer.call(via(sim_id), {:trip_branch, line_id}, 120_000)
   end
 
   def trip_generator(sim_id, gen_id) do
-    GenServer.call(via(sim_id), {:trip_generator, gen_id}, 30_000)
+    GenServer.call(via(sim_id), {:trip_generator, gen_id}, 120_000)
   end
 
   def get_state(sim_id) do
-    GenServer.call(via(sim_id), :get_state, 30_000)
+    GenServer.call(via(sim_id), :get_state, 120_000)
   end
 
   def reset(sim_id) do
     GenServer.call(via(sim_id), :reset)
+  end
+
+  @doc """
+  Integration 4: Run Monte Carlo N-k contingency screening.
+  Broadcasts results via `:simulation_nk_screening_done`.
+  """
+  def screen_nk(sim_id, opts \\ []) do
+    GenServer.call(via(sim_id), {:screen_nk, opts}, 300_000)
   end
 
   @impl true
@@ -57,7 +67,35 @@ defmodule PowerModel.Engine.SimulationServer do
       Grid.get_full_grid_snapshot()
     end
 
-    cascade_state = Cascade.init(snapshot, base_mva)
+    # Integration 7: Hourly load profile scaling
+    hour = Keyword.get(opts, :hour, nil)
+    snapshot = if hour do
+      scale_loads_for_hour(snapshot, hour)
+    else
+      snapshot
+    end
+
+    # Forward all new opts to Cascade.init
+    use_transient = Keyword.get(opts, :use_transient, false)
+    use_ac = Keyword.get(opts, :use_ac, false)
+    scenario = Keyword.get(opts, :scenario, nil)
+    use_opf = Keyword.get(opts, :use_opf, false)
+    run_cpf = Keyword.get(opts, :run_cpf, false)
+    run_small_signal = Keyword.get(opts, :run_small_signal, false)
+    run_harmonics = Keyword.get(opts, :run_harmonics, false)
+
+    cascade_opts = [
+      use_ac: use_ac,
+      use_transient: use_transient,
+      scenario: scenario,
+      use_opf: use_opf,
+      run_cpf: run_cpf,
+      run_small_signal: run_small_signal,
+      run_harmonics: run_harmonics,
+      ras_schemes: Keyword.get(opts, :ras_schemes, [])
+    ]
+
+    cascade_state = Cascade.init(snapshot, base_mva, cascade_opts)
 
     state = %__MODULE__{
       sim_id: sim_id,
@@ -68,11 +106,20 @@ defmodule PowerModel.Engine.SimulationServer do
       ac_solution: nil,
       base_mva: base_mva,
       base_overloaded: cascade_state.base_overloaded,
-      base_line_loading: cascade_state.base_line_loading
+      base_line_loading: cascade_state.base_line_loading,
+      cascade_opts: cascade_opts
     }
 
-    if length(snapshot.buses) > 0 do
-      send(self(), :initial_solve)
+    # Use the base solution from cascade init if available (avoids redundant 3rd DC solve)
+    state = if cascade_state.solution do
+      dc_solution = cascade_state.solution
+      broadcast(sim_id, "dc_update", solution_payload(dc_solution, cascade_state.base_line_loading, cascade_state.lines))
+      %{state | dc_solution: dc_solution}
+    else
+      if snapshot.buses != [] do
+        send(self(), :initial_solve)
+      end
+      state
     end
 
     {:ok, state}
@@ -89,76 +136,30 @@ defmodule PowerModel.Engine.SimulationServer do
     end
   end
 
+  @impl true
   def handle_info({:ac_result, solution}, state) do
     broadcast(state.sim_id, "ac_update", solution_payload(solution, state.base_line_loading, state.cascade_state.lines))
     {:noreply, %{state | ac_solution: solution}}
   end
 
+  @impl true
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
   def handle_call({:trip_branch, line_id}, _from, state) do
-    cascade = state.cascade_state
-
-    {final_cascade, step_results} =
-      Cascade.trip_line(cascade, line_id)
-
-    Enum.each(step_results, fn step ->
-      broadcast(state.sim_id, "cascade_step", cascade_step_payload(step, state.base_line_loading))
-    end)
-
-    state = %{state | cascade_state: final_cascade}
-    state = case solve_dc_from_cascade(state) do
-      {:ok, solution} ->
-        broadcast(state.sim_id, "dc_update", solution_payload(solution, state.base_line_loading, state.cascade_state.lines))
-        state = %{state | dc_solution: solution}
-        spawn_ac_refinement(state)
-        state
-      _ ->
-        state
-    end
-
-    broadcast(state.sim_id, "cascade_done", %{
-      steps: length(step_results),
-      stable: final_cascade.stable,
-      total_events: length(final_cascade.events)
-    })
-
+    {final_cascade, step_results} = Cascade.trip_line(state.cascade_state, line_id)
+    {state, step_results} = finalize_trip(state, final_cascade, step_results)
     {:reply, {:ok, step_results}, state}
   end
 
+  @impl true
   def handle_call({:trip_generator, gen_id}, _from, state) do
-    cascade = state.cascade_state
-
-    {final_cascade, step_results} =
-      Cascade.trip_generator(cascade, gen_id)
-
-    Enum.each(step_results, fn step ->
-      payload = cascade_step_payload(step, state.base_line_loading)
-      broadcast(state.sim_id, "cascade_step", payload)
-    end)
-
-    state = %{state | cascade_state: final_cascade}
-    state = case solve_dc_from_cascade(state) do
-      {:ok, solution} ->
-        payload = solution_payload(solution, state.base_line_loading, state.cascade_state.lines)
-        broadcast(state.sim_id, "dc_update", payload)
-        state = %{state | dc_solution: solution}
-        spawn_ac_refinement(state)
-        state
-      _ ->
-        state
-    end
-
-    broadcast(state.sim_id, "cascade_done", %{
-      steps: length(step_results),
-      stable: final_cascade.stable,
-      total_events: length(final_cascade.events)
-    })
-
+    {final_cascade, step_results} = Cascade.trip_generator(state.cascade_state, gen_id)
+    {state, step_results} = finalize_trip(state, final_cascade, step_results)
     {:reply, {:ok, step_results}, state}
   end
 
+  @impl true
   def handle_call(:get_state, _from, state) do
     reply = %{
       sim_id: state.sim_id,
@@ -173,8 +174,14 @@ defmodule PowerModel.Engine.SimulationServer do
     {:reply, reply, state}
   end
 
+  @impl true
   def handle_call(:reset, _from, state) do
-    cascade = Cascade.init(state.snapshot, state.base_mva)
+    # Use saved cascade_opts to preserve all forwarded options on reset
+    cascade_opts = state.cascade_opts || [
+      use_ac: state.cascade_state.use_ac || false,
+      use_transient: state.cascade_state.use_transient || false
+    ]
+    cascade = Cascade.init(state.snapshot, state.base_mva, cascade_opts)
     state = %{state |
       cascade_state: cascade,
       dc_solution: nil,
@@ -185,6 +192,32 @@ defmodule PowerModel.Engine.SimulationServer do
     send(self(), :initial_solve)
     broadcast(state.sim_id, "reset", %{})
     {:reply, :ok, state}
+  end
+
+  # Integration 4: Monte Carlo N-k screening
+  @impl true
+  def handle_call({:screen_nk, opts}, _from, state) do
+    snapshot = dispatched_snapshot(state)
+    result =
+      try do
+        MonteCarlo.screen_random_nk(snapshot,
+          Keyword.merge([base_mva: state.base_mva], opts))
+      rescue
+        e ->
+          Logger.warning("[SIM] Monte Carlo screening failed: #{inspect(e)}")
+          []
+      catch
+        :throw, reason ->
+          Logger.warning("[SIM] Monte Carlo screening error: #{inspect(reason)}")
+          []
+      end
+
+    broadcast(state.sim_id, "nk_screening_done", %{
+      results: result,
+      count: length(result)
+    })
+
+    {:reply, {:ok, result}, state}
   end
 
   defp solve_dc(state) do
@@ -200,23 +233,7 @@ defmodule PowerModel.Engine.SimulationServer do
   end
 
   defp solve_dc_from_cascade(state) do
-    cascade = state.cascade_state
-    dispatch = cascade.dispatch
-
-    active_gens = cascade.generators
-    |> Enum.reject(&MapSet.member?(cascade.tripped_generators, &1.id))
-    |> Enum.map(fn g ->
-      d = Map.get(dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
-      %{g | p_max_mw: d, capacity_factor: 1.0}
-    end)
-
-    snapshot = %{
-      buses: cascade.buses,
-      lines: Enum.reject(cascade.lines, &MapSet.member?(cascade.tripped_lines, &1.id)),
-      transformers: Enum.reject(cascade.transformers, &MapSet.member?(cascade.tripped_transformers, &1.id)),
-      generators: active_gens,
-      loads: cascade.loads
-    }
+    snapshot = dispatched_snapshot(state)
 
     try do
       solution = DCPowerFlow.solve(snapshot, base_mva: state.base_mva)
@@ -226,6 +243,30 @@ defmodule PowerModel.Engine.SimulationServer do
         Logger.warning("DC cascade solve failed: #{kind} #{inspect(reason)}")
         :error
     end
+  end
+
+  defp finalize_trip(state, final_cascade, step_results) do
+    Enum.each(step_results, fn step ->
+      broadcast(state.sim_id, "cascade_step", cascade_step_payload(step, state.base_line_loading))
+    end)
+
+    state = %{state | cascade_state: final_cascade}
+
+    state =
+      case solve_dc_from_cascade(state) do
+        {:ok, solution} ->
+          broadcast(state.sim_id, "dc_update", solution_payload(solution, state.base_line_loading, state.cascade_state.lines))
+          state = %{state | dc_solution: solution}
+          spawn_ac_refinement(state)
+          state
+
+        _ ->
+          state
+      end
+
+    broadcast(state.sim_id, "cascade_done", cascade_done_payload(final_cascade, step_results))
+
+    {state, step_results}
   end
 
   defp spawn_ac_refinement(state) do
@@ -242,9 +283,12 @@ defmodule PowerModel.Engine.SimulationServer do
   defp dispatched_snapshot(state) do
     cascade = state.cascade_state
     dispatch = cascade.dispatch
+    offline = cascade.offline_generators || MapSet.new()
 
     active_gens = cascade.generators
-    |> Enum.reject(&MapSet.member?(cascade.tripped_generators, &1.id))
+    |> Enum.reject(fn g ->
+      MapSet.member?(cascade.tripped_generators, g.id) or MapSet.member?(offline, g.id)
+    end)
     |> Enum.map(fn g ->
       d = Map.get(dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
       %{g | p_max_mw: d, capacity_factor: 1.0}
@@ -270,17 +314,17 @@ defmodule PowerModel.Engine.SimulationServer do
         delta = flow.loading_pct - base_pct
         {_type, id} = key
 
-        cond do
-          flow.loading_pct > 100.0 and base_pct <= 100.0 ->
+        case classify_flow(flow.loading_pct, base_pct, delta) do
+          :overloaded ->
             detail = line_detail(line_lookup, id, flow.loading_pct, base_pct, delta, "overloaded")
             {[id | ol], st, rt, [detail | comp]}
-          delta >= 15.0 and flow.loading_pct >= 50.0 ->
+          :stressed ->
             detail = line_detail(line_lookup, id, flow.loading_pct, base_pct, delta, "stressed")
             {ol, [id | st], rt, [detail | comp]}
-          delta >= 5.0 and flow.loading_pct >= 10.0 ->
+          :rerouted ->
             detail = line_detail(line_lookup, id, flow.loading_pct, base_pct, delta, "compensating")
             {ol, st, [id | rt], [detail | comp]}
-          true ->
+          :normal ->
             {ol, st, rt, comp}
         end
       end)
@@ -316,6 +360,15 @@ defmodule PowerModel.Engine.SimulationServer do
     }
   end
 
+  defp classify_flow(loading_pct, base_pct, delta) do
+    cond do
+      loading_pct > 100.0 and base_pct <= 100.0 -> :overloaded
+      delta >= 15.0 and loading_pct >= 50.0 -> :stressed
+      delta >= 5.0 and loading_pct >= 10.0 -> :rerouted
+      true -> :normal
+    end
+  end
+
   defp status_rank("overloaded"), do: 3
   defp status_rank("stressed"), do: 2
   defp status_rank(_), do: 1
@@ -325,7 +378,8 @@ defmodule PowerModel.Engine.SimulationServer do
     "ac_update" => :simulation_ac_update,
     "cascade_step" => :simulation_cascade_step,
     "cascade_done" => :simulation_cascade_done,
-    "reset" => :simulation_reset
+    "reset" => :simulation_reset,
+    "nk_screening_done" => :simulation_nk_screening_done
   }
 
   defp broadcast(sim_id, event, payload) do
@@ -357,34 +411,31 @@ defmodule PowerModel.Engine.SimulationServer do
     water_facility_trips = Enum.filter(trips, &(&1.component_type == "water_facility"))
     water_facility_ids = Map.get(step, :water_facility_ids, [])
 
+    critical_facility_trips = Enum.filter(trips, &(&1.component_type == "critical_facility"))
+    critical_facility_ids = Map.get(step, :critical_facility_ids, [])
+
     solutions = if is_list(step.solution), do: step.solution, else: []
 
-    {overloaded_line_ids, stressed_line_ids, rerouted_line_ids} =
-      Enum.reduce(solutions, {[], [], []}, fn sol, {ol, st, rt} ->
-        {sol_ol, sol_st, sol_rt} =
-          Enum.reduce(sol.line_flows, {[], [], []}, fn {k, f}, {o2, s2, r2} ->
-            base_pct = Map.get(base_load, k, 0.0)
-            delta = f.loading_pct - base_pct
-            {_type, id} = k
+    classified =
+      for sol <- solutions,
+          {k, f} <- sol.line_flows,
+          base_pct = Map.get(base_load, k, 0.0),
+          delta = f.loading_pct - base_pct,
+          class = classify_flow(f.loading_pct, base_pct, delta),
+          class != :normal,
+          {_type, id} = k,
+          do: {class, id}
 
-            cond do
-              f.loading_pct > 100.0 and base_pct <= 100.0 ->
-                {[id | o2], s2, r2}
-              delta >= 15.0 and f.loading_pct >= 50.0 ->
-                {o2, [id | s2], r2}
-              delta >= 5.0 and f.loading_pct >= 10.0 ->
-                {o2, s2, [id | r2]}
-              true ->
-                {o2, s2, r2}
-            end
-          end)
+    grouped = Enum.group_by(classified, &elem(&1, 0), &elem(&1, 1))
 
-        {ol ++ sol_ol, st ++ sol_st, rt ++ sol_rt}
-      end)
+    overloaded_line_ids = Map.get(grouped, :overloaded, [])
+    stressed_line_ids = Map.get(grouped, :stressed, [])
+    rerouted_line_ids = Map.get(grouped, :rerouted, [])
 
     %{
       step: step.step,
       simulated_time: Map.get(step, :simulated_time, 0.0),
+      frequency_hz: Map.get(step, :frequency_hz, 60.0),
       islands: step.islands,
       trips: trips,
       tripped_line_ids: tripped_line_ids,
@@ -399,9 +450,121 @@ defmodule PowerModel.Engine.SimulationServer do
         %{id: t.component_id, name: get_in(t, [:details, :name]),
           facility_type: get_in(t, [:details, :facility_type]),
           cause: t.failure_cause}
+      end),
+      critical_facility_ids: critical_facility_ids,
+      critical_facility_trips: Enum.map(critical_facility_trips, fn t ->
+        %{id: t.component_id, name: get_in(t, [:details, :name]),
+          category: get_in(t, [:details, :category]),
+          cause: t.failure_cause}
       end)
     }
   end
+
+  # Build the cascade_done broadcast payload with post-stabilization data
+  defp cascade_done_payload(final_cascade, step_results) do
+    base = %{
+      steps: length(step_results),
+      stable: final_cascade.stable,
+      total_events: length(final_cascade.events)
+    }
+
+    # Add OPF results if available
+    base = if final_cascade.opf_result do
+      Map.merge(base, %{
+        opf_converged: final_cascade.opf_result.converged,
+        opf_total_cost: final_cascade.opf_result.total_cost,
+        lmps: final_cascade.lmps,
+        congested_lines: final_cascade.congested_lines
+      })
+    else
+      base
+    end
+
+    # Add CPF results if available
+    base = if final_cascade.cpf_result do
+      Map.merge(base, %{
+        voltage_margin_mw: final_cascade.voltage_margin_mw,
+        critical_bus_id: final_cascade.critical_bus_id,
+        cpf_converged: final_cascade.cpf_result.converged
+      })
+    else
+      base
+    end
+
+    # Add small-signal results if available
+    base = if final_cascade.small_signal_result do
+      Map.merge(base, %{
+        small_signal_stable: final_cascade.small_signal_stable,
+        stability_modes: Enum.take(final_cascade.stability_modes || [], 10)
+      })
+    else
+      base
+    end
+
+    # Add harmonics results if available
+    base = if final_cascade.harmonics_result do
+      Map.merge(base, %{
+        harmonics_worst_thd: final_cascade.harmonics_worst_thd,
+        harmonics_violations: final_cascade.harmonics_violations
+      })
+    else
+      base
+    end
+
+    # Add scenario description if present
+    if final_cascade.scenario do
+      Map.put(base, :scenario_description, final_cascade.scenario.description)
+    else
+      base
+    end
+  end
+
+  # Integration 7: Scale loads based on hourly load profiles.
+  # Queries hourly_load_profiles for the given hour and scales loads by
+  # the BA-level demand ratio (hourly demand / average demand).
+  defp scale_loads_for_hour(snapshot, hour) when is_integer(hour) and hour >= 0 and hour <= 23 do
+    try do
+      # Query average demand per BA and demand at the specified hour
+      ba_avg_query = from(h in PowerModel.Grid.HourlyLoadProfile,
+        group_by: h.ba_code,
+        select: {h.ba_code, avg(h.demand_mw)}
+      )
+
+      ba_hour_query = from(h in PowerModel.Grid.HourlyLoadProfile,
+        where: fragment("extract(hour from ?)", h.period) == ^hour,
+        group_by: h.ba_code,
+        select: {h.ba_code, avg(h.demand_mw)}
+      )
+
+      ba_avg = Map.new(PowerModel.Repo.all(ba_avg_query))
+      ba_hour = Map.new(PowerModel.Repo.all(ba_hour_query))
+
+      if map_size(ba_avg) == 0 or map_size(ba_hour) == 0 do
+        Logger.debug("[SIM] No hourly load profiles found, skipping load scaling")
+        snapshot
+      else
+        # Build BA lookup for loads (via generator BA membership or load BA field)
+        # For simplicity, compute a system-wide scale factor from all BAs
+        total_avg = ba_avg |> Map.values() |> Enum.sum()
+        total_hour = ba_hour |> Map.values() |> Enum.sum()
+
+        scale = if total_avg > 0.0, do: total_hour / total_avg, else: 1.0
+
+        scaled_loads = Enum.map(snapshot.loads, fn load ->
+          q = Map.get(load, :q_mvar) || 0.0
+          %{load | p_mw: load.p_mw * scale, q_mvar: q * scale}
+        end)
+
+        Logger.info("[SIM] Scaled loads for hour #{hour}: factor=#{Float.round(scale, 3)}")
+        %{snapshot | loads: scaled_loads}
+      end
+    rescue
+      e ->
+        Logger.warning("[SIM] Hourly load scaling failed: #{inspect(e)}")
+        snapshot
+    end
+  end
+  defp scale_loads_for_hour(snapshot, _hour), do: snapshot
 
   defp via(sim_id) do
     {:via, Registry, {PowerModel.SimulationRegistry, sim_id}}

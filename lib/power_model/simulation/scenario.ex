@@ -1,4 +1,8 @@
 defmodule PowerModel.Simulation.Scenario do
+  @moduledoc """
+  Persisted simulation scenario defining initial conditions and failure injections.
+  """
+
   use Ecto.Schema
   import Ecto.Changeset
 

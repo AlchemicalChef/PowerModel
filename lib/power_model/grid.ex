@@ -5,7 +5,7 @@ defmodule PowerModel.Grid do
 
   import Ecto.Query
   alias PowerModel.Repo
-  alias PowerModel.Grid.{Bus, Generator, TransmissionLine, Load, Substation, Transformer, Interconnection, WaterFacility}
+  alias PowerModel.Grid.{Bus, Generator, TransmissionLine, Load, Substation, Transformer, Interconnection, WaterFacility, CriticalFacility}
 
   def list_interconnections do
     Repo.all(Interconnection)
@@ -116,10 +116,45 @@ defmodule PowerModel.Grid do
     %{lines: lines, transformers: transformers}
   end
 
+  @snapshot_cache_table :grid_snapshot_cache
+
   def get_grid_snapshot(interconnection_id) do
+    # Check ETS cache first
+    ensure_cache_table()
+
+    case :ets.lookup(@snapshot_cache_table, interconnection_id) do
+      [{^interconnection_id, snapshot, cached_at}] ->
+        # Cache hit — use if less than 5 minutes old
+        age_ms = System.monotonic_time(:millisecond) - cached_at
+        if age_ms < 300_000 do
+          snapshot
+        else
+          load_and_cache_snapshot(interconnection_id)
+        end
+
+      [] ->
+        load_and_cache_snapshot(interconnection_id)
+    end
+  end
+
+  defp ensure_cache_table do
+    if :ets.whereis(@snapshot_cache_table) == :undefined do
+      :ets.new(@snapshot_cache_table, [:named_table, :set, :public, read_concurrency: true])
+    end
+  end
+
+  defp load_and_cache_snapshot(interconnection_id) do
     lines = in_service_lines(interconnection_id)
     transformers = in_service_transformers(interconnection_id)
-    build_snapshot_from_topology(lines, transformers)
+    snapshot = build_snapshot_from_topology(lines, transformers)
+    :ets.insert(@snapshot_cache_table, {interconnection_id, snapshot, System.monotonic_time(:millisecond)})
+    snapshot
+  end
+
+  @doc "Clear the grid snapshot cache (call after data changes)"
+  def clear_snapshot_cache do
+    ensure_cache_table()
+    :ets.delete_all_objects(@snapshot_cache_table)
   end
 
   def get_full_grid_snapshot do
@@ -144,7 +179,7 @@ defmodule PowerModel.Grid do
     end)
 
     if main_list == [] do
-      %{buses: [], lines: [], transformers: [], generators: [], loads: [], water_facilities: []}
+      %{buses: [], lines: [], transformers: [], generators: [], loads: [], water_facilities: [], critical_facilities: []}
     else
       buses = from(b in Bus, where: b.id in ^main_list) |> Repo.all()
       generators = from(g in Generator,
@@ -153,6 +188,8 @@ defmodule PowerModel.Grid do
         where: l.status == "in_service" and l.bus_id in ^main_list) |> Repo.all()
       water_facilities = from(w in WaterFacility,
         where: w.status == "active" and w.bus_id in ^main_list) |> Repo.all()
+      critical_facilities = from(cf in CriticalFacility,
+        where: cf.status == "active" and cf.bus_id in ^main_list) |> Repo.all()
 
       %{
         buses: buses,
@@ -160,7 +197,8 @@ defmodule PowerModel.Grid do
         transformers: transformers,
         generators: generators,
         loads: loads,
-        water_facilities: water_facilities
+        water_facilities: water_facilities,
+        critical_facilities: critical_facilities
       }
     end
   end
@@ -407,6 +445,110 @@ defmodule PowerModel.Grid do
     ) |> Repo.all()
   end
 
+  # --- Critical Facilities ---
+
+  def list_critical_facilities(opts \\ []) do
+    CriticalFacility
+    |> maybe_filter_category(opts[:category])
+    |> maybe_filter_cf_state(opts[:state])
+    |> Repo.all()
+  end
+
+  def export_critical_facilities do
+    from(cf in CriticalFacility,
+      where: cf.status == "active" and not is_nil(cf.coordinates),
+      select: %{
+        id: cf.id,
+        coordinates: cf.coordinates,
+        name: cf.name,
+        category: cf.category,
+        facility_type: cf.facility_type,
+        beds: cf.beds,
+        trauma: cf.trauma,
+        estimated_power_mw: cf.estimated_power_mw,
+        bus_id: cf.bus_id
+      }
+    )
+    |> Repo.all()
+  end
+
+  def get_critical_facilities_for_buses(bus_ids) when is_list(bus_ids) do
+    from(cf in CriticalFacility,
+      where: cf.bus_id in ^bus_ids and cf.status == "active"
+    ) |> Repo.all()
+  end
+
+  def map_critical_facilities_to_grid(opts \\ []) do
+    max_km = Keyword.get(opts, :max_km, 20)
+    max_meters = max_km * 1000
+
+    facilities = from(cf in CriticalFacility,
+      where: cf.status == "active" and not is_nil(cf.coordinates)
+    ) |> Repo.all()
+
+    {mapped, loads} = Enum.reduce(facilities, {0, 0}, fn facility, {map_count, load_count} ->
+      nearest = from(b in Bus,
+        where: not is_nil(b.coordinates),
+        where: fragment("ST_DWithin(?::geography, ?::geography, ?)",
+          b.coordinates, ^facility.coordinates, ^max_meters),
+        order_by: fragment("ST_Distance(?::geography, ?::geography)",
+          b.coordinates, ^facility.coordinates),
+        limit: 1
+      ) |> Repo.one()
+
+      case nearest do
+        nil ->
+          {map_count, load_count}
+        bus ->
+          facility
+          |> Ecto.Changeset.change(%{bus_id: bus.id})
+          |> Repo.update!()
+
+          lc = if facility.estimated_power_mw && facility.estimated_power_mw > 0 do
+            existing_load = from(l in Load, where: l.bus_id == ^bus.id) |> Repo.one()
+
+            case existing_load do
+              nil ->
+                q_mvar = facility.estimated_power_mw * 0.3287
+                %Load{}
+                |> Load.changeset(%{
+                  bus_id: bus.id,
+                  p_mw: facility.estimated_power_mw,
+                  q_mvar: q_mvar,
+                  load_type: "constant_power",
+                  status: "in_service"
+                })
+                |> Repo.insert!()
+                1
+              load ->
+                new_p = load.p_mw + facility.estimated_power_mw
+                new_q = (load.q_mvar || 0.0) + facility.estimated_power_mw * 0.3287
+                load
+                |> Ecto.Changeset.change(%{p_mw: new_p, q_mvar: new_q})
+                |> Repo.update!()
+                1
+            end
+          else
+            0
+          end
+
+          {map_count + 1, load_count + lc}
+      end
+    end)
+
+    {mapped, loads}
+  end
+
+  defp maybe_filter_category(query, nil), do: query
+  defp maybe_filter_category(query, category) do
+    from q in query, where: q.category == ^category
+  end
+
+  defp maybe_filter_cf_state(query, nil), do: query
+  defp maybe_filter_cf_state(query, state) do
+    from q in query, where: q.state == ^state
+  end
+
   @doc """
   Get grid snapshot including water facilities for a geographic region.
   """
@@ -458,13 +600,18 @@ defmodule PowerModel.Grid do
       where: w.status == "active" and w.bus_id in ^MapSet.to_list(all_bus_ids)
     ) |> Repo.all()
 
+    critical_facilities = from(cf in CriticalFacility,
+      where: cf.status == "active" and cf.bus_id in ^MapSet.to_list(all_bus_ids)
+    ) |> Repo.all()
+
     %{
       buses: all_buses,
       lines: lines,
       transformers: transformers,
       generators: generators,
       loads: loads,
-      water_facilities: water_facilities
+      water_facilities: water_facilities,
+      critical_facilities: critical_facilities
     }
   end
 end

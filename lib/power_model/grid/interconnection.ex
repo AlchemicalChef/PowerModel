@@ -1,4 +1,11 @@
 defmodule PowerModel.Grid.Interconnection do
+  @moduledoc """
+  Major AC interconnection (Eastern, Western, or ERCOT).
+
+  Buses belong to exactly one interconnection. International tie lines
+  connect buses across interconnection boundaries.
+  """
+
   use Ecto.Schema
   import Ecto.Changeset
 

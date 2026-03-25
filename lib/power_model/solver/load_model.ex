@@ -26,20 +26,42 @@ defmodule PowerModel.Solver.LoadModel do
   - "residential":    z=0.4, i=0.3, p=0.3  (high impedance component: heaters, incandescent lights)
   - "commercial":     z=0.2, i=0.2, p=0.6  (mixed: HVAC, fluorescent, electronics)
   - "industrial":     z=0.1, i=0.1, p=0.8  (motor-dominated, nearly constant power)
-  - "constant_power": z=0.0, i=0.0, p=1.0  (legacy default)
+  - "constant_power": z=0.0, i=0.0, p=1.0  (backward-compatible pure constant power)
+  - nil / other:      z=0.3, i=0.3, p=0.4  (typical system-wide average mix)
   """
   @spec zip_coefficients(String.t() | nil) :: zip_coefficients()
   def zip_coefficients("residential"), do: %{z: 0.4, i: 0.3, p: 0.3}
   def zip_coefficients("commercial"), do: %{z: 0.2, i: 0.2, p: 0.6}
   def zip_coefficients("industrial"), do: %{z: 0.1, i: 0.1, p: 0.8}
-  def zip_coefficients(_default), do: %{z: 0.0, i: 0.0, p: 1.0}
+  def zip_coefficients("constant_power"), do: %{z: 0.0, i: 0.0, p: 1.0}
+  def zip_coefficients(_default), do: %{z: 0.3, i: 0.3, p: 0.4}
+
+  @doc """
+  Default ZIP Q (reactive) coefficients by load type.
+
+  Reactive power has a higher impedance component than active power
+  because reactive loads (magnetizing branches, capacitor banks) are
+  inherently voltage-dependent.
+
+  - "residential":    z=0.9, i=0.05, p=0.05  (largely impedance: heating, lighting)
+  - "commercial":     z=0.5, i=0.2,  p=0.3   (mixed: HVAC, lighting, electronics)
+  - "industrial":     z=0.6, i=0.1,  p=0.3   (motors: magnetizing current is Z-type)
+  - nil / other:      z=0.5, i=0.2,  p=0.3   (typical system-wide average)
+  """
+  @spec zip_q_coefficients(String.t() | nil) :: zip_coefficients()
+  def zip_q_coefficients("residential"), do: %{z: 0.9, i: 0.05, p: 0.05}
+  def zip_q_coefficients("commercial"), do: %{z: 0.5, i: 0.2, p: 0.3}
+  def zip_q_coefficients("industrial"), do: %{z: 0.6, i: 0.1, p: 0.3}
+  def zip_q_coefficients("constant_power"), do: %{z: 0.0, i: 0.0, p: 1.0}
+  def zip_q_coefficients(_default), do: %{z: 0.5, i: 0.2, p: 0.3}
 
   @doc """
   Compute effective load (P, Q) at a given voltage magnitude.
 
   Given a load map (must have :p_mw and optionally :q_mvar and :load_type)
   and the bus voltage magnitude in per-unit, returns {p_mw, q_mvar} adjusted
-  by the ZIP model.
+  by the ZIP model. P and Q use separate ZIP coefficients because reactive
+  power loads have different voltage sensitivity than active power loads.
 
   ## Examples
 
@@ -56,13 +78,16 @@ defmodule PowerModel.Solver.LoadModel do
   @spec effective_load(map(), float()) :: {float(), float()}
   def effective_load(load, vm_pu) do
     p0 = load.p_mw
-    q0 = load[:q_mvar] || 0.0
-    load_type = load[:load_type]
+    q0 = Map.get(load, :q_mvar) || 0.0
+    load_type = Map.get(load, :load_type)
 
-    %{z: z, i: i, p: p} = zip_coefficients(load_type)
-    factor = z * vm_pu * vm_pu + i * vm_pu + p
+    %{z: zp, i: ip, p: pp} = zip_coefficients(load_type)
+    %{z: zq, i: iq, p: pq} = zip_q_coefficients(load_type)
 
-    {p0 * factor, q0 * factor}
+    p_factor = zp * vm_pu * vm_pu + ip * vm_pu + pp
+    q_factor = zq * vm_pu * vm_pu + iq * vm_pu + pq
+
+    {p0 * p_factor, q0 * q_factor}
   end
 
   @doc """

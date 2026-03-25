@@ -12,6 +12,7 @@ export class DataStore {
     this.transmissionLines = { count: 0, lines: [] };
     this.substations = { count: 0, ids: null, positions: null, voltages: null, states: null };
     this.waterFacilities = { count: 0, facilities: [] };
+    this.criticalFacilities = { count: 0, facilities: [] };
   }
 
   loadGenerators(buffer) {
@@ -105,6 +106,35 @@ export class DataStore {
     return this.waterFacilities.facilities;
   }
 
+  loadCriticalFacilities(json) {
+    const facilities = json.facilities.map((f) => ({
+      id: f.id,
+      position: [f.lon, f.lat],
+      name: f.name,
+      category: f.category,
+      facilityType: f.facilityType,
+      beds: f.beds,
+      trauma: f.trauma,
+      powerMw: f.powerMw,
+      busId: f.busId || null,
+      state: f.state || 0,
+    }));
+
+    this.criticalFacilities = { count: facilities.length, facilities };
+  }
+
+  getCriticalFacilityData() {
+    return this.criticalFacilities.facilities;
+  }
+
+  applyCriticalFacilityState(ids, newState) {
+    if (!ids || ids.length === 0) return;
+    const idSet = new Set(ids);
+    for (const f of this.criticalFacilities.facilities) {
+      if (idSet.has(f.id)) f.state = newState;
+    }
+  }
+
   applyLineStateMap(stateMap) {
     if (!stateMap || Object.keys(stateMap).length === 0) return;
     for (const line of this.transmissionLines.lines) {
@@ -144,6 +174,7 @@ export class DataStore {
     for (const line of this.transmissionLines.lines) line.state = STATE_NORMAL;
     if (this.substations.states) this.substations.states.fill(STATE_NORMAL);
     for (const f of this.waterFacilities.facilities) f.state = STATE_NORMAL;
+    for (const f of this.criticalFacilities.facilities) f.state = STATE_NORMAL;
   }
 
   resetTransientStates() {
@@ -161,6 +192,12 @@ export class DataStore {
         const s = this.substations.states[i];
         if (s === 1 || s === 2 || s === 4) this.substations.states[i] = STATE_NORMAL;
       }
+    }
+    for (const f of this.waterFacilities.facilities) {
+      if (f.state === 1 || f.state === 2 || f.state === 4) f.state = STATE_NORMAL;
+    }
+    for (const f of this.criticalFacilities.facilities) {
+      if (f.state === 1 || f.state === 2 || f.state === 4) f.state = STATE_NORMAL;
     }
   }
 

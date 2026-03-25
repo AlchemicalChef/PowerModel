@@ -1,4 +1,13 @@
 defmodule PowerModel.Grid.Bus do
+  @moduledoc """
+  Electrical bus (node) in the power grid network.
+
+  Bus types follow the standard power flow convention:
+    - 1 (PQ): load bus with specified P and Q
+    - 2 (PV): generator bus with specified P and voltage setpoint
+    - 3 (Slack/Swing): reference bus that absorbs power mismatch
+  """
+
   use Ecto.Schema
   import Ecto.Changeset
 
@@ -9,6 +18,7 @@ defmodule PowerModel.Grid.Bus do
     field :base_kv, :float
     field :vm_pu, :float, default: 1.0
     field :va_rad, :float, default: 0.0
+    field :b_shunt_mvar, :float, default: 0.0
     field :coordinates, Geo.PostGIS.Geometry
     field :source, :string
     field :source_id, :string
@@ -25,8 +35,8 @@ defmodule PowerModel.Grid.Bus do
 
   def changeset(bus, attrs) do
     bus
-    |> cast(attrs, [:bus_type, :base_kv, :vm_pu, :va_rad, :coordinates,
-                     :source, :source_id, :interconnection_id])
+    |> cast(attrs, [:bus_type, :base_kv, :vm_pu, :va_rad, :b_shunt_mvar,
+                     :coordinates, :source, :source_id, :interconnection_id])
     |> validate_required([:bus_type, :base_kv])
     |> validate_inclusion(:bus_type, Map.values(@bus_types))
     |> unique_constraint([:source, :source_id])

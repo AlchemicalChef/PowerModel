@@ -1,4 +1,9 @@
 defmodule PowerModel.Grid.HourlyGenerationMix do
+  @moduledoc """
+  Hourly generation mix by fuel type from EIA Form 930, indexed by
+  balancing authority.
+  """
+
   use Ecto.Schema
   import Ecto.Changeset
 

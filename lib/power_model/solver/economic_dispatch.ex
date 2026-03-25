@@ -5,6 +5,14 @@ defmodule PowerModel.Solver.EconomicDispatch do
   Respects p_min/p_max constraints and ramp rate limits.
   """
 
+  # Default ramp rate as fraction of p_max per minute, by fuel type
+  @ramp_rate_mult %{
+    "NUC" => 0.01, "COL" => 0.02, "NG" => 0.08, "WAT" => 0.5,
+    "WND" => 1.0, "SUN" => 1.0, "PET" => 0.03, "GEO" => 0.01,
+    "BIT" => 0.02, "SUB" => 0.02, "LIG" => 0.02, "OG" => 0.05,
+    "DFO" => 0.05, "RFO" => 0.03, "WH" => 0.5
+  }
+
   @doc """
   Dispatch generators to meet total_load_mw.
   Returns %{gen_id => dispatch_mw} map.
@@ -48,9 +56,13 @@ defmodule PowerModel.Solver.EconomicDispatch do
   Takes current dispatch, removes tripped generators, and redistributes
   the deficit using merit order among remaining generators with headroom.
 
+  The optional `time_window_min` parameter constrains each generator's
+  pickup to `ramp_rate_mw_per_min * time_window_min`. Pass `:infinity`
+  (or omit) for unconstrained redispatch.
+
   Returns {new_dispatch_map, unmet_deficit_mw}.
   """
-  def redispatch(current_dispatch, generators, tripped_gen_ids, deficit_mw) do
+  def redispatch(current_dispatch, generators, tripped_gen_ids, deficit_mw, time_window_min \\ :infinity) do
     online = generators
     |> Enum.reject(fn g -> MapSet.member?(tripped_gen_ids, g.id) end)
     |> Enum.sort_by(fn g -> Map.get(g, :marginal_cost_per_mwh) || 999.0 end)
@@ -61,7 +73,16 @@ defmodule PowerModel.Solver.EconomicDispatch do
       else
         current = Map.get(acc, g.id, 0.0)
         headroom = max((g.p_max_mw || 0.0) - current, 0.0)
-        increase = min(headroom, rem)
+
+        ramp_limit = case time_window_min do
+          :infinity -> headroom
+          tw when is_number(tw) and tw > 0 ->
+            ramp_rate = Map.get(g, :ramp_rate_mw_per_min) || default_ramp_rate(g)
+            ramp_rate * tw
+          _ -> headroom
+        end
+
+        increase = min(headroom, min(ramp_limit, rem))
         {Map.put(acc, g.id, current + increase), rem - increase}
       end
     end)
@@ -69,5 +90,11 @@ defmodule PowerModel.Solver.EconomicDispatch do
     new_dispatch = Map.drop(new_dispatch, MapSet.to_list(tripped_gen_ids))
 
     {new_dispatch, remaining}
+  end
+
+  defp default_ramp_rate(g) do
+    fuel = Map.get(g, :fuel_type) || ""
+    mult = Map.get(@ramp_rate_mult, fuel, 0.03)
+    (g.p_max_mw || 0.0) * mult
   end
 end

@@ -1,4 +1,9 @@
 defmodule PowerModel.Grid.BalancingAuthority do
+  @moduledoc """
+  NERC Balancing Authority responsible for maintaining load-generation
+  balance within its footprint. Identified by a short code (e.g., "PJM").
+  """
+
   use Ecto.Schema
   import Ecto.Changeset
 

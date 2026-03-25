@@ -14,9 +14,14 @@ const WATER_COLORS = {
 
 const GHOST_COLOR = [40, 40, 50, 20];
 
-export function createWaterFacilitiesLayer(dataStore, viewMode, zoom, onClick, selectedId, cascadeActive) {
-  const data = dataStore.getWaterFacilityData();
-  if (!data || data.length === 0) return [];
+export function createWaterFacilitiesLayer(dataStore, viewMode, zoom, onClick, selectedId, cascadeActive, visibleTypes) {
+  const allData = dataStore.getWaterFacilityData();
+  if (!allData || allData.length === 0) return [];
+
+  const data = visibleTypes
+    ? allData.filter((d) => visibleTypes[d.facilityType])
+    : allData;
+  if (data.length === 0) return [];
 
   const { atlas, mapping } = getIconAtlas();
 

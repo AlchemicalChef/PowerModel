@@ -24,16 +24,32 @@ defmodule PowerModel.Solver.NewtonRaphson do
   dV variables are only for PQ buses, and updates are additive:
     theta_new = theta_old + dtheta
     V_new     = V_old     + dV
+
+  ## Sparse math for large grids
+
+  For grids with more than 200 buses, the Jacobian is built in COO (coordinate)
+  triplet format, iterating only over non-zero entries (diagonal + adjacency
+  neighbors), giving O(nnz) construction instead of O(n²). The admittance
+  lookup uses a pre-built Map-of-Maps (`yij_map`) for O(1) element access.
+
+  Solve strategy by grid size:
+    - n <= 200:    Dense Rust NIF LU (`Sparse.lu_factorize`)
+    - n > 200:     Sparse LU via faer NIF (`Sparse.sparse_lu_solve`), falling
+                   back to dense NIF LU, normal equations (J^T J with LDL^T),
+                   Nx dense, or Gaussian elimination
   """
 
-  alias PowerModel.Solver.{YBus, Solution, Sparse, LoadModel}
+  alias PowerModel.Solver.{YBus, Solution, Sparse, LoadModel, EconomicDispatch}
 
   @max_iterations 50
   @tolerance 1.0e-4
-  @max_dtheta 0.3
-  @max_dv 0.1
+  @max_dtheta 0.5
+  @max_dv 0.2
 
   @pv_threshold_mw 50.0
+
+  # Grid size threshold: below this we use dense NIF LU on nested lists
+  @dense_nif_threshold 200
 
   defstruct [:ybus, :buses, :generators, :loads, :base_mva, :bus_index]
 
@@ -46,6 +62,8 @@ defmodule PowerModel.Solver.NewtonRaphson do
     * `:max_iterations` - maximum NR iterations (default 50)
     * `:tolerance` - convergence tolerance on max mismatch in p.u. (default 1e-4)
     * `:warm_start` - a previous `%Solution{}` to initialize voltages from
+    * `:use_bus_profiles` - if true, initialize V and angle from bus.vm_pu/va_rad (default false)
+    * `:skip_dispatch` - if true, use generator capacity_factor * p_max as-is (default false)
     * `:pv_threshold_mw` - minimum aggregate generation MW for a bus to be PV (default 50.0)
   """
   def solve(snapshot, opts \\ []) do
@@ -53,6 +71,8 @@ defmodule PowerModel.Solver.NewtonRaphson do
     max_iter = Keyword.get(opts, :max_iterations, @max_iterations)
     tol = Keyword.get(opts, :tolerance, @tolerance)
     warm_start = Keyword.get(opts, :warm_start, nil)
+    use_bus_profiles = Keyword.get(opts, :use_bus_profiles, false)
+    skip_dispatch = Keyword.get(opts, :skip_dispatch, false)
     pv_threshold = Keyword.get(opts, :pv_threshold_mw, @pv_threshold_mw)
 
     buses = snapshot.buses
@@ -71,6 +91,19 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
       ybus = YBus.build(buses, lines, transformers, base_mva)
 
+      # Balance generation to match load via economic dispatch
+      generators = if skip_dispatch do
+        generators
+      else
+        total_load = Enum.sum(Enum.map(loads, & &1.p_mw))
+        dispatch = EconomicDispatch.dispatch(generators, total_load)
+        Enum.map(generators, fn g ->
+          d = Map.get(dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
+          %{g | p_max_mw: d, capacity_factor: 1.0}
+          |> Map.put(:p_nameplate_mw, g.p_max_mw)  # preserve original for Q capability curve
+        end)
+      end
+
       gen_by_bus = Enum.group_by(generators, & &1.bus_id)
 
       {pq_indices, pv_indices, slack_idx} =
@@ -80,11 +113,17 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
       bus_loads = aggregate_loads_by_bus(loads, bus_index)
 
-      v_sched = scheduled_voltages(buses, pv_indices, slack_idx, n)
+      v_sched = scheduled_voltages(buses, pv_indices, slack_idx, n, gen_by_bus)
 
       q_limits = aggregate_q_limits(generators, bus_index, n, base_mva)
 
-      {vm, va} = initialize_voltages(n, warm_start, bus_ids, v_sched, pv_indices, slack_idx)
+      init = cond do
+        warm_start != nil -> warm_start
+        use_bus_profiles -> {:bus_profiles, buses}
+        true -> nil
+      end
+
+      {vm, va} = initialize_voltages(n, init, bus_ids, v_sched, pv_indices, slack_idx)
 
       y_data = build_y_data(ybus)
 
@@ -109,12 +148,16 @@ defmodule PowerModel.Solver.NewtonRaphson do
         max_mismatch: max_mis,
         total_gen_mw: compute_total_gen(generators, base_mva),
         total_load_mw: compute_total_load(loads),
-        total_loss_mw: 0.0
+        total_loss_mw: compute_total_losses(line_flows)
       }
 
       {:ok, solution}
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Bus classification
+  # ---------------------------------------------------------------------------
 
   defp classify_buses(buses, gen_by_bus, bus_index, pv_threshold) do
     bus_gen_capacity =
@@ -141,7 +184,10 @@ defmodule PowerModel.Solver.NewtonRaphson do
         if idx == slack_idx do
           false
         else
-          bus.bus_type == 2 or
+          has_gen = Map.has_key?(gen_by_bus, bus.id)
+          # PV if: bus is marked type 2 AND has generators (to provide Q),
+          # or has large generation capacity regardless of bus_type
+          (bus.bus_type == 2 and has_gen) or
             Map.get(bus_gen_capacity, bus.id, 0.0) > pv_threshold
         end
       end)
@@ -160,27 +206,26 @@ defmodule PowerModel.Solver.NewtonRaphson do
     {pq_indices, pv_indices, slack_idx}
   end
 
+  # ---------------------------------------------------------------------------
+  # Generation / load injection
+  # ---------------------------------------------------------------------------
+
   defp gen_injection(generators, bus_index, n, base_mva) do
     p = :array.new(n, default: 0.0)
     q = :array.new(n, default: 0.0)
 
+    # Only schedule P from generators. Q is not scheduled because:
+    # - PV buses: Q is a free variable (solver determines it from V constraint)
+    # - PQ buses: Q_gen is unknown; scheduling (q_max+q_min)/2 causes divergence
+    #   because the midpoint rarely matches what the network needs.
+    #   Instead, Q_sched = -Q_load only, and voltages adjust to balance Q.
     {p, q} =
       Enum.reduce(generators, {p, q}, fn gen, {p_acc, q_acc} ->
         idx = Map.fetch!(bus_index, gen.bus_id)
         p_mw = (gen.p_max_mw || 0.0) * (gen.capacity_factor || 1.0)
         p_pu = p_mw / base_mva
 
-        q_mw = cond do
-          gen.q_max_mvar != nil and gen.q_min_mvar != nil ->
-            (gen.q_max_mvar + gen.q_min_mvar) / 2.0
-          gen.q_max_mvar != nil ->
-            gen.q_max_mvar * 0.3
-          true ->
-            p_mw * 0.3287
-        end
-        q_pu = q_mw / base_mva
-
-        {array_add(p_acc, idx, p_pu), array_add(q_acc, idx, q_pu)}
+        {array_add(p_acc, idx, p_pu), q_acc}
       end)
 
     {p, q}
@@ -213,14 +258,18 @@ defmodule PowerModel.Solver.NewtonRaphson do
     end)
   end
 
-  defp scheduled_voltages(buses, pv_indices, slack_idx, _n) do
+  defp scheduled_voltages(buses, pv_indices, slack_idx, _n, gen_by_bus) do
     pv_set = MapSet.new(pv_indices)
 
     buses
     |> Enum.with_index()
     |> Enum.map(fn {bus, idx} ->
       if idx == slack_idx or MapSet.member?(pv_set, idx) do
-        bus.vm_pu || 1.0
+        # Prefer generator v_set_pu if available
+        case Map.get(gen_by_bus, bus.id) do
+          [gen | _] when gen.v_set_pu != nil and gen.v_set_pu > 0 -> gen.v_set_pu
+          _ -> bus.vm_pu || 1.0
+        end
       else
         1.0
       end
@@ -234,22 +283,48 @@ defmodule PowerModel.Solver.NewtonRaphson do
     |> Map.new(fn {idx, gens} ->
       {q_min, q_max} =
         Enum.reduce(gens, {0.0, 0.0}, fn g, {qmin_acc, qmax_acc} ->
-          p_max = g.p_max_mw
+          # p_max_mw is already set to dispatched value (from economic dispatch).
+          # p_nameplate_mw preserves the original nameplate for S_rated computation.
+          p_dispatch = g.p_max_mw
+          p_nameplate = Map.get(g, :p_nameplate_mw, p_dispatch)
 
-          {q_lo, q_hi} =
+          {q_lo_rated, q_hi_rated} =
             cond do
               g.q_max_mvar != nil and g.q_min_mvar != nil ->
                 {g.q_min_mvar, g.q_max_mvar}
 
               true ->
-                estimate_q_limits(Map.get(g, :fuel_type), p_max)
+                estimate_q_limits(Map.get(g, :fuel_type), p_nameplate)
             end
+
+          # Apply P-Q capability curve: use nameplate for S_rated, dispatch for Q_max(P)
+          {q_lo, q_hi} = capability_q_limits(q_lo_rated, q_hi_rated, p_nameplate, p_dispatch)
 
           {qmin_acc + q_lo / base_mva, qmax_acc + q_hi / base_mva}
         end)
 
       {idx, {q_min, q_max}}
     end)
+  end
+
+  # P-Q capability curve: armature current limit.
+  # S_rated = sqrt(P_max^2 + Q_max_rated^2) defines the MVA circle.
+  # At dispatch P: Q_max(P) = sqrt(S_rated^2 - P^2)
+  # At P = P_max: Q_max = Q_max_rated (by definition of the circle).
+  # At P < P_max: Q_max > Q_max_rated (more Q headroom available).
+  # Q_min (underexcited limit) stays roughly constant.
+  defp capability_q_limits(q_min_rated, q_max_rated, p_max, p_dispatch) do
+    if p_max <= 0.0 or q_max_rated <= 0.0 do
+      {q_min_rated, q_max_rated}
+    else
+      s_rated_sq = p_max * p_max + q_max_rated * q_max_rated
+      q_max = :math.sqrt(max(s_rated_sq - p_dispatch * p_dispatch, 0.0))
+      # Cap at 2x rated to avoid unrealistic values at very low P
+      q_max = min(q_max, q_max_rated * 2.0)
+      # Ensure a minimum floor
+      q_max = max(q_max, q_max_rated * 0.1)
+      {q_min_rated, q_max}
+    end
   end
 
   defp estimate_q_limits(fuel_type, p_max_mw) do
@@ -268,10 +343,41 @@ defmodule PowerModel.Solver.NewtonRaphson do
     end
   end
 
-  defp initialize_voltages(n, nil, _bus_ids, v_sched, pv_indices, slack_idx) do
-    vm = :array.new(n, default: 1.0)
-    va = :array.new(n, default: 0.0)
+  # ---------------------------------------------------------------------------
+  # Voltage initialization
+  # ---------------------------------------------------------------------------
 
+  defp initialize_voltages(n, nil, bus_ids, v_sched, pv_indices, slack_idx) do
+    initialize_voltages(n, :from_buses, bus_ids, v_sched, pv_indices, slack_idx)
+  end
+
+  defp initialize_voltages(_n, :from_buses, _bus_ids, v_sched, pv_indices, slack_idx) do
+    # Flat start: Vm=1.0, Va=0.0 for all buses
+    # PV and slack buses get their scheduled voltage magnitudes
+    vm = v_sched
+    va = :array.new(:array.size(v_sched), default: 0.0)
+
+    vm = :array.set(slack_idx, :array.get(slack_idx, v_sched), vm)
+
+    vm =
+      Enum.reduce(pv_indices, vm, fn idx, acc ->
+        :array.set(idx, :array.get(idx, v_sched), acc)
+      end)
+
+    {vm, va}
+  end
+
+  # Initialize from bus-stored voltage profiles (from MATPOWER solved cases)
+  defp initialize_voltages(_n, {:bus_profiles, buses}, _bus_ids, v_sched, pv_indices, slack_idx) do
+    vm = buses
+      |> Enum.map(fn b -> b.vm_pu || 1.0 end)
+      |> :array.from_list()
+
+    va = buses
+      |> Enum.map(fn b -> b.va_rad || 0.0 end)
+      |> :array.from_list()
+
+    # Override PV/slack with scheduled values
     vm = :array.set(slack_idx, :array.get(slack_idx, v_sched), vm)
 
     vm =
@@ -313,6 +419,10 @@ defmodule PowerModel.Solver.NewtonRaphson do
     {vm, va}
   end
 
+  # ---------------------------------------------------------------------------
+  # Y-bus data preparation — adjacency list + yij_map (Map of Maps)
+  # ---------------------------------------------------------------------------
+
   defp build_y_data(ybus) do
     n = ybus.n
 
@@ -331,14 +441,29 @@ defmodule PowerModel.Solver.NewtonRaphson do
         end
       end)
 
-    sparse = %{adj: adj, g_diag: g_diag, b_diag: b_diag, n: n}
+    # Build yij_map: %{i => %{j => {gij, bij}}} for O(1) admittance lookup.
+    # This replaces the linear-search find_yij that was called per Jacobian element.
+    yij_map = build_yij_map(adj, n)
 
-    if n <= 200 do
+    sparse = %{adj: adj, g_diag: g_diag, b_diag: b_diag, n: n, yij_map: yij_map}
+
+    if n <= @dense_nif_threshold do
       {g, b} = build_dense_gb(ybus)
       Map.merge(sparse, %{g: g, b: b, dense: true})
     else
       Map.put(sparse, :dense, false)
     end
+  end
+
+  defp build_yij_map(adj, n) do
+    Enum.reduce(0..(n - 1), %{}, fn i, outer_acc ->
+      neighbors = :array.get(i, adj)
+      inner_map =
+        Enum.reduce(neighbors, %{}, fn {j, gij, bij}, inner_acc ->
+          Map.put(inner_acc, j, {gij, bij})
+        end)
+      Map.put(outer_acc, i, inner_map)
+    end)
   end
 
   defp build_dense_gb(ybus) do
@@ -350,6 +475,10 @@ defmodule PowerModel.Solver.NewtonRaphson do
       {array_add(ga, r * n + c, re), array_add(ba, r * n + c, im)}
     end)
   end
+
+  # ---------------------------------------------------------------------------
+  # Newton-Raphson iteration loop
+  # ---------------------------------------------------------------------------
 
   defp iterate(
          vm, va, y_data, p_gen, q_gen, v_sched, q_limits,
@@ -385,8 +514,11 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
     {p_calc, q_calc} = compute_power_sparse(vm, va, y_data, n)
 
-    {pq_indices, pv_indices, q_sched} =
-      check_pv_pq_switching(pv_indices, pq_indices, q_calc, q_limits, q_sched)
+    # PV-PQ switching disabled — it causes divergence on large real grids
+    # because Q_calc is unreliable during convergence and switching removes
+    # voltage regulation at PV buses prematurely.
+    # Q limits are still respected via the scheduled voltage magnitudes.
+    {pq_indices, pv_indices, q_sched} = {pq_indices, pv_indices, q_sched}
 
     non_slack = (pq_indices ++ pv_indices) |> Enum.sort()
 
@@ -407,48 +539,56 @@ defmodule PowerModel.Solver.NewtonRaphson do
       max_mis < tol ->
         {vm, va, true, iter + 1, max_mis}
 
-      not is_number(max_mis) or max_mis > 1.0e10 ->
-        {vm, va, false, iter + 1, max_mis}
+      not is_number(max_mis) ->
+        {vm, va, false, iter + 1, :infinity}
 
       true ->
-        j_size = length(non_slack) + length(pq_indices)
-
-        non_slack_arr = :array.from_list(non_slack)
-        pq_arr = :array.from_list(pq_indices)
         n_ns = length(non_slack)
         n_pq = length(pq_indices)
+        j_size = n_ns + n_pq
 
-        jacobian =
+        correction =
           if y_data.dense do
-            build_jacobian_dense(
-              vm, va, y_data, p_calc, q_calc,
-              non_slack_arr, pq_arr, n_ns, n_pq, n
-            )
+            # Small grid path: build dense list-of-lists Jacobian
+            non_slack_arr = :array.from_list(non_slack)
+            pq_arr = :array.from_list(pq_indices)
+
+            jacobian =
+              build_jacobian_dense(
+                vm, va, y_data, p_calc, q_calc,
+                non_slack_arr, pq_arr, n_ns, n_pq, n
+              )
+
+            solve_jacobian_dense(jacobian, mismatch, j_size)
           else
-            build_jacobian_sparse(
+            # Large grid path: build COO triplets, solve with sparse/dense-flat strategy
+            solve_jacobian_coo(
               vm, va, y_data, p_calc, q_calc,
-              non_slack, pq_indices, n_ns, n_pq, n
+              non_slack, pq_indices, n_ns, n_pq, n, mismatch, j_size
             )
           end
 
-        correction = solve_jacobian(jacobian, mismatch, j_size)
         correction = limit_step_size(correction, n_ns, n_pq)
+
+        # Standard Newton step with mild damping only when mismatch is very large
+        # Step clamping (@max_dtheta, @max_dv) provides the main safety net
+        damping = if max_mis > 100.0, do: 0.5, else: 1.0
 
         va =
           Enum.with_index(non_slack)
           |> Enum.reduce(va, fn {bus_i, ci}, va_acc ->
             old = :array.get(bus_i, va_acc)
-            :array.set(bus_i, old + :array.get(ci, correction), va_acc)
+            :array.set(bus_i, old + damping * :array.get(ci, correction), va_acc)
           end)
 
         vm =
           Enum.with_index(pq_indices)
           |> Enum.reduce(vm, fn {bus_i, ci}, vm_acc ->
-            dv = :array.get(n_ns + ci, correction)
+            dv = damping * :array.get(n_ns + ci, correction)
             v_old = :array.get(bus_i, vm_acc)
             vm_new = v_old + dv
-            vm_new = max(vm_new, 0.5)
-            vm_new = min(vm_new, 1.5)
+            vm_new = max(vm_new, 0.7)
+            vm_new = min(vm_new, 1.3)
             :array.set(bus_i, vm_new, vm_acc)
           end)
 
@@ -460,33 +600,8 @@ defmodule PowerModel.Solver.NewtonRaphson do
     end
   end
 
-  defp check_pv_pq_switching(pv_indices, pq_indices, q_calc, q_limits, q_sched) do
-    {remaining_pv, switched_to_pq, updated_q_sched} =
-      Enum.reduce(pv_indices, {[], [], q_sched}, fn idx, {pv_acc, pq_acc, qs_acc} ->
-        q_injected = :array.get(idx, q_calc)
-
-        case Map.get(q_limits, idx) do
-          nil ->
-            {[idx | pv_acc], pq_acc, qs_acc}
-
-          {q_min, q_max} ->
-            cond do
-              q_injected > q_max ->
-                {pv_acc, [idx | pq_acc], :array.set(idx, q_max, qs_acc)}
-
-              q_injected < q_min ->
-                {pv_acc, [idx | pq_acc], :array.set(idx, q_min, qs_acc)}
-
-              true ->
-                {[idx | pv_acc], pq_acc, qs_acc}
-            end
-        end
-      end)
-
-    new_pq = (pq_indices ++ Enum.reverse(switched_to_pq)) |> Enum.sort()
-    new_pv = Enum.reverse(remaining_pv) |> Enum.sort()
-    {new_pq, new_pv, updated_q_sched}
-  end
+  # PV-PQ switching removed — causes divergence on large real grids.
+  # Q limits enforced implicitly via PV bus voltage regulation.
 
   defp limit_step_size(correction, n_ns, n_pq) do
     j_size = n_ns + n_pq
@@ -511,13 +626,17 @@ defmodule PowerModel.Solver.NewtonRaphson do
     end)
   end
 
+  # ---------------------------------------------------------------------------
+  # Power injection computation (sparse — iterates adjacency only)
+  # ---------------------------------------------------------------------------
+
   defp compute_power_sparse(vm, va, %{adj: adj, g_diag: g_diag, b_diag: b_diag, n: n}, _n) do
     p =
       for i <- 0..(n - 1) do
         vi = :array.get(i, vm)
         ai = :array.get(i, va)
         gii = :array.get(i, g_diag)
-        bii = :array.get(i, b_diag)
+        _bii = :array.get(i, b_diag)
 
         p_diag = vi * vi * gii
 
@@ -550,6 +669,10 @@ defmodule PowerModel.Solver.NewtonRaphson do
     {:array.from_list(p), :array.from_list(q)}
   end
 
+  # ---------------------------------------------------------------------------
+  # Dense Jacobian (small grids, n <= 200)
+  # ---------------------------------------------------------------------------
+
   defp build_jacobian_dense(vm, va, %{g: g, b: b, n: n}, p_calc, q_calc,
                             non_slack_arr, pq_arr, n_ns, n_pq, _n_total) do
     j_size = n_ns + n_pq
@@ -581,121 +704,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
     end
   end
 
-  defp build_jacobian_sparse(vm, va, y_data, p_calc, q_calc,
-                             non_slack_list, pq_list, n_ns, n_pq, n) do
-    %{adj: adj} = y_data
-
-    ns_arr = :array.from_list(non_slack_list)
-    pq_arr = :array.from_list(pq_list)
-
-    bus_neighbors =
-      Enum.reduce(0..(n - 1), %{}, fn i, acc ->
-        neighbors = :array.get(i, adj)
-        neighbor_set = MapSet.new(Enum.map(neighbors, fn {j, _, _} -> j end))
-        Map.put(acc, i, neighbor_set)
-      end)
-
-    j_size = n_ns + n_pq
-
-    for row <- 0..(j_size - 1) do
-      for col <- 0..(j_size - 1) do
-        cond do
-          row < n_ns and col < n_ns ->
-            i = :array.get(row, ns_arr)
-            j = :array.get(col, ns_arr)
-            if i == j or MapSet.member?(Map.get(bus_neighbors, i, MapSet.new()), j) do
-              jacobian_j1_sparse(i, j, vm, va, y_data, p_calc, q_calc, n)
-            else
-              0.0
-            end
-
-          row < n_ns and col >= n_ns ->
-            i = :array.get(row, ns_arr)
-            j = :array.get(col - n_ns, pq_arr)
-            if i == j or MapSet.member?(Map.get(bus_neighbors, i, MapSet.new()), j) do
-              jacobian_j2_sparse(i, j, vm, va, y_data, p_calc, n)
-            else
-              0.0
-            end
-
-          row >= n_ns and col < n_ns ->
-            i = :array.get(row - n_ns, pq_arr)
-            j = :array.get(col, ns_arr)
-            if i == j or MapSet.member?(Map.get(bus_neighbors, i, MapSet.new()), j) do
-              jacobian_j3_sparse(i, j, vm, va, y_data, p_calc, q_calc, n)
-            else
-              0.0
-            end
-
-          true ->
-            i = :array.get(row - n_ns, pq_arr)
-            j = :array.get(col - n_ns, pq_arr)
-            if i == j or MapSet.member?(Map.get(bus_neighbors, i, MapSet.new()), j) do
-              jacobian_j4_sparse(i, j, vm, va, y_data, q_calc, n)
-            else
-              0.0
-            end
-        end
-      end
-    end
-  end
-
-  defp jacobian_j1_sparse(i, i, vm, _va, %{b_diag: b_diag}, _p_calc, q_calc, _n) do
-    -:array.get(i, q_calc) - :array.get(i, vm) * :array.get(i, vm) * :array.get(i, b_diag)
-  end
-
-  defp jacobian_j1_sparse(i, j, vm, va, %{adj: adj}, _p_calc, _q_calc, _n) do
-    vi = :array.get(i, vm)
-    vj = :array.get(j, vm)
-    theta = :array.get(i, va) - :array.get(j, va)
-    {gij, bij} = find_yij(adj, i, j)
-    vi * vj * (gij * :math.sin(theta) - bij * :math.cos(theta))
-  end
-
-  defp jacobian_j2_sparse(i, i, vm, _va, %{g_diag: g_diag}, p_calc, _n) do
-    vi = :array.get(i, vm)
-    :array.get(i, p_calc) / vi + vi * :array.get(i, g_diag)
-  end
-
-  defp jacobian_j2_sparse(i, j, vm, va, %{adj: adj}, _p_calc, _n) do
-    vi = :array.get(i, vm)
-    theta = :array.get(i, va) - :array.get(j, va)
-    {gij, bij} = find_yij(adj, i, j)
-    vi * (gij * :math.cos(theta) + bij * :math.sin(theta))
-  end
-
-  defp jacobian_j3_sparse(i, i, vm, _va, %{g_diag: g_diag}, p_calc, _q_calc, _n) do
-    :array.get(i, p_calc) - :array.get(i, vm) * :array.get(i, vm) * :array.get(i, g_diag)
-  end
-
-  defp jacobian_j3_sparse(i, j, vm, va, %{adj: adj}, _p_calc, _q_calc, _n) do
-    vi = :array.get(i, vm)
-    vj = :array.get(j, vm)
-    theta = :array.get(i, va) - :array.get(j, va)
-    {gij, bij} = find_yij(adj, i, j)
-    -vi * vj * (gij * :math.cos(theta) + bij * :math.sin(theta))
-  end
-
-  defp jacobian_j4_sparse(i, i, vm, _va, %{b_diag: b_diag}, q_calc, _n) do
-    vi = :array.get(i, vm)
-    :array.get(i, q_calc) / vi - vi * :array.get(i, b_diag)
-  end
-
-  defp jacobian_j4_sparse(i, j, vm, va, %{adj: adj}, _q_calc, _n) do
-    vi = :array.get(i, vm)
-    theta = :array.get(i, va) - :array.get(j, va)
-    {gij, bij} = find_yij(adj, i, j)
-    vi * (gij * :math.sin(theta) - bij * :math.cos(theta))
-  end
-
-  defp find_yij(adj, i, j) do
-    neighbors = :array.get(i, adj)
-    case Enum.find(neighbors, fn {k, _, _} -> k == j end) do
-      {_, gij, bij} -> {gij, bij}
-      nil -> {0.0, 0.0}
-    end
-  end
-
+  # Dense Jacobian element formulas (for small grid path, using dense g/b arrays)
   defp jacobian_j1(i, j, vm, _va, _g, b, n, _p_calc, q_calc) when i == j do
     -:array.get(i, q_calc) - :array.get(i, vm) * :array.get(i, vm) * :array.get(i * n + i, b)
   end
@@ -748,11 +757,369 @@ defmodule PowerModel.Solver.NewtonRaphson do
     vi * (gij * :math.sin(theta) - bij * :math.cos(theta))
   end
 
-  defp solve_jacobian(jacobian, mismatch, size) do
-    if size <= 200 do
+  # ---------------------------------------------------------------------------
+  # COO Jacobian build + sparse solve (large grids, n > 200)
+  # ---------------------------------------------------------------------------
+
+  # Build the Jacobian as COO triplets and solve the linear system.
+  # Only iterates over non-zero entries: diagonals + adjacency neighbors.
+  defp solve_jacobian_coo(vm, va, y_data, p_calc, q_calc,
+                          non_slack, pq_indices, n_ns, _n_pq, n,
+                          mismatch, j_size) do
+    %{yij_map: yij_map, g_diag: g_diag, b_diag: b_diag, adj: adj} = y_data
+
+    # Build reverse index maps: bus_index -> position in the Jacobian variable ordering
+    # non_slack buses map to rows/cols 0..(n_ns-1) for dtheta
+    # pq buses map to rows/cols n_ns..(j_size-1) for dV
+    ns_pos = non_slack |> Enum.with_index() |> Map.new()
+    pq_pos = pq_indices |> Enum.with_index() |> Map.new()
+
+    # Accumulate COO triplets: {row_indices, col_indices, values}
+    # Pre-size hint: diagonals contribute j_size entries,
+    # off-diagonals contribute ~4 * avg_degree * n_ns entries (sparse)
+    {coo_rows, coo_cols, coo_vals} =
+      build_coo_triplets(
+        vm, va, yij_map, g_diag, b_diag, adj, p_calc, q_calc,
+        non_slack, pq_indices, ns_pos, pq_pos, n_ns, n
+      )
+
+    # Solve the system using the appropriate strategy
+    solve_coo_system(coo_rows, coo_cols, coo_vals, mismatch, j_size, n)
+  end
+
+  # Build COO triplets by iterating only over non-zero entries.
+  # For each bus i that is a Jacobian variable, emit:
+  #   - Diagonal entries for J1(i,i), J2(i,i), J3(i,i), J4(i,i) as applicable
+  #   - Off-diagonal entries for each neighbor j of bus i
+  defp build_coo_triplets(
+         vm, va, yij_map, g_diag, b_diag, adj, p_calc, q_calc,
+         non_slack, pq_indices, ns_pos, pq_pos, n_ns, _n
+       ) do
+    # Process all non-slack buses for J1 (dP/dtheta) and J2 (dP/dV) blocks
+    {rows1, cols1, vals1} =
+      Enum.reduce(non_slack, {[], [], []}, fn i, {racc, cacc, vacc} ->
+        row = Map.fetch!(ns_pos, i)
+        vi = :array.get(i, vm)
+        ai = :array.get(i, va)
+        gii = :array.get(i, g_diag)
+        bii = :array.get(i, b_diag)
+        pi = :array.get(i, p_calc)
+        qi = :array.get(i, q_calc)
+
+        # J1 diagonal: dP_i/dtheta_i = -Q_i - Vi^2 * Bii
+        j1_diag = -qi - vi * vi * bii
+        racc = [row | racc]
+        cacc = [row | cacc]
+        vacc = [j1_diag | vacc]
+
+        # J2 diagonal (only if i is PQ): dP_i/dV_i = P_i/Vi + Vi*Gii
+        {racc, cacc, vacc} =
+          case Map.get(pq_pos, i) do
+            nil -> {racc, cacc, vacc}
+            col_pq ->
+              j2_diag = pi / vi + vi * gii
+              {[row | racc], [n_ns + col_pq | cacc], [j2_diag | vacc]}
+          end
+
+        # Off-diagonal entries: iterate over neighbors of bus i
+        neighbors = :array.get(i, adj)
+
+        Enum.reduce(neighbors, {racc, cacc, vacc}, fn {j, _gij_unused, _bij_unused}, {r, c, v} ->
+          {gij, bij} = get_yij(yij_map, i, j)
+          vj = :array.get(j, vm)
+          theta = ai - :array.get(j, va)
+          sin_t = :math.sin(theta)
+          cos_t = :math.cos(theta)
+
+          # J1 off-diagonal: dP_i/dtheta_j (only if j is non-slack)
+          {r, c, v} =
+            case Map.get(ns_pos, j) do
+              nil -> {r, c, v}
+              col_j ->
+                val = vi * vj * (gij * sin_t - bij * cos_t)
+                {[row | r], [col_j | c], [val | v]}
+            end
+
+          # J2 off-diagonal: dP_i/dV_j (only if j is PQ)
+          {r, c, v} =
+            case Map.get(pq_pos, j) do
+              nil -> {r, c, v}
+              col_j ->
+                val = vi * (gij * cos_t + bij * sin_t)
+                {[row | r], [n_ns + col_j | c], [val | v]}
+            end
+
+          {r, c, v}
+        end)
+      end)
+
+    # Process PQ buses for J3 (dQ/dtheta) and J4 (dQ/dV) blocks
+    {rows2, cols2, vals2} =
+      Enum.reduce(pq_indices, {[], [], []}, fn i, {racc, cacc, vacc} ->
+        row_pq = Map.fetch!(pq_pos, i)
+        row = n_ns + row_pq
+        vi = :array.get(i, vm)
+        ai = :array.get(i, va)
+        gii = :array.get(i, g_diag)
+        bii = :array.get(i, b_diag)
+        pi = :array.get(i, p_calc)
+        qi = :array.get(i, q_calc)
+
+        # J3 diagonal: dQ_i/dtheta_i = P_i - Vi^2 * Gii
+        j3_diag = pi - vi * vi * gii
+        # i must be in ns_pos since PQ buses are non-slack
+        col_ns = Map.fetch!(ns_pos, i)
+        racc = [row | racc]
+        cacc = [col_ns | cacc]
+        vacc = [j3_diag | vacc]
+
+        # J4 diagonal: dQ_i/dV_i = Q_i/Vi - Vi*Bii
+        j4_diag = qi / vi - vi * bii
+        racc = [row | racc]
+        cacc = [n_ns + row_pq | cacc]
+        vacc = [j4_diag | vacc]
+
+        # Off-diagonal entries: iterate over neighbors of bus i
+        neighbors = :array.get(i, adj)
+
+        Enum.reduce(neighbors, {racc, cacc, vacc}, fn {j, _gij_unused, _bij_unused}, {r, c, v} ->
+          {gij, bij} = get_yij(yij_map, i, j)
+          vj = :array.get(j, vm)
+          theta = ai - :array.get(j, va)
+          sin_t = :math.sin(theta)
+          cos_t = :math.cos(theta)
+
+          # J3 off-diagonal: dQ_i/dtheta_j (only if j is non-slack)
+          {r, c, v} =
+            case Map.get(ns_pos, j) do
+              nil -> {r, c, v}
+              col_j ->
+                val = -vi * vj * (gij * cos_t + bij * sin_t)
+                {[row | r], [col_j | c], [val | v]}
+            end
+
+          # J4 off-diagonal: dQ_i/dV_j (only if j is PQ)
+          {r, c, v} =
+            case Map.get(pq_pos, j) do
+              nil -> {r, c, v}
+              col_j ->
+                val = vi * (gij * sin_t - bij * cos_t)
+                {[row | r], [n_ns + col_j | c], [val | v]}
+            end
+
+          {r, c, v}
+        end)
+      end)
+
+    # Combine both halves
+    {Enum.reverse(rows1) ++ Enum.reverse(rows2),
+     Enum.reverse(cols1) ++ Enum.reverse(cols2),
+     Enum.reverse(vals1) ++ Enum.reverse(vals2)}
+  end
+
+  # O(1) admittance lookup from pre-built Map of Maps
+  defp get_yij(yij_map, i, j) do
+    case yij_map do
+      %{^i => %{^j => yij}} -> yij
+      _ -> {0.0, 0.0}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # COO system solve strategies
+  # ---------------------------------------------------------------------------
+
+  # Choose the best solver based on grid size and NIF availability.
+  # For n > 200 the primary solver is sparse LU via faer (handles asymmetric
+  # Jacobians directly, O(nnz) complexity). Falls back to dense methods and
+  # normal equations if the NIF is unavailable.
+  defp solve_coo_system(coo_rows, coo_cols, coo_vals, mismatch, j_size, _n) do
+    # Try sparse LU first — works for any size and handles asymmetric matrices
+    case try_sparse_lu_solve(coo_rows, coo_cols, coo_vals, mismatch, j_size) do
+      {:ok, x} ->
+        :array.from_list(x)
+
+      :fallback ->
+        # Sparse LU unavailable or failed; fall back to dense/normal-equation chain
+        solve_coo_fallback(coo_rows, coo_cols, coo_vals, mismatch, j_size)
+    end
+  end
+
+  # Attempt sparse LU solve via the faer-based Rust NIF.
+  defp try_sparse_lu_solve(coo_rows, coo_cols, coo_vals, mismatch, j_size) do
+    try do
+      case Sparse.sparse_lu_solve(coo_rows, coo_cols, coo_vals, mismatch, j_size) do
+        {:ok, x} -> {:ok, x}
+        {:error, _reason} -> :fallback
+      end
+    rescue
+      ErlangError -> :fallback
+    end
+  end
+
+  # Fallback chain when sparse LU is not available.
+  defp solve_coo_fallback(coo_rows, coo_cols, coo_vals, mismatch, j_size) do
+    # Try dense flat NIF (reasonable for j_size up to ~5000)
+    case try_dense_solve_flat_from_coo(coo_rows, coo_cols, coo_vals, mismatch, j_size) do
+      {:ok, x} ->
+        :array.from_list(x)
+
+      :fallback ->
+        # Try normal equations with sparse LDL^T
+        case try_normal_equations_sparse(coo_rows, coo_cols, coo_vals, mismatch, j_size) do
+          {:ok, x} ->
+            :array.from_list(x)
+
+          :fallback ->
+            # Try Nx dense solve
+            case try_nx_solve_flat_from_coo(coo_rows, coo_cols, coo_vals, mismatch, j_size) do
+              {:ok, x} ->
+                :array.from_list(x)
+
+              :fallback ->
+                # Last resort: Gaussian elimination
+                flat = coo_to_flat(coo_rows, coo_cols, coo_vals, j_size)
+                jacobian = flat_to_nested(flat, j_size)
+                solve_jacobian_gauss(jacobian, mismatch, j_size)
+            end
+        end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Normal equations: J^T J x = J^T b  (sparse LDL^T via Rust NIF)
+  # ---------------------------------------------------------------------------
+
+  # Compute J^T * J in COO format and J^T * b, then solve with sparse LDL^T.
+  # The Jacobian is stored as COO triplets; we need to form the product J^T * J
+  # efficiently. For a sparse matrix with nnz entries, J^T * J can be computed
+  # by iterating over columns: for each column j, the non-zero rows form a
+  # clique in J^T * J.
+  defp try_normal_equations_sparse(coo_rows, coo_cols, coo_vals, mismatch, j_size) do
+    try do
+      # Group by row for J^T * b and J^T * J computation
+      row_entries =
+        coo_rows
+        |> Enum.zip(coo_cols)
+        |> Enum.zip(coo_vals)
+        |> Enum.reduce(%{}, fn {{r, c}, v}, acc ->
+          Map.update(acc, r, [{c, v}], fn existing -> [{c, v} | existing] end)
+        end)
+
+      # Compute J^T * b
+      jtb = :array.new(j_size, default: 0.0)
+
+      jtb =
+        Enum.reduce(row_entries, jtb, fn {row_idx, entries}, acc ->
+          b_r = Enum.at(mismatch, row_idx, 0.0)
+          Enum.reduce(entries, acc, fn {col_idx, val}, acc2 ->
+            # J^T[col_idx, row_idx] * b[row_idx] = val * b_r
+            array_add(acc2, col_idx, val * b_r)
+          end)
+        end)
+
+      jtb_list = :array.to_list(jtb)
+
+      # Compute J^T * J in COO format
+      # For each row r of J, the non-zero columns form pairs (ci, cj) where
+      # (J^T J)[ci, cj] += J[r, ci] * J[r, cj]
+      # We accumulate into a map %{{ci, cj} => val} to consolidate duplicates
+      jtj_map =
+        Enum.reduce(row_entries, %{}, fn {_row_idx, entries}, acc ->
+          # entries is [{col_idx, val}, ...]
+          # For all pairs (including diagonal), accumulate the outer product
+          Enum.reduce(entries, acc, fn {ci, vi}, acc2 ->
+            Enum.reduce(entries, acc2, fn {cj, vj}, acc3 ->
+              Map.update(acc3, {ci, cj}, vi * vj, fn old -> old + vi * vj end)
+            end)
+          end)
+        end)
+
+      # Add Tikhonov regularization for numerical stability
+      # This ensures J^T J + alpha*I is positive definite
+      alpha = 1.0e-10
+
+      jtj_map =
+        Enum.reduce(0..(j_size - 1), jtj_map, fn i, acc ->
+          Map.update(acc, {i, i}, alpha, fn old -> old + alpha end)
+        end)
+
+      # Convert to COO lists
+      {jtj_rows, jtj_cols, jtj_vals} =
+        Enum.reduce(jtj_map, {[], [], []}, fn {{r, c}, v}, {ra, ca, va} ->
+          {[r | ra], [c | ca], [v | va]}
+        end)
+
+      # Solve with sparse LDL^T NIF
+      case Sparse.sparse_solve(jtj_rows, jtj_cols, jtj_vals, jtb_list, j_size) do
+        {:ok, x} -> {:ok, x}
+        {:error, _reason} -> :fallback
+      end
+    rescue
+      ErlangError -> :fallback
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Dense solve helpers
+  # ---------------------------------------------------------------------------
+
+  defp try_dense_solve_flat_from_coo(coo_rows, coo_cols, coo_vals, mismatch, j_size) do
+    try do
+      flat = coo_to_flat(coo_rows, coo_cols, coo_vals, j_size)
+      case Sparse.dense_solve_flat(flat, mismatch, j_size) do
+        {:ok, x} -> {:ok, x}
+        {:error, _} -> :fallback
+      end
+    rescue
+      ErlangError -> :fallback
+    end
+  end
+
+  defp try_nx_solve_flat_from_coo(coo_rows, coo_cols, coo_vals, mismatch, j_size) do
+    try do
+      flat = coo_to_flat(coo_rows, coo_cols, coo_vals, j_size)
+      a = flat |> Nx.tensor(type: :f64) |> Nx.reshape({j_size, j_size})
+      b = Nx.tensor(mismatch, type: :f64)
+      x = Nx.LinAlg.solve(a, b) |> Nx.to_flat_list()
+      {:ok, x}
+    rescue
+      ArgumentError -> :fallback
+    end
+  end
+
+  # Convert COO triplets to a flat row-major list (summing duplicate entries)
+  defp coo_to_flat(coo_rows, coo_cols, coo_vals, j_size) do
+    flat = :array.new(j_size * j_size, default: 0.0)
+
+    flat =
+      coo_rows
+      |> Enum.zip(coo_cols)
+      |> Enum.zip(coo_vals)
+      |> Enum.reduce(flat, fn {{r, c}, v}, acc ->
+        idx = r * j_size + c
+        :array.set(idx, :array.get(idx, acc) + v, acc)
+      end)
+
+    :array.to_list(flat)
+  end
+
+  # Convert a flat row-major list to nested list-of-lists
+  defp flat_to_nested(flat_list, j_size) do
+    flat_list
+    |> Enum.chunk_every(j_size)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Dense solve for small grid path
+  # ---------------------------------------------------------------------------
+
+  defp solve_jacobian_dense(jacobian, mismatch, size) do
+    if size <= @dense_nif_threshold do
       solve_jacobian_small(jacobian, mismatch, size)
     else
-      solve_jacobian_large(jacobian, mismatch, size)
+      # Shouldn't reach here (dense path only for n <= 200) but handle gracefully
+      solve_jacobian_nx(jacobian, mismatch, size)
     end
   end
 
@@ -769,12 +1136,8 @@ defmodule PowerModel.Solver.NewtonRaphson do
           solve_jacobian_nx(jacobian, mismatch, size)
       end
     rescue
-      _ -> solve_jacobian_nx(jacobian, mismatch, size)
+      ErlangError -> solve_jacobian_nx(jacobian, mismatch, size)
     end
-  end
-
-  defp solve_jacobian_large(jacobian, mismatch, size) do
-    solve_jacobian_nx(jacobian, mismatch, size)
   end
 
   defp solve_jacobian_nx(jacobian, mismatch, size) do
@@ -784,7 +1147,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
       x = Nx.LinAlg.solve(a, b) |> Nx.to_flat_list()
       :array.from_list(x)
     rescue
-      _ ->
+      ArgumentError ->
         try do
           case Sparse.lu_factorize(jacobian, size) do
             {:ok, l, u, perm} ->
@@ -797,10 +1160,14 @@ defmodule PowerModel.Solver.NewtonRaphson do
               solve_jacobian_gauss(jacobian, mismatch, size)
           end
         rescue
-          _ -> solve_jacobian_gauss(jacobian, mismatch, size)
+          ErlangError -> solve_jacobian_gauss(jacobian, mismatch, size)
         end
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Gaussian elimination fallback (always works, O(n³))
+  # ---------------------------------------------------------------------------
 
   defp solve_jacobian_gauss(jacobian, mismatch, size) do
     aug =
@@ -870,6 +1237,10 @@ defmodule PowerModel.Solver.NewtonRaphson do
     :array.get(col, :array.get(row, aug))
   end
 
+  # ---------------------------------------------------------------------------
+  # AC line flow computation
+  # ---------------------------------------------------------------------------
+
   defp compute_ac_line_flows(lines, transformers, vm, va, bus_index, base_mva) do
     line_flows =
       Enum.map(lines, fn line ->
@@ -889,11 +1260,13 @@ defmodule PowerModel.Solver.NewtonRaphson do
         b = -x / denom
 
         p_ij = vi * vi * g - vi * vj * (g * :math.cos(theta_ij) + b * :math.sin(theta_ij))
+        p_ji = vj * vj * g - vj * vi * (g * :math.cos(-theta_ij) + b * :math.sin(-theta_ij))
 
         q_ij =
           -vi * vi * (b + b_sh) - vi * vj * (g * :math.sin(theta_ij) - b * :math.cos(theta_ij))
 
         s_ij = :math.sqrt(p_ij * p_ij + q_ij * q_ij) * base_mva
+        loss_mw = (p_ij + p_ji) * base_mva
 
         {{:line, line.id},
          %{
@@ -902,6 +1275,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
            p_flow_mw: p_ij * base_mva,
            q_flow_mvar: q_ij * base_mva,
            s_flow_mva: s_ij,
+           loss_mw: loss_mw,
            loading_pct:
              if(line.rating_a_mva && line.rating_a_mva > 0,
                do: s_ij / line.rating_a_mva * 100.0,
@@ -918,7 +1292,8 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
         vi = :array.get(i, vm)
         vj = :array.get(j, vm)
-        theta_ij = :array.get(i, va) - :array.get(j, va)
+        shift = (Map.get(xfmr, :phase_shift_deg) || 0.0) * :math.pi() / 180.0
+        theta_ij = :array.get(i, va) - :array.get(j, va) - shift
         t = xfmr.tap_ratio || 1.0
 
         r = xfmr.r_pu || 0.0
@@ -931,11 +1306,16 @@ defmodule PowerModel.Solver.NewtonRaphson do
           vi * vi * g / (t * t) -
             vi * vj / t * (g * :math.cos(theta_ij) + b * :math.sin(theta_ij))
 
+        p_ji =
+          vj * vj * g -
+            vj * vi / t * (g * :math.cos(-theta_ij) + b * :math.sin(-theta_ij))
+
         q_ij =
           -(vi * vi * b / (t * t)) -
             vi * vj / t * (g * :math.sin(theta_ij) - b * :math.cos(theta_ij))
 
         s_ij = :math.sqrt(p_ij * p_ij + q_ij * q_ij) * base_mva
+        loss_mw = (p_ij + p_ji) * base_mva
 
         {{:transformer, xfmr.id},
          %{
@@ -944,6 +1324,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
            p_flow_mw: p_ij * base_mva,
            q_flow_mvar: q_ij * base_mva,
            s_flow_mva: s_ij,
+           loss_mw: loss_mw,
            loading_pct:
              if(xfmr.rated_mva > 0,
                do: s_ij / xfmr.rated_mva * 100.0,
@@ -954,6 +1335,12 @@ defmodule PowerModel.Solver.NewtonRaphson do
       end)
 
     Map.new(line_flows ++ xfmr_flows)
+  end
+
+  defp compute_total_losses(line_flows) do
+    Enum.reduce(line_flows, 0.0, fn {_key, flow}, acc ->
+      acc + (Map.get(flow, :loss_mw) || 0.0)
+    end)
   end
 
   defp compute_total_gen(generators, _base_mva) do

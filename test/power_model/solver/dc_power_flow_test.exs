@@ -17,7 +17,7 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
     }
   end
 
-  defp line(id, from, to, opts \\ []) do
+  defp line(id, from, to, opts) do
     %{
       id: id,
       from_bus_id: from,
@@ -30,7 +30,7 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
     }
   end
 
-  defp transformer(id, from, to, opts \\ []) do
+  defp transformer(id, from, to, opts) do
     %{
       id: id,
       from_bus_id: from,
@@ -42,7 +42,7 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
     }
   end
 
-  defp generator(id, bus_id, opts \\ []) do
+  defp generator(id, bus_id, opts) do
     %{
       id: id,
       bus_id: bus_id,
@@ -53,7 +53,7 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
     }
   end
 
-  defp load(id, bus_id, opts \\ []) do
+  defp load(id, bus_id, opts) do
     %{
       id: id,
       bus_id: bus_id,

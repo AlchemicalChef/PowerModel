@@ -42,7 +42,7 @@ defmodule PowerModel.Simulation.Cascading.IslandDetectorTest do
     }
   end
 
-  defp generator(id, bus_id, opts \\ []) do
+  defp generator(id, bus_id, opts) do
     %{
       id: id,
       bus_id: bus_id,
@@ -53,7 +53,7 @@ defmodule PowerModel.Simulation.Cascading.IslandDetectorTest do
     }
   end
 
-  defp load(id, bus_id, opts \\ []) do
+  defp load(id, bus_id, opts) do
     %{
       id: id,
       bus_id: bus_id,
@@ -81,7 +81,7 @@ defmodule PowerModel.Simulation.Cascading.IslandDetectorTest do
     test "disconnection: removing a bridge line -> 2 islands" do
       # Topology: 1 -- 2 -- 3.  Remove line 2-3 => island {1,2} and {3}.
       buses = [bus(1), bus(2), bus(3)]
-      all_lines = [line(1, 1, 2), line(2, 2, 3)]
+      _all_lines = [line(1, 1, 2), line(2, 2, 3)]
 
       # Keep only line 1 (1-2); line 2 (2-3) is tripped
       active_lines = [line(1, 1, 2)]
@@ -112,7 +112,7 @@ defmodule PowerModel.Simulation.Cascading.IslandDetectorTest do
     test "ring topology stays connected when one line is removed" do
       # Ring: 1-2, 2-3, 3-1.  Remove line 3-1 => still one island.
       buses = [bus(1), bus(2), bus(3)]
-      ring_lines = [line(1, 1, 2), line(2, 2, 3), line(3, 3, 1)]
+      _ring_lines = [line(1, 1, 2), line(2, 2, 3), line(3, 3, 1)]
 
       # Remove line 3 (3-1); alternative path 1-2-3 keeps all connected
       active_lines = [line(1, 1, 2), line(2, 2, 3)]
@@ -126,7 +126,7 @@ defmodule PowerModel.Simulation.Cascading.IslandDetectorTest do
 
     test "transformer connects buses across voltage levels" do
       # Bus 1 (138kV) connected to bus 2 (345kV) only via transformer
-      buses = [bus(1, base_kv: 138.0), bus(2, base_kv: 345.0)]
+      _buses = [bus(1, base_kv: 138.0), bus(2, base_kv: 345.0)]
       xfmrs = [transformer(1, 1, 2)]
 
       islands = IslandDetector.detect([1, 2], [], xfmrs)
@@ -138,7 +138,7 @@ defmodule PowerModel.Simulation.Cascading.IslandDetectorTest do
 
     test "mixed lines and transformers form correct topology" do
       # 1 --line-- 2 --xfmr-- 3 --line-- 4
-      buses = [bus(1), bus(2), bus(3), bus(4)]
+      _buses = [bus(1), bus(2), bus(3), bus(4)]
       lines = [line(1, 1, 2), line(2, 3, 4)]
       xfmrs = [transformer(1, 2, 3)]
 
@@ -151,7 +151,7 @@ defmodule PowerModel.Simulation.Cascading.IslandDetectorTest do
 
     test "removing transformer creates two islands" do
       # 1 --line-- 2    3 --line-- 4  (transformer 2-3 removed)
-      buses = [bus(1), bus(2), bus(3), bus(4)]
+      _buses = [bus(1), bus(2), bus(3), bus(4)]
       lines = [line(1, 1, 2), line(2, 3, 4)]
       xfmrs = []  # transformer removed
 

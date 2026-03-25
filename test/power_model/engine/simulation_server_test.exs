@@ -19,7 +19,7 @@ defmodule PowerModel.Engine.SimulationServerTest do
     }
   end
 
-  defp line(id, from, to, opts \\ []) do
+  defp line(id, from, to, opts) do
     %{
       id: id,
       from_bus_id: from,
@@ -35,7 +35,7 @@ defmodule PowerModel.Engine.SimulationServerTest do
     }
   end
 
-  defp generator(id, bus_id, opts \\ []) do
+  defp generator(id, bus_id, opts) do
     %{
       id: id,
       bus_id: bus_id,
@@ -49,7 +49,7 @@ defmodule PowerModel.Engine.SimulationServerTest do
     }
   end
 
-  defp load(id, bus_id, opts \\ []) do
+  defp load(id, bus_id, opts) do
     %{
       id: id,
       bus_id: bus_id,
@@ -79,18 +79,6 @@ defmodule PowerModel.Engine.SimulationServerTest do
     }
   end
 
-  # Start a SimulationServer with a specific snapshot, bypassing Grid DB calls.
-  # We do this by directly calling Cascade.init and building the state struct.
-  defp start_test_server(snapshot, sim_id) do
-    # Subscribe to PubSub to receive broadcasts
-    Phoenix.PubSub.subscribe(PowerModel.PubSub, "simulation:#{sim_id}")
-
-    # We need to start the server via DynamicSupervisor, but it will try to
-    # read from the DB. Instead, we'll test internal logic via direct state
-    # manipulation. For integration-like tests, we test the cascade logic
-    # and solution_payload computation directly.
-    snapshot
-  end
 
   # ---------------------------------------------------------------------------
   # Cascade + SimulationServer logic tests
@@ -249,35 +237,66 @@ defmodule PowerModel.Engine.SimulationServerTest do
   # ---------------------------------------------------------------------------
 
   describe "calibrate_ratings/2" do
-    test "bumps ratings on lines with base flow > 80%" do
+    test "bumps ratings on lines with base flow > 200% (data artifact threshold)" do
       lines = [
         line(1, 1, 2, rating_a_mva: 100.0),
-        line(2, 2, 3, rating_a_mva: 100.0)
+        line(2, 2, 3, rating_a_mva: 100.0),
+        line(3, 3, 4, rating_a_mva: 100.0)
       ]
 
       base_loading = %{
-        {:line, 1} => 95.0,  # > 80% => should be bumped
-        {:line, 2} => 50.0   # < 80% => keep as-is
+        {:line, 1} => 350.0,  # > 200% => data artifact, should be bumped
+        {:line, 2} => 150.0,  # 100-200% => genuinely stressed, keep as-is
+        {:line, 3} => 50.0    # < 100% => keep as-is
       }
 
       calibrated = PowerModel.Failure.Cascade.calibrate_ratings(lines, base_loading)
 
-      [cal1, cal2] = calibrated
+      [cal1, cal2, cal3] = calibrated
 
-      # Line 1: new_rating = 100 * 95 / 80 = 118.75
+      # Line 1: new_rating = 100 * 350 / 80 = 437.5
       assert cal1.rating_a_mva > 100.0
-      assert_in_delta cal1.rating_a_mva, 118.75, 0.1
+      assert_in_delta cal1.rating_a_mva, 437.5, 0.1
 
-      # Line 2: unchanged
+      # Line 2: unchanged (150% is not a clear data artifact)
       assert cal2.rating_a_mva == 100.0
+
+      # Line 3: unchanged
+      assert cal3.rating_a_mva == 100.0
     end
 
-    test "does not bump lines below 80%" do
+    test "does not bump lines below 200%" do
       lines = [line(1, 1, 2, rating_a_mva: 200.0)]
-      base_loading = %{{:line, 1} => 60.0}
+      base_loading = %{{:line, 1} => 150.0}
 
       [calibrated] = PowerModel.Failure.Cascade.calibrate_ratings(lines, base_loading)
       assert calibrated.rating_a_mva == 200.0
+    end
+  end
+
+  describe "calibrate_transformer_ratings/2" do
+    test "bumps transformer ratings for clear data artifacts (>200%)" do
+      xfmrs = [
+        %{id: 1, from_bus_id: 1, to_bus_id: 2, x_pu: 0.01, tap_ratio: 1.0,
+          phase_shift_deg: 0.0, rated_mva: 100.0, status: "in_service"},
+        %{id: 2, from_bus_id: 3, to_bus_id: 4, x_pu: 0.05, tap_ratio: 1.0,
+          phase_shift_deg: 0.0, rated_mva: 200.0, status: "in_service"}
+      ]
+
+      base_loading = %{
+        {:transformer, 1} => 500.0,  # > 200% => should be bumped
+        {:transformer, 2} => 150.0   # < 200% => keep as-is
+      }
+
+      calibrated = PowerModel.Failure.Cascade.calibrate_transformer_ratings(xfmrs, base_loading)
+      [cal1, cal2] = calibrated
+
+      # Xfmr 1: new_rating = 100 * 500/80 = 625.0
+      assert cal1.rated_mva > 100.0
+      assert_in_delta cal1.rated_mva, 625.0, 0.1
+
+      # Xfmr 2: unchanged
+      assert cal2.rated_mva == 200.0
     end
   end
 end

@@ -262,7 +262,7 @@ defmodule PowerModel.Solver.IEEE14BusTest do
         "Expected >50 MW on line 1-2, got #{flow.p_flow_mw} MW"
     end
 
-    test "power balance: net injection at non-slack buses matches DC flow", %{solution: sol} do
+    test "power balance: net injection at non-slack buses matches DC flow", %{solution: _sol} do
       # For DC, the sum of flows out of each bus should equal net injection.
       # Verify total generation roughly covers total load.
       total_load = Enum.sum(Enum.map(@loads, & &1.p_mw))

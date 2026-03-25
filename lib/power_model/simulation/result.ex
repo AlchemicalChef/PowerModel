@@ -1,4 +1,8 @@
 defmodule PowerModel.Simulation.Result do
+  @moduledoc """
+  Persisted simulation result capturing the final grid state after cascade resolution.
+  """
+
   use Ecto.Schema
   import Ecto.Changeset
 

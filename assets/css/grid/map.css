@@ -302,6 +302,26 @@
   flex-shrink: 0;
 }
 
+.layer-toggle {
+  cursor: pointer;
+  user-select: none;
+  transition: opacity 0.15s;
+}
+
+.layer-toggle:hover {
+  color: #fff;
+}
+
+.layer-toggle:not(.active) {
+  opacity: 0.35;
+  text-decoration: line-through;
+}
+
+.layer-toggle:not(.active) .legend-dot,
+.layer-toggle:not(.active) .legend-swatch {
+  opacity: 0.3;
+}
+
 .legend-square {
   width: 8px;
   height: 8px;

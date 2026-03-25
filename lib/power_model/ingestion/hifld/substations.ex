@@ -429,7 +429,7 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
         }
       end
     rescue
-      _ -> nil
+      _e -> nil
     end
   end
 

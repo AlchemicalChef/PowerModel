@@ -15,13 +15,17 @@ defmodule PowerModel.Ingestion.GeneratorDefaults do
     "DFO" => 3.0, "RFO" => 3.5, "WH" => 3.0
   }
 
+  # Nuclear plants do not provide upward governor response (NRC regulations);
+  # droop 0.0 disables their participation in frequency response.
   @droop_pct %{
-    "NUC" => 5.0, "COL" => 4.0, "NG" => 4.0, "WAT" => 3.0,
+    "NUC" => 0.0, "COL" => 4.0, "NG" => 4.0, "WAT" => 3.0,
     "WND" => 0.0, "SUN" => 0.0
   }
 
+  # Governor time constants represent effective mechanical power delivery time,
+  # not just servo response. Includes boiler/turbine/water column dynamics.
   @gov_time_constant_s %{
-    "NUC" => 0.5, "COL" => 0.3, "NG" => 0.2, "WAT" => 1.5,
+    "NUC" => 999.0, "COL" => 8.0, "NG" => 1.5, "WAT" => 3.0,
     "WND" => 0.0, "SUN" => 0.0
   }
 
@@ -37,6 +41,40 @@ defmodule PowerModel.Ingestion.GeneratorDefaults do
     "RFO" => 70.0, "WH" => 5.0
   }
 
+  # p_min as fraction of p_max when EIA Minimum Load data is missing
+  @p_min_fraction %{
+    "NUC" => 1.0,   # nuclear runs at 100% or is offline
+    "COL" => 0.35,  # coal minimum stable load ~35%
+    "NG"  => 0.30,  # gas CT ~30%, CC ~40% (use 30% conservative)
+    "WAT" => 0.10,  # hydro ~10%
+    "WND" => 0.0,
+    "SUN" => 0.0,
+    "PET" => 0.25,
+    "GEO" => 0.70,  # geothermal baseload, high minimum
+    "BIT" => 0.35,
+    "SUB" => 0.35,
+    "LIG" => 0.35,
+    "OG"  => 0.30,
+    "DFO" => 0.25,
+    "RFO" => 0.30,
+    "WH"  => 0.10
+  }
+
+  # Transient stability defaults by fuel type
+  @x_d_prime %{
+    "NUC" => 0.20, "COL" => 0.25, "NG" => 0.30, "WAT" => 0.35,
+    "WND" => 0.0, "SUN" => 0.0, "PET" => 0.30, "GEO" => 0.25,
+    "BIT" => 0.25, "SUB" => 0.25, "LIG" => 0.25, "OG" => 0.30,
+    "DFO" => 0.30, "RFO" => 0.30, "WH" => 0.35
+  }
+
+  @x_d %{
+    "NUC" => 1.10, "COL" => 1.00, "NG" => 1.20, "WAT" => 0.90,
+    "WND" => 0.0, "SUN" => 0.0, "PET" => 1.20, "GEO" => 1.00,
+    "BIT" => 1.00, "SUB" => 1.00, "LIG" => 1.00, "OG" => 1.20,
+    "DFO" => 1.20, "RFO" => 1.20, "WH" => 0.90
+  }
+
   @ng_ct_movers MapSet.new(["CA", "CT"])
   @ng_cc_movers MapSet.new(["CC", "CS", "ST"])
 
@@ -49,14 +87,28 @@ defmodule PowerModel.Ingestion.GeneratorDefaults do
     fuel = fuel_type || ""
     p_max = p_max_mw || 0.0
 
+    gov_time = gov_time_for_fuel_and_mover(fuel, prime_mover)
+    inertia = inertia_for_fuel_and_mover(fuel, prime_mover)
+
     %{
-      inertia_h: Map.get(@inertia_h, fuel, 3.0),
+      inertia_h: inertia,
       droop_pct: Map.get(@droop_pct, fuel, 4.0),
-      gov_time_constant_s: Map.get(@gov_time_constant_s, fuel, 0.3),
+      gov_time_constant_s: gov_time,
       ramp_rate_mw_per_min: p_max * Map.get(@ramp_rate_mult, fuel, 0.03),
-      marginal_cost_per_mwh: marginal_cost_for(fuel, prime_mover)
+      marginal_cost_per_mwh: marginal_cost_for(fuel, prime_mover),
+      p_min_mw: p_max * Map.get(@p_min_fraction, fuel, 0.25),
+      x_d_pu: Map.get(@x_d, fuel, 1.0),
+      x_d_prime_pu: Map.get(@x_d_prime, fuel, 0.30),
+      d_factor: 2.0,
+      mva_base: p_max * 1.1
     }
   end
+
+  defp gov_time_for_fuel_and_mover("NG", pm) when pm in ["CC", "CS"], do: 5.0
+  defp gov_time_for_fuel_and_mover(fuel, _pm), do: Map.get(@gov_time_constant_s, fuel, 1.5)
+
+  defp inertia_for_fuel_and_mover("NG", pm) when pm in ["CC", "CS"], do: 5.0
+  defp inertia_for_fuel_and_mover(fuel, _pm), do: Map.get(@inertia_h, fuel, 3.0)
 
   defp marginal_cost_for("NG", prime_mover) do
     cond do

@@ -32,23 +32,27 @@ defmodule PowerModel.Solver.Frequency do
   }
 
   @default_gov_time %{
-    "nuclear" => 5.0,
-    "coal"    => 5.0,
-    "gas"     => 0.5,
-    "hydro"   => 2.0,
+    "nuclear" => 999.0,
+    "coal"    => 8.0,
+    "gas"     => 1.5,
+    "hydro"   => 3.0,
     "wind"    => 999.0,
     "solar"   => 999.0
   }
 
   @droop 0.05
 
+  # NERC BAL-003 governor deadband: +/- 0.036 Hz
+  @governor_deadband_hz 0.036
+
   @load_damping 1.0
 
+  # NERC PRC-006 aligned UFLS stages: {threshold_hz, shed_fraction, delay_s}
   @ufls_stages [
-    {59.5, 0.05, 0.1},
-    {59.0, 0.10, 0.1},
-    {58.5, 0.15, 0.1},
-    {58.0, 0.20, 0.1}
+    {59.5, 0.10, 0.3},
+    {59.0, 0.10, 0.3},
+    {58.5, 0.10, 0.3},
+    {58.0, 0.05, 0.3}
   ]
 
   @doc """
@@ -126,7 +130,11 @@ defmodule PowerModel.Solver.Frequency do
         p_mech = total_gov_mw
         p_elec_adjustment = -cumulative_shed
 
-        load_damping_mw = state.total_load_mw * @load_damping * state.df / @f0
+        # Load damping: when frequency drops (df < 0), loads decrease,
+        # which REDUCES the deficit (stabilizing effect).
+        # P_elec = P_load0 * (1 + D * df/f0), so the reduction in load is:
+        # delta_P_load = -P_load0 * D * df/f0 (positive when df < 0)
+        load_damping_mw = -state.total_load_mw * @load_damping * state.df / @f0
 
         p_imbalance = -lost_mw + p_mech + load_damping_mw + p_elec_adjustment
 
@@ -135,7 +143,9 @@ defmodule PowerModel.Solver.Frequency do
         new_df = state.df + dfdt * dt_seconds
         new_freq = @f0 + new_df
 
-        new_freq = max(new_freq, 55.0) |> min(65.0)
+        # Below 57 Hz, all conventional generation has tripped on relay 81 —
+        # the grid is collapsed and cannot recover.
+        new_freq = if new_freq < 57.0, do: 0.0, else: min(new_freq, 65.0)
         new_df = new_freq - @f0
 
         record = %{
@@ -265,12 +275,15 @@ defmodule PowerModel.Solver.Frequency do
     {new_states, total} =
       Enum.zip(gov_units, gov_state)
       |> Enum.map_reduce(0.0, fn {unit, current_dp}, total_mw ->
-        if not unit.has_governor do
+        if not unit.has_governor or abs(df) < @governor_deadband_hz do
           {current_dp, total_mw + current_dp}
         else
           dp_target = -(df / @f0) / unit.droop * unit.p_rated
 
-          dp_target = max(0.0, min(dp_target, unit.headroom))
+          # Allow negative dp_target for overfrequency (generator reduces output)
+          # but don't go below negative of current dispatch
+          dp_target = min(dp_target, unit.headroom)
+          dp_target = max(-unit.p_rated, dp_target)
 
           dp_new = current_dp + (dp_target - current_dp) * min(dt / unit.t_gov, 1.0)
 

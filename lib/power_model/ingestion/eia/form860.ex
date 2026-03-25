@@ -100,7 +100,7 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
         }
       end
     rescue
-      _ -> nil
+      _e -> nil
     end
   end
 

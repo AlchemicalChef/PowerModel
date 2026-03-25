@@ -9,6 +9,8 @@ defmodule PowerModel.Ingestion.InternationalConnections do
   representing import capacity.
   """
 
+  require Logger
+
   alias PowerModel.Repo
   alias PowerModel.Grid.{Bus, Generator, TransmissionLine, Interconnection}
 
@@ -143,7 +145,7 @@ defmodule PowerModel.Ingestion.InternationalConnections do
   buses and transmission lines. Idempotent — uses on_conflict: :nothing.
   """
   def run do
-    IO.puts("Creating international connections...")
+    Logger.info("Creating international connections...")
 
     ties = @us_canada_ties ++ @us_mexico_ties
     counter = :counters.new(1, [:atomics])
@@ -152,13 +154,11 @@ defmodule PowerModel.Ingestion.InternationalConnections do
       case create_tie_line(tie) do
         {:ok, _} ->
           :counters.add(counter, 1, 1)
-        {:skip, _reason} ->
-          :ok
       end
     end)
 
     total = :counters.get(counter, 1)
-    IO.puts("Created #{total} international tie lines (#{length(@us_canada_ties)} CA, #{length(@us_mexico_ties)} MX defined).")
+    Logger.info("Created #{total} international tie lines (#{length(@us_canada_ties)} CA, #{length(@us_mexico_ties)} MX defined).")
     {:ok, total}
   end
 

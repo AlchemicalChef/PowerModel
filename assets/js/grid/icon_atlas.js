@@ -1,6 +1,6 @@
 const ICON_SIZE = 64;
 const COLS = 5;
-const ROWS = 3;
+const ROWS = 4;
 
 let _cached = null;
 
@@ -32,6 +32,16 @@ export function waterIconName(facilityType) {
   }
 }
 
+export function criticalFacilityIconName(category) {
+  switch (category) {
+    case 1: return "ci_hospital";
+    case 2: return "ci_fire";
+    case 3: return "ci_police";
+    case 4: return "ci_ems";
+    default: return "ci_hospital";
+  }
+}
+
 function buildAtlas() {
   const canvas = document.createElement("canvas");
   canvas.width = COLS * ICON_SIZE;
@@ -53,12 +63,17 @@ function buildAtlas() {
   drawFlask(ctx, cell(0, 2), s);
   drawChevrons(ctx, cell(1, 2), s);
   drawWaves(ctx, cell(2, 2), s);
+  drawCross(ctx, cell(3, 2), s);
+  drawFireShield(ctx, cell(4, 2), s);
+  drawBadge(ctx, cell(0, 3), s);
+  drawStarOfLife(ctx, cell(1, 3), s);
 
   const mapping = {};
   const names = [
     ["gen_gas", "gen_coal", "gen_nuclear", "gen_hydro", "gen_wind"],
     ["gen_solar", "gen_other", "substation", "water_desal", "water_waste"],
-    ["water_treat", "water_pump", "water_reservoir"],
+    ["water_treat", "water_pump", "water_reservoir", "ci_hospital", "ci_fire"],
+    ["ci_police", "ci_ems"],
   ];
   for (let r = 0; r < names.length; r++) {
     for (let c = 0; c < names[r].length; c++) {
@@ -300,4 +315,74 @@ function drawWaves(ctx, { cx, cy }, s) {
     ctx.quadraticCurveTo(cx + s * 0.4, y + s * 0.22, cx + s * 0.8, y);
     ctx.stroke();
   }
+}
+
+// Hospital: red cross
+function drawCross(ctx, { cx, cy }, s) {
+  ctx.fillStyle = "white";
+  const w = s * 0.35;
+  const h = s * 0.9;
+  ctx.fillRect(cx - w / 2, cy - h / 2, w, h);
+  ctx.fillRect(cx - h / 2, cy - w / 2, h, w);
+}
+
+// Fire station: shield with flame
+function drawFireShield(ctx, { cx, cy }, s) {
+  ctx.fillStyle = "white";
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - s * 0.9);
+  ctx.lineTo(cx + s * 0.65, cy - s * 0.5);
+  ctx.lineTo(cx + s * 0.55, cy + s * 0.6);
+  ctx.quadraticCurveTo(cx, cy + s, cx, cy + s);
+  ctx.quadraticCurveTo(cx, cy + s, cx - s * 0.55, cy + s * 0.6);
+  ctx.lineTo(cx - s * 0.65, cy - s * 0.5);
+  ctx.closePath();
+  ctx.fill();
+  // Cutout flame
+  ctx.globalCompositeOperation = "destination-out";
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - s * 0.35);
+  ctx.bezierCurveTo(cx + s * 0.08, cy - s * 0.1, cx + s * 0.3, cy + s * 0.1, cx + s * 0.2, cy + s * 0.35);
+  ctx.bezierCurveTo(cx + s * 0.1, cy + s * 0.55, cx, cy + s * 0.45, cx, cy + s * 0.45);
+  ctx.bezierCurveTo(cx, cy + s * 0.45, cx - s * 0.1, cy + s * 0.55, cx - s * 0.2, cy + s * 0.35);
+  ctx.bezierCurveTo(cx - s * 0.3, cy + s * 0.1, cx - s * 0.08, cy - s * 0.1, cx, cy - s * 0.35);
+  ctx.fill();
+  ctx.globalCompositeOperation = "source-over";
+}
+
+// Police: badge/shield
+function drawBadge(ctx, { cx, cy }, s) {
+  ctx.fillStyle = "white";
+  // Star shape with 6 points
+  const outerR = s * 0.85;
+  const innerR = s * 0.5;
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const aOuter = (i * Math.PI * 2) / 6 - Math.PI / 2;
+    const aInner = aOuter + Math.PI / 6;
+    ctx.lineTo(cx + Math.cos(aOuter) * outerR, cy + Math.sin(aOuter) * outerR);
+    ctx.lineTo(cx + Math.cos(aInner) * innerR, cy + Math.sin(aInner) * innerR);
+  }
+  ctx.closePath();
+  ctx.fill();
+}
+
+// EMS: star of life (6-pointed with bar)
+function drawStarOfLife(ctx, { cx, cy }, s) {
+  ctx.fillStyle = "white";
+  const barW = s * 0.32;
+  const barH = s * 0.95;
+  for (let i = 0; i < 3; i++) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate((i * Math.PI) / 3);
+    ctx.fillRect(-barW / 2, -barH, barW, barH * 2);
+    ctx.restore();
+  }
+  // Center dot cutout
+  ctx.globalCompositeOperation = "destination-out";
+  ctx.beginPath();
+  ctx.arc(cx, cy, s * 0.15, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalCompositeOperation = "source-over";
 }

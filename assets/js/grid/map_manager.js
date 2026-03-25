@@ -5,6 +5,7 @@ import { createGeneratorsLayer } from "./layers/generators_layer";
 import { createTransmissionLayer } from "./layers/transmission_layer";
 import { createSubstationsLayer } from "./layers/substations_layer";
 import { createWaterFacilitiesLayer } from "./layers/water_facilities_layer";
+import { createCriticalFacilitiesLayer } from "./layers/critical_facilities_layer";
 import { COLOR_SCALES } from "./color_scales";
 
 const MAPLIBRE_STYLE =
@@ -29,6 +30,7 @@ export class MapManager {
     this.onViewportChange = null;
     this.onCascadeActiveChange = null;
     this.selectedComponent = null;
+    this.hiddenLayers = new Set();
     this.map = null;
     this.deckOverlay = null;
 
@@ -69,7 +71,7 @@ export class MapManager {
   }
 
   async loadInitialData() {
-    const [genData, transData, subData, waterData] = await Promise.all([
+    const [genData, transData, subData, waterData, ciData] = await Promise.all([
       fetch("/grid_data/generators.bin").then((r) =>
         r.ok ? r.arrayBuffer() : null
       ),
@@ -82,12 +84,16 @@ export class MapManager {
       fetch("/grid_data/water_facilities.json").then((r) =>
         r.ok ? r.json() : null
       ),
+      fetch("/grid_data/critical_facilities.json").then((r) =>
+        r.ok ? r.json() : null
+      ),
     ]);
 
     if (genData) this.dataStore.loadGenerators(genData);
     if (transData) this.dataStore.loadTransmissionLines(transData);
     if (subData) this.dataStore.loadSubstations(subData);
     if (waterData) this.dataStore.loadWaterFacilities(waterData);
+    if (ciData) this.dataStore.loadCriticalFacilities(ciData);
 
     this._updateLayers();
   }
@@ -132,9 +138,18 @@ export class MapManager {
       const wf = this.dataStore.waterFacilities;
       if (wf.facilities) {
         const facility = wf.facilities.find(f => f.id === numId);
-        if (facility) {
-          lon = facility.lon || facility.longitude;
-          lat = facility.lat || facility.latitude;
+        if (facility && facility.position) {
+          lon = facility.position[0];
+          lat = facility.position[1];
+        }
+      }
+    } else if (type === "critical_facility") {
+      const cf = this.dataStore.criticalFacilities;
+      if (cf.facilities) {
+        const facility = cf.facilities.find(f => f.id === numId);
+        if (facility && facility.position) {
+          lon = facility.position[0];
+          lat = facility.position[1];
         }
       }
     }
@@ -169,7 +184,7 @@ export class MapManager {
       );
     }
 
-    if (this.dataStore.generators.count > 0) {
+    if (this.dataStore.generators.count > 0 && this.isLayerVisible("generators")) {
       layers.push(
         createGeneratorsLayer(this.dataStore, this.viewMode, zoom, (info) => {
           if (info.object && this.onComponentClick) {
@@ -184,7 +199,7 @@ export class MapManager {
       );
     }
 
-    if (this.dataStore.substations.count > 0 && (zoom >= 8 || ca)) {
+    if (this.dataStore.substations.count > 0 && (zoom >= 8 || ca) && this.isLayerVisible("substations")) {
       layers.push(
         createSubstationsLayer(this.dataStore, this.viewMode, zoom, (info) => {
           if (info.object && this.onComponentClick) {
@@ -198,7 +213,16 @@ export class MapManager {
       );
     }
 
-    if (this.dataStore.waterFacilities.count > 0) {
+    const wfVisible = {
+      1: this.isLayerVisible("wf_desal"),
+      2: this.isLayerVisible("wf_waste"),
+      3: this.isLayerVisible("wf_treat"),
+      4: this.isLayerVisible("wf_pump"),
+      5: this.isLayerVisible("wf_reservoir"),
+    };
+    const anyWFVisible = Object.values(wfVisible).some(v => v);
+
+    if (this.dataStore.waterFacilities.count > 0 && anyWFVisible) {
       layers.push(
         createWaterFacilitiesLayer(this.dataStore, this.viewMode, zoom, (info) => {
           if (info.object && this.onComponentClick) {
@@ -211,7 +235,34 @@ export class MapManager {
               state: obj.state,
             });
           }
-        }, selectedType === "water_facility" ? selectedId : null, ca)
+        }, selectedType === "water_facility" ? selectedId : null, ca, wfVisible)
+      );
+    }
+
+    const ciVisible = {
+      1: this.isLayerVisible("ci_hospital"),
+      2: this.isLayerVisible("ci_fire"),
+      3: this.isLayerVisible("ci_police"),
+      4: this.isLayerVisible("ci_ems"),
+    };
+    const anyCIVisible = Object.values(ciVisible).some(v => v);
+
+    if (this.dataStore.criticalFacilities.count > 0 && anyCIVisible) {
+      layers.push(
+        createCriticalFacilitiesLayer(this.dataStore, this.viewMode, zoom, (info) => {
+          if (info.object && this.onComponentClick) {
+            const obj = info.object;
+            this.onComponentClick("critical_facility", obj.id, {
+              category: obj.category,
+              facilityType: obj.facilityType,
+              beds: obj.beds,
+              trauma: obj.trauma,
+              powerMw: obj.powerMw,
+              busId: obj.busId,
+              state: obj.state,
+            });
+          }
+        }, selectedType === "critical_facility" ? selectedId : null, ca, ciVisible)
       );
     }
 
@@ -291,6 +342,10 @@ export class MapManager {
     if (data.water_facility_ids && data.water_facility_ids.length > 0) {
       this.dataStore.applyWaterFacilityState(data.water_facility_ids, 3);
     }
+
+    if (data.critical_facility_ids && data.critical_facility_ids.length > 0) {
+      this.dataStore.applyCriticalFacilityState(data.critical_facility_ids, 3);
+    }
   }
 
   resetToBaseline() {
@@ -308,6 +363,19 @@ export class MapManager {
   setViewMode(mode) {
     this.viewMode = mode;
     this._updateLayers();
+  }
+
+  toggleLayer(layerId) {
+    if (this.hiddenLayers.has(layerId)) {
+      this.hiddenLayers.delete(layerId);
+    } else {
+      this.hiddenLayers.add(layerId);
+    }
+    this._updateLayers();
+  }
+
+  isLayerVisible(layerId) {
+    return !this.hiddenLayers.has(layerId);
   }
 
   showCascadeStep(step) {

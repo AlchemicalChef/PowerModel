@@ -17,14 +17,35 @@ defmodule PowerModel.Failure.Protection do
   @uvls_stage2_pu 0.85
   @uvls_stage3_pu 0.80
 
+  # NERC PRC-006 aligned UFLS stages: {threshold_hz, stage, cumulative_shed_fraction}
   @ufls_stages [
-    {58.0, 4, 0.55},
+    {58.0, 4, 0.35},
     {58.5, 3, 0.30},
-    {59.0, 2, 0.15},
-    {59.5, 1, 0.05}
+    {59.0, 2, 0.20},
+    {59.5, 1, 0.10}
   ]
 
-  @overcurrent_k 0.14
+  # Conductor thermal time constants by voltage class (seconds).
+  # Represents time for conductor to reach thermal limit from rated temperature.
+  @thermal_tau %{
+    69  => 600.0,
+    115 => 900.0,
+    138 => 900.0,
+    230 => 1200.0,
+    345 => 1500.0,
+    500 => 1800.0,
+    765 => 1800.0
+  }
+
+  # Generator underfrequency relay 81 settings by fuel category
+  @uf_relay %{
+    "nuclear" => 59.0,
+    "coal"    => 58.0,
+    "gas"     => 57.5,
+    "hydro"   => 57.0,
+    "wind"    => 57.5,
+    "solar"   => 57.5
+  }
 
   @doc """
   Check thermal overloads and return components to trip.
@@ -248,15 +269,156 @@ defmodule PowerModel.Failure.Protection do
   end
 
   @doc """
-  Inverse-time overcurrent trip time.
-  Returns time in seconds for a given loading percentage.
+  Conductor thermal trip time using thermal model.
+
+  Uses `t = tau * ln((I^2 - 1) / (I^2 - I_max^2))` where I is the current
+  ratio (loading_pct/100), I_max is the emergency rating ratio, and tau is
+  the conductor thermal time constant.
+
+  When loading exceeds the emergency rating, trips on protection relay (~0.5s).
+  When loading is between Rate A and the emergency rating, the conductor heats
+  slowly and may survive for minutes.
+
+  ## Options
+    * `:voltage_kv` — line voltage class for thermal tau lookup
+    * `:rating_a_mva` — normal continuous rating
+    * `:rating_b_mva` — 30-minute emergency rating
+    * `:rating_c_mva` — 5-minute emergency rating
   """
-  def overcurrent_trip_time(loading_pct, k \\ @overcurrent_k) do
+  def overcurrent_trip_time(loading_pct, opts \\ [])
+
+  def overcurrent_trip_time(loading_pct, opts) when is_list(opts) do
+    if loading_pct <= 100.0 do
+      :infinity
+    else
+      voltage_kv = Keyword.get(opts, :voltage_kv)
+      rating_a = Keyword.get(opts, :rating_a_mva)
+      rating_c = Keyword.get(opts, :rating_c_mva)
+
+      # Emergency ratio: Rate C / Rate A (default 1.5x)
+      i_max = if rating_a && rating_a > 0 && rating_c && rating_c > 0 do
+        rating_c / rating_a
+      else
+        1.5
+      end
+
+      i = loading_pct / 100.0
+      i_sq = i * i
+      i_max_sq = i_max * i_max
+
+      # Determine emergency rating ratio for Rate B (30 min) tier
+      rating_b = Keyword.get(opts, :rating_b_mva)
+      i_rate_b = if rating_a && rating_a > 0 && rating_b && rating_b > 0 do
+        rating_b / rating_a
+      else
+        1.2
+      end
+
+      cond do
+        i_sq >= i_max_sq ->
+          # Exceeds Rate C — fast relay trip
+          0.5
+
+        i >= i_rate_b ->
+          # Between Rate B and Rate C — trip after Rate C time limit (5 min = 300s)
+          300.0
+
+        i > 1.0 ->
+          # Between Rate A and Rate B — trip after Rate B time limit (30 min = 1800s)
+          1800.0
+
+        true ->
+          :infinity
+      end
+    end
+  end
+
+  # Backward-compatible 2-arity with numeric k (legacy callers)
+  def overcurrent_trip_time(loading_pct, k) when is_number(k) do
     if loading_pct <= 100.0 do
       :infinity
     else
       ratio = loading_pct / 100.0
       k / (ratio - 1.0)
+    end
+  end
+
+  @doc """
+  Effective rating for a line given how long the overload has persisted.
+
+  * < 30s: use Rate C (short-term emergency, default 1.5 * Rate A)
+  * < 30 min: use Rate B (emergency, default 1.2 * Rate A)
+  * otherwise: use Rate A (normal continuous)
+  """
+  def effective_rating(line, elapsed_s \\ 0.0) do
+    rate_a = Map.get(line, :rating_a_mva) || 0.0
+
+    cond do
+      elapsed_s < 30.0 ->
+        Map.get(line, :rating_c_mva) || rate_a * 1.5
+      elapsed_s < 1800.0 ->
+        Map.get(line, :rating_b_mva) || rate_a * 1.2
+      true ->
+        rate_a
+    end
+  end
+
+  @doc """
+  Check generator protection relays (Relay 81 underfrequency).
+
+  Returns a list of generator trip events for generators whose protection
+  relays would operate at the given system frequency.
+  """
+  def check_generator_relays(generators, frequency_hz) do
+    if frequency_hz >= 59.5 do
+      # No generator relays fire above 59.5 Hz
+      []
+    else
+      Enum.flat_map(generators, fn gen ->
+        fuel = normalize_gen_fuel(Map.get(gen, :fuel_type))
+        trip_hz = Map.get(@uf_relay, fuel, 57.5)
+
+        if frequency_hz < trip_hz do
+          [%{
+            component_type: "generator",
+            component_id: gen.id,
+            failure_cause: "relay_81_uf",
+            details: %{
+              frequency_hz: frequency_hz,
+              trip_setpoint_hz: trip_hz,
+              fuel_type: fuel,
+              p_mw: gen.p_max_mw
+            },
+            trip_time_s: 0.5
+          }]
+        else
+          []
+        end
+      end)
+    end
+  end
+
+  defp thermal_tau_for_kv(nil), do: 900.0
+  defp thermal_tau_for_kv(kv) do
+    # Find closest voltage class
+    {_best_kv, tau} =
+      @thermal_tau
+      |> Enum.min_by(fn {v, _tau} -> abs(v - kv) end)
+
+    tau
+  end
+
+  defp normalize_gen_fuel(nil), do: "gas"
+  defp normalize_gen_fuel(fuel) when is_binary(fuel) do
+    f = String.downcase(fuel)
+    cond do
+      f in ["nuc", "nuclear"] -> "nuclear"
+      f in ["col", "coal", "bit", "sub", "lig"] -> "coal"
+      f in ["ng", "gas", "og", "dfo", "rfo", "pet"] -> "gas"
+      f in ["wat", "wh", "hydro"] -> "hydro"
+      f in ["wnd", "wind"] -> "wind"
+      f in ["sun", "solar"] -> "solar"
+      true -> "gas"
     end
   end
 end

@@ -1,4 +1,8 @@
 defmodule PowerModel.Grid.HourlyLoadProfile do
+  @moduledoc """
+  Hourly demand data from EIA Form 930, indexed by balancing authority.
+  """
+
   use Ecto.Schema
   import Ecto.Changeset
 

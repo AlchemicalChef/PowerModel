@@ -49,7 +49,12 @@ defmodule PowerModelWeb.GridLive.Index do
       voltage_kv: parse_number(params["voltageKv"]),
       rating_mva: parse_number(params["ratingMva"]),
       fuel_type: fuel_type_name(parse_int(params["fuelType"])),
-      facility_type: water_facility_type_name(parse_int(params["facilityType"])),
+      facility_type: if(type == "critical_facility",
+        do: params["facilityType"],
+        else: water_facility_type_name(parse_int(params["facilityType"]))),
+      category: critical_facility_category_name(parse_int(params["category"])),
+      beds: parse_int(params["beds"]),
+      trauma: params["trauma"],
       power_mw: parse_number(params["powerMw"]),
       bus_id: parse_int(params["busId"]),
       state: parse_int(params["state"]),
@@ -87,6 +92,53 @@ defmodule PowerModelWeb.GridLive.Index do
 
   def handle_event("inject_failure", _params, socket) do
     {:noreply, socket}
+  end
+
+  # --- Harmonic controls ---
+
+  def handle_event("harmonic_source_type", %{"value" => type, "gen-id" => gen_id}, socket) do
+    component = socket.assigns.selected_component
+
+    if component && to_string(component.id) == gen_id do
+      component = Map.merge(component, %{
+        harmonic_type: type,
+        thd_result: nil,
+        ieee_519_compliant: nil
+      })
+      {:noreply, assign(socket, :selected_component, component)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("harmonic_adjust", %{"value" => value, "gen-id" => gen_id, "harmonic" => h}, socket) do
+    component = socket.assigns.selected_component
+
+    if component && to_string(component.id) == gen_id do
+      key = String.to_atom("h#{h}_pct")
+      {val, _} = Float.parse(value)
+      component = Map.put(component, key, val)
+      {:noreply, assign(socket, :selected_component, component)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("run_harmonics", %{"gen-id" => gen_id}, socket) do
+    component = socket.assigns.selected_component
+
+    if component && to_string(component.id) == gen_id do
+      # Run harmonic analysis in a task to avoid blocking
+      self_pid = self()
+      Task.Supervisor.start_child(PowerModel.TaskSupervisor, fn ->
+        result = run_harmonic_analysis(component)
+        send(self_pid, {:harmonic_result, result})
+      end)
+
+      {:noreply, socket}
+    else
+      {:noreply, socket}
+    end
   end
 
   def handle_event("reset_simulation", _params, socket) do
@@ -255,6 +307,21 @@ defmodule PowerModelWeb.GridLive.Index do
     {:noreply, socket}
   end
 
+  def handle_info({:harmonic_result, result}, socket) do
+    component = socket.assigns.selected_component
+
+    if component do
+      component = Map.merge(component, %{
+        thd_result: result.thd,
+        ieee_519_compliant: result.compliant
+      })
+
+      {:noreply, assign(socket, :selected_component, component)}
+    else
+      {:noreply, socket}
+    end
+  end
+
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   defp lookup_from_db("generator", id) do
@@ -357,6 +424,30 @@ defmodule PowerModelWeb.GridLive.Index do
     end
   end
 
+  defp lookup_from_db("critical_facility", id) do
+    case PowerModel.Repo.get(PowerModel.Grid.CriticalFacility, id) do
+      nil -> nil
+      cf ->
+        %{
+          type: "critical_facility",
+          id: cf.id,
+          capacity: nil,
+          voltage_kv: nil,
+          rating_mva: nil,
+          fuel_type: nil,
+          facility_type: cf.facility_type,
+          category: cf.category,
+          beds: cf.beds,
+          trauma: cf.trauma,
+          address: cf.address,
+          power_mw: cf.estimated_power_mw,
+          bus_id: cf.bus_id,
+          state: 0,
+          data_source: critical_facility_source(cf)
+        }
+    end
+  end
+
   defp lookup_from_db(_, _), do: nil
 
   defp resolve_data_source(type, id) when is_integer(id) do
@@ -382,10 +473,66 @@ defmodule PowerModelWeb.GridLive.Index do
           nil -> nil
           w -> water_source(w)
         end
+      "critical_facility" ->
+        case PowerModel.Repo.get(PowerModel.Grid.CriticalFacility, id) do
+          nil -> nil
+          cf -> critical_facility_source(cf)
+        end
       _ -> nil
     end
   end
   defp resolve_data_source(_, _), do: nil
+
+  defp run_harmonic_analysis(component) do
+    alias PowerModel.Solver.Harmonics.{Sources, Solver, Impedance}
+
+    gen_id = component.id
+    bus_id = component[:bus_id]
+    p_mw = component[:capacity] || 100.0
+    harmonic_type = Map.get(component, :harmonic_type, "none")
+
+    # Build custom spectrum from slider values
+    custom_spectrum = %{
+      5 => Map.get(component, :h5_pct, 0.0),
+      7 => Map.get(component, :h7_pct, 0.0),
+      11 => Map.get(component, :h11_pct, 0.0)
+    }
+
+    # Generate injection spectrum based on type
+    base_spectrum = case harmonic_type do
+      "six_pulse" -> Sources.six_pulse_spectrum(p_mw / 100.0)
+      "twelve_pulse" -> Sources.twelve_pulse_spectrum(p_mw / 100.0)
+      "pwm_inverter" -> Sources.pwm_inverter_spectrum(p_mw, 1.0, base_mva: 100.0)
+      "arc_furnace" -> Sources.arc_furnace_spectrum(p_mw)
+      _ -> %{}
+    end
+
+    # Override with slider values (convert pct to pu current)
+    i_fund = p_mw / 100.0
+    spectrum = Enum.reduce(custom_spectrum, base_spectrum, fn {h, pct}, acc ->
+      if pct > 0.0 do
+        mag = i_fund * pct / 100.0
+        Map.put(acc, h, {mag, 0.0})
+      else
+        Map.delete(acc, h)
+      end
+    end)
+
+    # Compute THD from the spectrum
+    thd = if map_size(spectrum) > 0 do
+      sum_sq = Enum.reduce(spectrum, 0.0, fn {_h, {mag, _}}, acc ->
+        acc + mag * mag
+      end)
+      :math.sqrt(sum_sq) / max(i_fund, 0.001) * 100.0
+    else
+      0.0
+    end
+
+    # Check IEEE 519 compliance (simplified: THD < 5% for transmission)
+    compliant = thd < 5.0
+
+    %{thd: thd, compliant: compliant}
+  end
 
   defp generator_source(g) do
     cond do
@@ -425,11 +572,35 @@ defmodule PowerModelWeb.GridLive.Index do
     end
   end
 
+  defp critical_facility_source(cf) do
+    source_label = case cf.category do
+      "hospital" -> "HIFLD Hospitals"
+      "fire_station" -> "HIFLD Fire Stations"
+      "police_station" -> "HIFLD Law Enforcement"
+      "ems_station" -> "HIFLD EMS Stations"
+      _ -> "HIFLD"
+    end
+
+    case cf.source do
+      "hifld" -> source_label
+      s when is_binary(s) and s != "" -> s
+      _ -> source_label
+    end
+  end
+
+  defp critical_facility_category_name(nil), do: nil
+  defp critical_facility_category_name(1), do: "Hospital"
+  defp critical_facility_category_name(2), do: "Fire Station"
+  defp critical_facility_category_name(3), do: "Police Station"
+  defp critical_facility_category_name(4), do: "EMS Station"
+  defp critical_facility_category_name(_), do: nil
+
   defp humanize_lookup_type("transmission_line"), do: "Line"
   defp humanize_lookup_type("generator"), do: "Generator"
   defp humanize_lookup_type("substation"), do: "Substation"
   defp humanize_lookup_type("transformer"), do: "Transformer"
   defp humanize_lookup_type("water_facility"), do: "Water facility"
+  defp humanize_lookup_type("critical_facility"), do: "Critical facility"
   defp humanize_lookup_type(t), do: t
 
   defp ensure_sim_server(sim_id, interconnection, component \\ nil) do
@@ -558,6 +729,10 @@ defmodule PowerModelWeb.GridLive.Index do
       |> Enum.flat_map(& &1[:water_facility_ids] || [])
       |> Enum.uniq()
 
+    all_critical = cascade_steps
+      |> Enum.flat_map(& &1[:critical_facility_ids] || [])
+      |> Enum.uniq()
+
     last_step = List.last(cascade_steps) || %{step: 0, islands: 1}
     final_step_num = (last_step[:step] || 0) + 1
 
@@ -573,9 +748,11 @@ defmodule PowerModelWeb.GridLive.Index do
       rerouted_line_ids: dc_payload[:rerouted_line_ids] || [],
       shed_ids: all_shed,
       water_facility_ids: all_water,
+      critical_facility_ids: all_critical,
       simulated_time: 0.0,
       trips: [],
-      water_facility_trips: []
+      water_facility_trips: [],
+      critical_facility_trips: []
     }
   end
 

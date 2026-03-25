@@ -12,3 +12,4 @@ crate-type = ["cdylib"]
 rustler = "0.37"
 sprs = "0.11"
 sprs-ldl = "0.10"
+faer = "0.24"

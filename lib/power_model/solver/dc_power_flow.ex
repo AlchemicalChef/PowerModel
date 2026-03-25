@@ -2,7 +2,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
   @moduledoc """
   DC Power Flow approximation.
   Assumes V=1.0 pu, lossless lines. Solves P = B' * theta.
-  Target: <50ms per interconnection.
+  Uses sparse COO construction throughout — O(nnz) not O(n²).
   """
 
   alias PowerModel.Solver.{Sparse, Solution}
@@ -15,11 +15,9 @@ defmodule PowerModel.Solver.DCPowerFlow do
   """
   def solve(snapshot, opts \\ []) do
     base_mva = Keyword.get(opts, :base_mva, 100.0)
-    buses = snapshot.buses
-    lines = snapshot.lines
-    transformers = snapshot.transformers
-    generators = snapshot.generators
-    loads = snapshot.loads
+
+    %{buses: buses, lines: lines, transformers: transformers,
+      generators: generators, loads: loads} = snapshot
 
     n = length(buses)
     if n == 0, do: throw({:error, :empty_grid})
@@ -29,8 +27,8 @@ defmodule PowerModel.Solver.DCPowerFlow do
 
     slack_idx = find_slack_index(buses, generators, bus_index)
 
-    {b_prime_dense, p_inject} = build_b_prime_and_injection(
-      buses, lines, transformers, generators, loads,
+    {coo_rows, coo_cols, coo_vals, p_inject} = build_sparse_system(
+      lines, transformers, generators, loads,
       bus_index, slack_idx, n, base_mva
     )
 
@@ -38,9 +36,18 @@ defmodule PowerModel.Solver.DCPowerFlow do
     if non_slack_size == 0 do
       Solution.new(bus_ids, List.duplicate(1.0, n), List.duplicate(0.0, n), %{}, base_mva)
     else
-      theta = solve_system(b_prime_dense, p_inject, non_slack_size)
+      theta = if non_slack_size == 1 do
+        # Single non-slack bus: trivial 1x1 solve (avoids sprs n>1 assertion)
+        b_diag = Enum.find_value(Enum.zip([coo_rows, coo_cols, coo_vals]), 0.0, fn {r, c, v} ->
+          if r == 0 and c == 0, do: v
+        end)
+        p = hd(p_inject)
+        [if(abs(b_diag) > 1.0e-15, do: p / b_diag, else: 0.0)]
+      else
+        solve_sparse_system(coo_rows, coo_cols, coo_vals, p_inject, non_slack_size)
+      end
 
-      theta_full = insert_at(theta, slack_idx, 0.0)
+      theta_full = List.insert_at(theta, slack_idx, 0.0)
 
       theta_arr = :array.from_list(theta_full)
 
@@ -56,7 +63,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
       nil ->
         gen_by_bus = Enum.group_by(generators, & &1.bus_id)
         {max_bus_id, _} = Enum.max_by(gen_by_bus, fn {_id, gens} ->
-          Enum.sum(Enum.map(gens, & &1.p_max_mw))
+          Enum.sum_by(gens, & &1.p_max_mw)
         end, fn -> {hd(buses).id, []} end)
         Map.fetch!(bus_index, max_bus_id)
       slack ->
@@ -64,37 +71,62 @@ defmodule PowerModel.Solver.DCPowerFlow do
     end
   end
 
-  defp build_b_prime_and_injection(_buses, lines, transformers, generators, loads,
-                                    bus_index, slack_idx, n, base_mva) do
-    b_full = :array.new(n * n, default: 0.0)
+  # Build the reduced B' matrix directly as COO triplets and the P injection vector.
+  # Eliminates the slack bus row/column during construction — no dense matrix ever created.
+  defp build_sparse_system(lines, transformers, generators, loads,
+                           bus_index, slack_idx, n, base_mva) do
+    # Build index remapping: original index -> reduced index (skipping slack)
+    remap = build_remap(n, slack_idx)
 
-    b_full = Enum.reduce(lines, b_full, fn line, b ->
+    # Build B' triplets in reduced coordinates
+    b_triplets = %{}
+
+    b_triplets = Enum.reduce(lines, b_triplets, fn line, bt ->
       i = Map.fetch!(bus_index, line.from_bus_id)
       j = Map.fetch!(bus_index, line.to_bus_id)
-      x = line.x_pu || 0.001
+      raw_x = line.x_pu || 0.001
+      # Clamp susceptance: |b| <= 1000 (i.e. |x| >= 0.001)
+      x = if(abs(raw_x) < 0.001, do: sign(raw_x) * 0.001, else: raw_x)
       b_ij = 1.0 / x
 
-      b
-      |> array_add(i * n + i, b_ij)
-      |> array_add(j * n + j, b_ij)
-      |> array_add(i * n + j, -b_ij)
-      |> array_add(j * n + i, -b_ij)
+      add_branch_triplets(bt, i, j, b_ij, b_ij, -b_ij, -b_ij, slack_idx, remap)
     end)
 
-    b_full = Enum.reduce(transformers, b_full, fn xfmr, b ->
+    b_triplets = Enum.reduce(transformers, b_triplets, fn xfmr, bt ->
       i = Map.fetch!(bus_index, xfmr.from_bus_id)
       j = Map.fetch!(bus_index, xfmr.to_bus_id)
-      x = xfmr.x_pu
-      b_ij = 1.0 / x
+      raw_x = xfmr.x_pu
+      # Clamp susceptance: |b| <= 1000 (i.e. |x| >= 0.001), preserving sign
+      x = if(abs(raw_x) < 0.001, do: sign(raw_x) * 0.001, else: raw_x)
+      t = xfmr.tap_ratio || 1.0
+      y_series = 1.0 / x
 
-      b
-      |> array_add(i * n + i, b_ij)
-      |> array_add(j * n + j, b_ij)
-      |> array_add(i * n + j, -b_ij)
-      |> array_add(j * n + i, -b_ij)
+      add_branch_triplets(bt, i, j,
+        y_series / (t * t), y_series,
+        -y_series / t, -y_series / t,
+        slack_idx, remap)
     end)
 
+    # Build P injection vector (reduced, slack removed)
     p_full = :array.new(n, default: 0.0)
+
+    # Phase-shifting transformer injections
+    p_full = Enum.reduce(transformers, p_full, fn xfmr, p ->
+      shift_deg = Map.get(xfmr, :phase_shift_deg) || 0.0
+
+      if shift_deg != 0.0 do
+        i = Map.fetch!(bus_index, xfmr.from_bus_id)
+        j = Map.fetch!(bus_index, xfmr.to_bus_id)
+        x = xfmr.x_pu
+        t = xfmr.tap_ratio || 1.0
+        shift_rad = shift_deg * :math.pi() / 180.0
+        p_shift = shift_rad / (x * t)
+
+        p |> array_add(i, p_shift) |> array_add(j, -p_shift)
+      else
+        p
+      end
+    end)
 
     p_full = Enum.reduce(generators, p_full, fn gen, p ->
       idx = Map.fetch!(bus_index, gen.bus_id)
@@ -108,77 +140,99 @@ defmodule PowerModel.Solver.DCPowerFlow do
       array_add(p, idx, -p_pu)
     end)
 
-    non_slack_indices = Enum.reject(0..(n-1), &(&1 == slack_idx))
+    # Extract reduced P injection (skip slack bus)
+    p_inject = for i <- 0..(n - 1), i != slack_idx, do: :array.get(i, p_full)
 
-    b_prime = for i <- non_slack_indices, j <- non_slack_indices do
-      :array.get(i * n + j, b_full)
-    end
-
-    p_inject = for i <- non_slack_indices do
-      :array.get(i, p_full)
-    end
-
-    {b_prime, p_inject}
-  end
-
-  @sparse_threshold 500
-
-  defp solve_system(b_prime_flat, p_inject, size) do
-    if size > @sparse_threshold do
-      solve_sparse(b_prime_flat, p_inject, size)
-    else
-      solve_dense_system(b_prime_flat, p_inject, size)
-    end
-  end
-
-  defp solve_sparse(b_prime_flat, p_inject, size) do
+    # Extract COO arrays from triplet map
     {rows, cols, vals} =
-      b_prime_flat
-      |> Enum.with_index()
-      |> Enum.reduce({[], [], []}, fn {val, idx}, {rs, cs, vs} ->
-        if abs(val) > 1.0e-15 do
-          r = div(idx, size)
-          c = rem(idx, size)
-          {[r | rs], [c | cs], [val | vs]}
+      Enum.reduce(b_triplets, {[], [], []}, fn {{r, c}, v}, {rs, cs, vs} ->
+        if abs(v) > 1.0e-15 do
+          {[r | rs], [c | cs], [v | vs]}
         else
           {rs, cs, vs}
         end
       end)
 
+    {rows, cols, vals, p_inject}
+  end
+
+  # Build remap: original bus index -> reduced index (skipping slack)
+  defp build_remap(n, slack_idx) do
+    {remap, _} = Enum.reduce(0..(n - 1), {%{}, 0}, fn i, {m, ri} ->
+      if i == slack_idx do
+        {m, ri}
+      else
+        {Map.put(m, i, ri), ri + 1}
+      end
+    end)
+    remap
+  end
+
+  # Add a branch's 4 B' matrix entries, skipping slack bus rows/columns
+  defp add_branch_triplets(bt, i, j, b_ii, b_jj, b_ij, b_ji, slack_idx, remap) do
+    bt
+    |> maybe_add(i, i, b_ii, slack_idx, remap)
+    |> maybe_add(j, j, b_jj, slack_idx, remap)
+    |> maybe_add(i, j, b_ij, slack_idx, remap)
+    |> maybe_add(j, i, b_ji, slack_idx, remap)
+  end
+
+  defp maybe_add(bt, r, c, val, slack_idx, remap) do
+    if r == slack_idx or c == slack_idx do
+      bt
+    else
+      ri = Map.fetch!(remap, r)
+      ci = Map.fetch!(remap, c)
+      Map.update(bt, {ri, ci}, val, &(&1 + val))
+    end
+  end
+
+  # Solve using sparse NIF, with dense fallback
+  defp solve_sparse_system(rows, cols, vals, p_inject, size) do
     try do
       case Sparse.sparse_solve(rows, cols, vals, p_inject, size) do
         {:ok, x} -> x
-        _ -> solve_dense_system(b_prime_flat, p_inject, size)
+        _ -> dense_fallback(rows, cols, vals, p_inject, size)
       end
     rescue
-      _ -> solve_dense_system(b_prime_flat, p_inject, size)
+      _ -> dense_fallback(rows, cols, vals, p_inject, size)
     end
   end
 
-  defp solve_dense_system(b_prime_flat, p_inject, size) do
-    b_matrix = Enum.chunk_every(b_prime_flat, size)
+  defp dense_fallback(rows, cols, vals, p_inject, size) do
+    # Build dense flat matrix from COO for dense NIF solvers
+    flat = List.duplicate(0.0, size * size) |> :array.from_list()
+
+    flat = Enum.zip([rows, cols, vals])
+    |> Enum.reduce(flat, fn {r, c, v}, arr ->
+      idx = r * size + c
+      :array.set(idx, :array.get(idx, arr) + v, arr)
+    end)
+
+    flat_list = :array.to_list(flat)
 
     try do
-      case Sparse.lu_factorize(b_matrix, size) do
-        {:ok, l, u, perm} ->
-          case Sparse.lu_solve(l, u, perm, p_inject) do
-            {:ok, x} -> x
-            _ -> nx_or_gaussian_solve(b_matrix, p_inject, size)
-          end
-        _ ->
-          nx_or_gaussian_solve(b_matrix, p_inject, size)
+      case Sparse.dense_solve_flat(flat_list, p_inject, size) do
+        {:ok, x} -> x
+        _ -> gaussian_solve_from_coo(rows, cols, vals, p_inject, size)
       end
     rescue
-      _ -> nx_or_gaussian_solve(b_matrix, p_inject, size)
+      _ -> gaussian_solve_from_coo(rows, cols, vals, p_inject, size)
     end
   end
 
-  defp nx_or_gaussian_solve(b_matrix, p_inject, size) do
-    try do
-      Sparse.solve_dense(b_matrix, p_inject)
-    rescue
-      _ -> gaussian_solve(b_matrix, p_inject, size)
+  defp gaussian_solve_from_coo(rows, cols, vals, p_inject, size) do
+    # Build dense matrix from COO
+    matrix = for r <- 0..(size - 1) do
+      row = List.duplicate(0.0, size) |> :array.from_list()
+      row = Enum.zip([rows, cols, vals])
+      |> Enum.reduce(row, fn {ri, ci, v}, arr ->
+        if ri == r, do: :array.set(ci, :array.get(ci, arr) + v, arr), else: arr
+      end)
+      :array.to_list(row)
     end
+
+    gaussian_solve(matrix, p_inject, size)
   end
 
   defp gaussian_solve(a, b, n) do
@@ -233,53 +287,62 @@ defmodule PowerModel.Solver.DCPowerFlow do
   end
 
   defp compute_line_flows(lines, transformers, theta_arr, bus_index, base_mva) do
-    line_flows = Enum.map(lines, fn line ->
-      i = Map.fetch!(bus_index, line.from_bus_id)
-      j = Map.fetch!(bus_index, line.to_bus_id)
-      x = line.x_pu || 0.001
-      theta_i = :array.get(i, theta_arr)
-      theta_j = :array.get(j, theta_arr)
-      flow_pu = (theta_i - theta_j) / x
-      flow_mw = flow_pu * base_mva
-
-      {{:line, line.id}, %{
-        from_bus_id: line.from_bus_id,
-        to_bus_id: line.to_bus_id,
-        p_flow_mw: flow_mw,
-        loading_pct: if(line.rating_a_mva && line.rating_a_mva > 0,
-          do: abs(flow_mw) / line.rating_a_mva * 100.0,
-          else: 0.0),
-        overloaded: line.rating_a_mva != nil and abs(flow_mw) > (line.rating_a_mva || 999_999)
-      }}
-    end)
-
-    xfmr_flows = Enum.map(transformers, fn xfmr ->
-      i = Map.fetch!(bus_index, xfmr.from_bus_id)
-      j = Map.fetch!(bus_index, xfmr.to_bus_id)
-      x = xfmr.x_pu
-      theta_i = :array.get(i, theta_arr)
-      theta_j = :array.get(j, theta_arr)
-      flow_pu = (theta_i - theta_j) / x
-      flow_mw = flow_pu * base_mva
-
-      {{:transformer, xfmr.id}, %{
-        from_bus_id: xfmr.from_bus_id,
-        to_bus_id: xfmr.to_bus_id,
-        p_flow_mw: flow_mw,
-        loading_pct: if(xfmr.rated_mva > 0,
-          do: abs(flow_mw) / xfmr.rated_mva * 100.0,
-          else: 0.0),
-        overloaded: abs(flow_mw) > xfmr.rated_mva
-      }}
-    end)
+    line_flows = Enum.map(lines, &compute_line_flow(&1, theta_arr, bus_index, base_mva))
+    xfmr_flows = Enum.map(transformers, &compute_xfmr_flow(&1, theta_arr, bus_index, base_mva))
 
     Map.new(line_flows ++ xfmr_flows)
   end
 
-  defp insert_at(list, idx, val) do
-    {before, after_} = Enum.split(list, idx)
-    before ++ [val] ++ after_
+  defp compute_line_flow(line, theta_arr, bus_index, base_mva) do
+    i = Map.fetch!(bus_index, line.from_bus_id)
+    j = Map.fetch!(bus_index, line.to_bus_id)
+    raw_x = line.x_pu || 0.001
+    x = if(abs(raw_x) < 0.001, do: sign(raw_x) * 0.001, else: raw_x)
+    theta_i = :array.get(i, theta_arr)
+    theta_j = :array.get(j, theta_arr)
+    flow_pu = (theta_i - theta_j) / x
+    flow_mw = flow_pu * base_mva
+
+    {{:line, line.id}, %{
+      from_bus_id: line.from_bus_id,
+      to_bus_id: line.to_bus_id,
+      p_flow_mw: flow_mw,
+      loading_pct: if(line.rating_a_mva && line.rating_a_mva > 0,
+        do: abs(flow_mw) / line.rating_a_mva * 100.0,
+        else: 0.0),
+      overloaded: line.rating_a_mva != nil and abs(flow_mw) > (line.rating_a_mva || 999_999)
+    }}
   end
+
+  defp compute_xfmr_flow(xfmr, theta_arr, bus_index, base_mva) do
+    i = Map.fetch!(bus_index, xfmr.from_bus_id)
+    j = Map.fetch!(bus_index, xfmr.to_bus_id)
+    raw_x = xfmr.x_pu
+    x = if(abs(raw_x) < 0.001, do: sign(raw_x) * 0.001, else: raw_x)
+    t = xfmr.tap_ratio || 1.0
+    shift_rad = (Map.get(xfmr, :phase_shift_deg) || 0.0) * :math.pi() / 180.0
+    theta_i = :array.get(i, theta_arr)
+    theta_j = :array.get(j, theta_arr)
+    # Standard DC transformer flow: P = (theta_i - theta_j - shift) / (x * t)
+    # The mutual admittance (off-diagonal of B') is 1/(x*t), which is the
+    # flow sensitivity to angle difference.
+    flow_pu = (theta_i - theta_j - shift_rad) / (x * t)
+    flow_mw = flow_pu * base_mva
+
+    {{:transformer, xfmr.id}, %{
+      from_bus_id: xfmr.from_bus_id,
+      to_bus_id: xfmr.to_bus_id,
+      p_flow_mw: flow_mw,
+      loading_pct: if(xfmr.rated_mva > 0,
+        do: abs(flow_mw) / xfmr.rated_mva * 100.0,
+        else: 0.0),
+      overloaded: abs(flow_mw) > xfmr.rated_mva
+    }}
+  end
+
+  # Sign function: returns 1.0 for positive, -1.0 for negative, 1.0 for zero
+  defp sign(x) when x >= 0, do: 1.0
+  defp sign(_x), do: -1.0
 
   defp array_add(arr, idx, val) do
     :array.set(idx, :array.get(idx, arr) + val, arr)

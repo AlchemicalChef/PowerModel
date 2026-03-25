@@ -48,6 +48,31 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
             <span class="info-value"><%= @component.voltage %> kV</span>
           </div>
         <% end %>
+        <%!-- Critical facility fields --%>
+        <%= if @component[:category] do %>
+          <div class="info-row">
+            <span class="info-label">Category</span>
+            <span class="info-value"><%= @component.category %></span>
+          </div>
+        <% end %>
+        <%= if @component[:address] do %>
+          <div class="info-row">
+            <span class="info-label">Address</span>
+            <span class="info-value"><%= @component.address %></span>
+          </div>
+        <% end %>
+        <%= if @component[:beds] do %>
+          <div class="info-row">
+            <span class="info-label">Beds</span>
+            <span class="info-value"><%= @component.beds %></span>
+          </div>
+        <% end %>
+        <%= if @component[:trauma] do %>
+          <div class="info-row">
+            <span class="info-label">Trauma Level</span>
+            <span class="info-value"><%= @component.trauma %></span>
+          </div>
+        <% end %>
         <%!-- Water facility fields --%>
         <%= if @component[:facility_type] do %>
           <div class="info-row">
@@ -81,6 +106,90 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
         <% end %>
       </div>
 
+      <%!-- Harmonics controls for generators --%>
+      <%= if @component.type == "generator" and not @cascade_active do %>
+        <div class="info-section harmonics-section">
+          <div class="info-section-header">
+            <span class="section-title">Harmonics</span>
+          </div>
+
+          <div class="harmonic-controls">
+            <div class="harmonic-row">
+              <label>Source Type</label>
+              <select phx-change="harmonic_source_type"
+                      phx-value-gen-id={@component.id}>
+                <option value="none" selected={harmonic_type(@component) == "none"}>None</option>
+                <option value="pwm_inverter" selected={harmonic_type(@component) == "pwm_inverter"}>PWM Inverter</option>
+                <option value="six_pulse" selected={harmonic_type(@component) == "six_pulse"}>6-Pulse Converter</option>
+                <option value="twelve_pulse" selected={harmonic_type(@component) == "twelve_pulse"}>12-Pulse Converter</option>
+                <option value="arc_furnace" selected={harmonic_type(@component) == "arc_furnace"}>Arc Furnace</option>
+              </select>
+            </div>
+
+            <%= if Map.get(@component, :harmonic_type, "none") != "none" do %>
+              <div class="harmonic-row">
+                <label>5th Harmonic</label>
+                <div class="slider-group">
+                  <input type="range" min="0" max="15" step="0.5"
+                    value={Map.get(@component, :h5_pct, default_h5(@component))}
+                    phx-change="harmonic_adjust"
+                    phx-value-gen-id={@component.id}
+                    phx-value-harmonic="5" />
+                  <span class="slider-value"><%= Map.get(@component, :h5_pct, default_h5(@component)) %>%</span>
+                </div>
+              </div>
+
+              <div class="harmonic-row">
+                <label>7th Harmonic</label>
+                <div class="slider-group">
+                  <input type="range" min="0" max="12" step="0.5"
+                    value={Map.get(@component, :h7_pct, default_h7(@component))}
+                    phx-change="harmonic_adjust"
+                    phx-value-gen-id={@component.id}
+                    phx-value-harmonic="7" />
+                  <span class="slider-value"><%= Map.get(@component, :h7_pct, default_h7(@component)) %>%</span>
+                </div>
+              </div>
+
+              <div class="harmonic-row">
+                <label>11th Harmonic</label>
+                <div class="slider-group">
+                  <input type="range" min="0" max="8" step="0.5"
+                    value={Map.get(@component, :h11_pct, 2.0)}
+                    phx-change="harmonic_adjust"
+                    phx-value-gen-id={@component.id}
+                    phx-value-harmonic="11" />
+                  <span class="slider-value"><%= Map.get(@component, :h11_pct, 2.0) %>%</span>
+                </div>
+              </div>
+
+              <button phx-click="run_harmonics"
+                      phx-value-gen-id={@component.id}
+                      class="harmonics-btn">
+                Analyze Harmonics
+              </button>
+            <% end %>
+          </div>
+
+          <%= if @component[:thd_result] do %>
+            <div class="harmonic-results">
+              <div class="info-row">
+                <span class="info-label">Bus THD</span>
+                <span class={"info-value #{if @component.thd_result > 5.0, do: "thd-violation", else: "thd-ok"}"}>
+                  <%= Float.round(@component.thd_result, 2) %>%
+                </span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">IEEE 519</span>
+                <span class={"info-value #{if @component[:ieee_519_compliant], do: "thd-ok", else: "thd-violation"}"}>
+                  <%= if @component[:ieee_519_compliant], do: "Compliant", else: "Violation" %>
+                </span>
+              </div>
+            </div>
+          <% end %>
+        </div>
+      <% end %>
+
       <div class="info-actions">
         <%= if can_trip?(@component.type) and not @cascade_active do %>
           <button
@@ -109,10 +218,12 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
   defp component_title("substation"), do: "Substation"
   defp component_title("transformer"), do: "Transformer"
   defp component_title("water_facility"), do: "Water"
+  defp component_title("critical_facility"), do: "Facility"
   defp component_title(type), do: String.capitalize(type)
 
   defp humanize_type("transmission_line"), do: "Transmission Line"
   defp humanize_type("water_facility"), do: "Water Facility"
+  defp humanize_type("critical_facility"), do: "Critical Facility"
   defp humanize_type(type), do: String.capitalize(type)
 
   defp can_trip?("transmission_line"), do: true
@@ -124,10 +235,44 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
   defp state_name(1), do: "Stressed"
   defp state_name(2), do: "Overloaded"
   defp state_name(3), do: "Tripped"
+  defp state_name(4), do: "Rerouted"
+  defp state_name(5), do: "Shed"
+  defp state_name(6), do: "Islanded"
   defp state_name(_), do: "Unknown"
 
   defp format_number(nil), do: "—"
   defp format_number(v) when is_float(v), do: Float.round(v, 1)
   defp format_number(v) when is_integer(v), do: v
   defp format_number(v), do: v
+
+  defp harmonic_type(component) do
+    Map.get(component, :harmonic_type) || default_harmonic_type(component)
+  end
+
+  defp default_harmonic_type(component) do
+    case Map.get(component, :fuel_type) do
+      ft when ft in ["Solar", "Wind"] -> "pwm_inverter"
+      _ -> "none"
+    end
+  end
+
+  defp default_h5(component) do
+    case harmonic_type(component) do
+      "pwm_inverter" -> 4.0
+      "six_pulse" -> 20.0
+      "twelve_pulse" -> 2.0
+      "arc_furnace" -> 4.5
+      _ -> 0.0
+    end
+  end
+
+  defp default_h7(component) do
+    case harmonic_type(component) do
+      "pwm_inverter" -> 3.0
+      "six_pulse" -> 14.3
+      "twelve_pulse" -> 1.5
+      "arc_furnace" -> 3.3
+      _ -> 0.0
+    end
+  end
 end

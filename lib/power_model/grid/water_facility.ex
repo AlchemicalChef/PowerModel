@@ -1,4 +1,9 @@
 defmodule PowerModel.Grid.WaterFacility do
+  @moduledoc """
+  Water infrastructure facility (treatment plant, pump station, reservoir)
+  linked to the power grid via a bus for interdependency analysis.
+  """
+
   use Ecto.Schema
   import Ecto.Changeset
 

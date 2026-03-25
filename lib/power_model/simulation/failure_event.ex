@@ -1,4 +1,8 @@
 defmodule PowerModel.Simulation.FailureEvent do
+  @moduledoc """
+  Individual failure event within a cascade simulation (trip, shed, or relay action).
+  """
+
   use Ecto.Schema
   import Ecto.Changeset
 

@@ -159,7 +159,7 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLines do
         }
       end
     rescue
-      _ -> nil
+      _e -> nil
     end
   end
   defp parse_api_feature(_), do: nil
@@ -241,7 +241,7 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLines do
         }
       end
     rescue
-      _ -> nil
+      _e -> nil
     end
   end
 

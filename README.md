@@ -86,7 +86,7 @@ All data is sourced from US government public datasets and included in the repo:
 | Buses | 14,486 |
 | Generators | 26,883 |
 | Transmission lines | 52,272 |
-| Substations | 10,513 |
+| Substations | 65,450 |
 | Loads | 12,844 |
 | Transformers | 2,331 |
 | Water facilities | 44 |

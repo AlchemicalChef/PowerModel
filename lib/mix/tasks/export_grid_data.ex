@@ -28,6 +28,7 @@ defmodule Mix.Tasks.PowerModel.ExportGridData do
     export_transmission_lines()
     export_substations()
     export_water_facilities()
+    export_critical_facilities()
 
     Mix.shell().info("Grid data exported to #{@output_dir}/")
   end
@@ -162,6 +163,40 @@ defmodule Mix.Tasks.PowerModel.ExportGridData do
       _ -> 0
     end
   end
+
+  defp export_critical_facilities do
+    facilities = PowerModel.Grid.export_critical_facilities()
+    count = length(facilities)
+
+    json = Jason.encode!(%{
+      count: count,
+      facilities: Enum.map(facilities, fn f ->
+        {lon, lat} = extract_coords(f.coordinates)
+        %{
+          id: f.id,
+          lon: lon,
+          lat: lat,
+          name: f.name,
+          category: critical_facility_category_code(f.category),
+          facilityType: f.facility_type,
+          beds: f.beds,
+          trauma: f.trauma,
+          powerMw: f.estimated_power_mw || 0.0,
+          busId: f.bus_id,
+          state: 0
+        }
+      end)
+    })
+
+    File.write!(Path.join(@output_dir, "critical_facilities.json"), json)
+    Mix.shell().info("  critical_facilities.json: #{count} records, #{byte_size(json)} bytes")
+  end
+
+  defp critical_facility_category_code("hospital"), do: 1
+  defp critical_facility_category_code("fire_station"), do: 2
+  defp critical_facility_category_code("police_station"), do: 3
+  defp critical_facility_category_code("ems_station"), do: 4
+  defp critical_facility_category_code(_), do: 0
 
   defp water_facility_type_code("desalination"), do: 1
   defp water_facility_type_code("wastewater"), do: 2

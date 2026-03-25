@@ -75,7 +75,7 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
         line
         |> Ecto.Changeset.change(%{
           r_pu: r_pu,
-          x_pu: max(x_pu, 0.0001),
+          x_pu: max(x_pu, 0.001),
           b_pu: b_pu,
           rating_a_mva: effective_rating,
           length_km: length_km
