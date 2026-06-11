@@ -17,7 +17,10 @@ primary_region = "ord"
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  # "suspend" resumes in ~ms (no 502 cold-start race like "stop", which boots
+  # the whole BEAM while fly-proxy is already connecting) and preserves
+  # in-memory simulation state across idle periods.
+  auto_stop_machines = "suspend"
   auto_start_machines = true
   min_machines_running = 0
   processes = ["app"]
