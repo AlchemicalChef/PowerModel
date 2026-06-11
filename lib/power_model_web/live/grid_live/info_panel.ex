@@ -24,6 +24,12 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
             <span class="info-value"><%= format_number(@component.capacity) %> MW</span>
           </div>
         <% end %>
+        <%= if @component[:capacity_mgd] do %>
+          <div class="info-row">
+            <span class="info-label">Capacity</span>
+            <span class="info-value"><%= format_number(@component.capacity_mgd) %> MGD</span>
+          </div>
+        <% end %>
         <%= if @component[:fuel_type] do %>
           <div class="info-row">
             <span class="info-label">Fuel Type</span>

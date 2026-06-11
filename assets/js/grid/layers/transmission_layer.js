@@ -16,13 +16,15 @@ function voltageClassKey(kv) {
   return String(closest);
 }
 
-export function createTransmissionLayer(dataStore, viewMode, zoom, onClick, selectedId, cascadeActive, hiddenVoltages) {
+export function createTransmissionLayer(dataStore, viewMode, zoom, onClick, selectedId, cascadeActive, hiddenVoltages, stateVersion) {
   let lines = dataStore.transmissionLines.lines;
 
+  // Zoom decluttering must never hide an active alarm: affected lines
+  // (tripped/overloaded/rerouted) render at every zoom level.
   if (zoom < 6) {
-    lines = lines.filter((l) => l.voltageKv >= 345);
+    lines = lines.filter((l) => l.state > 0 || l.voltageKv >= 345);
   } else if (zoom < 8) {
-    lines = lines.filter((l) => l.voltageKv >= 138);
+    lines = lines.filter((l) => l.state > 0 || l.voltageKv >= 138);
   }
 
   // Legend toggles hide voltage classes — but never an active alarm
@@ -73,7 +75,7 @@ export function createTransmissionLayer(dataStore, viewMode, zoom, onClick, sele
           getWidth: (d) => getCascadeLineWidth(d, zoom),
           onClick,
           updateTriggers: {
-            getColor: [Date.now()],
+            getColor: [stateVersion],
             getWidth: [zoom],
           },
           transitions: {
@@ -112,7 +114,7 @@ export function createTransmissionLayer(dataStore, viewMode, zoom, onClick, sele
         getWidth: (d) => getLineWidth(d, zoom),
         onClick,
         updateTriggers: {
-          getColor: [viewMode, Date.now()],
+          getColor: [viewMode, stateVersion],
         },
         transitions: {
           getColor: 600,

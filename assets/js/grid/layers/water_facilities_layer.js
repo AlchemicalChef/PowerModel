@@ -53,7 +53,7 @@ export function createWaterFacilitiesLayer(dataStore, viewMode, zoom, onClick, s
         : getWaterColor(d),
       onClick,
       updateTriggers: {
-        getColor: [viewMode, Date.now(), cascadeActive],
+        getColor: [viewMode, opts.stateVersion, cascadeActive],
         getSize: [cascadeActive],
       },
       transitions: {
@@ -120,7 +120,7 @@ export function createWaterFacilitiesLayer(dataStore, viewMode, zoom, onClick, s
             ? [255, 50, 30, 140]
             : [...COLOR_SCALES.getStateColor(d.state), 120],
           updateTriggers: {
-            getLineColor: [Date.now()],
+            getLineColor: [opts.stateVersion],
           },
         })
       );

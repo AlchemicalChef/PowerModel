@@ -85,8 +85,8 @@ defmodule PowerModel.Grid do
       join: tb in Bus, on: tl.to_bus_id == tb.id,
       where: tl.status == "in_service" and fb.interconnection_id == ^interconnection_id
         and not is_nil(fb.coordinates) and not is_nil(tb.coordinates)
-        and (is_nil(fb.interconnection_id) or is_nil(tb.interconnection_id) or
-               fb.interconnection_id == tb.interconnection_id),
+        and not is_nil(fb.interconnection_id)
+        and fb.interconnection_id == tb.interconnection_id,
       select: tl
     )
     |> Repo.all()
@@ -127,8 +127,8 @@ defmodule PowerModel.Grid do
       join: tb in Bus, on: t.to_bus_id == tb.id,
       where: t.status == "in_service" and fb.interconnection_id == ^interconnection_id
         and not is_nil(fb.coordinates) and not is_nil(tb.coordinates)
-        and (is_nil(fb.interconnection_id) or is_nil(tb.interconnection_id) or
-               fb.interconnection_id == tb.interconnection_id),
+        and not is_nil(fb.interconnection_id)
+        and fb.interconnection_id == tb.interconnection_id,
       select: t
     )
     |> Repo.all()
@@ -235,8 +235,8 @@ defmodule PowerModel.Grid do
       join: tb in Bus, on: tl.to_bus_id == tb.id,
       where: tl.status == "in_service"
         and not is_nil(fb.coordinates) and not is_nil(tb.coordinates)
-        and (is_nil(fb.interconnection_id) or is_nil(tb.interconnection_id) or
-               fb.interconnection_id == tb.interconnection_id),
+        and not is_nil(fb.interconnection_id)
+        and fb.interconnection_id == tb.interconnection_id,
       select: tl
     ) |> Repo.all()
     transformers = from(t in Transformer,
@@ -244,8 +244,8 @@ defmodule PowerModel.Grid do
       join: tb in Bus, on: t.to_bus_id == tb.id,
       where: t.status == "in_service"
         and not is_nil(fb.coordinates) and not is_nil(tb.coordinates)
-        and (is_nil(fb.interconnection_id) or is_nil(tb.interconnection_id) or
-               fb.interconnection_id == tb.interconnection_id),
+        and not is_nil(fb.interconnection_id)
+        and fb.interconnection_id == tb.interconnection_id,
       select: t
     ) |> Repo.all()
 
@@ -523,8 +523,10 @@ defmodule PowerModel.Grid do
     max_km = Keyword.get(opts, :max_km, 20)
     max_meters = max_km * 1000
 
+    # Only facilities not yet mapped: re-running must not re-ADD their MW to
+    # the shared bus loads (the merge below is additive, not idempotent).
     facilities = from(w in WaterFacility,
-      where: w.status == "active" and not is_nil(w.coordinates)
+      where: w.status == "active" and not is_nil(w.coordinates) and is_nil(w.bus_id)
     ) |> Repo.all()
 
     mapped = Enum.reduce(facilities, {0, 0}, fn facility, {map_count, load_count} ->
@@ -644,6 +646,11 @@ defmodule PowerModel.Grid do
   end
 
   defp rebuild_datacenter_loads do
+    {:ok, count} = Repo.transaction(fn -> do_rebuild_datacenter_loads() end)
+    count
+  end
+
+  defp do_rebuild_datacenter_loads do
     Repo.delete_all(from l in Load, where: l.load_type == "datacenter")
 
     now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)

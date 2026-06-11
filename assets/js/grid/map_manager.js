@@ -28,6 +28,11 @@ export class MapManager {
     this.cascadeActive = false;
     this.showWaterFacilities = false;
     this.showDatacenters = false;
+    // Monotonic counter bumped on every state mutation; used as the deck.gl
+    // updateTrigger so color accessors re-evaluate exactly when needed
+    // (Date.now() both defeated caching on idle pans and could collide
+    // within one millisecond).
+    this.stateVersion = 0;
     // Legend-driven visibility: sets of HIDDEN keys per category
     this.categoryFilters = {
       voltage: new Set(),
@@ -134,7 +139,7 @@ export class MapManager {
             });
           }
         }, selectedType === "transmission_line" ? selectedId : null, ca,
-        this.categoryFilters.voltage)
+        this.categoryFilters.voltage, this.stateVersion)
       );
     }
 
@@ -151,7 +156,7 @@ export class MapManager {
             });
           }
         }, selectedType === "generator" ? selectedId : null, ca,
-        this.categoryFilters.fuel)
+        this.categoryFilters.fuel, this.stateVersion)
       );
     }
 
@@ -179,7 +184,7 @@ export class MapManager {
           if (info.object && this.onComponentClick) {
             const obj = info.object;
             this.onComponentClick("water_facility", obj.id, {
-              capacity: obj.capacityMgd,
+              capacityMgd: obj.capacityMgd,
               powerMw: obj.powerMw,
               facilityType: obj.facilityType,
               busId: obj.busId,
@@ -188,7 +193,8 @@ export class MapManager {
           }
         }, selectedType === "water_facility" ? selectedId : null, ca,
         { affectedOnly: !this.showWaterFacilities && ca,
-          hiddenTypes: this.categoryFilters.water })
+          hiddenTypes: this.categoryFilters.water,
+          stateVersion: this.stateVersion })
       );
     }
 
@@ -209,7 +215,8 @@ export class MapManager {
           }
         }, selectedType === "datacenter" ? selectedId : null, ca,
         { affectedOnly: !this.showDatacenters && ca,
-          hiddenTypes: this.categoryFilters.datacenter })
+          hiddenTypes: this.categoryFilters.datacenter,
+          stateVersion: this.stateVersion })
       );
     }
 
@@ -217,6 +224,7 @@ export class MapManager {
   }
 
   applyDCResults(data) {
+    this.stateVersion++;
     // These are all LINE IDs — only apply to transmission lines
     const lineStateMap = {};
 
@@ -235,16 +243,18 @@ export class MapManager {
   }
 
   applyACResults(data) {
-    // AC voltage violations apply to substations (bus-level)
+    // AC refinement carries the same line-classification lists as DC --
+    // apply them, plus substation-level voltage violations when present.
     if (data.voltage_violation_substation_ids) {
       const subMap = {};
       for (const id of data.voltage_violation_substation_ids) subMap[id] = 1;
       this.dataStore.applySubstationStateMap(subMap);
     }
-    this._updateLayers();
+    this.applyDCResults(data);
   }
 
   applyCascadeStep(data) {
+    this.stateVersion++;
     this.cascadeHistory.push(data);
 
     if (!this.cascadeActive) {
@@ -292,6 +302,7 @@ export class MapManager {
   }
 
   resetToBaseline() {
+    this.stateVersion++;
     this.dataStore.resetAllStates();
     this.cascadeHistory = [];
 
@@ -329,14 +340,16 @@ export class MapManager {
   }
 
   showCascadeStep(step) {
-    // Reset and replay up to step, preserving all impact states
+    // Reset and replay THROUGH the clicked step (inclusive). Step numbers
+    // start at 0 (the manual trip), matching cascadeHistory indexes.
+    this.stateVersion++;
     this.dataStore.resetAllStates();
-    const shouldBeActive = step > 0 && this.cascadeHistory.length > 0;
+    const shouldBeActive = step >= 0 && this.cascadeHistory.length > 0;
     if (shouldBeActive !== this.cascadeActive) {
       this.cascadeActive = shouldBeActive;
       if (this.onCascadeActiveChange) this.onCascadeActiveChange(shouldBeActive);
     }
-    for (let i = 0; i < step && i < this.cascadeHistory.length; i++) {
+    for (let i = 0; i <= step && i < this.cascadeHistory.length; i++) {
       this._applyCascadeData(this.cascadeHistory[i]);
     }
     this._updateLayers();

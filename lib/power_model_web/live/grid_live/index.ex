@@ -43,6 +43,8 @@ defmodule PowerModelWeb.GridLive.Index do
       type: type,
       id: parse_int(id),
       capacity: parse_number(params["capacity"]),
+      capacity_mgd: parse_number(params["capacityMgd"]),
+      voltage: parse_number(params["voltage"]),
       voltage_kv: parse_number(params["voltageKv"]),
       rating_mva: parse_number(params["ratingMva"]),
       fuel_type: fuel_type_name(parse_int(params["fuelType"])),
@@ -283,19 +285,22 @@ defmodule PowerModelWeb.GridLive.Index do
 
   def handle_info(:run_n1_screening, socket) do
     sim_id = socket.assigns.sim_id
+    # self() inside the Task closure would be the Task's pid, not this LiveView
+    lv = self()
+    interconnection = socket.assigns.interconnection
+    hour = socket.assigns.selected_hour
 
     Task.start(fn ->
-      ensure_sim_server(sim_id, socket.assigns.interconnection,
-        socket.assigns.selected_hour)
+      ensure_sim_server(sim_id, interconnection, hour)
 
       case SimulationServer.get_state(sim_id) do
         %{has_dc_solution: true} = state ->
           # N-1 screening would run here against the current DC solution
           # For now, broadcast the result count back
           violations = length(state.tripped_lines) + length(state.tripped_generators)
-          send(self(), {:n1_screening_done, violations})
+          send(lv, {:n1_screening_done, violations})
         _ ->
-          send(self(), {:n1_screening_done, 0})
+          send(lv, {:n1_screening_done, 0})
       end
     end)
 

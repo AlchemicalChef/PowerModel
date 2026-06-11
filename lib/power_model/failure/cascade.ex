@@ -16,6 +16,8 @@ defmodule PowerModel.Failure.Cascade do
      When total headroom is insufficient the deficit triggers UFLS.
   """
 
+  require Logger
+
   alias PowerModel.Solver.DCPowerFlow
   alias PowerModel.Failure.{Protection, LoadShedding}
   alias PowerModel.Simulation.Cascading.IslandDetector
@@ -79,7 +81,7 @@ defmodule PowerModel.Failure.Cascade do
     %__MODULE__{
       buses: snapshot.buses,
       lines: snapshot.lines,
-      transformers: snapshot.transformers,
+      transformers: Map.get(snapshot, :transformers, []),
       generators: snapshot.generators,
       loads: snapshot.loads,
       water_facilities: Map.get(snapshot, :water_facilities, []),
@@ -167,8 +169,14 @@ defmodule PowerModel.Failure.Cascade do
       loading = Map.new(solution.line_flows, fn {key, flow} -> {key, flow.loading_pct} end)
 
       {overloaded, categories, loading}
+    rescue
+      e ->
+        Logger.warning("base-case solve raised #{Exception.message(e)}; no base filtering")
+        {MapSet.new(), %{}, %{}}
     catch
-      _ -> {MapSet.new(), %{}, %{}}
+      thrown ->
+        Logger.warning("base-case solve threw #{inspect(thrown)}; no base filtering")
+        {MapSet.new(), %{}, %{}}
     end
   end
 
@@ -382,27 +390,32 @@ defmodule PowerModel.Failure.Cascade do
       |> Enum.map(fn g -> Map.get(state.dispatch, g.id, 0.0) end)
       |> Enum.sum()
 
-    {shed_loads, shed_events} =
+    {shed_loads, ufls_events} =
       LoadShedding.apply_ufls(island_loads, online_gens, total_gen, total_load)
 
     # If UFLS didn't shed enough (e.g. frequency still above threshold),
-    # force-shed proportionally for the remaining deficit
-    {shed_loads, shed_events} =
-      if deficit_mw > 0 do
-        shed_so_far =
-          Enum.sum(Enum.map(shed_events, fn e -> Map.get(e.details, :shed_mw, 0.0) end))
+    # force-shed ONLY the remaining gap against the post-UFLS loads. Both
+    # rounds' events are kept so the conservation accounting stays exact.
+    ufls_shed_mw =
+      Enum.sum(Enum.map(ufls_events, fn e -> Map.get(e.details, :shed_mw, 0.0) end))
 
-        if shed_so_far < deficit_mw * 0.9 and total_load > 0 do
-          shed_fraction = min(deficit_mw / total_load, 1.0)
-          LoadShedding.apply_proportional_shedding(
-            shed_loads, shed_fraction, total_gen, total_load
-          )
-        else
-          {shed_loads, shed_events}
-        end
+    remaining_mw = deficit_mw - ufls_shed_mw
+    current_total = total_load - ufls_shed_mw
+
+    {shed_loads, force_events} =
+      if remaining_mw > 0.5 and current_total > 0 do
+        fraction = min(remaining_mw / current_total, 1.0)
+
+        # gen/load args express exactly the remaining gap so the internal cap
+        # cannot re-shed what round 1 already removed
+        LoadShedding.apply_proportional_shedding(
+          shed_loads, fraction, current_total - remaining_mw, current_total
+        )
       else
-        {shed_loads, shed_events}
+        {shed_loads, []}
       end
+
+    shed_events = ufls_events ++ force_events
 
     shed_map = Map.new(shed_loads, &{&1.id, &1})
     updated_loads = Enum.map(state.loads, fn l -> Map.get(shed_map, l.id, l) end)
@@ -547,9 +560,12 @@ defmodule PowerModel.Failure.Cascade do
   end
 
   # After a line/component trips, recompute generation-load balance PER
-  # ISLAND and redispatch within each. Islands without online generation are
-  # skipped -- their loads are accounted as blackouts by the island solver,
-  # not as UFLS shedding.
+  # ISLAND and rebalance within each: deficits raise reserves (or shed),
+  # SURPLUSES curtail generation. An island split leaves the exporting half
+  # over-dispatched -- without curtailment that surplus becomes a phantom
+  # sink at the slack bus, creating fictitious flows that trip healthy lines.
+  # Islands without online generation are skipped -- their loads are
+  # accounted as blackouts by the island solver, not as UFLS shedding.
   defp maybe_redispatch_after_trip(state) do
     state
     |> active_topology_islands()
@@ -572,14 +588,29 @@ defmodule PowerModel.Failure.Cascade do
 
         deficit = island_load - island_dispatch
 
-        if deficit > 0.5 do
-          redispatch(st, deficit, island)
-        else
-          st
+        cond do
+          deficit > 0.5 -> redispatch(st, deficit, island)
+          deficit < -0.5 -> curtail_island(st, island_gens, island_dispatch, island_load)
+          true -> st
         end
       end
     end)
   end
+
+  # Scale an island's generation down proportionally to match its load.
+  defp curtail_island(state, island_gens, island_dispatch, island_load)
+       when island_dispatch > 0.0 do
+    factor = max(island_load, 0.0) / island_dispatch
+
+    new_dispatch =
+      Enum.reduce(island_gens, state.dispatch, fn g, d ->
+        Map.update(d, g.id, 0.0, &(&1 * factor))
+      end)
+
+    %{state | dispatch: new_dispatch}
+  end
+
+  defp curtail_island(state, _gens, _dispatch, _load), do: state
 
   # ---------------------------------------------------------------------------
   # Island solving (timed variant)
@@ -631,55 +662,75 @@ defmodule PowerModel.Failure.Cascade do
         end))
         load_mw = Enum.sum(Enum.map(island_loads, & &1.p_mw))
 
-        if load_mw > gen_mw do
-          {shed_loads, shed_events} =
-            LoadShedding.apply_ufls(island_loads, island_gens, gen_mw, load_mw)
+        # Apply UFLS for any deficit, then ALWAYS power-flow solve the island
+        # (with post-shed loads). Skipping the solve would leave thermal /
+        # voltage / zone-3 protection unevaluated in the deficient island --
+        # especially when the deficit is too small for UFLS to act on.
+        {lds, island_loads, shed_events, event_shed_mw} =
+          if load_mw > gen_mw do
+            {shed_loads, shed_events} =
+              LoadShedding.apply_ufls(island_loads, island_gens, gen_mw, load_mw)
 
-          shed_map = Map.new(shed_loads, &{&1.id, &1})
-          lds = Enum.map(lds, fn l -> Map.get(shed_map, l.id, l) end)
+            shed_map = Map.new(shed_loads, &{&1.id, &1})
+            lds = Enum.map(lds, fn l -> Map.get(shed_map, l.id, l) end)
+            island_loads = Enum.map(island_loads, fn l -> Map.get(shed_map, l.id, l) end)
 
-          event_shed_mw =
-            Enum.sum(Enum.map(shed_events, fn e -> Map.get(e.details, :shed_mw, 0.0) end))
+            event_shed_mw =
+              Enum.sum(Enum.map(shed_events, fn e -> Map.get(e.details, :shed_mw, 0.0) end))
 
-          {trips ++ shed_events, results, lds, overloads, shed_mw + event_shed_mw, blackout_mw}
-        else
-          # Run DC power flow
-          snapshot = %{
-            buses: island_buses, lines: island_lines,
-            transformers: island_xfmrs, generators: island_gens,
-            loads: island_loads
-          }
-
-          try do
-            solution = DCPowerFlow.solve(snapshot, base_mva: base_mva)
-
-            # Compute trip times for each overloaded branch (inverse-time curve)
-            # Exclude lines already overloaded in the base case (model artifacts)
-            timed = compute_timed_overloads(solution.line_flows, base_overloaded)
-
-            voltage_trips = Protection.check_voltage_violations(
-              solution.bus_ids, solution.vm_pu
-            )
-
-            # Zone 3 distance relay check (load encroachment)
-            bus_index = solution.bus_ids
-              |> Enum.with_index()
-              |> Map.new()
-            zone3_trips = Protection.check_zone3_encroachment(
-              solution.line_flows, island_lines ++ island_xfmrs,
-              island_buses, solution.vm_pu, solution.va_rad, bus_index
-            )
-
-            # Zone 3 trips are treated like fast thermal trips (trip time ~0.5s)
-            zone3_timed = Enum.map(zone3_trips, fn t ->
-              Map.put(t, :trip_time_s, 0.5)
-            end)
-
-            {trips ++ voltage_trips, [solution | results], lds,
-             overloads ++ timed ++ zone3_timed, shed_mw, blackout_mw}
-          catch
-            _ -> {trips, results, lds, overloads, shed_mw, blackout_mw}
+            {lds, island_loads, shed_events, event_shed_mw}
+          else
+            {lds, island_loads, [], 0.0}
           end
+
+        # Run DC power flow
+        snapshot = %{
+          buses: island_buses, lines: island_lines,
+          transformers: island_xfmrs, generators: island_gens,
+          loads: island_loads
+        }
+
+        try do
+          solution = DCPowerFlow.solve(snapshot, base_mva: base_mva)
+
+          # Compute trip times for each overloaded branch (inverse-time curve)
+          # Exclude lines already overloaded in the base case (model artifacts)
+          timed = compute_timed_overloads(solution.line_flows, base_overloaded)
+
+          voltage_trips = Protection.check_voltage_violations(
+            solution.bus_ids, solution.vm_pu
+          )
+
+          # Zone 3 distance relay check (load encroachment)
+          bus_index = solution.bus_ids
+            |> Enum.with_index()
+            |> Map.new()
+          zone3_trips = Protection.check_zone3_encroachment(
+            solution.line_flows, island_lines ++ island_xfmrs,
+            island_buses, solution.vm_pu, solution.va_rad, bus_index
+          )
+
+          # Zone 3 trips are treated like fast thermal trips (trip time ~0.5s)
+          zone3_timed = Enum.map(zone3_trips, fn t ->
+            Map.put(t, :trip_time_s, 0.5)
+          end)
+
+          {trips ++ shed_events ++ voltage_trips, [solution | results], lds,
+           overloads ++ timed ++ zone3_timed, shed_mw + event_shed_mw, blackout_mw}
+        rescue
+          e ->
+            Logger.warning(
+              "island solve raised #{Exception.message(e)}; island dropped from this step"
+            )
+
+            {trips ++ shed_events, results, lds, overloads, shed_mw + event_shed_mw, blackout_mw}
+        catch
+          thrown ->
+            Logger.warning(
+              "island solve threw #{inspect(thrown)}; island dropped from this step"
+            )
+
+            {trips ++ shed_events, results, lds, overloads, shed_mw + event_shed_mw, blackout_mw}
         end
       end
     end)

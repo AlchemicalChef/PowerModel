@@ -51,7 +51,7 @@ export function createDatacentersLayer(dataStore, viewMode, zoom, onClick, selec
         : getDatacenterColor(d),
       onClick,
       updateTriggers: {
-        getColor: [viewMode, Date.now(), cascadeActive],
+        getColor: [viewMode, opts.stateVersion, cascadeActive],
         getSize: [cascadeActive],
       },
       transitions: {
@@ -118,7 +118,7 @@ export function createDatacentersLayer(dataStore, viewMode, zoom, onClick, selec
             ? [255, 50, 30, 140]
             : [...COLOR_SCALES.getStateColor(d.state), 120],
           updateTriggers: {
-            getLineColor: [Date.now()],
+            getLineColor: [opts.stateVersion],
           },
         })
       );

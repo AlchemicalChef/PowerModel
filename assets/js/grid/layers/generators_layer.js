@@ -15,7 +15,7 @@ function fuelKey(code) {
   return FUEL_LEGEND_KEY[code] || "other";
 }
 
-export function createGeneratorsLayer(dataStore, viewMode, zoom, onClick, selectedId, cascadeActive, hiddenFuels) {
+export function createGeneratorsLayer(dataStore, viewMode, zoom, onClick, selectedId, cascadeActive, hiddenFuels, stateVersion) {
   let data = dataStore.getGeneratorData();
 
   // Legend toggles hide fuel types — cascade-affected units stay visible.
@@ -45,7 +45,7 @@ export function createGeneratorsLayer(dataStore, viewMode, zoom, onClick, select
         : getGeneratorColor(d, viewMode),
       onClick,
       updateTriggers: {
-        getColor: [viewMode, dataStore.generators.states, cascadeActive],
+        getColor: [viewMode, stateVersion, cascadeActive],
         getSize: [cascadeActive, zoom],
         getIcon: [viewMode],
       },
@@ -75,7 +75,7 @@ export function createGeneratorsLayer(dataStore, viewMode, zoom, onClick, select
           getRadius: (d) => Math.sqrt(d.capacity) * 80 + 400,
           getFillColor: (d) => [...COLOR_SCALES.getStateColor(d.state), 50],
           updateTriggers: {
-            getFillColor: [Date.now()],
+            getFillColor: [stateVersion],
           },
         })
       );

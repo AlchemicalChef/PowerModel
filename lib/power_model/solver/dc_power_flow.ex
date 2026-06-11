@@ -170,7 +170,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
     b_full = Enum.reduce(lines, b_full, fn line, b ->
       i = Map.fetch!(bus_index, line.from_bus_id)
       j = Map.fetch!(bus_index, line.to_bus_id)
-      x = line.x_pu || 0.001
+      x = effective_reactance(line.x_pu)
       b_ij = 1.0 / x
 
       b
@@ -183,7 +183,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
     b_full = Enum.reduce(transformers, b_full, fn xfmr, b ->
       i = Map.fetch!(bus_index, xfmr.from_bus_id)
       j = Map.fetch!(bus_index, xfmr.to_bus_id)
-      x = xfmr.x_pu
+      x = effective_reactance(xfmr.x_pu)
       b_ij = 1.0 / x
 
       b
@@ -283,6 +283,19 @@ defmodule PowerModel.Solver.DCPowerFlow do
     end
   end
 
+  # Branch reactance with a floor: nil and non-positive values (zero-impedance
+  # jumpers, missing data) would otherwise divide by zero or flip signs.
+  defp effective_reactance(x) when is_number(x) and x > 0.0, do: x
+  defp effective_reactance(_), do: 0.001
+
+  defp gaussian_solve(a, b, 1) do
+    # Single-equation system: the elimination ranges below assume n >= 2
+    [[a11]] = a
+    [b1] = b
+    if abs(a11) < 1.0e-12, do: throw({:error, :singular_matrix})
+    [b1 / a11]
+  end
+
   defp gaussian_solve(a, b, n) do
     # Augmented matrix — each row stored as an :array for O(1) access
     aug = a
@@ -344,7 +357,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
     line_flows = Enum.map(lines, fn line ->
       i = Map.fetch!(bus_index, line.from_bus_id)
       j = Map.fetch!(bus_index, line.to_bus_id)
-      x = line.x_pu || 0.001
+      x = effective_reactance(line.x_pu)
       theta_i = :array.get(i, theta_arr)
       theta_j = :array.get(j, theta_arr)
       flow_pu = (theta_i - theta_j) / x
@@ -366,7 +379,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
     xfmr_flows = Enum.map(transformers, fn xfmr ->
       i = Map.fetch!(bus_index, xfmr.from_bus_id)
       j = Map.fetch!(bus_index, xfmr.to_bus_id)
-      x = xfmr.x_pu
+      x = effective_reactance(xfmr.x_pu)
       theta_i = :array.get(i, theta_arr)
       theta_j = :array.get(j, theta_arr)
       flow_pu = (theta_i - theta_j) / x

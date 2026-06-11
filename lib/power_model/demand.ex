@@ -307,9 +307,13 @@ defmodule PowerModel.Demand do
     end
   end
 
+  # Shift to UTC FIRST, then truncate -- truncating wall-clock minutes in a
+  # non-whole-hour-offset zone would yield a non-hour-aligned UTC timestamp
+  # that matches no stored row.
   defp truncate_to_hour(%DateTime{} = ts) do
+    ts = DateTime.shift_zone!(ts, "Etc/UTC")
+
     %{ts | minute: 0, second: 0, microsecond: {0, 0}}
-    |> DateTime.shift_zone!("Etc/UTC")
     |> DateTime.truncate(:second)
   end
 end

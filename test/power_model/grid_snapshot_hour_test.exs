@@ -11,6 +11,7 @@ defmodule PowerModel.GridSnapshotHourTest do
 
   setup do
     ba = Repo.insert!(%BalancingAuthority{code: "CISO", name: "California ISO"})
+    ic = Repo.insert!(%PowerModel.Grid.Interconnection{name: "TestIC"})
 
     # Minimal connected grid: snapshots keep only the largest connected
     # component among geolocated buses, so two coordinate-bearing buses
@@ -20,6 +21,7 @@ defmodule PowerModel.GridSnapshotHourTest do
         bus_type: 3,
         base_kv: 138.0,
         balancing_authority_id: ba.id,
+        interconnection_id: ic.id,
         coordinates: %Geo.Point{coordinates: {-117.1, 32.7}, srid: 4326}
       })
 
@@ -28,6 +30,7 @@ defmodule PowerModel.GridSnapshotHourTest do
         bus_type: 1,
         base_kv: 138.0,
         balancing_authority_id: ba.id,
+        interconnection_id: ic.id,
         coordinates: %Geo.Point{coordinates: {-117.0, 32.8}, srid: 4326}
       })
 
@@ -81,9 +84,10 @@ defmodule PowerModel.GridSnapshotHourTest do
     # A 3-bus chain WITHOUT coordinates (like the SyntheticUSA MATPOWER
     # import) would win largest-connected-component; the snapshot must still
     # pick the displayed (geolocated) 2-bus network.
-    ghost1 = Repo.insert!(%Bus{bus_type: 3, base_kv: 138.0})
-    ghost2 = Repo.insert!(%Bus{bus_type: 1, base_kv: 138.0})
-    ghost3 = Repo.insert!(%Bus{bus_type: 1, base_kv: 138.0})
+    ic2 = Repo.insert!(%PowerModel.Grid.Interconnection{name: "GhostIC"})
+    ghost1 = Repo.insert!(%Bus{bus_type: 3, base_kv: 138.0, interconnection_id: ic2.id})
+    ghost2 = Repo.insert!(%Bus{bus_type: 1, base_kv: 138.0, interconnection_id: ic2.id})
+    ghost3 = Repo.insert!(%Bus{bus_type: 1, base_kv: 138.0, interconnection_id: ic2.id})
 
     for {a, b} <- [{ghost1, ghost2}, {ghost2, ghost3}] do
       Repo.insert!(%TransmissionLine{

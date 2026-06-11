@@ -52,7 +52,8 @@ defmodule PowerModel.Engine.SimulationServer do
   end
 
   def reset(sim_id) do
-    GenServer.call(via(sim_id), :reset)
+    # Must queue behind (and survive) an in-flight trip call
+    GenServer.call(via(sim_id), :reset, @trip_timeout)
   end
 
   # Server
@@ -221,6 +222,15 @@ defmodule PowerModel.Engine.SimulationServer do
         {:reply, {:ok, step_results}, state}
 
       _ ->
+        # Final repaint failed, but the cascade itself completed -- the UI
+        # must still leave its "cascading" state.
+        broadcast(state.sim_id, "cascade_done", %{
+          steps: length(step_results),
+          stable: final_cascade.stable,
+          total_events: length(final_cascade.events),
+          balance: Cascade.balance(final_cascade)
+        })
+
         {:reply, {:ok, step_results}, state}
     end
   end
@@ -265,8 +275,14 @@ defmodule PowerModel.Engine.SimulationServer do
       solution = DCPowerFlow.solve_islands(snapshot, base_mva: state.base_mva)
       audit_solution(solution, state.sim_id)
       {:ok, solution}
+    rescue
+      e ->
+        Logger.warning("[sim #{state.sim_id}] DC solve raised: #{Exception.message(e)}")
+        :error
     catch
-      _ -> :error
+      thrown ->
+        Logger.warning("[sim #{state.sim_id}] DC solve threw: #{inspect(thrown)}")
+        :error
     end
   end
 
@@ -275,8 +291,14 @@ defmodule PowerModel.Engine.SimulationServer do
       solution = DCPowerFlow.solve_islands(active_snapshot(state), base_mva: state.base_mva)
       audit_solution(solution, state.sim_id)
       {:ok, solution}
+    rescue
+      e ->
+        Logger.warning("[sim #{state.sim_id}] post-cascade DC solve raised: #{Exception.message(e)}")
+        :error
     catch
-      _ -> :error
+      thrown ->
+        Logger.warning("[sim #{state.sim_id}] post-cascade DC solve threw: #{inspect(thrown)}")
+        :error
     end
   end
 
@@ -346,6 +368,8 @@ defmodule PowerModel.Engine.SimulationServer do
           end
         end)
         |> Enum.reject(&is_nil/1)
+        # One diverged island must not suppress the others' refinements
+        |> Enum.filter(& &1.converged)
 
       if solutions != [] do
         send(server, {:ac_result, epoch, Partition.merge_solutions(solutions, state.base_mva)})
@@ -398,13 +422,20 @@ defmodule PowerModel.Engine.SimulationServer do
       worsened = new_cat > base_cat
       shifted = delta >= 10.0 and flow.loading_pct >= 20.0
 
-      {_type, id} = key
+      case key do
+        # Only transmission LINES feed the map's line-coloring id lists --
+        # transformer ids live in a separate table and would collide with
+        # unrelated line ids (the map has no transformer layer to paint).
+        {:line, id} ->
+          cond do
+            new_cat == 3 and (worsened or shifted) -> {[id | ol], st, rt}
+            new_cat == 2 and (worsened or shifted) -> {ol, [id | st], rt}
+            (new_cat == 1 and worsened) or (new_cat <= 1 and shifted) -> {ol, st, [id | rt]}
+            true -> {ol, st, rt}
+          end
 
-      cond do
-        new_cat == 3 and (worsened or shifted) -> {[id | ol], st, rt}
-        new_cat == 2 and (worsened or shifted) -> {ol, [id | st], rt}
-        (new_cat == 1 and worsened) or (new_cat <= 1 and shifted) -> {ol, st, [id | rt]}
-        true -> {ol, st, rt}
+        _ ->
+          {ol, st, rt}
       end
     end)
   end
@@ -455,9 +486,10 @@ defmodule PowerModel.Engine.SimulationServer do
   defp cascade_step_payload(step, state) do
     trips = if is_list(step.trips), do: step.trips, else: []
 
-    # Separate trips by component type
+    # Separate trips by component type. Transformer ids must NOT enter the
+    # line id list -- separate tables, colliding numeric ids.
     tripped_line_ids = trips
-    |> Enum.filter(&(&1.component_type in ["transmission_line", "transformer"]))
+    |> Enum.filter(&(&1.component_type == "transmission_line"))
     |> Enum.map(& &1.component_id)
 
     tripped_generator_ids = trips

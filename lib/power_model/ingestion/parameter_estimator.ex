@@ -15,7 +15,10 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
 
   # IEEE/EPRI standard values per voltage class
   # {R (ohm/km), X (ohm/km), B (uS/km), Thermal rating (MVA), typical_circuits}
-  # typical_circuits: number of parallel circuits common at this voltage class
+  # typical_circuits: number of parallel circuits common at this voltage class.
+  # NOTE: US EHV (500/765 kV) is overwhelmingly SINGLE-circuit construction --
+  # the entire AEP 765 kV network is single circuit. Assuming 2 halves
+  # impedance and doubles ratings, systematically understating EHV loading.
   @line_params %{
     69   => {0.170, 0.450, 2.7, 130.0,  1},
     115  => {0.100, 0.420, 2.9, 200.0,  1},
@@ -23,8 +26,8 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
     161  => {0.060, 0.390, 3.1, 300.0,  1},
     230  => {0.040, 0.370, 3.3, 450.0,  1},
     345  => {0.020, 0.335, 3.6, 900.0,  1},
-    500  => {0.010, 0.300, 4.0, 1800.0, 2},
-    765  => {0.006, 0.280, 4.5, 3200.0, 2}
+    500  => {0.010, 0.300, 4.0, 1800.0, 1},
+    765  => {0.006, 0.280, 4.5, 3200.0, 1}
   }
 
   @base_mva 100.0

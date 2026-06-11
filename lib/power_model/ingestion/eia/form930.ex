@@ -31,14 +31,12 @@ defmodule PowerModel.Ingestion.EIA.Form930 do
   @utc_columns ["UTC Time at End of Hour", "UTC time at end of hour"]
   @demand_adjusted_columns [
     "Demand (MW) (Imputed)",
-    "Demand (MW) (Adjusted)",
-    "Adjusted Demand (MW)"
+    "Demand (MW) (Adjusted)"
   ]
   @demand_columns ["Demand (MW)"]
   @net_gen_adjusted_columns [
     "Net Generation (MW) (Imputed)",
-    "Net Generation (MW) (Adjusted)",
-    "Adjusted Net Generation (MW)"
+    "Net Generation (MW) (Adjusted)"
   ]
   @net_gen_columns ["Net Generation (MW)"]
   @interchange_columns ["Total Interchange (MW) (Imputed)", "Total Interchange (MW)"]
@@ -167,7 +165,16 @@ defmodule PowerModel.Ingestion.EIA.Form930 do
   defp parse_row(row, columns, ba_codes) do
     code = row |> at(columns.ba) |> String.trim()
     demand = first_number(row, [columns.demand_adjusted, columns.demand])
-    timestamp = parse_utc(at(row, columns.utc))
+
+    # EIA-930 timestamps the END of each hour; we store the hour BEGINNING so
+    # a stored row at H means "consumption during (H, H+1]" lines up with
+    # every lookup that truncates a requested time down to the hour.
+    timestamp =
+      case parse_utc(at(row, columns.utc)) do
+        nil -> nil
+        ts -> DateTime.add(ts, -3600, :second)
+      end
+
     ba_id = Map.get(ba_codes, code)
 
     if code != "" and ba_id && demand && timestamp do

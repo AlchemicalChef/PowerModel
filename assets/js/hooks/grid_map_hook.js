@@ -12,12 +12,21 @@ const GridMapHook = {
     }
 
     if (!this.mapManager) {
-      const noop = () => {};
-      this.mapManager = new Proxy({}, { get: () => noop });
+      // Recursive black hole: every property read yields another callable
+      // black hole, so arbitrarily deep accesses (manager.dataStore.x.count)
+      // and chained calls all no-op instead of throwing.
+      const blackhole = new Proxy(function () {}, {
+        get: (_t, prop) => (prop === Symbol.toPrimitive ? () => 0 : blackhole),
+        apply: () => blackhole,
+      });
+      this.mapManager = blackhole;
     }
 
-    // Load initial grid data
-    this.mapManager.loadInitialData();
+    // Load initial grid data; a failed fetch must not become an unhandled
+    // rejection that silently leaves the map empty with no trace.
+    Promise.resolve(this.mapManager.loadInitialData()).catch((err) =>
+      console.error("GridMap: initial grid data load failed", err)
+    );
 
     // Wire server -> JS events
     this.handleEvent("dc_results", (data) => {
