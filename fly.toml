@@ -1,0 +1,27 @@
+# Fly.io app configuration — deploy with `fly deploy`
+app = "powermodel-grid"
+primary_region = "ord"
+
+[build]
+
+[deploy]
+  # Run pending migrations before each new version takes traffic
+  release_command = "/app/bin/migrate"
+
+[env]
+  PHX_HOST = "powermodel-grid.fly.dev"
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[[vm]]
+  # Power-flow solves on the 20k-bus network need real headroom
+  memory = "2gb"
+  cpu_kind = "shared"
+  cpus = 2
