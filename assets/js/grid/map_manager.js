@@ -225,17 +225,24 @@ export class MapManager {
 
   applyDCResults(data) {
     this.stateVersion++;
-    // These are all LINE IDs — only apply to transmission lines
-    const lineStateMap = {};
 
-    if (data.overloaded_line_ids) {
-      for (const id of data.overloaded_line_ids) lineStateMap[id] = 2; // red - overloaded
+    // This is the authoritative flow classification for the current topology:
+    // clear previous flow states (keeping tripped marks, which the solver
+    // cannot see — tripped lines carry no flow) so recovered lines stop
+    // showing stale alarms.
+    this.dataStore.resetLineFlowStates();
+
+    // Apply least-severe first so a line in multiple lists keeps the most
+    // severe color (rerouted < stressed < overloaded).
+    const lineStateMap = {};
+    if (data.rerouted_line_ids) {
+      for (const id of data.rerouted_line_ids) lineStateMap[id] = 4; // orange - rerouted
     }
     if (data.stressed_line_ids) {
       for (const id of data.stressed_line_ids) lineStateMap[id] = 1; // yellow - stressed
     }
-    if (data.rerouted_line_ids) {
-      for (const id of data.rerouted_line_ids) lineStateMap[id] = 4; // orange - rerouted
+    if (data.overloaded_line_ids) {
+      for (const id of data.overloaded_line_ids) lineStateMap[id] = 2; // red - overloaded
     }
 
     this.dataStore.applyLineStateMap(lineStateMap);
@@ -267,19 +274,21 @@ export class MapManager {
   }
 
   _applyCascadeData(data) {
-    // Line-specific state changes
+    // Line-specific state changes, least-severe written first so multi-list
+    // ids keep the most severe state (rerouted < stressed < overloaded <
+    // tripped).
     const lineMap = {};
-    if (data.tripped_line_ids) {
-      for (const id of data.tripped_line_ids) lineMap[id] = 3;
-    }
-    if (data.overloaded_line_ids) {
-      for (const id of data.overloaded_line_ids) lineMap[id] = 2;
-    }
     if (data.rerouted_line_ids) {
       for (const id of data.rerouted_line_ids) lineMap[id] = 4;
     }
     if (data.stressed_line_ids) {
       for (const id of data.stressed_line_ids) lineMap[id] = 1;
+    }
+    if (data.overloaded_line_ids) {
+      for (const id of data.overloaded_line_ids) lineMap[id] = 2;
+    }
+    if (data.tripped_line_ids) {
+      for (const id of data.tripped_line_ids) lineMap[id] = 3;
     }
     this.dataStore.applyLineStateMap(lineMap);
 

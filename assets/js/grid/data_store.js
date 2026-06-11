@@ -135,6 +135,14 @@ export class DataStore {
     }
   }
 
+  // Clear flow-derived line states (stressed/overloaded/rerouted) while
+  // preserving tripped marks — used before an authoritative re-classification.
+  resetLineFlowStates() {
+    for (const line of this.transmissionLines.lines) {
+      if (line.state !== STATE_TRIPPED) line.state = STATE_NORMAL;
+    }
+  }
+
   // Apply per-ID states to transmission lines only
   applyLineStateMap(stateMap) {
     if (!stateMap || Object.keys(stateMap).length === 0) return;
