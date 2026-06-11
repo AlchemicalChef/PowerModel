@@ -9,32 +9,51 @@ defmodule PowerModel.Solver.StabilityTest do
   # ===========================================================================
 
   defp bus(id, opts \\ []) do
-    %{id: id, bus_type: Keyword.get(opts, :bus_type, 1), base_kv: 138.0,
-      vm_pu: 1.0, va_rad: 0.0, b_shunt_mvar: 0.0}
+    %{
+      id: id,
+      bus_type: Keyword.get(opts, :bus_type, 1),
+      base_kv: 138.0,
+      vm_pu: 1.0,
+      va_rad: 0.0,
+      b_shunt_mvar: 0.0
+    }
   end
 
   defp line(id, from, to, opts \\ []) do
-    %{id: id, from_bus_id: from, to_bus_id: to,
-      voltage_kv: 138.0, r_pu: 0.01,
+    %{
+      id: id,
+      from_bus_id: from,
+      to_bus_id: to,
+      voltage_kv: 138.0,
+      r_pu: 0.01,
       x_pu: Keyword.get(opts, :x_pu, 0.1),
       b_pu: 0.02,
-      rating_a_mva: Keyword.get(opts, :rating_a_mva, 100.0)}
+      rating_a_mva: Keyword.get(opts, :rating_a_mva, 100.0)
+    }
   end
 
   defp generator(id, bus_id, opts) do
-    %{id: id, bus_id: bus_id,
+    %{
+      id: id,
+      bus_id: bus_id,
       p_max_mw: Keyword.get(opts, :p_max_mw, 100.0),
       capacity_factor: 1.0,
-      fuel_type: "NG", status: "in_service",
+      fuel_type: "NG",
+      status: "in_service",
       marginal_cost_per_mwh: 35.0,
       inertia_h: Keyword.get(opts, :inertia_h, 5.0),
-      d_factor: Keyword.get(opts, :d_factor, 2.0)}
+      d_factor: Keyword.get(opts, :d_factor, 2.0)
+    }
   end
 
   defp load(id, bus_id, opts) do
-    %{id: id, bus_id: bus_id,
+    %{
+      id: id,
+      bus_id: bus_id,
       p_mw: Keyword.get(opts, :p_mw, 50.0),
-      q_mvar: 0.0, status: "in_service"}
+      q_mvar: 0.0,
+      status: "in_service"
+    }
   end
 
   # 3-bus system: Gen1(bus1) --L1-- Bus2(load) --L2-- Gen2(bus3)
@@ -61,7 +80,7 @@ defmodule PowerModel.Solver.StabilityTest do
         line(3, 1, 4, x_pu: 0.2, rating_a_mva: 200.0),
         line(4, 2, 5, x_pu: 0.1, rating_a_mva: 200.0),
         line(5, 3, 5, x_pu: 0.15, rating_a_mva: 200.0),
-        line(6, 4, 5, x_pu: 0.2, rating_a_mva: 200.0),
+        line(6, 4, 5, x_pu: 0.2, rating_a_mva: 200.0)
       ],
       transformers: [],
       generators: [generator(1, 1, p_max_mw: 300.0)],
@@ -79,29 +98,41 @@ defmodule PowerModel.Solver.StabilityTest do
 
       # Build Y_red for the two generators
       # Simplified: treat as SMIB-like with direct admittance
-      b12 = 1.0 / 0.1  # line 1
-      b23 = 1.0 / 0.15 # line 2
+      # line 1
+      b12 = 1.0 / 0.1
+      # line 2
+      b23 = 1.0 / 0.15
       # Total admittance between gen 1 (bus 1) and gen 2 (bus 3) through bus 2
       # Series: b_total = 1 / (1/b12 + 1/b23)
       b_total = 1.0 / (1.0 / b12 + 1.0 / b23)
 
       y_red = {
-        [0, 0, 1, 1],           # rows
-        [0, 1, 0, 1],           # cols
-        [0.0, 0.0, 0.0, 0.0],  # G values
-        [-b_total, b_total, b_total, -b_total]  # B values
+        # rows
+        [0, 0, 1, 1],
+        # cols
+        [0, 1, 0, 1],
+        # G values
+        [0.0, 0.0, 0.0, 0.0],
+        # B values
+        [-b_total, b_total, b_total, -b_total]
       }
 
-      angles = [0.2, -0.1]  # operating point angles
+      # operating point angles
+      angles = [0.2, -0.1]
       e_prime = [1.1, 1.05]
 
-      result = SmallSignal.analyze(
-        snapshot.generators, y_red, angles, e_prime
-      )
+      result =
+        SmallSignal.analyze(
+          snapshot.generators,
+          y_red,
+          angles,
+          e_prime
+        )
 
       assert %SmallSignal{} = result
       assert result.n_gen == 2
-      assert length(result.eigenvalues) == 4  # 2n states
+      # 2n states
+      assert length(result.eigenvalues) == 4
       assert is_boolean(result.stable)
     end
 
@@ -148,10 +179,24 @@ defmodule PowerModel.Solver.StabilityTest do
         n_gen: 2,
         eigenvalues: [{-0.5, 3.0}, {-0.5, -3.0}, {-2.0, 12.0}, {-2.0, -12.0}],
         modes: [
-          %{freq_hz: 0.48, damping_ratio: 0.16, type: :unknown, eigenvalue: {-0.5, 3.0}, participation: %{}},
-          %{freq_hz: 1.91, damping_ratio: 0.16, type: :unknown, eigenvalue: {-2.0, 12.0}, participation: %{}}
+          %{
+            freq_hz: 0.48,
+            damping_ratio: 0.16,
+            type: :unknown,
+            eigenvalue: {-0.5, 3.0},
+            participation: %{}
+          },
+          %{
+            freq_hz: 1.91,
+            damping_ratio: 0.16,
+            type: :unknown,
+            eigenvalue: {-2.0, 12.0},
+            participation: %{}
+          }
         ],
-        stable: true, a_matrix: nil, gen_ids: [1, 2]
+        stable: true,
+        a_matrix: nil,
+        gen_ids: [1, 2]
       }
 
       classified = SmallSignal.classify_modes(result)
@@ -226,6 +271,7 @@ defmodule PowerModel.Solver.StabilityTest do
       data = CPF.pv_data(result, 5)
 
       assert is_list(data)
+
       if data != [] do
         {load_mw, vm} = hd(data)
         assert is_float(load_mw)

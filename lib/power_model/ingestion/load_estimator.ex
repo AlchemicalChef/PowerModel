@@ -25,11 +25,12 @@ defmodule PowerModel.Ingestion.LoadEstimator do
     {deleted, _} = Repo.delete_all(from l in Load, where: l.load_type == "constant_power")
     if deleted > 0, do: Logger.info("  Cleared #{deleted} existing estimated loads.")
 
-    total_gen = Repo.one(
-      from g in Generator,
-        where: g.status == "in_service" and not is_nil(g.bus_id),
-        select: sum(g.p_max_mw)
-    ) || 0.0
+    total_gen =
+      Repo.one(
+        from g in Generator,
+          where: g.status == "in_service" and not is_nil(g.bus_id),
+          select: sum(g.p_max_mw)
+      ) || 0.0
 
     target_load = total_gen * 0.85
 
@@ -42,41 +43,45 @@ defmodule PowerModel.Ingestion.LoadEstimator do
       Logger.info("  No PQ buses found. Run bus mapping first.")
       {:error, :no_buses}
     else
-      gen_per_bus = Repo.all(
-        from g in Generator,
-          where: g.status == "in_service" and not is_nil(g.bus_id),
-          group_by: g.bus_id,
-          select: {g.bus_id, sum(g.p_max_mw)}
-      ) |> Map.new()
+      gen_per_bus =
+        Repo.all(
+          from g in Generator,
+            where: g.status == "in_service" and not is_nil(g.bus_id),
+            group_by: g.bus_id,
+            select: {g.bus_id, sum(g.p_max_mw)}
+        )
+        |> Map.new()
 
       base_load_per_bus = target_load / length(pq_buses)
 
-      loads = Enum.map(pq_buses, fn bus ->
-        gen_mw = Map.get(gen_per_bus, bus.id, 0.0)
+      loads =
+        Enum.map(pq_buses, fn bus ->
+          gen_mw = Map.get(gen_per_bus, bus.id, 0.0)
 
-        p_mw = if total_gen > 0 do
-          uniform = base_load_per_bus * 0.5
-          proportional = (gen_mw / total_gen) * target_load * 0.5
-          uniform + proportional
-        else
-          base_load_per_bus
-        end
+          p_mw =
+            if total_gen > 0 do
+              uniform = base_load_per_bus * 0.5
+              proportional = gen_mw / total_gen * target_load * 0.5
+              uniform + proportional
+            else
+              base_load_per_bus
+            end
 
-        p_mw = max(p_mw, 1.0)
-        q_mvar = p_mw * @q_ratio
+          p_mw = max(p_mw, 1.0)
+          q_mvar = p_mw * @q_ratio
 
-        now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+          now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
 
-        %{
-          bus_id: bus.id,
-          p_mw: Float.round(p_mw, 2),
-          q_mvar: Float.round(q_mvar, 2),
-          load_type: "constant_power",
-          status: "in_service",
-          inserted_at: now,
-          updated_at: now
-        }
-      end)
+          %{
+            bus_id: bus.id,
+            p_mw: Float.round(p_mw, 2),
+            q_mvar: Float.round(q_mvar, 2),
+            load_type: "constant_power",
+            status: "in_service",
+            inserted_at: now,
+            updated_at: now
+          }
+        end)
 
       loads
       |> Enum.chunk_every(500)

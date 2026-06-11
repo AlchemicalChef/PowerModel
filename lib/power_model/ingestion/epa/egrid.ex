@@ -14,16 +14,20 @@ defmodule PowerModel.Ingestion.EPA.EGrid do
   alias PowerModel.Grid.Generator
 
   def ingest(path) do
-    xlsx_file = cond do
-      File.regular?(path) and String.ends_with?(path, ".xlsx") ->
-        path
-      File.dir?(path) ->
-        case Path.wildcard(Path.join(path, "egrid*.xlsx")) do
-          [found | _] -> found
-          [] -> nil
-        end
-      true -> nil
-    end
+    xlsx_file =
+      cond do
+        File.regular?(path) and String.ends_with?(path, ".xlsx") ->
+          path
+
+        File.dir?(path) ->
+          case Path.wildcard(Path.join(path, "egrid*.xlsx")) do
+            [found | _] -> found
+            [] -> nil
+          end
+
+        true ->
+          nil
+      end
 
     if xlsx_file do
       IO.puts("Reading eGRID from #{xlsx_file}...")
@@ -82,13 +86,17 @@ defmodule PowerModel.Ingestion.EPA.EGrid do
             plant_cfs
             |> Enum.chunk_every(500)
             |> Enum.reduce(0, fn batch, total ->
-              count = Enum.reduce(batch, 0, fn {plant_id, cf}, cnt ->
-                {n, _} = from(g in Generator,
-                  where: g.eia_plant_id == ^plant_id
-                )
-                |> Repo.update_all(set: [capacity_factor: cf])
-                cnt + n
-              end)
+              count =
+                Enum.reduce(batch, 0, fn {plant_id, cf}, cnt ->
+                  {n, _} =
+                    from(g in Generator,
+                      where: g.eia_plant_id == ^plant_id
+                    )
+                    |> Repo.update_all(set: [capacity_factor: cf])
+
+                  cnt + n
+                end)
+
               total + count
             end)
 
@@ -102,22 +110,23 @@ defmodule PowerModel.Ingestion.EPA.EGrid do
 
   defp extract_sheet_to_csv(xlsx_path, sheet_prefix) do
     script = """
-import openpyxl, csv, io, sys
-wb = openpyxl.load_workbook('#{xlsx_path}', read_only=True, data_only=True)
-sheet = None
-for name in wb.sheetnames:
-    if name.startswith('#{sheet_prefix}'):
-        sheet = wb[name]
-        break
-if not sheet:
-    sys.exit(1)
-out = io.StringIO()
-writer = csv.writer(out)
-for row in sheet.iter_rows(values_only=True):
-    writer.writerow([str(c) if c is not None else '' for c in row])
-print(out.getvalue())
-wb.close()
-"""
+    import openpyxl, csv, io, sys
+    wb = openpyxl.load_workbook('#{xlsx_path}', read_only=True, data_only=True)
+    sheet = None
+    for name in wb.sheetnames:
+        if name.startswith('#{sheet_prefix}'):
+            sheet = wb[name]
+            break
+    if not sheet:
+        sys.exit(1)
+    out = io.StringIO()
+    writer = csv.writer(out)
+    for row in sheet.iter_rows(values_only=True):
+        writer.writerow([str(c) if c is not None else '' for c in row])
+    print(out.getvalue())
+    wb.close()
+    """
+
     case System.cmd("python3", ["-c", script], stderr_to_stdout: true) do
       {output, 0} -> output
       _ -> nil
@@ -135,6 +144,7 @@ wb.close()
   defp parse_float(nil), do: nil
   defp parse_float(""), do: nil
   defp parse_float(val) when is_number(val), do: val * 1.0
+
   defp parse_float(val) when is_binary(val) do
     case Float.parse(String.trim(val)) do
       {f, _} -> f

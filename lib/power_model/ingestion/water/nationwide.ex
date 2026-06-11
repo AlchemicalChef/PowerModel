@@ -91,9 +91,11 @@ defmodule PowerModel.Ingestion.Water.Nationwide do
 
     if is_number(lon) and is_number(lat) and abs(lon) > 0.1 and abs(lat) > 0.1 do
       nid_id = attrs["NIDID"] || attrs["FID"] || attrs["OBJECTID"]
-      storage = parse_float(attrs["NID_STORAGE"]) ||
-                parse_float(attrs["NORMAL_STORAGE"]) ||
-                parse_float(attrs["MAX_STORAGE"])
+
+      storage =
+        parse_float(attrs["NID_STORAGE"]) ||
+          parse_float(attrs["NORMAL_STORAGE"]) ||
+          parse_float(attrs["MAX_STORAGE"])
 
       now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
 
@@ -129,8 +131,10 @@ defmodule PowerModel.Ingestion.Water.Nationwide do
 
   def ingest_drinking_water do
     IO.puts("--- EPA Drinking Water Systems ---")
+
     ingest_from_api(@drinking_water_url, :treatment, &parse_drinking_water/1,
-      where: "WS_Type='COMM'")
+      where: "WS_Type='COMM'"
+    )
   end
 
   defp parse_drinking_water(%{"attributes" => attrs, "geometry" => geom}) do
@@ -184,12 +188,15 @@ defmodule PowerModel.Ingestion.Water.Nationwide do
     |> Stream.reject(&is_nil/1)
     |> Stream.chunk_every(@batch_size)
     |> Stream.each(fn batch ->
-      {inserted, _} = Repo.insert_all(WaterFacility, batch,
-        on_conflict: :nothing,
-        conflict_target: [:source, :source_id]
-      )
+      {inserted, _} =
+        Repo.insert_all(WaterFacility, batch,
+          on_conflict: :nothing,
+          conflict_target: [:source, :source_id]
+        )
+
       :counters.add(counter, 1, inserted)
       total = :counters.get(counter, 1)
+
       if rem(total, 2000) < @batch_size do
         IO.puts("  #{total} records inserted...")
       end
@@ -204,7 +211,8 @@ defmodule PowerModel.Ingestion.Water.Nationwide do
   defp get_count(base_url, where) do
     case Req.get("#{base_url}/query",
            params: [where: where, returnCountOnly: "true", f: "json"],
-           receive_timeout: 60_000) do
+           receive_timeout: 60_000
+         ) do
       {:ok, %{status: 200, body: %{"count" => count}}} -> {:ok, count}
       {:ok, resp} -> {:error, resp.body}
       {:error, err} -> {:error, err}
@@ -248,7 +256,8 @@ defmodule PowerModel.Ingestion.Water.Nationwide do
            params: params,
            receive_timeout: 120_000,
            retry: :transient,
-           max_retries: 3) do
+           max_retries: 3
+         ) do
       {:ok, %{status: 200, body: body}} when is_map(body) ->
         if body["error"] do
           {:error, body["error"]}
@@ -271,35 +280,42 @@ defmodule PowerModel.Ingestion.Water.Nationwide do
   # ---------------------------------------------------------------------------
 
   defp parse_name(nil), do: "Unknown"
+
   defp parse_name(name) when is_binary(name) do
     case String.trim(name) do
       "" -> "Unknown"
       n -> n
     end
   end
+
   defp parse_name(_), do: "Unknown"
 
   defp parse_float(nil), do: nil
   defp parse_float(v) when is_float(v), do: v
   defp parse_float(v) when is_integer(v), do: v * 1.0
+
   defp parse_float(v) when is_binary(v) do
     case Float.parse(v) do
       {f, _} -> f
       :error -> nil
     end
   end
+
   defp parse_float(_), do: nil
 
   defp parse_epa_status(nil), do: "active"
+
   defp parse_epa_status(status) when is_binary(status) do
     case String.upcase(String.trim(status)) do
       s when s in ["ACTIVE", "EFFECTIVE", "OPERATING"] -> "active"
       _ -> "inactive"
     end
   end
+
   defp parse_epa_status(_), do: "active"
 
   defp parse_dam_status(nil), do: "active"
+
   defp parse_dam_status(status) when is_binary(status) do
     case String.upcase(String.trim(status)) do
       s when s in ["SATISFACTORY", "FAIR", "GOOD"] -> "active"
@@ -307,14 +323,17 @@ defmodule PowerModel.Ingestion.Water.Nationwide do
       _ -> "active"
     end
   end
+
   defp parse_dam_status(_), do: "active"
 
   defp parse_county(nil), do: nil
+
   defp parse_county(countystate) when is_binary(countystate) do
     case String.split(countystate, ",") do
       [county | _] -> String.trim(county)
       _ -> countystate
     end
   end
+
   defp parse_county(_), do: nil
 end

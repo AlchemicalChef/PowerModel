@@ -21,12 +21,18 @@ defmodule PowerModel.Transient.Governor.TGOV1 do
   """
 
   defstruct [
-    :x_gov,    # governor state (valve position, pu)
-    :r,        # droop (pu)
-    :t1,       # time constant (seconds)
-    :p_ref,    # power reference setpoint (pu)
-    :p_max,    # maximum mechanical power (pu)
-    :p_min     # minimum mechanical power (pu)
+    # governor state (valve position, pu)
+    :x_gov,
+    # droop (pu)
+    :r,
+    # time constant (seconds)
+    :t1,
+    # power reference setpoint (pu)
+    :p_ref,
+    # maximum mechanical power (pu)
+    :p_max,
+    # minimum mechanical power (pu)
+    :p_min
   ]
 
   @doc """
@@ -65,7 +71,7 @@ defmodule PowerModel.Transient.Governor.TGOV1 do
   Returns `dx_gov/dt` given the current state, rotor speed, and reference.
   """
   def derivative(%__MODULE__{} = gov, omega) do
-    speed_error = (1.0 / gov.r) * (omega - 1.0)
+    speed_error = 1.0 / gov.r * (omega - 1.0)
     (gov.p_ref - speed_error - gov.x_gov) / gov.t1
   end
 

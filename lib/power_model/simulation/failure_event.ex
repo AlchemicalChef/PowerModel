@@ -20,8 +20,7 @@ defmodule PowerModel.Simulation.FailureEvent do
 
   def changeset(event, attrs) do
     event
-    |> cast(attrs, [:step, :component_type, :component_id, :failure_cause,
-                     :details, :scenario_id])
+    |> cast(attrs, [:step, :component_type, :component_id, :failure_cause, :details, :scenario_id])
     |> validate_required([:step, :component_type, :component_id, :failure_cause, :scenario_id])
     |> validate_inclusion(:component_type, ~w(transmission_line generator transformer load bus))
     |> foreign_key_constraint(:scenario_id)

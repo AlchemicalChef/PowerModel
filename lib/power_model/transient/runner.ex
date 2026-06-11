@@ -42,9 +42,11 @@ defmodule PowerModel.Transient.Runner do
     solution = Keyword.get(opts, :solution) || solve_base_case(snapshot, base_mva)
 
     # Filter to synchronous generators only
-    sync_gens = Enum.filter(snapshot.generators, fn g ->
-      (Map.get(g, :inertia_h) || 0.0) > 0.0
-    end) |> Enum.sort_by(& &1.id)
+    sync_gens =
+      Enum.filter(snapshot.generators, fn g ->
+        (Map.get(g, :inertia_h) || 0.0) > 0.0
+      end)
+      |> Enum.sort_by(& &1.id)
 
     if length(sync_gens) < 2 do
       {:error, :insufficient_generators}
@@ -61,11 +63,12 @@ defmodule PowerModel.Transient.Runner do
       # Run simulation
       n_steps = round(duration_s / dt)
 
-      trajectory = if use_nif do
-        run_nif(state, n_steps, output_every)
-      else
-        nil
-      end
+      trajectory =
+        if use_nif do
+          run_nif(state, n_steps, output_every)
+        else
+          nil
+        end
 
       trajectory = trajectory || Classical.simulate(state, n_steps, output_every)
 
@@ -74,15 +77,16 @@ defmodule PowerModel.Transient.Runner do
 
       stable = Enum.empty?(events)
 
-      {:ok, %{
-        trajectory: trajectory,
-        events: events,
-        stable: stable,
-        n_gen: state.n_gen,
-        gen_ids: state.gen_ids,
-        duration_s: duration_s,
-        dt: dt
-      }}
+      {:ok,
+       %{
+         trajectory: trajectory,
+         events: events,
+         stable: stable,
+         n_gen: state.n_gen,
+         gen_ids: state.gen_ids,
+         duration_s: duration_s,
+         dt: dt
+       }}
     end
   end
 
@@ -92,20 +96,23 @@ defmodule PowerModel.Transient.Runner do
   end
 
   defp build_y_reduced(state, snapshot, sync_gens, base_mva) do
-    result = if length(snapshot.buses) > 500 do
-      # Try NIF Kron reduction for large systems
-      try do
-        NetworkInterface.build_y_reduced(
-          snapshot.buses, snapshot.lines,
-          Map.get(snapshot, :transformers, []),
-          sync_gens, base_mva
-        )
-      rescue
-        _ -> nil
+    result =
+      if length(snapshot.buses) > 500 do
+        # Try NIF Kron reduction for large systems
+        try do
+          NetworkInterface.build_y_reduced(
+            snapshot.buses,
+            snapshot.lines,
+            Map.get(snapshot, :transformers, []),
+            sync_gens,
+            base_mva
+          )
+        rescue
+          _ -> nil
+        end
+      else
+        nil
       end
-    else
-      nil
-    end
 
     case result do
       {:ok, rows, cols, g, b} ->
@@ -115,9 +122,12 @@ defmodule PowerModel.Transient.Runner do
         # Fallback to Elixir Kron reduction
         {:ok, rows, cols, g, b} =
           NetworkInterface.build_y_reduced_elixir(
-            snapshot.buses, snapshot.lines,
+            snapshot.buses,
+            snapshot.lines,
             Map.get(snapshot, :transformers, []),
-            sync_gens, base_mva)
+            sync_gens,
+            base_mva
+          )
 
         %{state | y_red_rows: rows, y_red_cols: cols, y_red_g: g, y_red_b: b}
     end
@@ -133,12 +143,17 @@ defmodule PowerModel.Transient.Runner do
     # modeled as setting P_mech to 2x (simulates acceleration)
     # then restoring at clear time
     case State.gen_index(state, gen_id) do
-      nil -> state
+      nil ->
+        state
+
       idx ->
         original_p = Enum.at(state.p_mech, idx)
+
         state
-        |> State.add_event(0.001, gen_id, original_p * 2.0)  # fault on: P_elec ≈ 0
-        |> State.add_event(clear_time_s, gen_id, original_p)  # fault cleared
+        # fault on: P_elec ≈ 0
+        |> State.add_event(0.001, gen_id, original_p * 2.0)
+        # fault cleared
+        |> State.add_event(clear_time_s, gen_id, original_p)
     end
   end
 
@@ -165,18 +180,29 @@ defmodule PowerModel.Transient.Runner do
     try do
       case Sparse.transient_classical_simulate(
              state.n_gen,
-             state.delta, state.omega, state.p_mech, state.e_prime,
-             state.h, state.d,
-             state.y_red_rows, state.y_red_cols,
-             state.y_red_g, state.y_red_b,
-             state.dt, n_steps,
-             event_times, event_indices, event_p_mechs,
-             output_every) do
+             state.delta,
+             state.omega,
+             state.p_mech,
+             state.e_prime,
+             state.h,
+             state.d,
+             state.y_red_rows,
+             state.y_red_cols,
+             state.y_red_g,
+             state.y_red_b,
+             state.dt,
+             n_steps,
+             event_times,
+             event_indices,
+             event_p_mechs,
+             output_every
+           ) do
         {:ok, raw_trajectory} ->
           # Convert raw trajectory to maps
           Enum.map(raw_trajectory, fn row ->
             [t | rest] = row
             {deltas, omegas} = Enum.split(rest, state.n_gen)
+
             %{
               t: t,
               delta: deltas,
@@ -185,7 +211,8 @@ defmodule PowerModel.Transient.Runner do
             }
           end)
 
-        _ -> nil
+        _ ->
+          nil
       end
     rescue
       _ -> nil
@@ -212,6 +239,7 @@ defmodule PowerModel.Transient.Runner do
         }
       end)
     end)
-    |> Enum.uniq_by(& &1.component_id)  # Only report first OOS per generator
+    # Only report first OOS per generator
+    |> Enum.uniq_by(& &1.component_id)
   end
 end

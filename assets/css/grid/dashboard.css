@@ -400,7 +400,9 @@
   position: absolute;
   top: 60px;
   left: 12px;
-  width: 240px;
+  width: 330px;
+  max-height: calc(100vh - 84px);
+  overflow-y: auto;
   background: rgba(15, 15, 25, 0.92);
   border: 1px solid rgba(100, 100, 120, 0.4);
   border-radius: 10px;
@@ -444,3 +446,241 @@
 }
 .violation-count { font-size: 18px; font-weight: 700; color: #e74c3c; }
 .violation-text { font-size: 11px; color: #ccc; }
+
+.screening-config-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.screening-config-label {
+  display: grid;
+  gap: 3px;
+  font-size: 9px;
+  color: #a6b3d5;
+  text-transform: uppercase;
+  letter-spacing: 0.35px;
+}
+
+.screening-input {
+  width: 100%;
+  background: rgba(26, 31, 47, 0.9);
+  border: 1px solid rgba(102, 117, 163, 0.35);
+  border-radius: 6px;
+  color: #dce5fa;
+  font-size: 10px;
+  padding: 5px 6px;
+}
+
+.screening-meta {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 10px;
+  color: #9aa7c8;
+}
+
+.screening-list {
+  margin-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.screening-item {
+  background: rgba(24, 29, 45, 0.85);
+  border: 1px solid rgba(91, 104, 149, 0.3);
+  border-radius: 6px;
+  padding: 6px;
+}
+
+.screening-item.severe {
+  border-color: rgba(231, 76, 60, 0.45);
+}
+
+.screening-item-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10px;
+  color: #d6def3;
+  font-weight: 600;
+}
+
+.screening-item-metrics {
+  margin-top: 3px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 9px;
+  color: #aeb9d8;
+}
+
+.model-options-group,
+.validation-group,
+.analysis-group {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(100, 100, 120, 0.25);
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: #c9cfdf;
+  cursor: pointer;
+}
+
+.toggle-row input {
+  accent-color: #4ecdc4;
+}
+
+.toggle-text {
+  line-height: 1.2;
+}
+
+.validation-select {
+  width: 100%;
+  padding: 6px 8px;
+  background: rgba(40, 42, 62, 0.9);
+  border: 1px solid rgba(120, 126, 168, 0.35);
+  border-radius: 6px;
+  color: #d9e2f5;
+  font-size: 11px;
+}
+
+.validation-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.validation-btn {
+  padding: 7px;
+  font-size: 11px;
+}
+
+.validation-report {
+  margin-top: 8px;
+  padding: 8px;
+  background: rgba(23, 27, 44, 0.9);
+  border: 1px solid rgba(103, 119, 170, 0.28);
+  border-radius: 6px;
+}
+
+.validation-report-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 10px;
+  color: #9ca8c7;
+  margin-bottom: 6px;
+}
+
+.validation-clear-btn {
+  border: none;
+  background: transparent;
+  color: #7eb0ff;
+  cursor: pointer;
+  font-size: 10px;
+  padding: 0;
+}
+
+.validation-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.validation-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.validation-badge.ok {
+  background: rgba(46, 204, 113, 0.22);
+  color: #58d68d;
+}
+
+.validation-badge.fail {
+  background: rgba(231, 76, 60, 0.2);
+  color: #ff8f84;
+}
+
+.validation-score {
+  font-size: 11px;
+  color: #d7def0;
+  font-weight: 600;
+}
+
+.validation-case-id {
+  margin: 6px 0 3px;
+  font-size: 11px;
+  color: #e5e9f7;
+  font-weight: 600;
+}
+
+.validation-case-desc {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.3;
+  color: #99a7cb;
+}
+
+.validation-metrics {
+  margin-top: 6px;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 2px;
+  font-size: 10px;
+  color: #c9d4f0;
+}
+
+.validation-suite-list {
+  margin-top: 6px;
+  display: grid;
+  gap: 4px;
+}
+
+.validation-suite-item {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: #d7def3;
+}
+
+.validation-error {
+  margin: 8px 0 0;
+  font-size: 10px;
+  color: #ffb6ad;
+}
+
+.validation-error code {
+  font-size: 10px;
+  color: #ffd4ce;
+}
+
+.ok-text { color: #58d68d; }
+.fail-text { color: #ff8f84; }
+
+.analysis-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 3px;
+  font-size: 10px;
+  color: #d1dbf4;
+}
+
+@media (max-width: 980px) {
+  .failure-controls {
+    width: calc(100vw - 24px);
+    max-height: 42vh;
+  }
+}

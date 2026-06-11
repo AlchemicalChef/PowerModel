@@ -248,6 +248,7 @@ defmodule PowerModel.Solver.Harmonics.Filter do
     # Create a dummy fundamental solution (flat start: V=1.0, angle=0)
     bus_ids = Enum.map(snapshot.buses, & &1.id)
     n = length(bus_ids)
+
     fundamental = %{
       bus_ids: bus_ids,
       vm_pu: List.duplicate(1.0, n),
@@ -255,16 +256,24 @@ defmodule PowerModel.Solver.Harmonics.Filter do
     }
 
     # Solve without filter
-    {:ok, voltages_before} = Solver.solve(snapshot, fundamental, harmonic_sources,
-                                           max_harmonic: max_h, base_mva: base_mva)
+    {:ok, voltages_before} =
+      Solver.solve(snapshot, fundamental, harmonic_sources,
+        max_harmonic: max_h,
+        base_mva: base_mva
+      )
+
     thd_before = Solver.compute_thd(voltages_before)
 
     # Modify snapshot to include filter as additional shunt admittance at bus
     modified_snapshot = add_filter_to_snapshot(snapshot, bus_id, filter_spec, base_mva)
 
     # Solve with filter
-    {:ok, voltages_after} = Solver.solve(modified_snapshot, fundamental, harmonic_sources,
-                                          max_harmonic: max_h, base_mva: base_mva)
+    {:ok, voltages_after} =
+      Solver.solve(modified_snapshot, fundamental, harmonic_sources,
+        max_harmonic: max_h,
+        base_mva: base_mva
+      )
+
     thd_after = Solver.compute_thd(voltages_after)
 
     # Compute reduction
@@ -311,9 +320,10 @@ defmodule PowerModel.Solver.Harmonics.Filter do
     l_henries = x_l_ohm / @omega_0
 
     # Find bus kV for impedance-to-pu conversion
-    bus_kv = Enum.find_value(snapshot.buses, 1.0, fn bus ->
-      if bus.id == bus_id, do: Map.get(bus, :base_kv) || 1.0
-    end)
+    bus_kv =
+      Enum.find_value(snapshot.buses, 1.0, fn bus ->
+        if bus.id == bus_id, do: Map.get(bus, :base_kv) || 1.0
+      end)
 
     # Store filter data on snapshot for the harmonic solver
     filter_data = %{
@@ -334,6 +344,7 @@ defmodule PowerModel.Solver.Harmonics.Filter do
     z_base = bus_kv * bus_kv / base_mva
 
     max_h = 25
+
     harmonic_shunts =
       Map.new(1..max_h, fn h ->
         omega_h = @omega_0 * h

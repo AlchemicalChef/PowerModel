@@ -74,7 +74,10 @@ defmodule Mix.Tasks.PowerModel.FixImpedances do
       # Clear the grid snapshot cache so the fixes take effect
       PowerModel.Grid.clear_snapshot_cache()
 
-      Mix.shell().info("\nDone. Transformer impedances: #{xfmr_fixed}, Line impedances: #{line_fixed}, Transformer ratings: #{rating_fixed}")
+      Mix.shell().info(
+        "\nDone. Transformer impedances: #{xfmr_fixed}, Line impedances: #{line_fixed}, Transformer ratings: #{rating_fixed}"
+      )
+
       Mix.shell().info("Grid snapshot cache cleared.")
     end
   end
@@ -95,41 +98,62 @@ defmodule Mix.Tasks.PowerModel.FixImpedances do
       transformers: %{
         total: length(transformers),
         zero_x_clamped: count_where(transformers, fn t -> t.x_pu == 0.0001 end),
-        tiny_x: count_where(transformers, fn t -> abs(t.x_pu) < @min_x_branch and t.x_pu != 0.0001 end),
+        tiny_x:
+          count_where(transformers, fn t -> abs(t.x_pu) < @min_x_branch and t.x_pu != 0.0001 end),
         negative_x: count_where(transformers, fn t -> t.x_pu < 0 end),
         x_distribution: impedance_histogram(transformers),
-        worst_tiny: transformers
+        worst_tiny:
+          transformers
           |> Enum.filter(fn t -> abs(t.x_pu) < @min_x_branch end)
           |> Enum.sort_by(fn t -> abs(t.x_pu) end)
           |> Enum.take(10)
-          |> Enum.map(fn t -> %{id: t.id, x_pu: t.x_pu, rated_mva: t.rated_mva, tap: t.tap_ratio} end),
-        small_rating_count: count_where(transformers, fn t ->
-          abs(t.x_pu) < 0.005 and t.rated_mva < voltage_based_rating(t)
-        end)
+          |> Enum.map(fn t ->
+            %{id: t.id, x_pu: t.x_pu, rated_mva: t.rated_mva, tap: t.tap_ratio}
+          end),
+        small_rating_count:
+          count_where(transformers, fn t ->
+            abs(t.x_pu) < 0.005 and t.rated_mva < voltage_based_rating(t)
+          end)
       },
       lines: %{
         total: length(lines),
         zero_x_clamped: count_where(lines, fn l -> l.x_pu == 0.0001 end),
-        tiny_x: count_where(lines, fn l -> l.x_pu != nil and abs(l.x_pu) < @min_x_branch and l.x_pu != 0.0001 end),
+        tiny_x:
+          count_where(lines, fn l ->
+            l.x_pu != nil and abs(l.x_pu) < @min_x_branch and l.x_pu != 0.0001
+          end),
         x_distribution: impedance_histogram(lines),
-        worst_tiny: lines
+        worst_tiny:
+          lines
           |> Enum.filter(fn l -> l.x_pu != nil and abs(l.x_pu) < @min_x_branch end)
           |> Enum.sort_by(fn l -> abs(l.x_pu) end)
           |> Enum.take(10)
-          |> Enum.map(fn l -> %{id: l.id, x_pu: l.x_pu, rating_a_mva: l.rating_a_mva, voltage_kv: l.voltage_kv} end)
+          |> Enum.map(fn l ->
+            %{id: l.id, x_pu: l.x_pu, rating_a_mva: l.rating_a_mva, voltage_kv: l.voltage_kv}
+          end)
       }
     }
   end
 
   defp impedance_histogram(components) do
-    bins = [{0, 0.001}, {0.001, 0.005}, {0.005, 0.01}, {0.01, 0.05},
-            {0.05, 0.1}, {0.1, 0.5}, {0.5, 1.0}, {1.0, 10.0}]
+    bins = [
+      {0, 0.001},
+      {0.001, 0.005},
+      {0.005, 0.01},
+      {0.01, 0.05},
+      {0.05, 0.1},
+      {0.1, 0.5},
+      {0.5, 1.0},
+      {1.0, 10.0}
+    ]
 
     Map.new(bins, fn {lo, hi} ->
-      count = Enum.count(components, fn c ->
-        x = Map.get(c, :x_pu) || 0.0
-        abs(x) >= lo and abs(x) < hi
-      end)
+      count =
+        Enum.count(components, fn c ->
+          x = Map.get(c, :x_pu) || 0.0
+          abs(x) >= lo and abs(x) < hi
+        end)
+
       {"#{lo}-#{hi}", count}
     end)
   end
@@ -147,13 +171,18 @@ defmodule Mix.Tasks.PowerModel.FixImpedances do
     Mix.shell().info("  Undersized ratings:            #{t.small_rating_count}")
 
     Mix.shell().info("\n  |x_pu| distribution:")
+
     for {range, count} <- Enum.sort(t.x_distribution) do
       bar = String.duplicate("#", min(count, 60))
-      Mix.shell().info("    #{String.pad_trailing(range, 12)} #{String.pad_leading("#{count}", 5)} #{bar}")
+
+      Mix.shell().info(
+        "    #{String.pad_trailing(range, 12)} #{String.pad_leading("#{count}", 5)} #{bar}"
+      )
     end
 
     if t.worst_tiny != [] do
       Mix.shell().info("\n  Worst tiny-x transformers:")
+
       for w <- t.worst_tiny do
         Mix.shell().info("    Xfmr #{w.id}: x=#{w.x_pu}, rated=#{w.rated_mva}MVA, tap=#{w.tap}")
       end
@@ -165,9 +194,13 @@ defmodule Mix.Tasks.PowerModel.FixImpedances do
     Mix.shell().info("  Tiny |x| < #{@min_x_branch}:            #{l.tiny_x}")
 
     Mix.shell().info("\n  |x_pu| distribution:")
+
     for {range, count} <- Enum.sort(l.x_distribution) do
       bar = String.duplicate("#", min(count, 60))
-      Mix.shell().info("    #{String.pad_trailing(range, 12)} #{String.pad_leading("#{count}", 5)} #{bar}")
+
+      Mix.shell().info(
+        "    #{String.pad_trailing(range, 12)} #{String.pad_leading("#{count}", 5)} #{bar}"
+      )
     end
   end
 
@@ -182,19 +215,17 @@ defmodule Mix.Tasks.PowerModel.FixImpedances do
       x = xfmr.x_pu
       abs_x = abs(x)
 
-      new_x = cond do
-        # Zero-impedance bus ties (MATPOWER x=0 clamped to 0.0001)
-        x == 0.0001 -> @min_x_bus_tie
-
-        # Tiny positive impedance
-        x > 0 and x < @min_x_branch -> @min_x_branch
-
-        # Tiny negative impedance (preserve sign for star-point models)
-        x < 0 and abs_x < @min_x_branch -> -@min_x_branch
-
-        # Already OK
-        true -> nil
-      end
+      new_x =
+        cond do
+          # Zero-impedance bus ties (MATPOWER x=0 clamped to 0.0001)
+          x == 0.0001 -> @min_x_bus_tie
+          # Tiny positive impedance
+          x > 0 and x < @min_x_branch -> @min_x_branch
+          # Tiny negative impedance (preserve sign for star-point models)
+          x < 0 and abs_x < @min_x_branch -> -@min_x_branch
+          # Already OK
+          true -> nil
+        end
 
       if new_x do
         # Also fix r_pu if it was clamped along with x
@@ -216,17 +247,22 @@ defmodule Mix.Tasks.PowerModel.FixImpedances do
   # ---------------------------------------------------------------------------
 
   defp fix_line_impedances do
-    lines = Repo.all(from(l in TransmissionLine,
-      where: l.status == "in_service" and not is_nil(l.x_pu)))
+    lines =
+      Repo.all(
+        from(l in TransmissionLine,
+          where: l.status == "in_service" and not is_nil(l.x_pu)
+        )
+      )
 
     Enum.reduce(lines, 0, fn line, count ->
       x = line.x_pu
 
-      new_x = cond do
-        x == 0.0001 -> @min_x_bus_tie
-        x > 0 and x < @min_x_branch -> @min_x_branch
-        true -> nil
-      end
+      new_x =
+        cond do
+          x == 0.0001 -> @min_x_bus_tie
+          x > 0 and x < @min_x_branch -> @min_x_branch
+          true -> nil
+        end
 
       if new_x do
         line
@@ -249,11 +285,13 @@ defmodule Mix.Tasks.PowerModel.FixImpedances do
     # a nominal value that's far too small for the actual power transfer.
     # We fix ratings for transformers where |x| < 0.005 (high-susceptance
     # branches most prone to large flows).
-    transformers = Repo.all(
-      from(t in Transformer,
-        where: t.status == "in_service",
-        preload: [:from_bus, :to_bus])
-    )
+    transformers =
+      Repo.all(
+        from(t in Transformer,
+          where: t.status == "in_service",
+          preload: [:from_bus, :to_bus]
+        )
+      )
 
     Enum.reduce(transformers, 0, fn xfmr, count ->
       appropriate_rating = voltage_based_rating_from_buses(xfmr.from_bus, xfmr.to_bus)

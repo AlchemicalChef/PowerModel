@@ -33,12 +33,27 @@ defmodule PowerModel.Grid.WaterFacility do
   def changeset(facility, attrs) do
     facility
     |> cast(attrs, [
-      :name, :facility_type, :coordinates, :city, :county, :state,
-      :owner, :status, :capacity_mgd, :storage_acre_feet,
-      :power_consumption_mw, :generator_id, :bus_id, :source, :source_id
+      :name,
+      :facility_type,
+      :coordinates,
+      :city,
+      :county,
+      :state,
+      :owner,
+      :status,
+      :capacity_mgd,
+      :storage_acre_feet,
+      :power_consumption_mw,
+      :generator_id,
+      :bus_id,
+      :source,
+      :source_id
     ])
     |> validate_required([:name, :facility_type, :coordinates])
-    |> validate_inclusion(:facility_type, ~w(desalination wastewater treatment pump_station reservoir pipeline))
+    |> validate_inclusion(
+      :facility_type,
+      ~w(desalination wastewater treatment pump_station reservoir pipeline)
+    )
     |> unique_constraint([:source, :source_id])
   end
 end

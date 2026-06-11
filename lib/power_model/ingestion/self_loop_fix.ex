@@ -36,9 +36,11 @@ defmodule PowerModel.Ingestion.SelfLoopFix do
   end
 
   defp count_self_loops do
-    Repo.one(from tl in TransmissionLine,
-      where: not is_nil(tl.from_bus_id) and tl.from_bus_id == tl.to_bus_id,
-      select: count())
+    Repo.one(
+      from tl in TransmissionLine,
+        where: not is_nil(tl.from_bus_id) and tl.from_bus_id == tl.to_bus_id,
+        select: count()
+    )
   end
 
   defp create_missing_substation_buses do
@@ -48,13 +50,16 @@ defmodule PowerModel.Ingestion.SelfLoopFix do
       |> MapSet.new()
 
     substations = Repo.all(Substation)
-    missing = Enum.filter(substations, fn sub ->
-      voltage_levels = determine_voltage_levels(sub)
-      Enum.any?(voltage_levels, fn kv ->
-        source_id = "#{sub.id}_#{round(kv)}kV"
-        not MapSet.member?(existing_source_ids, source_id)
+
+    missing =
+      Enum.filter(substations, fn sub ->
+        voltage_levels = determine_voltage_levels(sub)
+
+        Enum.any?(voltage_levels, fn kv ->
+          source_id = "#{sub.id}_#{round(kv)}kV"
+          not MapSet.member?(existing_source_ids, source_id)
+        end)
       end)
-    end)
 
     Logger.info("Creating buses for #{length(missing)} substations without buses...")
 
@@ -63,32 +68,36 @@ defmodule PowerModel.Ingestion.SelfLoopFix do
     missing
     |> Enum.chunk_every(1000)
     |> Enum.each(fn batch ->
-      entries = Enum.flat_map(batch, fn sub ->
-        voltage_levels = determine_voltage_levels(sub)
-        ic_id = determine_interconnection(sub.coordinates)
-        now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+      entries =
+        Enum.flat_map(batch, fn sub ->
+          voltage_levels = determine_voltage_levels(sub)
+          ic_id = determine_interconnection(sub.coordinates)
+          now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
 
-        Enum.filter(voltage_levels, fn kv ->
-          not MapSet.member?(existing_source_ids, "#{sub.id}_#{round(kv)}kV")
+          Enum.filter(voltage_levels, fn kv ->
+            not MapSet.member?(existing_source_ids, "#{sub.id}_#{round(kv)}kV")
+          end)
+          |> Enum.map(fn kv ->
+            %{
+              bus_type: 1,
+              base_kv: kv,
+              vm_pu: 1.0,
+              va_rad: 0.0,
+              coordinates: sub.coordinates,
+              source: "substation",
+              source_id: "#{sub.id}_#{round(kv)}kV",
+              interconnection_id: ic_id,
+              inserted_at: now,
+              updated_at: now
+            }
+          end)
         end)
-        |> Enum.map(fn kv ->
-          %{
-            bus_type: 1,
-            base_kv: kv,
-            vm_pu: 1.0,
-            va_rad: 0.0,
-            coordinates: sub.coordinates,
-            source: "substation",
-            source_id: "#{sub.id}_#{round(kv)}kV",
-            interconnection_id: ic_id,
-            inserted_at: now,
-            updated_at: now
-          }
-        end)
-      end)
 
       if length(entries) > 0 do
-        Repo.insert_all(Bus, entries, on_conflict: :nothing, conflict_target: [:source, :source_id])
+        Repo.insert_all(Bus, entries,
+          on_conflict: :nothing,
+          conflict_target: [:source, :source_id]
+        )
       end
 
       :counters.add(counter, 1, length(entries))
@@ -102,18 +111,22 @@ defmodule PowerModel.Ingestion.SelfLoopFix do
   end
 
   defp clear_self_loop_assignments do
-    {count, _} = from(tl in TransmissionLine,
-      where: not is_nil(tl.from_bus_id) and tl.from_bus_id == tl.to_bus_id)
-    |> Repo.update_all(set: [from_bus_id: nil, to_bus_id: nil])
+    {count, _} =
+      from(tl in TransmissionLine,
+        where: not is_nil(tl.from_bus_id) and tl.from_bus_id == tl.to_bus_id
+      )
+      |> Repo.update_all(set: [from_bus_id: nil, to_bus_id: nil])
 
     Logger.info("Cleared bus assignments on #{count} self-loop lines")
   end
 
   defp remap_self_loop_lines do
-    lines = from(tl in TransmissionLine,
-      where: is_nil(tl.from_bus_id) and is_nil(tl.to_bus_id) and not is_nil(tl.geometry),
-      select: %{id: tl.id, voltage_kv: tl.voltage_kv, geometry: tl.geometry}
-    ) |> Repo.all()
+    lines =
+      from(tl in TransmissionLine,
+        where: is_nil(tl.from_bus_id) and is_nil(tl.to_bus_id) and not is_nil(tl.geometry),
+        select: %{id: tl.id, voltage_kv: tl.voltage_kv, geometry: tl.geometry}
+      )
+      |> Repo.all()
 
     Logger.info("Re-mapping #{length(lines)} lines...")
 
@@ -129,42 +142,53 @@ defmodule PowerModel.Ingestion.SelfLoopFix do
         from_bus = find_nearest_bus_at_voltage(from_point, line.voltage_kv, @line_match_radius_m)
         to_bus = find_nearest_bus_at_voltage(to_point, line.voltage_kv, @line_match_radius_m)
 
-        {from_bus, to_bus} = resolve_self_loop(from_bus, to_bus, from_point, to_point, line.voltage_kv)
+        {from_bus, to_bus} =
+          resolve_self_loop(from_bus, to_bus, from_point, to_point, line.voltage_kv)
 
         cond do
           from_bus && to_bus && from_bus.id != to_bus.id ->
             from(tl in TransmissionLine, where: tl.id == ^line.id)
             |> Repo.update_all(set: [from_bus_id: from_bus.id, to_bus_id: to_bus.id])
+
             :counters.add(counter, 1, 1)
 
           from_bus && to_bus ->
             from(tl in TransmissionLine, where: tl.id == ^line.id)
             |> Repo.update_all(set: [from_bus_id: from_bus.id, to_bus_id: to_bus.id])
+
             :counters.add(counter, 2, 1)
 
           true ->
             changes = []
             changes = if from_bus, do: [from_bus_id: from_bus.id] ++ changes, else: changes
             changes = if to_bus, do: [to_bus_id: to_bus.id] ++ changes, else: changes
+
             if length(changes) > 0 do
               from(tl in TransmissionLine, where: tl.id == ^line.id)
               |> Repo.update_all(set: changes)
             end
+
             :counters.add(counter, 3, 1)
         end
       end)
 
       total = :counters.get(counter, 1) + :counters.get(counter, 2) + :counters.get(counter, 3)
+
       if rem(total, 5000) < 500 do
-        Logger.info("  #{total}/#{length(lines)} — fixed: #{:counters.get(counter, 1)}, still loops: #{:counters.get(counter, 2)}, unmapped: #{:counters.get(counter, 3)}")
+        Logger.info(
+          "  #{total}/#{length(lines)} — fixed: #{:counters.get(counter, 1)}, still loops: #{:counters.get(counter, 2)}, unmapped: #{:counters.get(counter, 3)}"
+        )
       end
     end)
 
-    Logger.info("Mapping results: fixed=#{:counters.get(counter, 1)}, still_loops=#{:counters.get(counter, 2)}, unmapped=#{:counters.get(counter, 3)}")
+    Logger.info(
+      "Mapping results: fixed=#{:counters.get(counter, 1)}, still_loops=#{:counters.get(counter, 2)}, unmapped=#{:counters.get(counter, 3)}"
+    )
   end
 
   defp resolve_self_loop(nil, _, _, _, _), do: {nil, nil}
   defp resolve_self_loop(_, nil, _, _, _), do: {nil, nil}
+
   defp resolve_self_loop(from_bus, to_bus, from_point, to_point, voltage_kv)
        when from_bus.id == to_bus.id do
     from_dist = point_distance(from_point, from_bus.coordinates)
@@ -182,43 +206,50 @@ defmodule PowerModel.Ingestion.SelfLoopFix do
       end
     end
   end
+
   defp resolve_self_loop(from_bus, to_bus, _, _, _), do: {from_bus, to_bus}
 
   defp find_second_nearest_bus(nil, _kv, _exclude), do: nil
+
   defp find_second_nearest_bus(point, voltage_kv, exclude_bus_id) do
     tolerance = voltage_kv * 0.1
 
     from(b in Bus,
-      where: fragment("ST_DWithin(?::geography, ?::geography, ?)",
-                       b.coordinates, ^point, ^@line_match_radius_m)
-             and b.base_kv >= ^(voltage_kv - tolerance)
-             and b.base_kv <= ^(voltage_kv + tolerance)
-             and b.id != ^exclude_bus_id,
-      order_by: fragment("ST_Distance(?::geography, ?::geography)",
-                          b.coordinates, ^point),
+      where:
+        fragment(
+          "ST_DWithin(?::geography, ?::geography, ?)",
+          b.coordinates,
+          ^point,
+          ^@line_match_radius_m
+        ) and
+          b.base_kv >= ^(voltage_kv - tolerance) and
+          b.base_kv <= ^(voltage_kv + tolerance) and
+          b.id != ^exclude_bus_id,
+      order_by: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
       limit: 1
     )
     |> Repo.one()
   end
 
   defp find_nearest_bus_at_voltage(nil, _kv, _radius), do: nil
+
   defp find_nearest_bus_at_voltage(point, voltage_kv, radius_m) do
     tolerance = voltage_kv * 0.1
 
     from(b in Bus,
-      where: fragment("ST_DWithin(?::geography, ?::geography, ?)",
-                       b.coordinates, ^point, ^radius_m)
-             and b.base_kv >= ^(voltage_kv - tolerance)
-             and b.base_kv <= ^(voltage_kv + tolerance),
-      order_by: fragment("ST_Distance(?::geography, ?::geography)",
-                          b.coordinates, ^point),
+      where:
+        fragment("ST_DWithin(?::geography, ?::geography, ?)", b.coordinates, ^point, ^radius_m) and
+          b.base_kv >= ^(voltage_kv - tolerance) and
+          b.base_kv <= ^(voltage_kv + tolerance),
+      order_by: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
       limit: 1
     )
     |> Repo.one()
   end
 
-  defp point_distance(nil, _), do: 999999.0
-  defp point_distance(_, nil), do: 999999.0
+  defp point_distance(nil, _), do: 999_999.0
+  defp point_distance(_, nil), do: 999_999.0
+
   defp point_distance(%Geo.Point{coordinates: {lon1, lat1}}, %Geo.Point{coordinates: {lon2, lat2}}) do
     dlat = (lat2 - lat1) * 111.0
     dlon = (lon2 - lon1) * 111.0 * :math.cos(lat1 * :math.pi() / 180.0)
@@ -232,6 +263,7 @@ defmodule PowerModel.Ingestion.SelfLoopFix do
       _ -> nil
     end
   end
+
   defp get_line_endpoint(%Geo.LineString{coordinates: coords}, :to) do
     case List.last(coords) do
       {lon, lat} -> %Geo.Point{coordinates: {lon, lat}, srid: 4326}
@@ -239,16 +271,19 @@ defmodule PowerModel.Ingestion.SelfLoopFix do
       _ -> nil
     end
   end
+
   defp get_line_endpoint(_, _), do: nil
 
   defp determine_voltage_levels(sub) do
     levels = []
     levels = if sub.max_voltage_kv, do: [sub.max_voltage_kv | levels], else: levels
-    levels = if sub.min_voltage_kv && sub.min_voltage_kv != sub.max_voltage_kv do
-      [sub.min_voltage_kv | levels]
-    else
-      levels
-    end
+
+    levels =
+      if sub.min_voltage_kv && sub.min_voltage_kv != sub.max_voltage_kv do
+        [sub.min_voltage_kv | levels]
+      else
+        levels
+      end
 
     case levels do
       [] -> [138.0]
@@ -257,16 +292,20 @@ defmodule PowerModel.Ingestion.SelfLoopFix do
   end
 
   defp determine_interconnection(nil), do: nil
+
   defp determine_interconnection(%Geo.Point{coordinates: {lon, lat}}) do
     cond do
       lat >= 25.8 and lat <= 36.5 and lon >= -104.0 and lon <= -93.5 ->
         get_ic_id("ERCOT")
+
       lon < -104.0 ->
         get_ic_id("Western")
+
       true ->
         get_ic_id("Eastern")
     end
   end
+
   defp determine_interconnection(_), do: nil
 
   defp get_ic_id(name) do

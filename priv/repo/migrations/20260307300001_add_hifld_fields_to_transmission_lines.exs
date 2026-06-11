@@ -3,10 +3,13 @@ defmodule PowerModel.Repo.Migrations.AddHifldFieldsToTransmissionLines do
 
   def change do
     alter table(:transmission_lines) do
-      add :line_type, :string         # "AC; OVERHEAD", "AC; UNDERGROUND", "DC; OVERHEAD"
+      # "AC; OVERHEAD", "AC; UNDERGROUND", "DC; OVERHEAD"
+      add :line_type, :string
       add :owner, :string
-      add :sub_1, :string             # HIFLD substation 1 name/ID
-      add :sub_2, :string             # HIFLD substation 2 name/ID
+      # HIFLD substation 1 name/ID
+      add :sub_1, :string
+      # HIFLD substation 2 name/ID
+      add :sub_2, :string
       add :naics_code, :string
       add :naics_desc, :string
     end

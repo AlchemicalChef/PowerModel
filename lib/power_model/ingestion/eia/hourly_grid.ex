@@ -48,10 +48,11 @@ defmodule PowerModel.Ingestion.EIA.HourlyGrid do
 
     Logger.info("Ingesting EIA hourly demand data for #{length(bas)} BAs from #{start_date}...")
 
-    results = Enum.map(bas, fn ba_code ->
-      Logger.info("  Fetching demand for #{ba_code}...")
-      fetch_and_store_demand(ba_code, api_key, start_date, end_date)
-    end)
+    results =
+      Enum.map(bas, fn ba_code ->
+        Logger.info("  Fetching demand for #{ba_code}...")
+        fetch_and_store_demand(ba_code, api_key, start_date, end_date)
+      end)
 
     total = Enum.sum(results)
     Logger.info("EIA hourly demand ingestion complete: #{total} records")
@@ -67,12 +68,15 @@ defmodule PowerModel.Ingestion.EIA.HourlyGrid do
     end_date = Keyword.get(opts, :end, nil)
     bas = Keyword.get(opts, :bas, @major_bas ++ @regions)
 
-    Logger.info("Ingesting EIA hourly generation mix for #{length(bas)} BAs from #{start_date}...")
+    Logger.info(
+      "Ingesting EIA hourly generation mix for #{length(bas)} BAs from #{start_date}..."
+    )
 
-    results = Enum.map(bas, fn ba_code ->
-      Logger.info("  Fetching generation mix for #{ba_code}...")
-      fetch_and_store_generation_mix(ba_code, api_key, start_date, end_date)
-    end)
+    results =
+      Enum.map(bas, fn ba_code ->
+        Logger.info("  Fetching generation mix for #{ba_code}...")
+        fetch_and_store_generation_mix(ba_code, api_key, start_date, end_date)
+      end)
 
     total = Enum.sum(results)
     Logger.info("EIA generation mix ingestion complete: #{total} records")
@@ -96,19 +100,23 @@ defmodule PowerModel.Ingestion.EIA.HourlyGrid do
       {"Fall", "2025-10-13T00", "2025-10-19T23"}
     ]
 
-    totals = Enum.map(weeks, fn {label, start_d, end_d} ->
-      Logger.info("  #{label} week (#{start_d} to #{end_d})...")
-      week_total = Enum.reduce(sample_bas, 0, fn ba, acc ->
-        n = fetch_and_store_demand(ba, api_key, start_d, end_d)
-        Process.sleep(@request_delay)
-        m = fetch_and_store_generation_mix(ba, api_key, start_d, end_d)
-        Process.sleep(@request_delay)
-        Logger.info("    #{ba}: #{n} demand + #{m} gen mix records")
-        acc + n + m
+    totals =
+      Enum.map(weeks, fn {label, start_d, end_d} ->
+        Logger.info("  #{label} week (#{start_d} to #{end_d})...")
+
+        week_total =
+          Enum.reduce(sample_bas, 0, fn ba, acc ->
+            n = fetch_and_store_demand(ba, api_key, start_d, end_d)
+            Process.sleep(@request_delay)
+            m = fetch_and_store_generation_mix(ba, api_key, start_d, end_d)
+            Process.sleep(@request_delay)
+            Logger.info("    #{ba}: #{n} demand + #{m} gen mix records")
+            acc + n + m
+          end)
+
+        Logger.info("  #{label}: #{week_total} records")
+        week_total
       end)
-      Logger.info("  #{label}: #{week_total} records")
-      week_total
-    end)
 
     total = Enum.sum(totals)
     Logger.info("Sample ingestion complete: #{total} total records")
@@ -116,39 +124,43 @@ defmodule PowerModel.Ingestion.EIA.HourlyGrid do
   end
 
   defp fetch_and_store_demand(ba_code, api_key, start_date, end_date) do
-    params = base_params(api_key, start_date, end_date) ++ [
-      {"facets[respondent][]", ba_code}
-    ]
+    params =
+      base_params(api_key, start_date, end_date) ++
+        [
+          {"facets[respondent][]", ba_code}
+        ]
 
     records = fetch_all_pages("#{@base_url}/region-data/data/", params)
 
     by_period = Enum.group_by(records, & &1["period"])
 
-    entries = Enum.map(by_period, fn {period, rows} ->
-      ba_name = get_in(List.first(rows), ["respondent-name"])
-      now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+    entries =
+      Enum.map(by_period, fn {period, rows} ->
+        ba_name = get_in(List.first(rows), ["respondent-name"])
+        now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
 
-      metrics = Map.new(rows, fn r -> {r["type"], parse_value(r["value"])} end)
+        metrics = Map.new(rows, fn r -> {r["type"], parse_value(r["value"])} end)
 
-      %{
-        ba_code: ba_code,
-        ba_name: ba_name,
-        period: parse_period(period),
-        demand_mw: metrics["D"],
-        generation_mw: metrics["NG"],
-        interchange_mw: metrics["TI"],
-        forecast_mw: metrics["DF"],
-        inserted_at: now,
-        updated_at: now
-      }
-    end)
-    |> Enum.filter(fn e -> e.period != nil end)
+        %{
+          ba_code: ba_code,
+          ba_name: ba_name,
+          period: parse_period(period),
+          demand_mw: metrics["D"],
+          generation_mw: metrics["NG"],
+          interchange_mw: metrics["TI"],
+          forecast_mw: metrics["DF"],
+          inserted_at: now,
+          updated_at: now
+        }
+      end)
+      |> Enum.filter(fn e -> e.period != nil end)
 
     entries
     |> Enum.chunk_every(500)
     |> Enum.each(fn batch ->
       Repo.insert_all(HourlyLoadProfile, batch,
-        on_conflict: {:replace, [:demand_mw, :generation_mw, :interchange_mw, :forecast_mw, :updated_at]},
+        on_conflict:
+          {:replace, [:demand_mw, :generation_mw, :interchange_mw, :forecast_mw, :updated_at]},
         conflict_target: [:ba_code, :period]
       )
     end)
@@ -157,25 +169,28 @@ defmodule PowerModel.Ingestion.EIA.HourlyGrid do
   end
 
   defp fetch_and_store_generation_mix(ba_code, api_key, start_date, end_date) do
-    params = base_params(api_key, start_date, end_date) ++ [
-      {"facets[respondent][]", ba_code}
-    ]
+    params =
+      base_params(api_key, start_date, end_date) ++
+        [
+          {"facets[respondent][]", ba_code}
+        ]
 
     records = fetch_all_pages("#{@base_url}/fuel-type-data/data/", params)
 
     now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
 
-    entries = Enum.map(records, fn r ->
-      %{
-        ba_code: ba_code,
-        period: parse_period(r["period"]),
-        fuel_type: r["fueltype"],
-        generation_mw: parse_value(r["value"]),
-        inserted_at: now,
-        updated_at: now
-      }
-    end)
-    |> Enum.filter(fn e -> e.period != nil and e.fuel_type != nil end)
+    entries =
+      Enum.map(records, fn r ->
+        %{
+          ba_code: ba_code,
+          period: parse_period(r["period"]),
+          fuel_type: r["fueltype"],
+          generation_mw: parse_value(r["value"]),
+          inserted_at: now,
+          updated_at: now
+        }
+      end)
+      |> Enum.filter(fn e -> e.period != nil and e.fuel_type != nil end)
 
     entries
     |> Enum.chunk_every(500)
@@ -214,6 +229,7 @@ defmodule PowerModel.Ingestion.EIA.HourlyGrid do
     case fetch_page(url, page_params) do
       {:ok, data, total} ->
         acc = acc ++ data
+
         if offset + @page_size < total do
           Process.sleep(@request_delay)
           fetch_all_pages(url, params, offset + @page_size, acc)
@@ -254,6 +270,7 @@ defmodule PowerModel.Ingestion.EIA.HourlyGrid do
   end
 
   defp parse_period(nil), do: nil
+
   defp parse_period(period_str) when is_binary(period_str) do
     case NaiveDateTime.from_iso8601(period_str <> ":00:00") do
       {:ok, ndt} -> DateTime.from_naive!(ndt, "Etc/UTC")
@@ -263,6 +280,7 @@ defmodule PowerModel.Ingestion.EIA.HourlyGrid do
 
   defp parse_value(nil), do: nil
   defp parse_value(v) when is_number(v), do: v * 1.0
+
   defp parse_value(v) when is_binary(v) do
     case Float.parse(v) do
       {f, _} -> f
@@ -272,6 +290,7 @@ defmodule PowerModel.Ingestion.EIA.HourlyGrid do
 
   defp parse_int(nil), do: nil
   defp parse_int(v) when is_integer(v), do: v
+
   defp parse_int(v) when is_binary(v) do
     case Integer.parse(v) do
       {n, _} -> n

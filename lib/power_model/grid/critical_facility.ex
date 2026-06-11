@@ -39,10 +39,25 @@ defmodule PowerModel.Grid.CriticalFacility do
   def changeset(facility, attrs) do
     facility
     |> cast(attrs, [
-      :name, :category, :facility_type, :coordinates, :address,
-      :city, :county, :state, :zip, :owner, :status,
-      :beds, :trauma, :helipad, :total_staff,
-      :estimated_power_mw, :bus_id, :source, :source_id
+      :name,
+      :category,
+      :facility_type,
+      :coordinates,
+      :address,
+      :city,
+      :county,
+      :state,
+      :zip,
+      :owner,
+      :status,
+      :beds,
+      :trauma,
+      :helipad,
+      :total_staff,
+      :estimated_power_mw,
+      :bus_id,
+      :source,
+      :source_id
     ])
     |> validate_required([:name, :category, :coordinates])
     |> validate_inclusion(:category, @categories)

@@ -35,8 +35,17 @@ defmodule PowerModel.Grid.Bus do
 
   def changeset(bus, attrs) do
     bus
-    |> cast(attrs, [:bus_type, :base_kv, :vm_pu, :va_rad, :b_shunt_mvar,
-                     :coordinates, :source, :source_id, :interconnection_id])
+    |> cast(attrs, [
+      :bus_type,
+      :base_kv,
+      :vm_pu,
+      :va_rad,
+      :b_shunt_mvar,
+      :coordinates,
+      :source,
+      :source_id,
+      :interconnection_id
+    ])
     |> validate_required([:bus_type, :base_kv])
     |> validate_inclusion(:bus_type, Map.values(@bus_types))
     |> unique_constraint([:source, :source_id])

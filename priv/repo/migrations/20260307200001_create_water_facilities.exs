@@ -4,7 +4,8 @@ defmodule PowerModel.Repo.Migrations.CreateWaterFacilities do
   def change do
     create table(:water_facilities) do
       add :name, :string, null: false
-      add :facility_type, :string, null: false  # desalination, wastewater, treatment, pump_station, reservoir
+      # desalination, wastewater, treatment, pump_station, reservoir
+      add :facility_type, :string, null: false
       add :coordinates, :geometry, null: false
       add :city, :string
       add :county, :string
@@ -13,16 +14,22 @@ defmodule PowerModel.Repo.Migrations.CreateWaterFacilities do
       add :status, :string, default: "active"
 
       # Capacity
-      add :capacity_mgd, :float          # million gallons per day
-      add :storage_acre_feet, :float     # for reservoirs
+      # million gallons per day
+      add :capacity_mgd, :float
+      # for reservoirs
+      add :storage_acre_feet, :float
 
       # Power linkage
-      add :power_consumption_mw, :float  # electrical load
-      add :generator_id, :integer        # FK to generators table (if co-located)
-      add :bus_id, :integer              # FK to buses (electrical connection)
+      # electrical load
+      add :power_consumption_mw, :float
+      # FK to generators table (if co-located)
+      add :generator_id, :integer
+      # FK to buses (electrical connection)
+      add :bus_id, :integer
 
       # Source tracking
-      add :source, :string               # epa, sdcwa, carlsbad, manual
+      # epa, sdcwa, carlsbad, manual
+      add :source, :string
       add :source_id, :string
 
       timestamps()

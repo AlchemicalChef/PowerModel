@@ -92,17 +92,21 @@ defmodule PowerModel.Solver.NewtonRaphson do
       ybus = YBus.build(buses, lines, transformers, base_mva)
 
       # Balance generation to match load via economic dispatch
-      generators = if skip_dispatch do
-        generators
-      else
-        total_load = Enum.sum(Enum.map(loads, & &1.p_mw))
-        dispatch = EconomicDispatch.dispatch(generators, total_load)
-        Enum.map(generators, fn g ->
-          d = Map.get(dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
-          %{g | p_max_mw: d, capacity_factor: 1.0}
-          |> Map.put(:p_nameplate_mw, g.p_max_mw)  # preserve original for Q capability curve
-        end)
-      end
+      generators =
+        if skip_dispatch do
+          generators
+        else
+          total_load = Enum.sum(Enum.map(loads, & &1.p_mw))
+          dispatch = EconomicDispatch.dispatch(generators, total_load)
+
+          Enum.map(generators, fn g ->
+            d = Map.get(dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
+
+            %{g | p_max_mw: d, capacity_factor: 1.0}
+            # preserve original for Q capability curve
+            |> Map.put(:p_nameplate_mw, g.p_max_mw)
+          end)
+        end
 
       gen_by_bus = Enum.group_by(generators, & &1.bus_id)
 
@@ -117,20 +121,35 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
       q_limits = aggregate_q_limits(generators, bus_index, n, base_mva)
 
-      init = cond do
-        warm_start != nil -> warm_start
-        use_bus_profiles -> {:bus_profiles, buses}
-        true -> nil
-      end
+      init =
+        cond do
+          warm_start != nil -> warm_start
+          use_bus_profiles -> {:bus_profiles, buses}
+          true -> nil
+        end
 
       {vm, va} = initialize_voltages(n, init, bus_ids, v_sched, pv_indices, slack_idx)
 
       y_data = build_y_data(ybus)
 
       {vm, va, converged, iter, max_mis} =
-        iterate(vm, va, y_data, p_gen, q_gen, v_sched, q_limits,
-                pq_indices, pv_indices, slack_idx, n, max_iter, tol,
-                bus_loads, base_mva)
+        iterate(
+          vm,
+          va,
+          y_data,
+          p_gen,
+          q_gen,
+          v_sched,
+          q_limits,
+          pq_indices,
+          pv_indices,
+          slack_idx,
+          n,
+          max_iter,
+          tol,
+          bus_loads,
+          base_mva
+        )
 
       vm_list = :array.to_list(vm)
       va_list = :array.to_list(va)
@@ -369,11 +388,13 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
   # Initialize from bus-stored voltage profiles (from MATPOWER solved cases)
   defp initialize_voltages(_n, {:bus_profiles, buses}, _bus_ids, v_sched, pv_indices, slack_idx) do
-    vm = buses
+    vm =
+      buses
       |> Enum.map(fn b -> b.vm_pu || 1.0 end)
       |> :array.from_list()
 
-    va = buses
+    va =
+      buses
       |> Enum.map(fn b -> b.va_rad || 0.0 end)
       |> :array.from_list()
 
@@ -458,10 +479,12 @@ defmodule PowerModel.Solver.NewtonRaphson do
   defp build_yij_map(adj, n) do
     Enum.reduce(0..(n - 1), %{}, fn i, outer_acc ->
       neighbors = :array.get(i, adj)
+
       inner_map =
         Enum.reduce(neighbors, %{}, fn {j, gij, bij}, inner_acc ->
           Map.put(inner_acc, j, {gij, bij})
         end)
+
       Map.put(outer_acc, i, inner_map)
     end)
   end
@@ -481,29 +504,81 @@ defmodule PowerModel.Solver.NewtonRaphson do
   # ---------------------------------------------------------------------------
 
   defp iterate(
-         vm, va, y_data, p_gen, q_gen, v_sched, q_limits,
-         pq_indices, pv_indices, slack_idx, n, max_iter, tol,
-         bus_loads, base_mva
+         vm,
+         va,
+         y_data,
+         p_gen,
+         q_gen,
+         v_sched,
+         q_limits,
+         pq_indices,
+         pv_indices,
+         slack_idx,
+         n,
+         max_iter,
+         tol,
+         bus_loads,
+         base_mva
        ) do
     do_iterate(
-      vm, va, y_data, p_gen, q_gen, v_sched, q_limits,
-      pq_indices, pv_indices, slack_idx, n, 0, max_iter, tol,
-      bus_loads, base_mva
+      vm,
+      va,
+      y_data,
+      p_gen,
+      q_gen,
+      v_sched,
+      q_limits,
+      pq_indices,
+      pv_indices,
+      slack_idx,
+      n,
+      0,
+      max_iter,
+      tol,
+      bus_loads,
+      base_mva
     )
   end
 
   defp do_iterate(
-         vm, va, _y_data, _p_gen, _q_gen, _v_sched, _q_limits,
-         _pq, _pv, _slack, _n, iter, max_iter, _tol, _bus_loads, _base_mva
+         vm,
+         va,
+         _y_data,
+         _p_gen,
+         _q_gen,
+         _v_sched,
+         _q_limits,
+         _pq,
+         _pv,
+         _slack,
+         _n,
+         iter,
+         max_iter,
+         _tol,
+         _bus_loads,
+         _base_mva
        )
        when iter >= max_iter do
     {vm, va, false, iter, :infinity}
   end
 
   defp do_iterate(
-         vm, va, y_data, p_gen, q_gen, v_sched, q_limits,
-         pq_indices, pv_indices, slack_idx, n, iter, max_iter, tol,
-         bus_loads, base_mva
+         vm,
+         va,
+         y_data,
+         p_gen,
+         q_gen,
+         v_sched,
+         q_limits,
+         pq_indices,
+         pv_indices,
+         slack_idx,
+         n,
+         iter,
+         max_iter,
+         tol,
+         bus_loads,
+         base_mva
        ) do
     vm =
       Enum.reduce(pv_indices, vm, fn idx, acc ->
@@ -555,16 +630,34 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
             jacobian =
               build_jacobian_dense(
-                vm, va, y_data, p_calc, q_calc,
-                non_slack_arr, pq_arr, n_ns, n_pq, n
+                vm,
+                va,
+                y_data,
+                p_calc,
+                q_calc,
+                non_slack_arr,
+                pq_arr,
+                n_ns,
+                n_pq,
+                n
               )
 
             solve_jacobian_dense(jacobian, mismatch, j_size)
           else
             # Large grid path: build COO triplets, solve with sparse/dense-flat strategy
             solve_jacobian_coo(
-              vm, va, y_data, p_calc, q_calc,
-              non_slack, pq_indices, n_ns, n_pq, n, mismatch, j_size
+              vm,
+              va,
+              y_data,
+              p_calc,
+              q_calc,
+              non_slack,
+              pq_indices,
+              n_ns,
+              n_pq,
+              n,
+              mismatch,
+              j_size
             )
           end
 
@@ -593,9 +686,22 @@ defmodule PowerModel.Solver.NewtonRaphson do
           end)
 
         do_iterate(
-          vm, va, y_data, p_gen, q_gen, v_sched, q_limits,
-          pq_indices, pv_indices, slack_idx, n, iter + 1, max_iter, tol,
-          bus_loads, base_mva
+          vm,
+          va,
+          y_data,
+          p_gen,
+          q_gen,
+          v_sched,
+          q_limits,
+          pq_indices,
+          pv_indices,
+          slack_idx,
+          n,
+          iter + 1,
+          max_iter,
+          tol,
+          bus_loads,
+          base_mva
         )
     end
   end
@@ -673,8 +779,18 @@ defmodule PowerModel.Solver.NewtonRaphson do
   # Dense Jacobian (small grids, n <= 200)
   # ---------------------------------------------------------------------------
 
-  defp build_jacobian_dense(vm, va, %{g: g, b: b, n: n}, p_calc, q_calc,
-                            non_slack_arr, pq_arr, n_ns, n_pq, _n_total) do
+  defp build_jacobian_dense(
+         vm,
+         va,
+         %{g: g, b: b, n: n},
+         p_calc,
+         q_calc,
+         non_slack_arr,
+         pq_arr,
+         n_ns,
+         n_pq,
+         _n_total
+       ) do
     j_size = n_ns + n_pq
 
     for row <- 0..(j_size - 1) do
@@ -763,9 +879,20 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
   # Build the Jacobian as COO triplets and solve the linear system.
   # Only iterates over non-zero entries: diagonals + adjacency neighbors.
-  defp solve_jacobian_coo(vm, va, y_data, p_calc, q_calc,
-                          non_slack, pq_indices, n_ns, _n_pq, n,
-                          mismatch, j_size) do
+  defp solve_jacobian_coo(
+         vm,
+         va,
+         y_data,
+         p_calc,
+         q_calc,
+         non_slack,
+         pq_indices,
+         n_ns,
+         _n_pq,
+         n,
+         mismatch,
+         j_size
+       ) do
     %{yij_map: yij_map, g_diag: g_diag, b_diag: b_diag, adj: adj} = y_data
 
     # Build reverse index maps: bus_index -> position in the Jacobian variable ordering
@@ -779,8 +906,20 @@ defmodule PowerModel.Solver.NewtonRaphson do
     # off-diagonals contribute ~4 * avg_degree * n_ns entries (sparse)
     {coo_rows, coo_cols, coo_vals} =
       build_coo_triplets(
-        vm, va, yij_map, g_diag, b_diag, adj, p_calc, q_calc,
-        non_slack, pq_indices, ns_pos, pq_pos, n_ns, n
+        vm,
+        va,
+        yij_map,
+        g_diag,
+        b_diag,
+        adj,
+        p_calc,
+        q_calc,
+        non_slack,
+        pq_indices,
+        ns_pos,
+        pq_pos,
+        n_ns,
+        n
       )
 
     # Solve the system using the appropriate strategy
@@ -792,8 +931,20 @@ defmodule PowerModel.Solver.NewtonRaphson do
   #   - Diagonal entries for J1(i,i), J2(i,i), J3(i,i), J4(i,i) as applicable
   #   - Off-diagonal entries for each neighbor j of bus i
   defp build_coo_triplets(
-         vm, va, yij_map, g_diag, b_diag, adj, p_calc, q_calc,
-         non_slack, pq_indices, ns_pos, pq_pos, n_ns, _n
+         vm,
+         va,
+         yij_map,
+         g_diag,
+         b_diag,
+         adj,
+         p_calc,
+         q_calc,
+         non_slack,
+         pq_indices,
+         ns_pos,
+         pq_pos,
+         n_ns,
+         _n
        ) do
     # Process all non-slack buses for J1 (dP/dtheta) and J2 (dP/dV) blocks
     {rows1, cols1, vals1} =
@@ -815,7 +966,9 @@ defmodule PowerModel.Solver.NewtonRaphson do
         # J2 diagonal (only if i is PQ): dP_i/dV_i = P_i/Vi + Vi*Gii
         {racc, cacc, vacc} =
           case Map.get(pq_pos, i) do
-            nil -> {racc, cacc, vacc}
+            nil ->
+              {racc, cacc, vacc}
+
             col_pq ->
               j2_diag = pi / vi + vi * gii
               {[row | racc], [n_ns + col_pq | cacc], [j2_diag | vacc]}
@@ -834,7 +987,9 @@ defmodule PowerModel.Solver.NewtonRaphson do
           # J1 off-diagonal: dP_i/dtheta_j (only if j is non-slack)
           {r, c, v} =
             case Map.get(ns_pos, j) do
-              nil -> {r, c, v}
+              nil ->
+                {r, c, v}
+
               col_j ->
                 val = vi * vj * (gij * sin_t - bij * cos_t)
                 {[row | r], [col_j | c], [val | v]}
@@ -843,7 +998,9 @@ defmodule PowerModel.Solver.NewtonRaphson do
           # J2 off-diagonal: dP_i/dV_j (only if j is PQ)
           {r, c, v} =
             case Map.get(pq_pos, j) do
-              nil -> {r, c, v}
+              nil ->
+                {r, c, v}
+
               col_j ->
                 val = vi * (gij * cos_t + bij * sin_t)
                 {[row | r], [n_ns + col_j | c], [val | v]}
@@ -892,7 +1049,9 @@ defmodule PowerModel.Solver.NewtonRaphson do
           # J3 off-diagonal: dQ_i/dtheta_j (only if j is non-slack)
           {r, c, v} =
             case Map.get(ns_pos, j) do
-              nil -> {r, c, v}
+              nil ->
+                {r, c, v}
+
               col_j ->
                 val = -vi * vj * (gij * cos_t + bij * sin_t)
                 {[row | r], [col_j | c], [val | v]}
@@ -901,7 +1060,9 @@ defmodule PowerModel.Solver.NewtonRaphson do
           # J4 off-diagonal: dQ_i/dV_j (only if j is PQ)
           {r, c, v} =
             case Map.get(pq_pos, j) do
-              nil -> {r, c, v}
+              nil ->
+                {r, c, v}
+
               col_j ->
                 val = vi * (gij * sin_t - bij * cos_t)
                 {[row | r], [n_ns + col_j | c], [val | v]}
@@ -912,8 +1073,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
       end)
 
     # Combine both halves
-    {Enum.reverse(rows1) ++ Enum.reverse(rows2),
-     Enum.reverse(cols1) ++ Enum.reverse(cols2),
+    {Enum.reverse(rows1) ++ Enum.reverse(rows2), Enum.reverse(cols1) ++ Enum.reverse(cols2),
      Enum.reverse(vals1) ++ Enum.reverse(vals2)}
   end
 
@@ -1012,6 +1172,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
       jtb =
         Enum.reduce(row_entries, jtb, fn {row_idx, entries}, acc ->
           b_r = Enum.at(mismatch, row_idx, 0.0)
+
           Enum.reduce(entries, acc, fn {col_idx, val}, acc2 ->
             # J^T[col_idx, row_idx] * b[row_idx] = val * b_r
             array_add(acc2, col_idx, val * b_r)
@@ -1067,6 +1228,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
   defp try_dense_solve_flat_from_coo(coo_rows, coo_cols, coo_vals, mismatch, j_size) do
     try do
       flat = coo_to_flat(coo_rows, coo_cols, coo_vals, j_size)
+
       case Sparse.dense_solve_flat(flat, mismatch, j_size) do
         {:ok, x} -> {:ok, x}
         {:error, _} -> :fallback

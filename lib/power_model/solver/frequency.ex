@@ -23,21 +23,21 @@ defmodule PowerModel.Solver.Frequency do
 
   @default_inertia %{
     "nuclear" => 6.0,
-    "coal"    => 4.0,
-    "gas"     => 3.5,
-    "hydro"   => 3.0,
-    "wind"    => 0.0,
-    "solar"   => 0.0,
-    "import"  => 0.0
+    "coal" => 4.0,
+    "gas" => 3.5,
+    "hydro" => 3.0,
+    "wind" => 0.0,
+    "solar" => 0.0,
+    "import" => 0.0
   }
 
   @default_gov_time %{
     "nuclear" => 999.0,
-    "coal"    => 8.0,
-    "gas"     => 1.5,
-    "hydro"   => 3.0,
-    "wind"    => 999.0,
-    "solar"   => 999.0
+    "coal" => 8.0,
+    "gas" => 1.5,
+    "hydro" => 3.0,
+    "wind" => 999.0,
+    "solar" => 999.0
   }
 
   @droop 0.05
@@ -79,9 +79,10 @@ defmodule PowerModel.Solver.Frequency do
   """
   @spec simulate(list(map()), list(map()), float(), float(), float()) :: list(map())
   def simulate(generators, loads, lost_mw, dt_seconds \\ 0.1, duration_seconds \\ 30.0) do
-    online_gens = Enum.filter(generators, fn g ->
-      (Map.get(g, :capacity_factor) || 1.0) > 0.0 and (Map.get(g, :p_max_mw) || 0.0) > 0.0
-    end)
+    online_gens =
+      Enum.filter(generators, fn g ->
+        (Map.get(g, :capacity_factor) || 1.0) > 0.0 and (Map.get(g, :p_max_mw) || 0.0) > 0.0
+      end)
 
     {h_sys, s_sys} = system_inertia(online_gens)
     total_load_mw = Enum.sum(Enum.map(loads, & &1.p_mw))
@@ -109,61 +110,69 @@ defmodule PowerModel.Solver.Frequency do
     }
 
     {trajectory, _} =
-      Enum.reduce(1..total_steps, {[initial_record], %{
-        freq: freq,
-        df: df,
-        gov_state: gov_state,
-        ufls_state: ufls_state,
-        cumulative_shed_mw: cumulative_shed_mw,
-        total_load_mw: total_load_mw
-      }}, fn step, {records, state} ->
-        t = step * dt_seconds
+      Enum.reduce(
+        1..total_steps,
+        {[initial_record],
+         %{
+           freq: freq,
+           df: df,
+           gov_state: gov_state,
+           ufls_state: ufls_state,
+           cumulative_shed_mw: cumulative_shed_mw,
+           total_load_mw: total_load_mw
+         }},
+        fn step, {records, state} ->
+          t = step * dt_seconds
 
-        {new_gov_state, total_gov_mw} =
-          update_governors(gov_units, state.gov_state, state.df, dt_seconds)
+          {new_gov_state, total_gov_mw} =
+            update_governors(gov_units, state.gov_state, state.df, dt_seconds)
 
-        {new_ufls_state, new_shed_mw} =
-          update_ufls(state.ufls_state, state.freq, t, state.total_load_mw)
+          {new_ufls_state, new_shed_mw} =
+            update_ufls(state.ufls_state, state.freq, t, state.total_load_mw)
 
-        cumulative_shed = state.cumulative_shed_mw + new_shed_mw
+          cumulative_shed = state.cumulative_shed_mw + new_shed_mw
 
-        p_mech = total_gov_mw
-        p_elec_adjustment = -cumulative_shed
+          p_mech = total_gov_mw
+          # Load shedding reduces electrical demand and therefore RELIEVES
+          # the generation deficit (positive contribution to imbalance).
+          p_elec_adjustment = cumulative_shed
 
-        # Load damping: when frequency drops (df < 0), loads decrease,
-        # which REDUCES the deficit (stabilizing effect).
-        # P_elec = P_load0 * (1 + D * df/f0), so the reduction in load is:
-        # delta_P_load = -P_load0 * D * df/f0 (positive when df < 0)
-        load_damping_mw = -state.total_load_mw * @load_damping * state.df / @f0
+          # Load damping: when frequency drops (df < 0), loads decrease,
+          # which REDUCES the deficit (stabilizing effect).
+          # P_elec = P_load0 * (1 + D * df/f0), so the reduction in load is:
+          # delta_P_load = -P_load0 * D * df/f0 (positive when df < 0)
+          load_damping_mw = -state.total_load_mw * @load_damping * state.df / @f0
 
-        p_imbalance = -lost_mw + p_mech + load_damping_mw + p_elec_adjustment
+          p_imbalance = -lost_mw + p_mech + load_damping_mw + p_elec_adjustment
 
-        dfdt = @f0 * p_imbalance / (2.0 * h_sys * s_sys)
+          dfdt = @f0 * p_imbalance / (2.0 * h_sys * s_sys)
 
-        new_df = state.df + dfdt * dt_seconds
-        new_freq = @f0 + new_df
+          new_df = state.df + dfdt * dt_seconds
+          new_freq = @f0 + new_df
 
-        # Below 57 Hz, all conventional generation has tripped on relay 81 —
-        # the grid is collapsed and cannot recover.
-        new_freq = if new_freq < 57.0, do: 0.0, else: min(new_freq, 65.0)
-        new_df = new_freq - @f0
+          # Below 57 Hz, all conventional generation has tripped on relay 81 —
+          # the grid is collapsed and cannot recover.
+          new_freq = if new_freq < 57.0, do: 0.0, else: min(new_freq, 65.0)
+          new_df = new_freq - @f0
 
-        record = %{
-          time: Float.round(t, 4),
-          frequency: Float.round(new_freq, 6),
-          gov_response_mw: Float.round(total_gov_mw, 2),
-          load_shed_mw: Float.round(cumulative_shed, 2)
-        }
+          record = %{
+            time: Float.round(t, 4),
+            frequency: Float.round(new_freq, 6),
+            gov_response_mw: Float.round(total_gov_mw, 2),
+            load_shed_mw: Float.round(cumulative_shed, 2)
+          }
 
-        {[record | records], %{
-          freq: new_freq,
-          df: new_df,
-          gov_state: new_gov_state,
-          ufls_state: new_ufls_state,
-          cumulative_shed_mw: cumulative_shed,
-          total_load_mw: state.total_load_mw
-        }}
-      end)
+          {[record | records],
+           %{
+             freq: new_freq,
+             df: new_df,
+             gov_state: new_gov_state,
+             ufls_state: new_ufls_state,
+             cumulative_shed_mw: cumulative_shed,
+             total_load_mw: state.total_load_mw
+           }}
+        end
+      )
 
     Enum.reverse(trajectory)
   end
@@ -214,7 +223,9 @@ defmodule PowerModel.Solver.Frequency do
 
   defp inertia_for(gen) do
     case Map.get(gen, :inertia_h) do
-      h when is_number(h) and h > 0 -> h
+      h when is_number(h) and h > 0 ->
+        h
+
       _ ->
         fuel = normalize_fuel(Map.get(gen, :fuel_type))
         Map.get(@default_inertia, fuel, 3.5)
@@ -223,7 +234,9 @@ defmodule PowerModel.Solver.Frequency do
 
   defp gov_time_for(gen) do
     case Map.get(gen, :gov_time_constant_s) do
-      t when is_number(t) and t > 0 -> t
+      t when is_number(t) and t > 0 ->
+        t
+
       _ ->
         fuel = normalize_fuel(Map.get(gen, :fuel_type))
         Map.get(@default_gov_time, fuel, 2.0)
@@ -231,19 +244,34 @@ defmodule PowerModel.Solver.Frequency do
   end
 
   defp normalize_fuel(nil), do: "gas"
+
   defp normalize_fuel(fuel) when is_binary(fuel) do
     f = String.downcase(fuel)
+
     cond do
-      String.contains?(f, "nuclear") or String.contains?(f, "nuc") -> "nuclear"
+      String.contains?(f, "nuclear") or String.contains?(f, "nuc") ->
+        "nuclear"
+
       String.contains?(f, "coal") or String.contains?(f, "bit") or
         String.contains?(f, "col") or String.contains?(f, "sub") or
-        String.contains?(f, "lig") -> "coal"
-      String.contains?(f, "gas") or String.contains?(f, "ng") or String.contains?(f, "ct") -> "gas"
+          String.contains?(f, "lig") ->
+        "coal"
+
+      String.contains?(f, "gas") or String.contains?(f, "ng") or String.contains?(f, "ct") ->
+        "gas"
+
       String.contains?(f, "hydro") or String.contains?(f, "wat") or
-        String.contains?(f, "wh") -> "hydro"
-      String.contains?(f, "wind") or String.contains?(f, "wnd") -> "wind"
-      String.contains?(f, "solar") or String.contains?(f, "sun") or String.contains?(f, "pv") -> "solar"
-      true -> "gas"
+          String.contains?(f, "wh") ->
+        "hydro"
+
+      String.contains?(f, "wind") or String.contains?(f, "wnd") ->
+        "wind"
+
+      String.contains?(f, "solar") or String.contains?(f, "sun") or String.contains?(f, "pv") ->
+        "solar"
+
+      true ->
+        "gas"
     end
   end
 
@@ -253,10 +281,11 @@ defmodule PowerModel.Solver.Frequency do
       t_gov = gov_time_for(gen)
       h = inertia_for(gen)
 
-      droop = case Map.get(gen, :droop_pct) do
-        d when is_number(d) and d > 0 -> d / 100.0
-        _ -> @droop
-      end
+      droop =
+        case Map.get(gen, :droop_pct) do
+          d when is_number(d) and d > 0 -> d / 100.0
+          _ -> @droop
+        end
 
       headroom = gen.p_max_mw - p_rated
 

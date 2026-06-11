@@ -10,19 +10,21 @@ defmodule PowerModelWeb.GridComponents do
 
   def loading_bar(assigns) do
     pct = min(assigns.value / assigns.max * 100, 100)
-    color = cond do
-      pct < 50 -> "#2ecc71"
-      pct < 75 -> "#f1c40f"
-      pct < 90 -> "#e67e22"
-      true -> "#e74c3c"
-    end
+
+    color =
+      cond do
+        pct < 50 -> "#2ecc71"
+        pct < 75 -> "#f1c40f"
+        pct < 90 -> "#e67e22"
+        true -> "#e74c3c"
+      end
 
     assigns = assign(assigns, pct: pct, color: color)
 
     ~H"""
     <div class={"loading-bar " <> @class}>
       <div class="loading-fill" style={"width: #{@pct}%; background: #{@color}"}></div>
-      <span class="loading-text"><%= Float.round(@pct, 1) %>%</span>
+      <span class="loading-text">{Float.round(@pct, 1)}%</span>
     </div>
     """
   end
@@ -35,7 +37,7 @@ defmodule PowerModelWeb.GridComponents do
 
     ~H"""
     <span class="voltage-badge" style={"background: #{@color}"}>
-      <%= Float.round(@voltage, 1) %> kV
+      {Float.round(@voltage, 1)} kV
     </span>
     """
   end
@@ -49,7 +51,7 @@ defmodule PowerModelWeb.GridComponents do
     ~H"""
     <span class="state-indicator">
       <span class="state-dot" style={"background: #{@color}"}></span>
-      <%= @label %>
+      {@label}
     </span>
     """
   end
@@ -61,8 +63,11 @@ defmodule PowerModelWeb.GridComponents do
     assigns = assign(assigns, color: color, label: label)
 
     ~H"""
-    <span class="fuel-badge" style={"background: #{@color}20; color: #{@color}; border: 1px solid #{@color}40"}>
-      <%= @label %>
+    <span
+      class="fuel-badge"
+      style={"background: #{@color}20; color: #{@color}; border: 1px solid #{@color}40"}
+    >
+      {@label}
     </span>
     """
   end
@@ -70,18 +75,19 @@ defmodule PowerModelWeb.GridComponents do
   attr :mw, :float, required: true
 
   def power_display(assigns) do
-    {value, unit} = if assigns.mw >= 1000 do
-      {Float.round(assigns.mw / 1000.0, 2), "GW"}
-    else
-      {Float.round(assigns.mw, 1), "MW"}
-    end
+    {value, unit} =
+      if assigns.mw >= 1000 do
+        {Float.round(assigns.mw / 1000.0, 2), "GW"}
+      else
+        {Float.round(assigns.mw, 1), "MW"}
+      end
 
     assigns = assign(assigns, value: value, unit: unit)
 
     ~H"""
     <span class="power-display">
-      <span class="power-value"><%= @value %></span>
-      <span class="power-unit"><%= @unit %></span>
+      <span class="power-value">{@value}</span>
+      <span class="power-unit">{@unit}</span>
     </span>
     """
   end

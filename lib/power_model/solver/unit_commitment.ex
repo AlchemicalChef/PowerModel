@@ -22,22 +22,25 @@ defmodule PowerModel.Solver.UnitCommitment do
     reserve_margin = Keyword.get(opts, :reserve_margin, @default_reserve_margin)
     target_capacity = total_load_mw * reserve_margin
 
-    in_service = Enum.filter(generators, fn g ->
-      Map.get(g, :status, "in_service") == "in_service"
-    end)
+    in_service =
+      Enum.filter(generators, fn g ->
+        Map.get(g, :status, "in_service") == "in_service"
+      end)
 
-    {must_run, dispatchable} = Enum.split_with(in_service, fn g ->
-      fuel = Map.get(g, :fuel_type) || ""
-      MapSet.member?(@must_run_fuels, fuel)
-    end)
+    {must_run, dispatchable} =
+      Enum.split_with(in_service, fn g ->
+        fuel = Map.get(g, :fuel_type) || ""
+        MapSet.member?(@must_run_fuels, fuel)
+      end)
 
     must_run_capacity = Enum.sum(Enum.map(must_run, fn g -> g.p_max_mw || 0.0 end))
 
     remaining_target = max(target_capacity - must_run_capacity, 0.0)
 
-    sorted = Enum.sort_by(dispatchable, fn g ->
-      Map.get(g, :marginal_cost_per_mwh) || 999.0
-    end)
+    sorted =
+      Enum.sort_by(dispatchable, fn g ->
+        Map.get(g, :marginal_cost_per_mwh) || 999.0
+      end)
 
     {committed_dispatchable, _cap} =
       Enum.reduce(sorted, {[], 0.0}, fn g, {acc, cap} ->

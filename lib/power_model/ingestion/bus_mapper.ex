@@ -51,11 +51,13 @@ defmodule PowerModel.Ingestion.BusMapper do
   defp determine_voltage_levels(sub) do
     levels = []
     levels = if sub.max_voltage_kv, do: [sub.max_voltage_kv | levels], else: levels
-    levels = if sub.min_voltage_kv && sub.min_voltage_kv != sub.max_voltage_kv do
-      [sub.min_voltage_kv | levels]
-    else
-      levels
-    end
+
+    levels =
+      if sub.min_voltage_kv && sub.min_voltage_kv != sub.max_voltage_kv do
+        [sub.min_voltage_kv | levels]
+      else
+        levels
+      end
 
     case levels do
       [] -> [138.0]
@@ -64,8 +66,9 @@ defmodule PowerModel.Ingestion.BusMapper do
   end
 
   defp map_generators_to_buses do
-    generators = from(g in Generator, where: is_nil(g.bus_id) and not is_nil(g.coordinates))
-                 |> Repo.all()
+    generators =
+      from(g in Generator, where: is_nil(g.bus_id) and not is_nil(g.coordinates))
+      |> Repo.all()
 
     Enum.each(generators, fn gen ->
       nearest_bus = find_nearest_bus(gen.coordinates, @gen_match_radius_m)
@@ -75,15 +78,16 @@ defmodule PowerModel.Ingestion.BusMapper do
         |> Ecto.Changeset.change(%{bus_id: nearest_bus.id})
         |> Repo.update()
       else
-        {:ok, bus} = %Bus{}
-        |> Bus.changeset(%{
-          bus_type: 2,
-          base_kv: 13.8,
-          coordinates: gen.coordinates,
-          source: "synthetic",
-          source_id: "gen_#{gen.id}"
-        })
-        |> Repo.insert()
+        {:ok, bus} =
+          %Bus{}
+          |> Bus.changeset(%{
+            bus_type: 2,
+            base_kv: 13.8,
+            coordinates: gen.coordinates,
+            source: "synthetic",
+            source_id: "gen_#{gen.id}"
+          })
+          |> Repo.insert()
 
         gen
         |> Ecto.Changeset.change(%{bus_id: bus.id})
@@ -93,9 +97,11 @@ defmodule PowerModel.Ingestion.BusMapper do
   end
 
   defp map_transmission_line_buses do
-    lines = from(tl in TransmissionLine,
-      where: is_nil(tl.from_bus_id) or is_nil(tl.to_bus_id)
-    ) |> Repo.all()
+    lines =
+      from(tl in TransmissionLine,
+        where: is_nil(tl.from_bus_id) or is_nil(tl.to_bus_id)
+      )
+      |> Repo.all()
 
     Enum.each(lines, fn line ->
       from_point = get_line_endpoint(line.geometry, :from)
@@ -117,16 +123,20 @@ defmodule PowerModel.Ingestion.BusMapper do
   end
 
   defp create_substation_transformers do
-    buses_by_source = from(b in Bus,
-      where: b.source == "substation",
-      select: b
-    ) |> Repo.all() |> Enum.group_by(fn b ->
-      b.source_id |> String.split("_") |> List.first()
-    end)
+    buses_by_source =
+      from(b in Bus,
+        where: b.source == "substation",
+        select: b
+      )
+      |> Repo.all()
+      |> Enum.group_by(fn b ->
+        b.source_id |> String.split("_") |> List.first()
+      end)
 
     Enum.each(buses_by_source, fn {_sub_id, buses} ->
       if length(buses) >= 2 do
         sorted = Enum.sort_by(buses, & &1.base_kv, :desc)
+
         sorted
         |> Enum.chunk_every(2, 1, :discard)
         |> Enum.each(fn [high, low] ->
@@ -149,26 +159,25 @@ defmodule PowerModel.Ingestion.BusMapper do
 
   defp find_nearest_bus(point, radius_m) do
     from(b in Bus,
-      where: fragment("ST_DWithin(?::geography, ?::geography, ?)",
-                       b.coordinates, ^point, ^radius_m),
-      order_by: fragment("ST_Distance(?::geography, ?::geography)",
-                          b.coordinates, ^point),
+      where:
+        fragment("ST_DWithin(?::geography, ?::geography, ?)", b.coordinates, ^point, ^radius_m),
+      order_by: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
       limit: 1
     )
     |> Repo.one()
   end
 
   defp find_nearest_bus_at_voltage(nil, _kv, _radius), do: nil
+
   defp find_nearest_bus_at_voltage(point, voltage_kv, radius_m) do
     tolerance = voltage_kv * 0.1
 
     from(b in Bus,
-      where: fragment("ST_DWithin(?::geography, ?::geography, ?)",
-                       b.coordinates, ^point, ^radius_m)
-             and b.base_kv >= ^(voltage_kv - tolerance)
-             and b.base_kv <= ^(voltage_kv + tolerance),
-      order_by: fragment("ST_Distance(?::geography, ?::geography)",
-                          b.coordinates, ^point),
+      where:
+        fragment("ST_DWithin(?::geography, ?::geography, ?)", b.coordinates, ^point, ^radius_m) and
+          b.base_kv >= ^(voltage_kv - tolerance) and
+          b.base_kv <= ^(voltage_kv + tolerance),
+      order_by: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
       limit: 1
     )
     |> Repo.one()
@@ -181,6 +190,7 @@ defmodule PowerModel.Ingestion.BusMapper do
       _ -> nil
     end
   end
+
   defp get_line_endpoint(%Geo.LineString{coordinates: coords}, :to) do
     case List.last(coords) do
       {lon, lat} -> %Geo.Point{coordinates: {lon, lat}, srid: 4326}
@@ -188,9 +198,11 @@ defmodule PowerModel.Ingestion.BusMapper do
       _ -> nil
     end
   end
+
   defp get_line_endpoint(_, _), do: nil
 
   defp determine_interconnection(nil), do: nil
+
   defp determine_interconnection(%Geo.Point{coordinates: {lon, lat}}) do
     cond do
       lat >= 25.8 and lat <= 36.5 and lon >= -104.0 and lon <= -93.5 ->
@@ -203,17 +215,21 @@ defmodule PowerModel.Ingestion.BusMapper do
         get_or_create_interconnection("Eastern")
     end
   end
+
   defp determine_interconnection(_), do: nil
 
   defp get_or_create_interconnection(name) do
     alias PowerModel.Grid.Interconnection
 
     case Repo.get_by(Interconnection, name: name) do
-      %{id: id} -> id
+      %{id: id} ->
+        id
+
       nil ->
-        {:ok, ic} = %Interconnection{}
-        |> Interconnection.changeset(%{name: name})
-        |> Repo.insert(on_conflict: :nothing, conflict_target: [:name])
+        {:ok, ic} =
+          %Interconnection{}
+          |> Interconnection.changeset(%{name: name})
+          |> Repo.insert(on_conflict: :nothing, conflict_target: [:name])
 
         case ic.id do
           nil -> Repo.get_by!(Interconnection, name: name).id

@@ -79,13 +79,14 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
   describe "solve/2 basic" do
     test "2-bus system: single gen, single load" do
       # Bus 1 (gen 100MW) --line--> Bus 2 (load 80MW)
-      snap = snapshot(
-        [bus(1, bus_type: 3), bus(2)],
-        [line(1, 1, 2, x_pu: 0.1)],
-        [],
-        [generator(1, 1, p_max_mw: 100.0)],
-        [load(1, 2, p_mw: 80.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1, bus_type: 3), bus(2)],
+          [line(1, 1, 2, x_pu: 0.1)],
+          [],
+          [generator(1, 1, p_max_mw: 100.0)],
+          [load(1, 2, p_mw: 80.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
 
@@ -96,6 +97,7 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
       assert Enum.at(solution.va_rad, 0) == 0.0
       # Non-slack bus should have a non-zero angle
       refute Enum.at(solution.va_rad, 1) == 0.0
+
       # Line flow should be ~20 MW (gen 100 - load 80 = 20 MW net at slack, flow = 80 MW to load bus)
       {_key, flow} = Enum.find(solution.line_flows, fn {{type, _id}, _f} -> type == :line end)
       assert abs(flow.p_flow_mw) > 0.0
@@ -103,13 +105,14 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
 
     test "balanced system: gen equals load, no flow" do
       # Gen 50MW on bus 1, Load 50MW on bus 1 => net injection = 0 at every bus
-      snap = snapshot(
-        [bus(1, bus_type: 3), bus(2)],
-        [line(1, 1, 2, x_pu: 0.1)],
-        [],
-        [generator(1, 1, p_max_mw: 50.0)],
-        [load(1, 1, p_mw: 50.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1, bus_type: 3), bus(2)],
+          [line(1, 1, 2, x_pu: 0.1)],
+          [],
+          [generator(1, 1, p_max_mw: 50.0)],
+          [load(1, 1, p_mw: 50.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
 
@@ -120,13 +123,14 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
     end
 
     test "3-bus system with transformer" do
-      snap = snapshot(
-        [bus(1, bus_type: 3), bus(2), bus(3)],
-        [line(1, 1, 2, x_pu: 0.1)],
-        [transformer(1, 2, 3, x_pu: 0.05)],
-        [generator(1, 1, p_max_mw: 200.0)],
-        [load(1, 3, p_mw: 100.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1, bus_type: 3), bus(2), bus(3)],
+          [line(1, 1, 2, x_pu: 0.1)],
+          [transformer(1, 2, 3, x_pu: 0.05)],
+          [generator(1, 1, p_max_mw: 200.0)],
+          [load(1, 3, p_mw: 100.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
 
@@ -138,13 +142,14 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
     end
 
     test "single bus system returns trivial solution" do
-      snap = snapshot(
-        [bus(1, bus_type: 3)],
-        [],
-        [],
-        [generator(1, 1, p_max_mw: 100.0)],
-        [load(1, 1, p_mw: 50.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1, bus_type: 3)],
+          [],
+          [],
+          [generator(1, 1, p_max_mw: 100.0)],
+          [load(1, 1, p_mw: 50.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
 
@@ -168,13 +173,14 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
   describe "line flows" do
     test "flow direction follows power injection" do
       # Gen on bus 1, load on bus 2 => flow goes 1->2 (positive)
-      snap = snapshot(
-        [bus(1, bus_type: 3), bus(2)],
-        [line(1, 1, 2, x_pu: 0.1)],
-        [],
-        [generator(1, 1, p_max_mw: 100.0)],
-        [load(1, 2, p_mw: 80.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1, bus_type: 3), bus(2)],
+          [line(1, 1, 2, x_pu: 0.1)],
+          [],
+          [generator(1, 1, p_max_mw: 100.0)],
+          [load(1, 2, p_mw: 80.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
       {{:line, 1}, flow} = Enum.find(solution.line_flows, fn {{_, id}, _} -> id == 1 end)
@@ -185,13 +191,14 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
 
     test "loading_pct computed correctly" do
       # Line rated at 100 MVA, flow should be ~80 MW => loading ~80%
-      snap = snapshot(
-        [bus(1, bus_type: 3), bus(2)],
-        [line(1, 1, 2, x_pu: 0.1, rating_a_mva: 100.0)],
-        [],
-        [generator(1, 1, p_max_mw: 100.0)],
-        [load(1, 2, p_mw: 80.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1, bus_type: 3), bus(2)],
+          [line(1, 1, 2, x_pu: 0.1, rating_a_mva: 100.0)],
+          [],
+          [generator(1, 1, p_max_mw: 100.0)],
+          [load(1, 2, p_mw: 80.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
       {{:line, 1}, flow} = Enum.find(solution.line_flows, fn {{_, id}, _} -> id == 1 end)
@@ -203,13 +210,14 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
 
     test "overloaded flag set when flow exceeds rating" do
       # Line rated 50 MVA, flow ~80 MW => overloaded
-      snap = snapshot(
-        [bus(1, bus_type: 3), bus(2)],
-        [line(1, 1, 2, x_pu: 0.1, rating_a_mva: 50.0)],
-        [],
-        [generator(1, 1, p_max_mw: 100.0)],
-        [load(1, 2, p_mw: 80.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1, bus_type: 3), bus(2)],
+          [line(1, 1, 2, x_pu: 0.1, rating_a_mva: 50.0)],
+          [],
+          [generator(1, 1, p_max_mw: 100.0)],
+          [load(1, 2, p_mw: 80.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
       {{:line, 1}, flow} = Enum.find(solution.line_flows, fn {{_, id}, _} -> id == 1 end)
@@ -220,16 +228,17 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
 
     test "parallel lines split flow" do
       # Two identical parallel lines: each should carry ~half the flow
-      snap = snapshot(
-        [bus(1, bus_type: 3), bus(2)],
-        [
-          line(1, 1, 2, x_pu: 0.1, rating_a_mva: 200.0),
-          line(2, 1, 2, x_pu: 0.1, rating_a_mva: 200.0)
-        ],
-        [],
-        [generator(1, 1, p_max_mw: 100.0)],
-        [load(1, 2, p_mw: 80.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1, bus_type: 3), bus(2)],
+          [
+            line(1, 1, 2, x_pu: 0.1, rating_a_mva: 200.0),
+            line(2, 1, 2, x_pu: 0.1, rating_a_mva: 200.0)
+          ],
+          [],
+          [generator(1, 1, p_max_mw: 100.0)],
+          [load(1, 2, p_mw: 80.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
 
@@ -243,16 +252,17 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
 
     test "flow splits inversely with reactance" do
       # Two parallel lines with different reactances: lower X gets more flow
-      snap = snapshot(
-        [bus(1, bus_type: 3), bus(2)],
-        [
-          line(1, 1, 2, x_pu: 0.05, rating_a_mva: 200.0),
-          line(2, 1, 2, x_pu: 0.15, rating_a_mva: 200.0)
-        ],
-        [],
-        [generator(1, 1, p_max_mw: 100.0)],
-        [load(1, 2, p_mw: 80.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1, bus_type: 3), bus(2)],
+          [
+            line(1, 1, 2, x_pu: 0.05, rating_a_mva: 200.0),
+            line(2, 1, 2, x_pu: 0.15, rating_a_mva: 200.0)
+          ],
+          [],
+          [generator(1, 1, p_max_mw: 100.0)],
+          [load(1, 2, p_mw: 80.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
 
@@ -272,13 +282,14 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
 
   describe "slack bus" do
     test "explicit slack bus (type 3) is used" do
-      snap = snapshot(
-        [bus(1), bus(2, bus_type: 3), bus(3)],
-        [line(1, 1, 2, x_pu: 0.1), line(2, 2, 3, x_pu: 0.1)],
-        [],
-        [generator(1, 1, p_max_mw: 50.0), generator(2, 2, p_max_mw: 100.0)],
-        [load(1, 3, p_mw: 80.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1), bus(2, bus_type: 3), bus(3)],
+          [line(1, 1, 2, x_pu: 0.1), line(2, 2, 3, x_pu: 0.1)],
+          [],
+          [generator(1, 1, p_max_mw: 50.0), generator(2, 2, p_max_mw: 100.0)],
+          [load(1, 3, p_mw: 80.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
 
@@ -288,13 +299,14 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
     end
 
     test "without explicit slack, largest generator bus becomes slack" do
-      snap = snapshot(
-        [bus(1), bus(2), bus(3)],
-        [line(1, 1, 2, x_pu: 0.1), line(2, 2, 3, x_pu: 0.1)],
-        [],
-        [generator(1, 1, p_max_mw: 50.0), generator(2, 3, p_max_mw: 200.0)],
-        [load(1, 2, p_mw: 80.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1), bus(2), bus(3)],
+          [line(1, 1, 2, x_pu: 0.1), line(2, 2, 3, x_pu: 0.1)],
+          [],
+          [generator(1, 1, p_max_mw: 50.0), generator(2, 3, p_max_mw: 200.0)],
+          [load(1, 2, p_mw: 80.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
 
@@ -309,13 +321,14 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
 
   describe "solution properties" do
     test "solution has correct bus count" do
-      snap = snapshot(
-        [bus(1, bus_type: 3), bus(2), bus(3)],
-        [line(1, 1, 2, x_pu: 0.1), line(2, 2, 3, x_pu: 0.1)],
-        [],
-        [generator(1, 1, p_max_mw: 200.0)],
-        [load(1, 2, p_mw: 50.0), load(2, 3, p_mw: 30.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1, bus_type: 3), bus(2), bus(3)],
+          [line(1, 1, 2, x_pu: 0.1), line(2, 2, 3, x_pu: 0.1)],
+          [],
+          [generator(1, 1, p_max_mw: 200.0)],
+          [load(1, 2, p_mw: 50.0), load(2, 3, p_mw: 30.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
 
@@ -325,13 +338,14 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
     end
 
     test "solution struct has expected fields" do
-      snap = snapshot(
-        [bus(1, bus_type: 3), bus(2)],
-        [line(1, 1, 2, x_pu: 0.1)],
-        [],
-        [generator(1, 1, p_max_mw: 150.0, capacity_factor: 0.8)],
-        [load(1, 2, p_mw: 100.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1, bus_type: 3), bus(2)],
+          [line(1, 1, 2, x_pu: 0.1)],
+          [],
+          [generator(1, 1, p_max_mw: 150.0, capacity_factor: 0.8)],
+          [load(1, 2, p_mw: 100.0)]
+        )
 
       solution = DCPowerFlow.solve(snap)
 
@@ -342,13 +356,14 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
     end
 
     test "custom base_mva" do
-      snap = snapshot(
-        [bus(1, bus_type: 3), bus(2)],
-        [line(1, 1, 2, x_pu: 0.1)],
-        [],
-        [generator(1, 1, p_max_mw: 100.0)],
-        [load(1, 2, p_mw: 80.0)]
-      )
+      snap =
+        snapshot(
+          [bus(1, bus_type: 3), bus(2)],
+          [line(1, 1, 2, x_pu: 0.1)],
+          [],
+          [generator(1, 1, p_max_mw: 100.0)],
+          [load(1, 2, p_mw: 80.0)]
+        )
 
       solution = DCPowerFlow.solve(snap, base_mva: 200.0)
 
@@ -367,6 +382,7 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
     test "5-bus ring network" do
       # Ring: 1-2-3-4-5-1
       buses = for i <- 1..5, do: bus(i, bus_type: if(i == 1, do: 3, else: 1))
+
       lines = [
         line(1, 1, 2, x_pu: 0.1),
         line(2, 2, 3, x_pu: 0.1),
@@ -374,7 +390,9 @@ defmodule PowerModel.Solver.DCPowerFlowTest do
         line(4, 4, 5, x_pu: 0.1),
         line(5, 5, 1, x_pu: 0.1)
       ]
+
       gens = [generator(1, 1, p_max_mw: 200.0)]
+
       loads = [
         load(1, 2, p_mw: 30.0),
         load(2, 3, p_mw: 40.0),

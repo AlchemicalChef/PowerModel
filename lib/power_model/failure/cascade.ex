@@ -21,7 +21,15 @@ defmodule PowerModel.Failure.Cascade do
 
   require Logger
 
-  alias PowerModel.Solver.{DCPowerFlow, NewtonRaphson, EconomicDispatch, UnitCommitment, LODF, OPF}
+  alias PowerModel.Solver.{
+    DCPowerFlow,
+    NewtonRaphson,
+    EconomicDispatch,
+    UnitCommitment,
+    LODF,
+    OPF
+  }
+
   alias PowerModel.Solver.Frequency
   alias PowerModel.Solver.Stability.{CPF, SmallSignal}
   alias PowerModel.Solver.Harmonics.Scenario, as: HarmonicsScenario
@@ -53,10 +61,23 @@ defmodule PowerModel.Failure.Cascade do
     :stable,
     :solution,
     :simulated_time,
+    :pending_events,
     :dispatch,
     :frequency_hz,
+    :island_frequency_hz,
+    :thermal_state,
+    :lodf_reference_dispatch,
+    :lodf_reference_load_mw,
     :use_ac,
     :use_transient,
+    :transient_checks_run,
+    :transient_unstable_checks,
+    :transient_failed_checks,
+    :transient_last_stable,
+    :transient_last_oos_count,
+    :transient_last_min_frequency_hz,
+    :transient_last_max_delta_deg,
+    :transient_last_duration_s,
     :last_solution,
     # Layer 2 controls
     :agc_state,
@@ -127,7 +148,10 @@ defmodule PowerModel.Failure.Cascade do
           {result.dispatch, result, result.lmps, result.congested_lines}
         rescue
           e ->
-            Logger.warning("[CASCADE INIT] OPF failed, falling back to EconomicDispatch: #{inspect(e)}")
+            Logger.warning(
+              "[CASCADE INIT] OPF failed, falling back to EconomicDispatch: #{inspect(e)}"
+            )
+
             {EconomicDispatch.dispatch(online_gens, total_load), nil, nil, nil}
         end
       else
@@ -148,35 +172,48 @@ defmodule PowerModel.Failure.Cascade do
     sil_loading = recompute_line_loading_map(base_solution, sil_lines)
 
     calibrated_lines = calibrate_ratings(sil_lines, sil_loading)
-    calibrated_xfmrs = calibrate_transformer_ratings(Map.get(snapshot, :transformers, []), raw_loading)
+
+    calibrated_xfmrs =
+      calibrate_transformer_ratings(Map.get(snapshot, :transformers, []), raw_loading)
 
     # Recompute loading percentages with fully calibrated ratings (no re-solve needed —
     # theta is the same because impedances and injections haven't changed)
-    {base_overloaded, base_loading} = recompute_loading_from_solution(
-      base_solution, calibrated_lines, calibrated_xfmrs
-    )
+    {base_overloaded, base_loading} =
+      recompute_loading_from_solution(
+        base_solution,
+        calibrated_lines,
+        calibrated_xfmrs
+      )
 
     # Initialize LODF for fast cascade steps (if base solution is available)
-    lodf_state = if base_solution do
-      try do
-        LODF.init(
-          %{buses: snapshot.buses, lines: calibrated_lines,
-            transformers: calibrated_xfmrs, generators: online_gens,
-            loads: snapshot.loads},
-          base_solution, base_mva: base_mva)
-      rescue
-        _ -> nil
+    lodf_state =
+      if base_solution do
+        try do
+          LODF.init(
+            %{
+              buses: snapshot.buses,
+              lines: calibrated_lines,
+              transformers: calibrated_xfmrs,
+              generators: online_gens,
+              loads: snapshot.loads
+            },
+            base_solution,
+            base_mva: base_mva
+          )
+        rescue
+          _ -> nil
+        end
+      else
+        nil
       end
-    else
-      nil
-    end
 
     # Initialize Layer 2 controls from snapshot data
     agc_state = init_agc(online_gens, dispatch)
 
-    oltc_states = calibrated_xfmrs
-    |> Enum.filter(fn x -> Map.get(x, :tap_ratio) != nil end)
-    |> Map.new(fn x -> {x.id, OLTC.init(x)} end)
+    oltc_states =
+      calibrated_xfmrs
+      |> Enum.filter(fn x -> Map.get(x, :tap_ratio) != nil end)
+      |> Map.new(fn x -> {x.id, OLTC.init(x)} end)
 
     svcs = Map.get(snapshot, :svcs, [])
     svc_states = Map.new(svcs, fn s -> {s.id, SVCController.init(s)} end)
@@ -211,10 +248,23 @@ defmodule PowerModel.Failure.Cascade do
       stable: false,
       solution: base_solution,
       simulated_time: 0.0,
+      pending_events: %{},
       dispatch: dispatch,
       frequency_hz: 60.0,
+      island_frequency_hz: %{0 => 60.0},
+      thermal_state: initial_thermal_state(base_solution),
+      lodf_reference_dispatch: dispatch,
+      lodf_reference_load_mw: total_load,
       use_ac: use_ac,
       use_transient: use_transient,
+      transient_checks_run: 0,
+      transient_unstable_checks: 0,
+      transient_failed_checks: 0,
+      transient_last_stable: nil,
+      transient_last_oos_count: nil,
+      transient_last_min_frequency_hz: nil,
+      transient_last_max_delta_deg: nil,
+      transient_last_duration_s: nil,
       last_solution: nil,
       agc_state: agc_state,
       oltc_states: oltc_states,
@@ -248,65 +298,74 @@ defmodule PowerModel.Failure.Cascade do
     }
 
     # Integration 1: Apply scenario if provided
-    state = if scenario do
-      try do
-        state = Scenarios.apply_scenario(state, scenario)
-        # Record scenario in events
-        event = %{
-          step: 0,
-          component_type: "system",
-          component_id: nil,
-          failure_cause: "scenario_applied",
-          details: %{description: scenario.description}
-        }
-        # Re-dispatch after scenario modifications (loads/ratings changed)
-        active_gens = active_generators(state)
-        new_total_load = Enum.sum_by(state.loads, & &1.p_mw)
-        new_dispatch = if use_opf do
-          try do
-            snap = build_active_snapshot(state)
-            result = OPF.solve(snap, base_mva: base_mva)
-            result.dispatch
-          rescue
-            _ -> EconomicDispatch.dispatch(active_gens, new_total_load)
-          end
-        else
-          EconomicDispatch.dispatch(active_gens, new_total_load)
+    state =
+      if scenario do
+        try do
+          state = Scenarios.apply_scenario(state, scenario)
+          # Record scenario in events
+          event = %{
+            step: 0,
+            component_type: "system",
+            component_id: nil,
+            failure_cause: "scenario_applied",
+            details: %{description: scenario.description}
+          }
+
+          # Re-dispatch after scenario modifications (loads/ratings changed)
+          active_gens = active_generators(state)
+          new_total_load = Enum.sum_by(state.loads, & &1.p_mw)
+
+          new_dispatch =
+            if use_opf do
+              try do
+                snap = build_active_snapshot(state)
+                result = OPF.solve(snap, base_mva: base_mva)
+                result.dispatch
+              rescue
+                _ -> EconomicDispatch.dispatch(active_gens, new_total_load)
+              end
+            else
+              EconomicDispatch.dispatch(active_gens, new_total_load)
+            end
+
+          %{state | dispatch: new_dispatch, events: [event | state.events]}
+        rescue
+          e ->
+            Logger.warning("[CASCADE INIT] Scenario application failed: #{inspect(e)}")
+            state
         end
-        %{state | dispatch: new_dispatch, events: [event | state.events]}
-      rescue
-        e ->
-          Logger.warning("[CASCADE INIT] Scenario application failed: #{inspect(e)}")
-          state
+      else
+        state
       end
-    else
-      state
-    end
 
     state
   end
 
   defp init_agc(online_gens, dispatch) do
-    agc_gens = Enum.filter(online_gens, fn g ->
-      (Map.get(g, :agc_participation_factor) || 0.0) > 0.0
-    end)
+    agc_gens =
+      Enum.filter(online_gens, fn g ->
+        (Map.get(g, :agc_participation_factor) || 0.0) > 0.0
+      end)
 
     if Enum.empty?(agc_gens) do
       nil
     else
-      gens_with_dispatch = Enum.map(agc_gens, fn g ->
-        Map.put(g, :dispatch_mw, Map.get(dispatch, g.id, 0.0))
-      end)
+      gens_with_dispatch =
+        Enum.map(agc_gens, fn g ->
+          Map.put(g, :dispatch_mw, Map.get(dispatch, g.id, 0.0))
+        end)
+
       AGC.init(gens_with_dispatch)
     end
   end
 
   # Solve DC once and return {solution, loading_map}
   defp compute_base_solution(snapshot, dispatch, base_mva) do
-    dispatched_gens = Enum.map(snapshot.generators, fn g ->
-      d = Map.get(dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
-      %{g | p_max_mw: d, capacity_factor: 1.0}
-    end)
+    dispatched_gens =
+      Enum.map(snapshot.generators, fn g ->
+        d = Map.get(dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
+        %{g | p_max_mw: d, capacity_factor: 1.0}
+      end)
 
     base_snapshot = %{
       buses: snapshot.buses,
@@ -319,15 +378,17 @@ defmodule PowerModel.Failure.Cascade do
     try do
       solution = DCPowerFlow.solve(base_snapshot, base_mva: base_mva)
 
-      base_loading = Map.new(solution.line_flows, fn {key, flow} ->
-        {key, flow.loading_pct}
-      end)
+      base_loading =
+        Map.new(solution.line_flows, fn {key, flow} ->
+          {key, flow.loading_pct}
+        end)
 
       {solution, base_loading}
     catch
       :throw, {:error, reason} ->
         Logger.warning("[CASCADE INIT] base solve failed: #{inspect(reason)}")
         {nil, %{}}
+
       kind, reason ->
         Logger.error("[CASCADE INIT] base solve unexpected failure: #{kind} #{inspect(reason)}")
         {nil, %{}}
@@ -337,6 +398,7 @@ defmodule PowerModel.Failure.Cascade do
   # Recompute just line loading percentages (for intermediate calibration steps).
   # Returns a map of {:line, id} => loading_pct.
   defp recompute_line_loading_map(nil, _lines), do: %{}
+
   defp recompute_line_loading_map(solution, lines) do
     line_rating_map = Map.new(lines, fn l -> {l.id, l.rating_a_mva} end)
 
@@ -344,11 +406,14 @@ defmodule PowerModel.Failure.Cascade do
     |> Enum.filter(fn {{type, _}, _} -> type == :line end)
     |> Map.new(fn {{:line, id} = key, flow} ->
       rating = Map.get(line_rating_map, id)
-      loading_pct = if rating && rating > 0 do
-        abs(flow.p_flow_mw) / rating * 100.0
-      else
-        0.0
-      end
+
+      loading_pct =
+        if rating && rating > 0 do
+          abs(flow.p_flow_mw) / rating * 100.0
+        else
+          0.0
+        end
+
       {key, loading_pct}
     end)
   end
@@ -356,25 +421,29 @@ defmodule PowerModel.Failure.Cascade do
   # Recompute loading percentages from an existing solution with updated ratings.
   # No re-solve needed — theta and flows in MW are the same, only loading_pct changes.
   defp recompute_loading_from_solution(nil, _lines, _xfmrs), do: {MapSet.new(), %{}}
+
   defp recompute_loading_from_solution(solution, lines, transformers) do
     line_rating_map = Map.new(lines, fn l -> {l.id, l.rating_a_mva} end)
     xfmr_rating_map = Map.new(transformers, fn x -> {x.id, x.rated_mva} end)
 
-    base_loading = Map.new(solution.line_flows, fn {{type, id} = key, flow} ->
-      rating = case type do
-        :line -> Map.get(line_rating_map, id)
-        :transformer -> Map.get(xfmr_rating_map, id)
-        _ -> nil
-      end
+    base_loading =
+      Map.new(solution.line_flows, fn {{type, id} = key, flow} ->
+        rating =
+          case type do
+            :line -> Map.get(line_rating_map, id)
+            :transformer -> Map.get(xfmr_rating_map, id)
+            _ -> nil
+          end
 
-      loading_pct = if rating && rating > 0 do
-        abs(flow.p_flow_mw) / rating * 100.0
-      else
-        0.0
-      end
+        loading_pct =
+          if rating && rating > 0 do
+            abs(flow.p_flow_mw) / rating * 100.0
+          else
+            0.0
+          end
 
-      {key, loading_pct}
-    end)
+        {key, loading_pct}
+      end)
 
     overloaded_set =
       base_loading
@@ -406,11 +475,12 @@ defmodule PowerModel.Failure.Cascade do
         new_a = line.rating_a_mva * scale
         updates = %{line | rating_a_mva: new_a}
 
-        updates = if Map.get(line, :rating_b_mva) do
-          %{updates | rating_b_mva: line.rating_b_mva * scale}
-        else
-          updates
-        end
+        updates =
+          if Map.get(line, :rating_b_mva) do
+            %{updates | rating_b_mva: line.rating_b_mva * scale}
+          else
+            updates
+          end
 
         if Map.get(line, :rating_c_mva) do
           %{updates | rating_c_mva: line.rating_c_mva * scale}
@@ -451,10 +521,21 @@ defmodule PowerModel.Failure.Cascade do
   Returns {final_state, all_step_results} for streaming.
   """
   def trip_line(%__MODULE__{} = state, line_id) do
-    state = %{state |
-      tripped_lines: MapSet.put(state.tripped_lines, line_id),
-      events: [trip_event("transmission_line", line_id) | state.events]
+    manual_trip = trip_event("transmission_line", line_id)
+
+    state = %{
+      state
+      | tripped_lines: MapSet.put(state.tripped_lines, line_id),
+        events: [manual_trip | state.events]
     }
+
+    state =
+      if should_check_transient?(state, [manual_trip]) do
+        check_transient_stability(state, [manual_trip])
+      else
+        state
+      end
+
     run_cascade(state)
   end
 
@@ -473,10 +554,11 @@ defmodule PowerModel.Failure.Cascade do
     # Invalidate LODF state: LODF only models topology changes (line outages),
     # not injection changes.  A generator trip changes the P-injection vector,
     # so a full DC re-solve is required to compute the new line flows correctly.
-    state = %{state |
-      tripped_generators: MapSet.put(state.tripped_generators, gen_id),
-      events: [trip_event("generator", gen_id) | state.events],
-      lodf_state: nil
+    state = %{
+      state
+      | tripped_generators: MapSet.put(state.tripped_generators, gen_id),
+        events: [trip_event("generator", gen_id) | state.events],
+        lodf_state: nil
     }
 
     # --- Frequency transient: compute nadir BEFORE redispatch ---
@@ -488,55 +570,64 @@ defmodule PowerModel.Failure.Cascade do
     # Set capacity_factor to dispatch/p_max so the frequency simulator
     # sees the correct operating point and governor headroom.
     # Without this, CF=1.0 means p_rated=p_max and headroom=0.
-    freq_gens = Enum.map(active_gens, fn g ->
-      dispatch_mw = Map.get(state.dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
-      cf = if g.p_max_mw > 0, do: dispatch_mw / g.p_max_mw, else: 1.0
-      %{g | capacity_factor: min(cf, 0.95)}  # cap at 95% to ensure some headroom
-    end)
+    freq_gens =
+      Enum.map(active_gens, fn g ->
+        dispatch_mw = Map.get(state.dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
+        cf = if g.p_max_mw > 0, do: dispatch_mw / g.p_max_mw, else: 1.0
+        # cap at 95% to ensure some headroom
+        %{g | capacity_factor: min(cf, 0.95)}
+      end)
 
-    nadir_hz = if lost_mw > 0.0 do
-      try do
-        trajectory = Frequency.simulate(freq_gens, state.loads, lost_mw, 0.1, 30.0)
-        Frequency.nadir(trajectory)
-      rescue
-        _ -> 60.0
+    nadir_hz =
+      if lost_mw > 0.0 do
+        try do
+          trajectory = Frequency.simulate(freq_gens, state.loads, lost_mw, 0.1, 30.0)
+          Frequency.nadir(trajectory)
+        rescue
+          _ -> 60.0
+        end
+      else
+        60.0
       end
-    else
-      60.0
-    end
 
-    state = %{state | frequency_hz: nadir_hz}
+    state = %{state | frequency_hz: nadir_hz, island_frequency_hz: %{0 => nadir_hz}}
 
     # Record frequency event when nadir is significant
-    state = if nadir_hz < 59.95 do
-      freq_event = %{
-        step: 0,
-        component_type: "system",
-        component_id: nil,
-        failure_cause: "frequency_excursion",
-        details: %{
-          nadir_hz: Float.round(nadir_hz, 3),
-          lost_mw: Float.round(lost_mw, 1),
-          tripped_gen_id: gen_id
+    state =
+      if nadir_hz < 59.95 do
+        freq_event = %{
+          step: 0,
+          component_type: "system",
+          component_id: nil,
+          failure_cause: "frequency_excursion",
+          details: %{
+            nadir_hz: Float.round(nadir_hz, 3),
+            lost_mw: Float.round(lost_mw, 1),
+            tripped_gen_id: gen_id
+          }
         }
-      }
-      %{state | events: [freq_event | state.events]}
-    else
-      state
-    end
+
+        %{state | events: [freq_event | state.events]}
+      else
+        state
+      end
 
     # --- Check generator relay 81 trips at the nadir frequency ---
     # This creates the critical feedback loop: gen trip -> freq drop ->
     # more gen trips -> deeper freq drop -> UFLS
     gen_relay_trips = Protection.check_generator_relays(active_gens, nadir_hz)
-    gen_relay_trips = Enum.reject(gen_relay_trips, fn t ->
-      MapSet.member?(state.tripped_generators, t.component_id)
-    end)
+
+    gen_relay_trips =
+      Enum.reject(gen_relay_trips, fn t ->
+        MapSet.member?(state.tripped_generators, t.component_id)
+      end)
 
     # Apply relay-tripped generators
-    relay_lost_mw = Enum.sum_by(gen_relay_trips, fn t ->
-      Map.get(state.dispatch, t.component_id, 0.0)
-    end)
+    relay_lost_mw =
+      Enum.sum_by(gen_relay_trips, fn t ->
+        Map.get(state.dispatch, t.component_id, 0.0)
+      end)
+
     state = apply_trips(state, gen_relay_trips)
 
     total_lost_mw = lost_mw + relay_lost_mw
@@ -560,49 +651,63 @@ defmodule PowerModel.Failure.Cascade do
   def trip_generators(%__MODULE__{} = state, gen_ids) when is_list(gen_ids) do
     total_lost = Enum.sum_by(gen_ids, fn id -> Map.get(state.dispatch, id, 0.0) end)
 
-    state = Enum.reduce(gen_ids, state, fn id, s ->
-      %{s |
-        tripped_generators: MapSet.put(s.tripped_generators, id),
-        events: [trip_event("generator", id) | s.events],
-        lodf_state: nil
-      }
-    end)
+    state =
+      Enum.reduce(gen_ids, state, fn id, s ->
+        %{
+          s
+          | tripped_generators: MapSet.put(s.tripped_generators, id),
+            events: [trip_event("generator", id) | s.events],
+            lodf_state: nil
+        }
+      end)
 
     # Frequency transient for the COMBINED deficit
     active_gens = active_generators(state)
-    freq_gens = Enum.map(active_gens, fn g ->
-      d = Map.get(state.dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
-      cf = if g.p_max_mw > 0, do: d / g.p_max_mw, else: 1.0
-      %{g | capacity_factor: min(cf, 0.95)}
-    end)
 
-    nadir_hz = if total_lost > 0.0 do
-      try do
-        trajectory = Frequency.simulate(freq_gens, state.loads, total_lost, 0.1, 30.0)
-        Frequency.nadir(trajectory)
-      rescue
-        _ -> 60.0
+    freq_gens =
+      Enum.map(active_gens, fn g ->
+        d = Map.get(state.dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
+        cf = if g.p_max_mw > 0, do: d / g.p_max_mw, else: 1.0
+        %{g | capacity_factor: min(cf, 0.95)}
+      end)
+
+    nadir_hz =
+      if total_lost > 0.0 do
+        try do
+          trajectory = Frequency.simulate(freq_gens, state.loads, total_lost, 0.1, 30.0)
+          Frequency.nadir(trajectory)
+        rescue
+          _ -> 60.0
+        end
+      else
+        60.0
       end
-    else
-      60.0
-    end
 
-    state = %{state | frequency_hz: nadir_hz}
+    state = %{state | frequency_hz: nadir_hz, island_frequency_hz: %{0 => nadir_hz}}
 
-    state = if nadir_hz < 59.95 do
-      event = %{step: 0, component_type: "system", component_id: nil,
-                failure_cause: "frequency_excursion",
-                details: %{nadir_hz: Float.round(nadir_hz, 3), lost_mw: Float.round(total_lost, 1)}}
-      %{state | events: [event | state.events]}
-    else
-      state
-    end
+    state =
+      if nadir_hz < 59.95 do
+        event = %{
+          step: 0,
+          component_type: "system",
+          component_id: nil,
+          failure_cause: "frequency_excursion",
+          details: %{nadir_hz: Float.round(nadir_hz, 3), lost_mw: Float.round(total_lost, 1)}
+        }
+
+        %{state | events: [event | state.events]}
+      else
+        state
+      end
 
     # Generator relay 81 trips
-    gen_relay_trips = Protection.check_generator_relays(active_gens, nadir_hz)
-    |> Enum.reject(fn t -> MapSet.member?(state.tripped_generators, t.component_id) end)
+    gen_relay_trips =
+      Protection.check_generator_relays(active_gens, nadir_hz)
+      |> Enum.reject(fn t -> MapSet.member?(state.tripped_generators, t.component_id) end)
 
-    relay_lost = Enum.sum_by(gen_relay_trips, fn t -> Map.get(state.dispatch, t.component_id, 0.0) end)
+    relay_lost =
+      Enum.sum_by(gen_relay_trips, fn t -> Map.get(state.dispatch, t.component_id, 0.0) end)
+
     state = apply_trips(state, gen_relay_trips)
 
     state = redispatch(state, total_lost + relay_lost, 5.0)
@@ -640,8 +745,14 @@ defmodule PowerModel.Failure.Cascade do
       try do
         snapshot = build_active_snapshot(state)
         result = OPF.solve(snapshot, base_mva: state.base_mva)
-        %{state | dispatch: result.dispatch, opf_result: result,
-          lmps: result.lmps, congested_lines: result.congested_lines}
+
+        %{
+          state
+          | dispatch: result.dispatch,
+            opf_result: result,
+            lmps: result.lmps,
+            congested_lines: result.congested_lines
+        }
       rescue
         _ ->
           # Fall back to standard redispatch on OPF failure
@@ -653,15 +764,19 @@ defmodule PowerModel.Failure.Cascade do
   end
 
   defp do_standard_redispatch(state, deficit_mw, time_window_min) do
+    {state, effective_deficit} =
+      apply_primary_frequency_response(state, deficit_mw, time_window_min)
+
     # Only redispatch among online generators (exclude tripped AND offline)
-    all_inactive = MapSet.union(state.tripped_generators, state.offline_generators || MapSet.new())
+    all_inactive =
+      MapSet.union(state.tripped_generators, state.offline_generators || MapSet.new())
 
     {new_dispatch, remaining} =
       EconomicDispatch.redispatch(
         state.dispatch,
         state.generators,
         all_inactive,
-        deficit_mw,
+        effective_deficit,
         time_window_min
       )
 
@@ -671,6 +786,80 @@ defmodule PowerModel.Failure.Cascade do
       trigger_ufls_for_deficit(state, remaining)
     else
       state
+    end
+  end
+
+  defp apply_primary_frequency_response(state, deficit_mw, _time_window_min)
+       when deficit_mw <= 0.0 do
+    {state, 0.0}
+  end
+
+  defp apply_primary_frequency_response(state, deficit_mw, time_window_min) do
+    freq_error_hz = max(60.0 - (state.frequency_hz || 60.0), 0.0)
+
+    if freq_error_hz < 0.01 do
+      {state, deficit_mw}
+    else
+      active_gens = active_generators(state)
+
+      governor_capable =
+        Enum.filter(active_gens, fn g ->
+          gov_t = Map.get(g, :gov_time_constant_s, 999.0)
+          inertia = Map.get(g, :inertia_h, 0.0)
+          gov_t > 0.0 and gov_t < 100.0 and inertia > 0.0
+        end)
+
+      response_scale = min(freq_error_hz / 0.5, 1.0)
+
+      {new_dispatch, picked_up_mw} =
+        Enum.reduce(governor_capable, {state.dispatch, 0.0}, fn gen, {dispatch, acc} ->
+          if acc >= deficit_mw do
+            {dispatch, acc}
+          else
+            current = Map.get(dispatch, gen.id, 0.0)
+            p_max = Map.get(gen, :p_max_mw, 0.0)
+            headroom = max(p_max - current, 0.0)
+
+            ramp_rate = Map.get(gen, :ramp_rate_mw_per_min) || p_max * 0.1
+
+            ramp_cap =
+              case time_window_min do
+                :infinity -> headroom
+                tw when is_number(tw) and tw > 0.0 -> ramp_rate * tw
+                _ -> headroom
+              end
+
+            primary_cap = headroom * response_scale
+            pickup = min(deficit_mw - acc, min(headroom, min(ramp_cap, primary_cap)))
+
+            if pickup > 0.0 do
+              {Map.put(dispatch, gen.id, current + pickup), acc + pickup}
+            else
+              {dispatch, acc}
+            end
+          end
+        end)
+
+      if picked_up_mw > 0.0 do
+        event = %{
+          step: state.step,
+          component_type: "system",
+          component_id: nil,
+          failure_cause: "governor_primary_response",
+          details: %{
+            pickup_mw: Float.round(picked_up_mw, 3),
+            deficit_mw: Float.round(deficit_mw, 3),
+            frequency_hz: Float.round(state.frequency_hz || 60.0, 4)
+          }
+        }
+
+        {
+          %{state | dispatch: new_dispatch, events: [event | state.events], lodf_state: nil},
+          max(deficit_mw - picked_up_mw, 0.0)
+        }
+      else
+        {state, deficit_mw}
+      end
     end
   end
 
@@ -689,8 +878,12 @@ defmodule PowerModel.Failure.Cascade do
 
         if shed_so_far < deficit_mw * 0.9 and total_load > 0 do
           shed_fraction = min(deficit_mw / total_load, 1.0)
+
           LoadShedding.apply_proportional_shedding(
-            shed_loads, shed_fraction, total_gen, total_load
+            shed_loads,
+            shed_fraction,
+            total_gen,
+            total_load
           )
         else
           {shed_loads, shed_events}
@@ -705,11 +898,7 @@ defmodule PowerModel.Failure.Cascade do
     events_with_step = Enum.map(shed_events, &Map.put(&1, :step, state.step))
 
     # Invalidate LODF: load shedding changes the injection vector
-    %{state |
-      loads: updated_loads,
-      events: events_with_step ++ state.events,
-      lodf_state: nil
-    }
+    %{state | loads: updated_loads, events: events_with_step ++ state.events, lodf_state: nil}
   end
 
   defp do_cascade(%{step: step} = state, step_results, _callback) when step >= @max_steps do
@@ -726,18 +915,22 @@ defmodule PowerModel.Failure.Cascade do
     state = run_hvdc_controllers(state)
 
     active_lines = Enum.reject(state.lines, &MapSet.member?(state.tripped_lines, &1.id))
-    active_xfmrs = Enum.reject(state.transformers, &MapSet.member?(state.tripped_transformers, &1.id))
+
+    active_xfmrs =
+      Enum.reject(state.transformers, &MapSet.member?(state.tripped_transformers, &1.id))
+
     active_gens = active_generators(state)
 
     # --- FACTS: modify line impedances before solve ---
     active_lines = apply_facts_to_lines(state.facts_states, state.facts_devices, active_lines)
 
     # Invalidate LODF if FACTS modified any line impedances
-    state = if facts_changed_impedances?(state.facts_states, state.facts_devices) do
-      %{state | lodf_state: nil}
-    else
-      state
-    end
+    state =
+      if facts_changed_impedances?(state.facts_states, state.facts_devices) do
+        %{state | lodf_state: nil}
+      else
+        state
+      end
 
     dispatched_gens = apply_dispatch(active_gens, state.dispatch)
 
@@ -745,19 +938,39 @@ defmodule PowerModel.Failure.Cascade do
     islands = IslandDetector.detect(bus_ids, active_lines, active_xfmrs)
 
     # Try LODF fast path for single-island, single-trip cascade steps
-    {non_thermal_trips, island_results, updated_loads, timed_overloads, island_frequency, state} =
-      if state.lodf_state != nil and length(islands) == 1 and not LODF.needs_refactorize?(state.lodf_state) do
+    {non_thermal_trips, island_results, updated_loads, timed_overloads, island_frequency,
+     island_frequency_map, current_flows, state} =
+      if can_use_lodf_fast_path?(state, islands, dispatched_gens) do
         try_lodf_solve(state, islands, active_lines, active_xfmrs, dispatched_gens)
       else
-        {trips, results, lds, overloads, freq} =
-          solve_islands_timed(islands, state.buses, active_lines, active_xfmrs,
-                              dispatched_gens, state.loads, state.base_mva,
-                              state.base_overloaded, state.use_ac, state.last_solution)
-        {trips, results, lds, overloads, freq, state}
+        {trips, results, lds, overloads, freq, freq_map, flows} =
+          solve_islands_timed(
+            islands,
+            state.buses,
+            active_lines,
+            active_xfmrs,
+            dispatched_gens,
+            state.loads,
+            state.base_mva,
+            state.base_overloaded,
+            state.use_ac,
+            state.last_solution,
+            state.thermal_state || %{}
+          )
+
+        # Leave LODF mode when trust region is violated and we had to full-solve.
+        state =
+          if state.lodf_state != nil and length(islands) == 1 do
+            %{state | lodf_state: nil}
+          else
+            state
+          end
+
+        {trips, results, lds, overloads, freq, freq_map, flows, state}
       end
 
-    # Update system frequency (use worst island frequency)
-    state = %{state | frequency_hz: island_frequency}
+    # Update system frequency (worst island) and per-island frequency map
+    state = %{state | frequency_hz: island_frequency, island_frequency_hz: island_frequency_map}
 
     # --- OLTC: check voltages after solve, update taps ---
     state = run_oltc_controllers(state, island_results)
@@ -768,80 +981,133 @@ defmodule PowerModel.Failure.Cascade do
     # --- AGC: adjust dispatch every 4 seconds ---
     state = run_agc(state)
 
-    # Check generator protection relays based on island frequency
-    gen_relay_trips = Protection.check_generator_relays(dispatched_gens, island_frequency)
+    # Check generator protection relays per island frequency
+    gen_relay_trips =
+      check_generator_relays_by_island(dispatched_gens, islands, island_frequency_map)
 
     # Filter out already-tripped generators
-    gen_relay_trips = Enum.reject(gen_relay_trips, fn t ->
-      MapSet.member?(state.tripped_generators, t.component_id)
-    end)
+    gen_relay_trips =
+      Enum.reject(gen_relay_trips, fn t ->
+        MapSet.member?(state.tripped_generators, t.component_id)
+      end)
 
-    # Merge generator relay trips into timed overloads for unified handling
-    all_timed = timed_overloads ++ gen_relay_trips
+    # Harmonics coupling: derate/trip stressed equipment during cascade evolution
+    {state, harmonic_timed, harmonic_events} =
+      maybe_apply_harmonic_stress(state, islands, island_results)
 
-    {water_trips, newly_affected} = check_water_facility_impacts(
-      state.water_facilities, state.affected_water_facilities, islands,
-      active_gens, state.buses
-    )
+    non_thermal_trips = non_thermal_trips ++ harmonic_events
 
-    {ci_trips, newly_affected_ci} = check_critical_facility_impacts(
-      state.critical_facilities, state.affected_critical_facilities, islands,
-      active_gens, state.buses
-    )
+    # Merge timed candidates into the pending-event queue
+    all_timed = timed_overloads ++ gen_relay_trips ++ harmonic_timed
+
+    pending_events =
+      update_pending_events(state.pending_events || %{}, all_timed, state.simulated_time)
+
+    state = %{state | pending_events: pending_events}
+
+    {water_trips, newly_affected} =
+      check_water_facility_impacts(
+        state.water_facilities,
+        state.affected_water_facilities,
+        islands,
+        active_gens,
+        state.buses
+      )
+
+    {ci_trips, newly_affected_ci} =
+      check_critical_facility_impacts(
+        state.critical_facilities,
+        state.affected_critical_facilities,
+        islands,
+        active_gens,
+        state.buses
+      )
 
     # Separate actionable trips (that cause further cascade propagation) from
     # non-actionable events (e.g. voltage violations on buses, load blackouts).
     # Non-actionable events are still recorded but don't prevent stabilization.
-    actionable_trips = Enum.filter(non_thermal_trips, fn t ->
-      Map.get(t, :component_type, "transmission_line") in
-        ["transmission_line", "transformer", "generator"]
-    end)
+    actionable_trips =
+      Enum.filter(non_thermal_trips, fn t ->
+        Map.get(t, :component_type, "transmission_line") in [
+          "transmission_line",
+          "transformer",
+          "generator"
+        ]
+      end)
 
-    if Enum.empty?(actionable_trips) and Enum.empty?(all_timed) do
+    if Enum.empty?(actionable_trips) and map_size(pending_events) == 0 do
       # Apply non-actionable events (blackouts, voltage violations) even when stable
-      state = if Enum.empty?(non_thermal_trips), do: state, else: apply_trips(state, non_thermal_trips)
+      state =
+        if Enum.empty?(non_thermal_trips), do: state, else: apply_trips(state, non_thermal_trips)
 
       step_result = %{
         step: state.step,
         simulated_time: state.simulated_time,
         frequency_hz: state.frequency_hz,
+        island_frequency_hz: state.island_frequency_hz,
         islands: length(islands),
         trips: non_thermal_trips ++ water_trips ++ ci_trips,
-        water_facility_ids: MapSet.to_list(MapSet.union(state.affected_water_facilities, newly_affected)),
-        critical_facility_ids: MapSet.to_list(MapSet.union(state.affected_critical_facilities, newly_affected_ci)),
+        water_facility_ids:
+          MapSet.to_list(MapSet.union(state.affected_water_facilities, newly_affected)),
+        critical_facility_ids:
+          MapSet.to_list(MapSet.union(state.affected_critical_facilities, newly_affected_ci)),
         solution: island_results
       }
+
       if callback, do: callback.(step_result)
 
-      stable_state = %{state | stable: true, loads: updated_loads,
-         affected_water_facilities: MapSet.union(state.affected_water_facilities, newly_affected),
-         affected_critical_facilities: MapSet.union(state.affected_critical_facilities, newly_affected_ci)}
+      stable_state = %{
+        state
+        | stable: true,
+          loads: updated_loads,
+          affected_water_facilities:
+            MapSet.union(state.affected_water_facilities, newly_affected),
+          affected_critical_facilities:
+            MapSet.union(state.affected_critical_facilities, newly_affected_ci)
+      }
+
       stable_state = run_post_stabilization(stable_state)
       {stable_state, Enum.reverse([step_result | step_results])}
     else
       state = apply_trips(state, non_thermal_trips)
       state = %{state | loads: updated_loads}
 
-      {tripped_component, trip_time_s} = pick_fastest_trip(all_timed)
+      {tripped_component, trip_time_s, remaining_pending} =
+        pop_next_pending_event(state.pending_events, state.simulated_time)
+
+      branch_map = branch_lookup(active_lines, active_xfmrs)
+
+      thermal_state =
+        advance_thermal_state(state.thermal_state || %{}, current_flows, branch_map, trip_time_s)
 
       {fastest_trips, state} =
         if tripped_component do
           {[tripped_component],
-           %{state | simulated_time: state.simulated_time + trip_time_s}}
+           %{
+             state
+             | simulated_time: state.simulated_time + trip_time_s,
+               pending_events: remaining_pending,
+               thermal_state: thermal_state
+           }}
         else
-          {[], state}
+          {[], %{state | pending_events: remaining_pending, thermal_state: thermal_state}}
         end
 
       all_trips_this_step = non_thermal_trips ++ fastest_trips ++ water_trips ++ ci_trips
-      state = %{state |
-        affected_water_facilities: MapSet.union(state.affected_water_facilities, newly_affected),
-        affected_critical_facilities: MapSet.union(state.affected_critical_facilities, newly_affected_ci)
+
+      state = %{
+        state
+        | affected_water_facilities:
+            MapSet.union(state.affected_water_facilities, newly_affected),
+          affected_critical_facilities:
+            MapSet.union(state.affected_critical_facilities, newly_affected_ci)
       }
 
       step_result = %{
         step: state.step,
         simulated_time: state.simulated_time,
         frequency_hz: state.frequency_hz,
+        island_frequency_hz: state.island_frequency_hz,
         islands: length(islands),
         trips: all_trips_this_step,
         water_facility_ids: MapSet.to_list(state.affected_water_facilities),
@@ -863,11 +1129,12 @@ defmodule PowerModel.Failure.Cascade do
         state = apply_trips(state, fastest_trips)
 
         # Integration 3: Auto-enable transient stability for large disturbances
-        state = if should_check_transient?(state, fastest_trips) do
-          check_transient_stability(state, fastest_trips)
-        else
-          state
-        end
+        state =
+          if should_check_transient?(state, fastest_trips) do
+            check_transient_stability(state, fastest_trips)
+          else
+            state
+          end
 
         state = maybe_redispatch_after_trip(state, trip_time_s)
 
@@ -895,49 +1162,125 @@ defmodule PowerModel.Failure.Cascade do
     end
   end
 
-  defp solve_islands_timed(islands, buses, lines, transformers, generators, loads, base_mva, base_overloaded, use_ac, last_solution) do
+  defp solve_islands_timed(
+         islands,
+         buses,
+         lines,
+         transformers,
+         generators,
+         loads,
+         base_mva,
+         base_overloaded,
+         use_ac,
+         last_solution,
+         thermal_state
+       ) do
     # Fast path: single island means the whole grid is connected — skip filtering
     if length(islands) == 1 do
       [island] = islands
-      {trips, results, lds, overloads, freq} =
-        solve_single_island(island, buses, lines, transformers, generators, loads, base_mva, base_overloaded, use_ac, last_solution)
-      {trips, results, lds, overloads, freq}
+
+      {trips, results, lds, overloads, freq, flow_map} =
+        solve_single_island(
+          island,
+          buses,
+          lines,
+          transformers,
+          generators,
+          loads,
+          base_mva,
+          base_overloaded,
+          use_ac,
+          last_solution,
+          thermal_state
+        )
+
+      {trips, results, lds, overloads, freq, %{0 => freq}, flow_map}
     else
-      {trips, results, lds, overloads, min_freq} =
-        Enum.reduce(islands, {[], [], loads, [], 60.0}, fn island, {trips, results, lds, overloads, freq} ->
-          {new_trips, new_results, new_lds, new_overloads, island_freq} =
-            solve_single_island(island, buses, lines, transformers, generators, lds, base_mva, base_overloaded, use_ac, last_solution)
+      {trips, results, lds, overloads, min_freq, freq_map, flow_map} =
+        islands
+        |> Enum.with_index()
+        |> Enum.reduce(
+          {[], [], loads, [], 60.0, %{}, %{}},
+          fn {island, idx}, {trips, results, lds, overloads, freq, freq_map, flow_map} ->
+            {new_trips, new_results, new_lds, new_overloads, island_freq, island_flows} =
+              solve_single_island(
+                island,
+                buses,
+                lines,
+                transformers,
+                generators,
+                lds,
+                base_mva,
+                base_overloaded,
+                use_ac,
+                last_solution,
+                thermal_state
+              )
 
-          worst_freq = min(freq, island_freq)
+            worst_freq = min(freq, island_freq)
 
-          {trips ++ new_trips, new_results ++ results, new_lds, overloads ++ new_overloads, worst_freq}
-        end)
+            {
+              trips ++ new_trips,
+              new_results ++ results,
+              new_lds,
+              overloads ++ new_overloads,
+              worst_freq,
+              Map.put(freq_map, idx, island_freq),
+              Map.merge(flow_map, island_flows)
+            }
+          end
+        )
 
-      {trips, results, lds, overloads, min_freq}
+      {trips, results, lds, overloads, min_freq, freq_map, flow_map}
     end
   end
 
-  defp solve_single_island(island_set, buses, lines, transformers, generators, loads, base_mva, base_overloaded, use_ac, last_solution) do
+  defp solve_single_island(
+         island_set,
+         buses,
+         lines,
+         transformers,
+         generators,
+         loads,
+         base_mva,
+         base_overloaded,
+         use_ac,
+         last_solution,
+         thermal_state
+       ) do
     island_buses = Enum.filter(buses, &MapSet.member?(island_set, &1.id))
-    island_lines = Enum.filter(lines, fn l ->
-      MapSet.member?(island_set, l.from_bus_id) and MapSet.member?(island_set, l.to_bus_id)
-    end)
-    island_xfmrs = Enum.filter(transformers, fn t ->
-      MapSet.member?(island_set, t.from_bus_id) and MapSet.member?(island_set, t.to_bus_id)
-    end)
+
+    island_lines =
+      Enum.filter(lines, fn l ->
+        MapSet.member?(island_set, l.from_bus_id) and MapSet.member?(island_set, l.to_bus_id)
+      end)
+
+    island_xfmrs =
+      Enum.filter(transformers, fn t ->
+        MapSet.member?(island_set, t.from_bus_id) and MapSet.member?(island_set, t.to_bus_id)
+      end)
+
     island_gens = Enum.filter(generators, &MapSet.member?(island_set, &1.bus_id))
     island_loads = Enum.filter(loads, &MapSet.member?(island_set, &1.bus_id))
 
     if length(island_buses) < 2 or Enum.empty?(island_gens) do
-      new_trips = Enum.map(island_loads, fn load ->
-        %{component_type: "load", component_id: load.id,
-          failure_cause: "island_blackout", details: %{}}
-      end)
-      {new_trips, [], loads, [], 60.0}
+      new_trips =
+        Enum.map(island_loads, fn load ->
+          %{
+            component_type: "load",
+            component_id: load.id,
+            failure_cause: "island_blackout",
+            details: %{}
+          }
+        end)
+
+      {new_trips, [], loads, [], 60.0, %{}}
     else
-      gen_mw = Enum.sum_by(island_gens, fn g ->
-        g.p_max_mw * (g.capacity_factor || 1.0)
-      end)
+      gen_mw =
+        Enum.sum_by(island_gens, fn g ->
+          g.p_max_mw * (g.capacity_factor || 1.0)
+        end)
+
       load_mw = Enum.sum_by(island_loads, & &1.p_mw)
 
       if load_mw > gen_mw do
@@ -950,71 +1293,109 @@ defmodule PowerModel.Failure.Cascade do
         # Compute frequency for this deficit island
         freq = estimate_island_frequency(island_gens, island_loads, gen_mw, load_mw)
 
-        {shed_events, [], updated_loads, [], freq}
+        {shed_events, [], updated_loads, [], freq, %{}}
       else
-        solve_island_power_flow(island_buses, island_lines, island_xfmrs,
-                                island_gens, island_loads, loads, base_mva, base_overloaded, use_ac, last_solution)
+        solve_island_power_flow(
+          island_buses,
+          island_lines,
+          island_xfmrs,
+          island_gens,
+          island_loads,
+          loads,
+          base_mva,
+          base_overloaded,
+          use_ac,
+          last_solution,
+          thermal_state
+        )
       end
     end
   end
 
-  defp solve_island_power_flow(island_buses, island_lines, island_xfmrs,
-                               island_gens, island_loads, loads, base_mva, base_overloaded,
-                               use_ac, last_solution) do
+  defp solve_island_power_flow(
+         island_buses,
+         island_lines,
+         island_xfmrs,
+         island_gens,
+         island_loads,
+         loads,
+         base_mva,
+         base_overloaded,
+         use_ac,
+         last_solution,
+         thermal_state
+       ) do
     snapshot = %{
-      buses: island_buses, lines: island_lines,
-      transformers: island_xfmrs, generators: island_gens,
+      buses: island_buses,
+      lines: island_lines,
+      transformers: island_xfmrs,
+      generators: island_gens,
       loads: island_loads
     }
 
     try do
       solution = solve_power_flow(snapshot, base_mva, use_ac, last_solution)
 
-      # Build line lookup for thermal model parameters
-      line_map = Map.new(island_lines, &{&1.id, &1})
+      branch_map = branch_lookup(island_lines, island_xfmrs)
 
-      timed = compute_timed_overloads(solution.line_flows, base_overloaded, line_map)
+      timed =
+        compute_timed_overloads(solution.line_flows, base_overloaded, branch_map, thermal_state)
 
-      voltage_trips = Protection.check_voltage_violations(
-        solution.bus_ids, solution.vm_pu
-      )
+      voltage_trips =
+        Protection.check_voltage_violations(
+          solution.bus_ids,
+          solution.vm_pu
+        )
 
-      bus_index = solution.bus_ids
+      bus_index =
+        solution.bus_ids
         |> Enum.with_index()
         |> Map.new()
-      zone3_trips = Protection.check_zone3_encroachment(
-        solution.line_flows, island_lines ++ island_xfmrs,
-        island_buses, solution.vm_pu, solution.va_rad, bus_index
-      )
 
-      zone3_timed = Enum.map(zone3_trips, fn t ->
-        Map.put(t, :trip_time_s, 0.5)
-      end)
+      zone3_trips =
+        Protection.check_zone3_encroachment(
+          solution.line_flows,
+          island_lines ++ island_xfmrs,
+          island_buses,
+          solution.vm_pu,
+          solution.va_rad,
+          bus_index
+        )
+
+      zone3_timed =
+        Enum.map(zone3_trips, fn t ->
+          Map.put(t, :trip_time_s, 0.5)
+        end)
 
       # UVLS: apply under-voltage load shedding when AC voltages are available
-      {updated_loads, uvls_events} = if use_ac do
-        bus_voltages = Map.new(Enum.zip(solution.bus_ids, solution.vm_pu))
-        {uvls_loads, uvls_evts} = LoadShedding.apply_uvls(island_loads, bus_voltages)
-        shed_map = Map.new(uvls_loads, &{&1.id, &1})
-        new_loads = Enum.map(loads, fn l -> Map.get(shed_map, l.id, l) end)
-        {new_loads, uvls_evts}
-      else
-        {loads, []}
-      end
+      {updated_loads, uvls_events} =
+        if use_ac do
+          bus_voltages = Map.new(Enum.zip(solution.bus_ids, solution.vm_pu))
+          {uvls_loads, uvls_evts} = LoadShedding.apply_uvls(island_loads, bus_voltages)
+          shed_map = Map.new(uvls_loads, &{&1.id, &1})
+          new_loads = Enum.map(loads, fn l -> Map.get(shed_map, l.id, l) end)
+          {new_loads, uvls_evts}
+        else
+          {loads, []}
+        end
 
       # Compute island frequency from gen/load balance
-      gen_mw = Enum.sum_by(island_gens, fn g ->
-        g.p_max_mw * (g.capacity_factor || 1.0)
-      end)
+      gen_mw =
+        Enum.sum_by(island_gens, fn g ->
+          g.p_max_mw * (g.capacity_factor || 1.0)
+        end)
+
       load_mw = Enum.sum_by(island_loads, & &1.p_mw)
       freq = estimate_island_frequency(island_gens, island_loads, gen_mw, load_mw)
 
       all_non_thermal = voltage_trips ++ uvls_events
-      {all_non_thermal, [solution], updated_loads, timed ++ zone3_timed, freq}
+
+      {all_non_thermal, [solution], updated_loads, timed ++ zone3_timed, freq,
+       solution.line_flows}
     catch
       kind, reason ->
         Logger.warning("island solve failed: #{kind} #{inspect(reason)}")
-        {[], [], loads, [], 60.0}
+        {[], [], loads, [], 60.0, %{}}
     end
   end
 
@@ -1030,7 +1411,8 @@ defmodule PowerModel.Failure.Cascade do
              base_mva: base_mva,
              warm_start: last_solution,
              max_iterations: 20,
-             tolerance: 1.0e-3) do
+             tolerance: 1.0e-3
+           ) do
         {:ok, solution} ->
           if solution.converged do
             solution
@@ -1047,20 +1429,23 @@ defmodule PowerModel.Failure.Cascade do
     end
   end
 
-  defp compute_timed_overloads(line_flows, base_overloaded, line_map) do
+  defp compute_timed_overloads(line_flows, base_overloaded, branch_map, thermal_state) do
     line_flows
     |> Enum.filter(fn {{_type, _id} = key, flow} ->
       flow.loading_pct > 100.0 and not MapSet.member?(base_overloaded, key)
     end)
     |> Enum.map(fn {{type, id}, flow} ->
-      # Look up line for thermal model parameters
-      line = Map.get(line_map, id)
+      key = {type, id}
+      branch = Map.get(branch_map, key)
+      current_temp = Map.get(thermal_state, key, 1.0)
 
-      trip_time = Protection.overcurrent_trip_time(flow.loading_pct,
-        voltage_kv: line && Map.get(line, :voltage_kv),
-        rating_a_mva: line && Map.get(line, :rating_a_mva),
-        rating_c_mva: line && Map.get(line, :rating_c_mva)
-      )
+      trip_time =
+        Protection.thermal_time_to_limit(current_temp, flow.loading_pct,
+          voltage_kv: branch && Map.get(branch, :voltage_kv),
+          rating_a_mva: branch && Map.get(branch, :rating_a_mva),
+          rating_c_mva: branch && Map.get(branch, :rating_c_mva),
+          rated_mva: branch && Map.get(branch, :rated_mva)
+        )
 
       %{
         component_type: component_type_string(type),
@@ -1069,11 +1454,13 @@ defmodule PowerModel.Failure.Cascade do
         details: %{
           loading_pct: flow.loading_pct,
           p_flow_mw: flow.p_flow_mw,
+          thermal_temp: Float.round(current_temp, 6),
           trip_time_s: trip_time
         },
         trip_time_s: trip_time
       }
     end)
+    |> Enum.reject(fn trip -> trip.trip_time_s == :infinity end)
   end
 
   defp estimate_island_frequency(island_gens, island_loads, gen_mw, load_mw) do
@@ -1084,6 +1471,7 @@ defmodule PowerModel.Failure.Cascade do
       load_mw > gen_mw ->
         # Generation deficit -- frequency will drop
         lost_mw = load_mw - gen_mw
+
         try do
           trajectory = Frequency.simulate(island_gens, island_loads, lost_mw, 0.1, 10.0)
           Frequency.nadir(trajectory)
@@ -1104,37 +1492,23 @@ defmodule PowerModel.Failure.Cascade do
     end
   end
 
-  defp pick_fastest_trip([]), do: {nil, 0.0}
-
-  defp pick_fastest_trip(timed_overloads) do
-    fastest =
-      Enum.min_by(timed_overloads, fn t ->
-        case t.trip_time_s do
-          :infinity -> 1.0e30
-          s -> s
-        end
-      end)
-
-    case fastest.trip_time_s do
-      :infinity -> {nil, 0.0}
-      s -> {Map.delete(fastest, :trip_time_s), s}
-    end
-  end
-
   # Run a transient stability simulation after a trip to detect OOS generators.
   # Produces generator trip events that feed back into the cascade.
   defp check_transient_stability(state, recent_trips) do
     # Only check if there were line/transformer trips (generator trips handled by redispatch)
-    has_network_trip = Enum.any?(recent_trips, fn t ->
-      t.component_type in ["transmission_line", "transformer"]
-    end)
+    has_network_trip =
+      Enum.any?(recent_trips, fn t ->
+        t.component_type in ["transmission_line", "transformer"]
+      end)
 
     if not has_network_trip do
       state
     else
       active_gens = active_generators(state)
       active_lines = Enum.reject(state.lines, &MapSet.member?(state.tripped_lines, &1.id))
-      active_xfmrs = Enum.reject(state.transformers, &MapSet.member?(state.tripped_transformers, &1.id))
+
+      active_xfmrs =
+        Enum.reject(state.transformers, &MapSet.member?(state.tripped_transformers, &1.id))
 
       # Build a snapshot for transient simulation
       snapshot = %{
@@ -1146,35 +1520,174 @@ defmodule PowerModel.Failure.Cascade do
       }
 
       # Run transient stability check (short duration, just looking for OOS)
-      try do
-        case PowerModel.Transient.Runner.run(snapshot, {:network_disturbance}, [
-               duration_s: 2.0,
-               dt: 0.01,
-               base_mva: state.base_mva,
-               use_nif: true
-             ]) do
-          {:ok, %{events: oos_events}} when oos_events != [] ->
+      case run_transient_with_fallback(snapshot, state.base_mva) do
+        {:ok, result} ->
+          oos_events = Map.get(result, :events, [])
+          summary = transient_summary(result, oos_events)
+          state = record_transient_summary(state, summary)
+
+          if oos_events != [] do
             # Convert OOS events to cascade trip events
-            oos_trips = Enum.map(oos_events, fn e ->
-              %{
-                component_type: "generator",
-                component_id: e.component_id,
-                failure_cause: "out_of_step",
-                details: Map.get(e, :details, %{})
-              }
-            end)
+            oos_trips =
+              Enum.map(oos_events, fn e ->
+                %{
+                  component_type: "generator",
+                  component_id: e.component_id,
+                  failure_cause: "out_of_step",
+                  details: Map.get(e, :details, %{})
+                }
+              end)
 
             Logger.info("[CASCADE] Transient stability: #{length(oos_trips)} generators OOS")
             apply_trips(state, oos_trips)
-
-          _ ->
+          else
             state
-        end
-      rescue
-        _ -> state
-      catch
-        _, _ -> state
+          end
+
+        {:error, reason} ->
+          record_transient_summary(state, transient_failure_summary(reason))
       end
+    end
+  end
+
+  defp run_transient_with_fallback(snapshot, base_mva) do
+    opts = [duration_s: 2.0, dt: 0.01, base_mva: base_mva]
+
+    case safe_transient_run(snapshot, use_nif: true, opts: opts) do
+      {:ok, result} ->
+        {:ok, result}
+
+      {:error, primary_reason} ->
+        case safe_transient_run(snapshot, use_nif: false, opts: opts) do
+          {:ok, result} ->
+            {:ok, result}
+
+          {:error, fallback_reason} ->
+            {:error, %{primary: primary_reason, fallback: fallback_reason}}
+        end
+    end
+  end
+
+  defp safe_transient_run(snapshot, use_nif: use_nif, opts: opts) do
+    try do
+      case PowerModel.Transient.Runner.run(
+             snapshot,
+             {:network_disturbance},
+             Keyword.put(opts, :use_nif, use_nif)
+           ) do
+        {:ok, _result} = ok ->
+          ok
+
+        {:error, reason} ->
+          {:error, reason}
+
+        other ->
+          {:error, {:unexpected_result, other}}
+      end
+    rescue
+      e ->
+        {:error, {:rescue, e}}
+    catch
+      kind, reason ->
+        {:error, {kind, reason}}
+    end
+  end
+
+  defp transient_summary(result, oos_events) do
+    trajectory = Map.get(result, :trajectory, [])
+    oos_count = length(oos_events)
+    stable = oos_count == 0 and Map.get(result, :stable, true)
+
+    %{
+      stable: stable,
+      failed: false,
+      oos_count: oos_count,
+      min_frequency_hz: transient_min_frequency_hz(trajectory),
+      max_delta_deg: transient_max_delta_spread_deg(trajectory),
+      duration_s: Map.get(result, :duration_s, 0.0),
+      reason: nil
+    }
+  end
+
+  defp transient_failure_summary(reason) do
+    %{
+      stable: nil,
+      failed: true,
+      oos_count: 0,
+      min_frequency_hz: nil,
+      max_delta_deg: nil,
+      duration_s: 0.0,
+      reason: inspect(reason)
+    }
+  end
+
+  defp record_transient_summary(state, summary) do
+    checks_run = (state.transient_checks_run || 0) + 1
+
+    unstable_checks =
+      (state.transient_unstable_checks || 0) +
+        if(summary.stable == false, do: 1, else: 0)
+
+    failed_checks =
+      (state.transient_failed_checks || 0) +
+        if(summary.failed, do: 1, else: 0)
+
+    event = %{
+      step: state.step,
+      component_type: "system",
+      component_id: nil,
+      failure_cause: "transient_screen",
+      details: %{
+        stable: summary.stable,
+        failed: summary.failed,
+        oos_count: summary.oos_count,
+        min_frequency_hz: summary.min_frequency_hz,
+        max_delta_deg: summary.max_delta_deg,
+        duration_s: summary.duration_s,
+        reason: summary.reason
+      }
+    }
+
+    %{
+      state
+      | events: [event | state.events],
+        transient_checks_run: checks_run,
+        transient_unstable_checks: unstable_checks,
+        transient_failed_checks: failed_checks,
+        transient_last_stable: summary.stable,
+        transient_last_oos_count: summary.oos_count,
+        transient_last_min_frequency_hz: summary.min_frequency_hz,
+        transient_last_max_delta_deg: summary.max_delta_deg,
+        transient_last_duration_s: summary.duration_s
+    }
+  end
+
+  defp transient_min_frequency_hz(trajectory) when is_list(trajectory) do
+    trajectory
+    |> Enum.flat_map(fn point -> Map.get(point, :frequency_hz, []) end)
+    |> Enum.filter(&is_number/1)
+    |> Enum.min(fn -> nil end)
+  end
+
+  defp transient_max_delta_spread_deg(trajectory) when is_list(trajectory) do
+    spread_rad =
+      trajectory
+      |> Enum.map(fn point ->
+        deltas = Map.get(point, :delta, [])
+
+        if deltas == [] do
+          nil
+        else
+          Enum.max(deltas) - Enum.min(deltas)
+        end
+      end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.max(fn -> nil end)
+
+    if is_number(spread_rad) do
+      spread_rad * 180.0 / :math.pi()
+    else
+      nil
     end
   end
 
@@ -1192,12 +1705,13 @@ defmodule PowerModel.Failure.Cascade do
 
       sil_applicable =
         x_pu > 0.0 and b_pu > 0.0 and rating_a > 0.0 and
-        ((voltage_kv >= 345.0 and length_km >= 200.0) or
-         (voltage_kv >= 500.0 and length_km >= 300.0))
+          ((voltage_kv >= 345.0 and length_km >= 200.0) or
+             (voltage_kv >= 500.0 and length_km >= 300.0))
 
       if sil_applicable do
         sil_pu = :math.sqrt(b_pu / x_pu)
         sil_mva = sil_pu * base_mva * 2.0
+
         if sil_mva < rating_a do
           %{line | rating_a_mva: sil_mva}
         else
@@ -1218,40 +1732,72 @@ defmodule PowerModel.Failure.Cascade do
   defp try_lodf_solve(state, islands, active_lines, active_xfmrs, dispatched_gens) do
     # Find lines tripped since LODF was last updated
     new_trips = MapSet.difference(state.tripped_lines, state.lodf_state.cumulative_trips)
+    branch_map = branch_lookup(active_lines, active_xfmrs)
 
     if MapSet.size(new_trips) == 0 do
       # No new trips — just rebuild flows from current LODF state
       lodf_flows = lodf_flow_map(state.lodf_state)
-      line_map = Map.new(active_lines, &{&1.id, &1})
-      timed = compute_timed_overloads(lodf_flows, state.base_overloaded, line_map)
+
+      timed =
+        compute_timed_overloads(
+          lodf_flows,
+          state.base_overloaded,
+          branch_map,
+          state.thermal_state || %{}
+        )
+
       freq = estimate_frequency_from_state(state)
-      {[], [], state.loads, timed, freq, state}
+      {shed_events, updated_loads} = maybe_shed_deficit_with_ufls(state.loads, dispatched_gens)
+      state = if Enum.empty?(shed_events), do: state, else: %{state | lodf_state: nil}
+      {shed_events, [], updated_loads, timed, freq, %{0 => freq}, lodf_flows, state}
     else
       # Apply each new trip through LODF
-      {lodf, split} = Enum.reduce_while(new_trips, {state.lodf_state, false}, fn line_id, {lodf, _} ->
-        case LODF.trip_line(lodf, {:line, line_id}) do
-          {:ok, new_lodf, _flows} -> {:cont, {new_lodf, false}}
-          {:island_split, new_lodf} -> {:halt, {new_lodf, true}}
-          {:error, new_lodf} -> {:halt, {new_lodf, true}}
-        end
-      end)
+      {lodf, split} =
+        Enum.reduce_while(new_trips, {state.lodf_state, false}, fn line_id, {lodf, _} ->
+          case LODF.trip_line(lodf, {:line, line_id}) do
+            {:ok, new_lodf, _flows} -> {:cont, {new_lodf, false}}
+            {:island_split, new_lodf} -> {:halt, {new_lodf, true}}
+            {:error, new_lodf} -> {:halt, {new_lodf, true}}
+          end
+        end)
 
       if split do
         # LODF detected island split — fall back to full solve
         state = %{state | lodf_state: nil}
-        {trips, results, lds, overloads, freq} =
-          solve_islands_timed(islands, state.buses, active_lines, active_xfmrs,
-                              dispatched_gens, state.loads, state.base_mva,
-                              state.base_overloaded, state.use_ac, state.last_solution)
-        {trips, results, lds, overloads, freq, state}
+
+        {trips, results, lds, overloads, freq, freq_map, flow_map} =
+          solve_islands_timed(
+            islands,
+            state.buses,
+            active_lines,
+            active_xfmrs,
+            dispatched_gens,
+            state.loads,
+            state.base_mva,
+            state.base_overloaded,
+            state.use_ac,
+            state.last_solution,
+            state.thermal_state || %{}
+          )
+
+        {trips, results, lds, overloads, freq, freq_map, flow_map, state}
       else
         # LODF succeeded — use updated flows
         lodf_flows = lodf_flow_map(lodf)
-        line_map = Map.new(active_lines, &{&1.id, &1})
-        timed = compute_timed_overloads(lodf_flows, state.base_overloaded, line_map)
+
+        timed =
+          compute_timed_overloads(
+            lodf_flows,
+            state.base_overloaded,
+            branch_map,
+            state.thermal_state || %{}
+          )
+
         freq = estimate_frequency_from_state(state)
         state = %{state | lodf_state: lodf}
-        {[], [], state.loads, timed, freq, state}
+        {shed_events, updated_loads} = maybe_shed_deficit_with_ufls(state.loads, dispatched_gens)
+        state = if Enum.empty?(shed_events), do: state, else: %{state | lodf_state: nil}
+        {shed_events, [], updated_loads, timed, freq, %{0 => freq}, lodf_flows, state}
       end
     end
   end
@@ -1264,13 +1810,298 @@ defmodule PowerModel.Failure.Cascade do
       rating = if branch, do: branch.rating, else: 0.0
       loading = if rating > 0.0, do: abs(flow_mw) / rating * 100.0, else: 0.0
 
-      {key, %{
-        p_flow_mw: flow_mw,
-        loading_pct: loading,
-        overloaded: rating > 0.0 and abs(flow_mw) > rating
-      }}
+      {key,
+       %{
+         p_flow_mw: flow_mw,
+         loading_pct: loading,
+         overloaded: rating > 0.0 and abs(flow_mw) > rating
+       }}
     end)
   end
+
+  defp maybe_shed_deficit_with_ufls(loads, dispatched_gens) do
+    gen_mw =
+      Enum.sum_by(dispatched_gens, fn g ->
+        g.p_max_mw * (g.capacity_factor || 1.0)
+      end)
+
+    load_mw = Enum.sum_by(loads, & &1.p_mw)
+
+    if load_mw > gen_mw do
+      {shed_loads, shed_events} =
+        LoadShedding.apply_ufls(loads, dispatched_gens, gen_mw, load_mw)
+
+      {shed_events, shed_loads}
+    else
+      {[], loads}
+    end
+  end
+
+  defp initial_thermal_state(nil), do: %{}
+
+  defp initial_thermal_state(solution) do
+    Map.new(solution.line_flows, fn {key, flow} ->
+      ratio = max(Map.get(flow, :loading_pct, 0.0), 0.0) / 100.0
+      {key, ratio * ratio}
+    end)
+  end
+
+  defp branch_lookup(lines, transformers) do
+    line_map = Map.new(lines, fn line -> {{:line, line.id}, line} end)
+    xfmr_map = Map.new(transformers, fn xfmr -> {{:transformer, xfmr.id}, xfmr} end)
+    Map.merge(line_map, xfmr_map)
+  end
+
+  defp advance_thermal_state(thermal_state, _flow_map, _branch_map, dt_s)
+       when not is_number(dt_s) or dt_s <= 0.0 do
+    thermal_state
+  end
+
+  defp advance_thermal_state(thermal_state, flow_map, branch_map, dt_s) do
+    keys =
+      Map.keys(branch_map)
+      |> Kernel.++(Map.keys(thermal_state))
+      |> Enum.uniq()
+
+    Enum.reduce(keys, %{}, fn key, acc ->
+      flow = Map.get(flow_map, key, %{loading_pct: 0.0})
+      branch = Map.get(branch_map, key, %{})
+      temp0 = Map.get(thermal_state, key, 1.0)
+
+      temp1 =
+        Protection.thermal_next_temperature(temp0, Map.get(flow, :loading_pct, 0.0), dt_s,
+          voltage_kv: Map.get(branch, :voltage_kv),
+          rating_a_mva: Map.get(branch, :rating_a_mva),
+          rating_c_mva: Map.get(branch, :rating_c_mva),
+          rated_mva: Map.get(branch, :rated_mva)
+        )
+
+      Map.put(acc, key, temp1)
+    end)
+  end
+
+  defp can_use_lodf_fast_path?(state, islands, _dispatched_gens) do
+    if state.lodf_state == nil or length(islands) != 1 or
+         LODF.needs_refactorize?(state.lodf_state) do
+      false
+    else
+      dispatch_ref = state.lodf_reference_dispatch || state.dispatch
+      dispatch_shift = relative_dispatch_shift(state.dispatch, dispatch_ref)
+      total_load = Enum.sum_by(state.loads, & &1.p_mw)
+      load_ref = max(state.lodf_reference_load_mw || total_load, 1.0e-6)
+      load_shift = abs(total_load - load_ref) / load_ref
+      severe_frequency_excursion = (state.frequency_hz || 60.0) < 59.7
+
+      dispatch_shift <= 0.05 and load_shift <= 0.05 and not severe_frequency_excursion
+    end
+  end
+
+  defp relative_dispatch_shift(_current, reference) when map_size(reference) == 0, do: 0.0
+
+  defp relative_dispatch_shift(current, reference) do
+    denom =
+      reference
+      |> Map.values()
+      |> Enum.sum()
+      |> max(1.0e-6)
+
+    numer =
+      reference
+      |> Enum.reduce(0.0, fn {id, ref_mw}, acc ->
+        acc + abs(Map.get(current, id, 0.0) - ref_mw)
+      end)
+
+    numer / denom
+  end
+
+  defp check_generator_relays_by_island(dispatched_gens, islands, island_frequency_map) do
+    bus_to_island =
+      islands
+      |> Enum.with_index()
+      |> Enum.reduce(%{}, fn {island, idx}, acc ->
+        Enum.reduce(island, acc, fn bus_id, a -> Map.put(a, bus_id, idx) end)
+      end)
+
+    dispatched_gens
+    |> Enum.group_by(fn g -> Map.get(bus_to_island, g.bus_id, 0) end)
+    |> Enum.flat_map(fn {island_idx, gens} ->
+      freq = Map.get(island_frequency_map, island_idx, 60.0)
+
+      Protection.check_generator_relays(gens, freq)
+      |> Enum.map(fn trip ->
+        details = Map.put(Map.get(trip, :details, %{}), :island_idx, island_idx)
+        %{trip | details: details}
+      end)
+    end)
+  end
+
+  defp update_pending_events(existing, timed_candidates, now_s) do
+    candidate_map = Map.new(timed_candidates, fn c -> {pending_event_key(c), c} end)
+
+    kept =
+      Enum.reduce(existing, %{}, fn {key, queued}, acc ->
+        case Map.get(candidate_map, key) do
+          nil ->
+            acc
+
+          candidate ->
+            delay_s = pending_delay_seconds(candidate)
+            target_execute_at = now_s + delay_s
+
+            execute_at_s =
+              min(Map.get(queued, :execute_at_s, target_execute_at), target_execute_at)
+
+            Map.put(acc, key, %{
+              key: key,
+              execute_at_s: execute_at_s,
+              delay_s: delay_s,
+              trip: Map.delete(candidate, :trip_time_s)
+            })
+        end
+      end)
+
+    Enum.reduce(candidate_map, kept, fn {key, candidate}, acc ->
+      if Map.has_key?(acc, key) do
+        acc
+      else
+        delay_s = pending_delay_seconds(candidate)
+
+        Map.put(acc, key, %{
+          key: key,
+          execute_at_s: now_s + delay_s,
+          delay_s: delay_s,
+          trip: Map.delete(candidate, :trip_time_s)
+        })
+      end
+    end)
+  end
+
+  defp pop_next_pending_event(pending_events, _now_s) when map_size(pending_events) == 0 do
+    {nil, 0.0, pending_events}
+  end
+
+  defp pop_next_pending_event(pending_events, now_s) do
+    {key, queued} =
+      Enum.min_by(pending_events, fn {_k, v} ->
+        Map.get(v, :execute_at_s, now_s)
+      end)
+
+    execute_at_s = Map.get(queued, :execute_at_s, now_s)
+    trip_time_s = max(execute_at_s - now_s, 0.0)
+    {Map.get(queued, :trip), trip_time_s, Map.delete(pending_events, key)}
+  end
+
+  defp pending_event_key(candidate) do
+    {
+      Map.get(candidate, :component_type),
+      Map.get(candidate, :component_id),
+      Map.get(candidate, :failure_cause)
+    }
+  end
+
+  defp pending_delay_seconds(candidate) do
+    case Map.get(candidate, :trip_time_s, 0.0) do
+      :infinity -> 1.0e30
+      s when is_number(s) and s >= 0.0 -> s
+      _ -> 0.0
+    end
+  end
+
+  defp maybe_apply_harmonic_stress(%{run_harmonics: true} = state, _islands, _island_results) do
+    try do
+      snapshot = build_active_snapshot(state)
+
+      if snapshot.buses == [] or snapshot.generators == [] do
+        {state, [], []}
+      else
+        scenario =
+          HarmonicsScenario.create_scenario(snapshot, base_mva: state.base_mva, max_harmonic: 15)
+
+        case HarmonicsScenario.run(scenario, snapshot) do
+          {:ok, result} ->
+            {worst_bus_id, worst_thd} = result.worst_bus
+            violations = result.total_violations
+
+            state = %{
+              state
+              | harmonics_result: result,
+                harmonics_worst_thd: %{bus_id: worst_bus_id, thd_pct: worst_thd},
+                harmonics_violations: violations
+            }
+
+            active_xfmrs =
+              Enum.reject(state.transformers, &MapSet.member?(state.tripped_transformers, &1.id))
+
+            {state, non_thermal_events} =
+              if worst_thd >= 8.0 and violations > 0 and active_xfmrs != [] do
+                factor = max(0.75, 1.0 - min(violations, 10) * 0.02)
+
+                updated_xfmrs =
+                  Enum.map(state.transformers, fn xfmr ->
+                    if MapSet.member?(state.tripped_transformers, xfmr.id) do
+                      xfmr
+                    else
+                      rated = Map.get(xfmr, :rated_mva) || Map.get(xfmr, :rating_a_mva) || 100.0
+                      %{xfmr | rated_mva: max(rated * factor, 1.0)}
+                    end
+                  end)
+
+                event = %{
+                  component_type: "system",
+                  component_id: nil,
+                  failure_cause: "harmonic_derating",
+                  details: %{
+                    worst_bus_id: worst_bus_id,
+                    worst_thd_pct: Float.round(worst_thd, 4),
+                    violations: violations,
+                    derate_factor: Float.round(factor, 4)
+                  }
+                }
+
+                {%{state | transformers: updated_xfmrs, lodf_state: nil}, [event]}
+              else
+                {state, []}
+              end
+
+            harmonic_timed =
+              if worst_thd >= 12.0 and active_xfmrs != [] do
+                candidate =
+                  Enum.find(active_xfmrs, fn xfmr ->
+                    xfmr.from_bus_id == worst_bus_id or xfmr.to_bus_id == worst_bus_id
+                  end) || List.first(active_xfmrs)
+
+                if candidate do
+                  [
+                    %{
+                      component_type: "transformer",
+                      component_id: candidate.id,
+                      failure_cause: "harmonic_overheating",
+                      details: %{
+                        worst_bus_id: worst_bus_id,
+                        worst_thd_pct: Float.round(worst_thd, 4)
+                      },
+                      trip_time_s: 0.2
+                    }
+                  ]
+                else
+                  []
+                end
+              else
+                []
+              end
+
+            {state, harmonic_timed, non_thermal_events}
+
+          {:error, _reason} ->
+            {state, [], []}
+        end
+      end
+    rescue
+      _ -> {state, [], []}
+    end
+  end
+
+  defp maybe_apply_harmonic_stress(state, _islands, _island_results), do: {state, [], []}
 
   defp estimate_frequency_from_state(state) do
     active_gens = active_generators(state)
@@ -1285,7 +2116,8 @@ defmodule PowerModel.Failure.Cascade do
     # ~30s time constant approximated per cascade step).
     if state.frequency_hz < 59.95 and computed_freq >= 59.95 do
       # Frequency is recovering -- blend toward 60.0 but don't jump there
-      recovery_rate = 0.3  # ~30% recovery per cascade step
+      # ~30% recovery per cascade step
+      recovery_rate = 0.3
       recovered = state.frequency_hz + (60.0 - state.frequency_hz) * recovery_rate
       min(recovered, computed_freq)
     else
@@ -1299,55 +2131,140 @@ defmodule PowerModel.Failure.Cascade do
 
   # RAS: check triggers against recent events
   defp run_ras(%{ras_schemes: schemes} = state) when schemes == [] or is_nil(schemes), do: state
+
   defp run_ras(state) do
-    {updated_ras, actions} = RAS.check(
-      state.ras_schemes,
-      state.events,
-      frequency_hz: state.frequency_hz
-    )
+    {updated_ras, actions} =
+      RAS.check(
+        state.ras_schemes,
+        state.events,
+        frequency_hz: state.frequency_hz
+      )
 
     state = %{state | ras_schemes: updated_ras}
 
     Enum.reduce(actions, state, fn action, st ->
       case Map.get(action, :type) do
         :trip_generator ->
-          event = %{step: st.step, component_type: "generator",
-                    component_id: action.target_id,
-                    failure_cause: "ras_action", details: %{ras_name: Map.get(action, :ras_name)}}
-          # Invalidate LODF: injection vector changes with generator trip
-          %{st |
-            tripped_generators: MapSet.put(st.tripped_generators, action.target_id),
-            events: [event | st.events],
-            lodf_state: nil}
+          delay_s = max(Map.get(action, :delay_s, 0.0), 0.0)
+
+          event = %{
+            step: st.step,
+            component_type: "generator",
+            component_id: action.target_id,
+            failure_cause: "ras_action",
+            details: %{ras_name: Map.get(action, :ras_name)}
+          }
+
+          if delay_s > 0.0 do
+            key = pending_event_key(Map.put(event, :trip_time_s, delay_s))
+
+            queued = %{
+              key: key,
+              execute_at_s: st.simulated_time + delay_s,
+              delay_s: delay_s,
+              trip: event
+            }
+
+            arm_event = %{
+              step: st.step,
+              component_type: "system",
+              component_id: nil,
+              failure_cause: "ras_action_armed",
+              details: %{
+                ras_name: Map.get(action, :ras_name),
+                delay_s: delay_s,
+                target_type: "generator",
+                target_id: action.target_id
+              }
+            }
+
+            %{
+              st
+              | pending_events: Map.put(st.pending_events || %{}, key, queued),
+                events: [arm_event | st.events]
+            }
+          else
+            # Invalidate LODF: injection vector changes with generator trip
+            %{
+              st
+              | tripped_generators: MapSet.put(st.tripped_generators, action.target_id),
+                events: [event | st.events],
+                lodf_state: nil
+            }
+          end
 
         :trip_line ->
-          event = %{step: st.step, component_type: "transmission_line",
-                    component_id: action.target_id,
-                    failure_cause: "ras_action", details: %{ras_name: Map.get(action, :ras_name)}}
-          %{st |
-            tripped_lines: MapSet.put(st.tripped_lines, action.target_id),
-            events: [event | st.events]}
+          delay_s = max(Map.get(action, :delay_s, 0.0), 0.0)
+
+          event = %{
+            step: st.step,
+            component_type: "transmission_line",
+            component_id: action.target_id,
+            failure_cause: "ras_action",
+            details: %{ras_name: Map.get(action, :ras_name)}
+          }
+
+          if delay_s > 0.0 do
+            key = pending_event_key(Map.put(event, :trip_time_s, delay_s))
+
+            queued = %{
+              key: key,
+              execute_at_s: st.simulated_time + delay_s,
+              delay_s: delay_s,
+              trip: event
+            }
+
+            arm_event = %{
+              step: st.step,
+              component_type: "system",
+              component_id: nil,
+              failure_cause: "ras_action_armed",
+              details: %{
+                ras_name: Map.get(action, :ras_name),
+                delay_s: delay_s,
+                target_type: "transmission_line",
+                target_id: action.target_id
+              }
+            }
+
+            %{
+              st
+              | pending_events: Map.put(st.pending_events || %{}, key, queued),
+                events: [arm_event | st.events]
+            }
+          else
+            %{
+              st
+              | tripped_lines: MapSet.put(st.tripped_lines, action.target_id),
+                events: [event | st.events]
+            }
+          end
 
         :shed_load ->
           target_ids = Map.get(action, :target_ids, [])
           fraction = Map.get(action, :fraction, 0.1)
-          updated_loads = Enum.map(st.loads, fn l ->
-            if l.id in target_ids do
-              %{l | p_mw: l.p_mw * (1.0 - fraction)}
-            else
-              l
-            end
-          end)
+
+          updated_loads =
+            Enum.map(st.loads, fn l ->
+              if l.id in target_ids do
+                %{l | p_mw: l.p_mw * (1.0 - fraction)}
+              else
+                l
+              end
+            end)
+
           # Invalidate LODF: load shedding changes the injection vector
           %{st | loads: updated_loads, lodf_state: nil}
 
-        _ -> st
+        _ ->
+          st
       end
     end)
   end
 
   # AGC: runs every 4 seconds of simulated time
   defp run_agc(%{agc_state: nil} = state), do: state
+
   defp run_agc(state) do
     dt_since_agc = state.simulated_time - (state.last_agc_time || 0.0)
 
@@ -1358,44 +2275,59 @@ defmodule PowerModel.Failure.Cascade do
       total_gen = Enum.sum_by(active_gens, fn g -> Map.get(state.dispatch, g.id, 0.0) end)
       total_load = Enum.sum_by(state.loads, & &1.p_mw)
 
-      {new_agc, adjustments} = AGC.step(
-        state.agc_state, state.frequency_hz,
-        total_gen, total_load, dt_since_agc
-      )
+      {new_agc, adjustments} =
+        AGC.step(
+          state.agc_state,
+          state.frequency_hz,
+          total_gen,
+          total_load,
+          dt_since_agc
+        )
 
       # Apply dispatch adjustments
-      new_dispatch = Enum.reduce(adjustments, state.dispatch, fn {gen_id, delta_p}, d ->
-        Map.update(d, gen_id, delta_p, &(&1 + delta_p))
-      end)
+      new_dispatch =
+        Enum.reduce(adjustments, state.dispatch, fn {gen_id, delta_p}, d ->
+          Map.update(d, gen_id, delta_p, &(&1 + delta_p))
+        end)
 
       # Invalidate LODF if AGC actually changed any dispatch values,
       # since the injection vector no longer matches the LODF base case.
       lodf = if Enum.empty?(adjustments), do: state.lodf_state, else: nil
 
-      %{state | agc_state: new_agc, dispatch: new_dispatch,
-        last_agc_time: state.simulated_time, lodf_state: lodf}
+      %{
+        state
+        | agc_state: new_agc,
+          dispatch: new_dispatch,
+          last_agc_time: state.simulated_time,
+          lodf_state: lodf
+      }
     end
   end
 
   # HVDC: update power injections based on frequency
   defp run_hvdc_controllers(%{hvdc_states: hvdc} = state) when map_size(hvdc) == 0, do: state
+
   defp run_hvdc_controllers(state) do
     dt_s = max(state.simulated_time - max(state.simulated_time - 1.0, 0.0), 0.1)
 
-    updated_hvdc = Map.new(state.hvdc_states, fn {id, hvdc_state} ->
-      {new_state, _p_inject} = HVDCController.step(hvdc_state, state.frequency_hz, dt_s)
-      {id, new_state}
-    end)
+    updated_hvdc =
+      Map.new(state.hvdc_states, fn {id, hvdc_state} ->
+        {new_state, _p_inject} = HVDCController.step(hvdc_state, state.frequency_hz, dt_s)
+        {id, new_state}
+      end)
 
     %{state | hvdc_states: updated_hvdc}
   end
 
   # OLTC: check secondary voltages and adjust taps
-  defp run_oltc_controllers(%{oltc_states: oltc} = state, _solutions) when map_size(oltc) == 0, do: state
+  defp run_oltc_controllers(%{oltc_states: oltc} = state, _solutions) when map_size(oltc) == 0,
+    do: state
+
   defp run_oltc_controllers(state, island_results) do
-    bus_voltages = Enum.reduce(island_results, %{}, fn sol, acc ->
-      Enum.zip(sol.bus_ids, sol.vm_pu) |> Enum.into(acc)
-    end)
+    bus_voltages =
+      Enum.reduce(island_results, %{}, fn sol, acc ->
+        Enum.zip(sol.bus_ids, sol.vm_pu) |> Enum.into(acc)
+      end)
 
     xfmr_map = Map.new(state.transformers, &{&1.id, &1})
     dt_s = 1.0
@@ -1410,43 +2342,49 @@ defmodule PowerModel.Failure.Cascade do
           v_secondary = Map.get(bus_voltages, xfmr.to_bus_id, 1.0)
           {new_oltc, action} = OLTC.step(oltc_state, v_secondary, dt_s)
 
-          changes = case action do
-            {:tap_change, new_tap} -> Map.put(changes, xfmr_id, new_tap)
-            :no_change -> changes
-          end
+          changes =
+            case action do
+              {:tap_change, new_tap} -> Map.put(changes, xfmr_id, new_tap)
+              :no_change -> changes
+            end
 
           {Map.put(oltc_acc, xfmr_id, new_oltc), changes}
         end
       end)
 
-    updated_xfmrs = if map_size(changed_xfmrs) == 0 do
-      state.transformers
-    else
-      Enum.map(state.transformers, fn x ->
-        case Map.get(changed_xfmrs, x.id) do
-          nil -> x
-          new_tap -> %{x | tap_ratio: new_tap}
-        end
-      end)
-    end
+    updated_xfmrs =
+      if map_size(changed_xfmrs) == 0 do
+        state.transformers
+      else
+        Enum.map(state.transformers, fn x ->
+          case Map.get(changed_xfmrs, x.id) do
+            nil -> x
+            new_tap -> %{x | tap_ratio: new_tap}
+          end
+        end)
+      end
 
     %{state | oltc_states: updated_oltc, transformers: updated_xfmrs}
   end
 
   # SVC: update reactive power injection from solved voltages
-  defp run_svc_controllers(%{svc_states: svc} = state, _solutions) when map_size(svc) == 0, do: state
-  defp run_svc_controllers(state, island_results) do
-    bus_voltages = Enum.reduce(island_results, %{}, fn sol, acc ->
-      Enum.zip(sol.bus_ids, sol.vm_pu) |> Enum.into(acc)
-    end)
+  defp run_svc_controllers(%{svc_states: svc} = state, _solutions) when map_size(svc) == 0,
+    do: state
 
-    updated_svc = Map.new(state.svc_states, fn {id, svc_state} ->
-      device = Enum.find(state.svc_devices, fn s -> s.id == id end)
-      bus_id = device && Map.get(device, :bus_id)
-      v_bus = Map.get(bus_voltages, bus_id, 1.0)
-      {new_state, _q_inject} = SVCController.step(svc_state, v_bus)
-      {id, new_state}
-    end)
+  defp run_svc_controllers(state, island_results) do
+    bus_voltages =
+      Enum.reduce(island_results, %{}, fn sol, acc ->
+        Enum.zip(sol.bus_ids, sol.vm_pu) |> Enum.into(acc)
+      end)
+
+    updated_svc =
+      Map.new(state.svc_states, fn {id, svc_state} ->
+        device = Enum.find(state.svc_devices, fn s -> s.id == id end)
+        bus_id = device && Map.get(device, :bus_id)
+        v_bus = Map.get(bus_voltages, bus_id, 1.0)
+        {new_state, _q_inject} = SVCController.step(svc_state, v_bus)
+        {id, new_state}
+      end)
 
     %{state | svc_states: updated_svc}
   end
@@ -1454,9 +2392,11 @@ defmodule PowerModel.Failure.Cascade do
   # Check if any FACTS device has changed a line's impedance from its base value
   defp facts_changed_impedances?(facts_states, facts_devices)
        when map_size(facts_states) == 0 or facts_devices == [], do: false
+
   defp facts_changed_impedances?(facts_states, facts_devices) do
     Enum.any?(facts_devices, fn device ->
       state = Map.get(facts_states, device.id)
+
       state != nil and Map.get(state, :x_set_pu) != nil and
         Map.get(state, :x_set_pu) != Map.get(device, :x_pu)
     end)
@@ -1467,27 +2407,32 @@ defmodule PowerModel.Failure.Cascade do
        when map_size(facts_states) == 0 or facts_devices == [] do
     lines
   end
+
   defp apply_facts_to_lines(facts_states, facts_devices, lines) do
     # Build a map from line_id to FACTS modifications
-    facts_by_line = Enum.reduce(facts_devices, %{}, fn device, acc ->
-      line_id = Map.get(device, :line_id)
-      facts_state = Map.get(facts_states, device.id)
+    facts_by_line =
+      Enum.reduce(facts_devices, %{}, fn device, acc ->
+        line_id = Map.get(device, :line_id)
+        facts_state = Map.get(facts_states, device.id)
 
-      if line_id && facts_state do
-        Map.put(acc, line_id, facts_state)
-      else
-        acc
-      end
-    end)
+        if line_id && facts_state do
+          Map.put(acc, line_id, facts_state)
+        else
+          acc
+        end
+      end)
 
     if map_size(facts_by_line) == 0 do
       lines
     else
       Enum.map(lines, fn line ->
         case Map.get(facts_by_line, line.id) do
-          nil -> line
+          nil ->
+            line
+
           facts_state ->
             x_set = Map.get(facts_state, :x_set_pu)
+
             if x_set && x_set != 0.0 do
               %{line | x_pu: x_set}
             else
@@ -1501,6 +2446,7 @@ defmodule PowerModel.Failure.Cascade do
   # Returns generators that are both online (committed) and not tripped
   defp active_generators(state) do
     offline = state.offline_generators || MapSet.new()
+
     Enum.reject(state.generators, fn g ->
       MapSet.member?(state.tripped_generators, g.id) or MapSet.member?(offline, g.id)
     end)
@@ -1519,68 +2465,126 @@ defmodule PowerModel.Failure.Cascade do
 
       case trip.component_type do
         "transmission_line" ->
-          %{st |
-            tripped_lines: MapSet.put(st.tripped_lines, trip.component_id),
-            events: [event | st.events]
+          pending =
+            drop_pending_for_component(
+              st.pending_events || %{},
+              "transmission_line",
+              trip.component_id
+            )
+
+          thermal_state = Map.delete(st.thermal_state || %{}, {:line, trip.component_id})
+
+          %{
+            st
+            | tripped_lines: MapSet.put(st.tripped_lines, trip.component_id),
+              events: [event | st.events],
+              pending_events: pending,
+              thermal_state: thermal_state
           }
+
         "transformer" ->
-          %{st |
-            tripped_transformers: MapSet.put(st.tripped_transformers, trip.component_id),
-            events: [event | st.events]
+          pending =
+            drop_pending_for_component(st.pending_events || %{}, "transformer", trip.component_id)
+
+          thermal_state = Map.delete(st.thermal_state || %{}, {:transformer, trip.component_id})
+
+          %{
+            st
+            | tripped_transformers: MapSet.put(st.tripped_transformers, trip.component_id),
+              events: [event | st.events],
+              pending_events: pending,
+              thermal_state: thermal_state
           }
+
         "generator" ->
           # Invalidate LODF: generator trip changes the injection vector,
           # which LODF cannot model (it only handles topology/line outages).
-          %{st |
-            tripped_generators: MapSet.put(st.tripped_generators, trip.component_id),
-            events: [event | st.events],
-            lodf_state: nil
+          pending =
+            drop_pending_for_component(st.pending_events || %{}, "generator", trip.component_id)
+
+          %{
+            st
+            | tripped_generators: MapSet.put(st.tripped_generators, trip.component_id),
+              events: [event | st.events],
+              lodf_state: nil,
+              pending_events: pending
           }
+
         _ ->
           %{st | events: [event | st.events]}
       end
     end)
   end
 
+  defp drop_pending_for_component(pending_events, component_type, component_id) do
+    Enum.reduce(pending_events, %{}, fn {key, queued}, acc ->
+      trip = Map.get(queued, :trip, %{})
+
+      if Map.get(trip, :component_type) == component_type and
+           Map.get(trip, :component_id) == component_id do
+        acc
+      else
+        Map.put(acc, key, queued)
+      end
+    end)
+  end
+
   defp trip_event(component_type, component_id, cause \\ "manual_trip") do
-    %{step: 0, component_type: component_type, component_id: component_id,
-      failure_cause: cause, details: %{}}
+    %{
+      step: 0,
+      component_type: component_type,
+      component_id: component_id,
+      failure_cause: cause,
+      details: %{}
+    }
   end
 
   defp component_type_string(:line), do: "transmission_line"
   defp component_type_string(:transformer), do: "transformer"
   defp component_type_string(other), do: Atom.to_string(other)
 
-  defp check_water_facility_impacts(water_facilities, already_affected, islands, active_gens, _buses) do
+  defp check_water_facility_impacts(
+         water_facilities,
+         already_affected,
+         islands,
+         active_gens,
+         _buses
+       ) do
     if Enum.empty?(water_facilities) do
       {[], MapSet.new()}
     else
       gen_bus_ids = MapSet.new(active_gens, & &1.bus_id)
 
-      dead_bus_ids = Enum.reduce(islands, MapSet.new(), fn island, acc ->
-        has_gen = Enum.any?(island, &MapSet.member?(gen_bus_ids, &1))
-        if has_gen do
-          acc
-        else
-          MapSet.union(acc, island)
-        end
-      end)
+      dead_bus_ids =
+        Enum.reduce(islands, MapSet.new(), fn island, acc ->
+          has_gen = Enum.any?(island, &MapSet.member?(gen_bus_ids, &1))
+
+          if has_gen do
+            acc
+          else
+            MapSet.union(acc, island)
+          end
+        end)
 
       {trips, new_ids} =
         water_facilities
         |> Enum.filter(fn wf ->
           wf.bus_id != nil and
-          MapSet.member?(dead_bus_ids, wf.bus_id) and
-          not MapSet.member?(already_affected, wf.id)
+            MapSet.member?(dead_bus_ids, wf.bus_id) and
+            not MapSet.member?(already_affected, wf.id)
         end)
         |> Enum.reduce({[], MapSet.new()}, fn wf, {t, ids} ->
           trip = %{
             component_type: "water_facility",
             component_id: wf.id,
             failure_cause: "power_loss",
-            details: %{name: wf.name, facility_type: wf.facility_type,
-                        power_mw: wf.power_consumption_mw}
+            details: %{
+              name: wf.name,
+              facility_type: wf.facility_type,
+              power_mw: wf.power_consumption_mw
+            }
           }
+
           {[trip | t], MapSet.put(ids, wf.id)}
         end)
 
@@ -1588,36 +2592,44 @@ defmodule PowerModel.Failure.Cascade do
     end
   end
 
-  defp check_critical_facility_impacts(critical_facilities, already_affected, islands, active_gens, _buses) do
+  defp check_critical_facility_impacts(
+         critical_facilities,
+         already_affected,
+         islands,
+         active_gens,
+         _buses
+       ) do
     if Enum.empty?(critical_facilities) do
       {[], MapSet.new()}
     else
       gen_bus_ids = MapSet.new(active_gens, & &1.bus_id)
 
-      dead_bus_ids = Enum.reduce(islands, MapSet.new(), fn island, acc ->
-        has_gen = Enum.any?(island, &MapSet.member?(gen_bus_ids, &1))
-        if has_gen do
-          acc
-        else
-          MapSet.union(acc, island)
-        end
-      end)
+      dead_bus_ids =
+        Enum.reduce(islands, MapSet.new(), fn island, acc ->
+          has_gen = Enum.any?(island, &MapSet.member?(gen_bus_ids, &1))
+
+          if has_gen do
+            acc
+          else
+            MapSet.union(acc, island)
+          end
+        end)
 
       {trips, new_ids} =
         critical_facilities
         |> Enum.filter(fn cf ->
           cf.bus_id != nil and
-          MapSet.member?(dead_bus_ids, cf.bus_id) and
-          not MapSet.member?(already_affected, cf.id)
+            MapSet.member?(dead_bus_ids, cf.bus_id) and
+            not MapSet.member?(already_affected, cf.id)
         end)
         |> Enum.reduce({[], MapSet.new()}, fn cf, {t, ids} ->
           trip = %{
             component_type: "critical_facility",
             component_id: cf.id,
             failure_cause: "power_loss",
-            details: %{name: cf.name, category: cf.category,
-                        power_mw: cf.estimated_power_mw}
+            details: %{name: cf.name, category: cf.category, power_mw: cf.estimated_power_mw}
           }
+
           {[trip | t], MapSet.put(ids, cf.id)}
         end)
 
@@ -1635,19 +2647,21 @@ defmodule PowerModel.Failure.Cascade do
   def build_active_snapshot(state) do
     offline = state.offline_generators || MapSet.new()
 
-    active_gens = state.generators
-    |> Enum.reject(fn g ->
-      MapSet.member?(state.tripped_generators, g.id) or MapSet.member?(offline, g.id)
-    end)
-    |> Enum.map(fn g ->
-      d = Map.get(state.dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
-      %{g | p_max_mw: d, capacity_factor: 1.0}
-    end)
+    active_gens =
+      state.generators
+      |> Enum.reject(fn g ->
+        MapSet.member?(state.tripped_generators, g.id) or MapSet.member?(offline, g.id)
+      end)
+      |> Enum.map(fn g ->
+        d = Map.get(state.dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
+        %{g | p_max_mw: d, capacity_factor: 1.0}
+      end)
 
     %{
       buses: state.buses,
       lines: Enum.reject(state.lines, &MapSet.member?(state.tripped_lines, &1.id)),
-      transformers: Enum.reject(state.transformers, &MapSet.member?(state.tripped_transformers, &1.id)),
+      transformers:
+        Enum.reject(state.transformers, &MapSet.member?(state.tripped_transformers, &1.id)),
       generators: active_gens,
       loads: state.loads
     }
@@ -1665,18 +2679,23 @@ defmodule PowerModel.Failure.Cascade do
       true
     else
       # Auto-enable for large disturbances
-      gen_trips = Enum.filter(recent_trips, fn t ->
-        t.component_type == "generator"
-      end)
-      lost_mw = Enum.sum_by(gen_trips, fn t ->
-        Map.get(state.dispatch, t.component_id, 0.0)
-      end)
+      gen_trips =
+        Enum.filter(recent_trips, fn t ->
+          t.component_type == "generator"
+        end)
 
-      line_trips = Enum.count(recent_trips, fn t ->
-        t.component_type in ["transmission_line", "transformer"]
-      end)
+      lost_mw =
+        Enum.sum_by(gen_trips, fn t ->
+          Map.get(state.dispatch, t.component_id, 0.0)
+        end)
 
-      total_tripped_lines = MapSet.size(state.tripped_lines) + MapSet.size(state.tripped_transformers)
+      line_trips =
+        Enum.count(recent_trips, fn t ->
+          t.component_type in ["transmission_line", "transformer"]
+        end)
+
+      total_tripped_lines =
+        MapSet.size(state.tripped_lines) + MapSet.size(state.tripped_transformers)
 
       lost_mw > 500.0 or line_trips >= 3 or total_tripped_lines >= 3
     end
@@ -1703,10 +2722,11 @@ defmodule PowerModel.Failure.Cascade do
       solver = if state.use_ac, do: :ac, else: :dc
       result = CPF.trace(snapshot, base_mva: state.base_mva, solver: solver, max_steps: 50)
 
-      %{state |
-        cpf_result: result,
-        voltage_margin_mw: result.margin_mw,
-        critical_bus_id: result.critical_bus_id
+      %{
+        state
+        | cpf_result: result,
+          voltage_margin_mw: result.margin_mw,
+          critical_bus_id: result.critical_bus_id
       }
     rescue
       e ->
@@ -1714,6 +2734,7 @@ defmodule PowerModel.Failure.Cascade do
         state
     end
   end
+
   defp maybe_run_cpf(state), do: state
 
   # Integration 6: Small-signal after cascade stabilizes
@@ -1722,11 +2743,13 @@ defmodule PowerModel.Failure.Cascade do
       active_gens = active_generators(state)
 
       # Limit to 50 largest generators for performance
-      top_gens = active_gens
-      |> Enum.sort_by(fn g -> -(Map.get(state.dispatch, g.id, 0.0)) end)
-      |> Enum.take(50)
+      top_gens =
+        active_gens
+        |> Enum.sort_by(fn g -> -Map.get(state.dispatch, g.id, 0.0) end)
+        |> Enum.take(50)
 
       n = length(top_gens)
+
       if n < 2 do
         %{state | small_signal_stable: true, stability_modes: [], small_signal_result: nil}
       else
@@ -1740,18 +2763,23 @@ defmodule PowerModel.Failure.Cascade do
         bus_index = Map.new(Enum.with_index(gen_bus_ids))
 
         active_lines = Enum.reject(state.lines, &MapSet.member?(state.tripped_lines, &1.id))
-        active_xfmrs = Enum.reject(state.transformers, &MapSet.member?(state.tripped_transformers, &1.id))
+
+        active_xfmrs =
+          Enum.reject(state.transformers, &MapSet.member?(state.tripped_transformers, &1.id))
 
         {rows, cols, g_vals, b_vals} =
           build_y_red_coo(gen_bus_ids, bus_index, active_lines, active_xfmrs)
 
-        result = SmallSignal.analyze(top_gens, {rows, cols, g_vals, b_vals},
-                                     base_angles, e_prime, base_mva: state.base_mva)
+        result =
+          SmallSignal.analyze(top_gens, {rows, cols, g_vals, b_vals}, base_angles, e_prime,
+            base_mva: state.base_mva
+          )
 
-        %{state |
-          small_signal_result: result,
-          small_signal_stable: result.stable,
-          stability_modes: result.modes
+        %{
+          state
+          | small_signal_result: result,
+            small_signal_stable: result.stable,
+            stability_modes: result.modes
         }
       end
     rescue
@@ -1760,6 +2788,7 @@ defmodule PowerModel.Failure.Cascade do
         state
     end
   end
+
   defp maybe_run_small_signal(state), do: state
 
   # Build a simplified reduced admittance matrix in COO format for small-signal.
@@ -1807,17 +2836,19 @@ defmodule PowerModel.Failure.Cascade do
   defp maybe_run_harmonics(%{run_harmonics: true} = state) do
     try do
       snapshot = build_active_snapshot(state)
-      harmonic_scenario = HarmonicsScenario.create_scenario(snapshot,
-        base_mva: state.base_mva, max_harmonic: 15)
+
+      harmonic_scenario =
+        HarmonicsScenario.create_scenario(snapshot, base_mva: state.base_mva, max_harmonic: 15)
 
       case HarmonicsScenario.run(harmonic_scenario, snapshot) do
         {:ok, result} ->
           {worst_bus_id, worst_thd} = result.worst_bus
 
-          %{state |
-            harmonics_result: result,
-            harmonics_worst_thd: %{bus_id: worst_bus_id, thd_pct: worst_thd},
-            harmonics_violations: result.total_violations
+          %{
+            state
+            | harmonics_result: result,
+              harmonics_worst_thd: %{bus_id: worst_bus_id, thd_pct: worst_thd},
+              harmonics_violations: result.total_violations
           }
 
         {:error, reason} ->
@@ -1830,5 +2861,6 @@ defmodule PowerModel.Failure.Cascade do
         state
     end
   end
+
   defp maybe_run_harmonics(state), do: state
 end

@@ -3,7 +3,13 @@ defmodule PowerModel.Ingestion do
   Coordinates data ingestion from EIA, HIFLD, and EPA sources.
   """
 
-  alias PowerModel.Ingestion.{BusMapper, ParameterEstimator, LoadEstimator, InternationalConnections}
+  alias PowerModel.Ingestion.{
+    BusMapper,
+    ParameterEstimator,
+    LoadEstimator,
+    InternationalConnections
+  }
+
   alias PowerModel.Ingestion.HIFLD
   alias PowerModel.Ingestion.EIA
 

@@ -35,11 +35,16 @@ defmodule PowerModel.Controls.RAS do
   """
 
   defstruct [
-    :name,      # human-readable name
-    :trigger,   # %{type: atom, component_id: integer, ...}
-    :actions,   # [%{type: atom, target_id: integer, delay_s: float, ...}]
-    :enabled,   # whether this RAS is armed
-    :fired      # whether this RAS has already fired (latching)
+    # human-readable name
+    :name,
+    # %{type: atom, component_id: integer, ...}
+    :trigger,
+    # [%{type: atom, target_id: integer, delay_s: float, ...}]
+    :actions,
+    # whether this RAS is armed
+    :enabled,
+    # whether this RAS has already fired (latching)
+    :fired
   ]
 
   @doc """
@@ -96,7 +101,8 @@ defmodule PowerModel.Controls.RAS do
 
     {updated_list, all_actions} =
       Enum.map_reduce(ras_list, [], fn ras, acc ->
-        if ras.enabled and not ras.fired and trigger_matches?(ras.trigger, events, frequency_hz, bus_voltages) do
+        if ras.enabled and not ras.fired and
+             trigger_matches?(ras.trigger, events, frequency_hz, bus_voltages) do
           fired_ras = %{ras | fired: true}
           actions_with_source = Enum.map(ras.actions, &Map.put(&1, :ras_name, ras.name))
           {fired_ras, acc ++ actions_with_source}
@@ -131,18 +137,33 @@ defmodule PowerModel.Controls.RAS do
     end)
   end
 
-  defp trigger_matches?(%{type: :underfrequency, threshold_hz: threshold}, _events, freq, _voltages) do
+  defp trigger_matches?(
+         %{type: :underfrequency, threshold_hz: threshold},
+         _events,
+         freq,
+         _voltages
+       ) do
     freq < threshold
   end
 
-  defp trigger_matches?(%{type: :overvoltage, bus_id: bus_id, threshold_pu: threshold}, _events, _freq, voltages) do
+  defp trigger_matches?(
+         %{type: :overvoltage, bus_id: bus_id, threshold_pu: threshold},
+         _events,
+         _freq,
+         voltages
+       ) do
     case Map.get(voltages, bus_id) do
       nil -> false
       v -> v > threshold
     end
   end
 
-  defp trigger_matches?(%{type: :undervoltage, bus_id: bus_id, threshold_pu: threshold}, _events, _freq, voltages) do
+  defp trigger_matches?(
+         %{type: :undervoltage, bus_id: bus_id, threshold_pu: threshold},
+         _events,
+         _freq,
+         voltages
+       ) do
     case Map.get(voltages, bus_id) do
       nil -> false
       v -> v < threshold

@@ -35,10 +35,18 @@ defmodule PowerModel.Grid.FACTSDevice do
   end
 
   @cast_fields [
-    :name, :device_type, :rated_mva,
-    :x_min_pu, :x_max_pu, :x_set_pu,
-    :angle_min_deg, :angle_max_deg, :angle_set_deg,
-    :status, :line_id, :bus_id
+    :name,
+    :device_type,
+    :rated_mva,
+    :x_min_pu,
+    :x_max_pu,
+    :x_set_pu,
+    :angle_min_deg,
+    :angle_max_deg,
+    :angle_set_deg,
+    :status,
+    :line_id,
+    :bus_id
   ]
 
   @valid_device_types ["TCSC", "phase_shifter", "SSSC"]

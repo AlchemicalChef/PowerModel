@@ -104,7 +104,8 @@ defmodule PowerModel.Ingestion.OSM.Substations do
            receive_timeout: 180_000,
            retry: :transient,
            max_retries: 2,
-           retry_delay: fn n -> n * 10_000 end) do
+           retry_delay: fn n -> n * 10_000 end
+         ) do
       {:ok, %{status: 200, body: %{"elements" => elements}}} when is_list(elements) ->
         {:ok, elements}
 
@@ -134,7 +135,7 @@ defmodule PowerModel.Ingestion.OSM.Substations do
     {lon, lat} = extract_coordinates(type, element)
 
     if is_number(lon) and is_number(lat) and
-       lat > 24.0 and lat < 50.0 and lon > -125.0 and lon < -66.0 do
+         lat > 24.0 and lat < 50.0 and lon > -125.0 and lon < -66.0 do
       osm_id = element["id"]
       name = tags["name"] || tags["ref"] || tags["description"]
       operator = tags["operator"]
@@ -155,6 +156,7 @@ defmodule PowerModel.Ingestion.OSM.Substations do
       }
     end
   end
+
   defp parse_osm_feature(_), do: nil
 
   defp extract_coordinates("node", %{"lon" => lon, "lat" => lat}), do: {lon, lat}
@@ -162,6 +164,7 @@ defmodule PowerModel.Ingestion.OSM.Substations do
   defp extract_coordinates(_, _), do: {nil, nil}
 
   defp parse_osm_voltage(nil), do: {nil, nil}
+
   defp parse_osm_voltage(voltage_str) when is_binary(voltage_str) do
     voltages =
       voltage_str
@@ -183,10 +186,12 @@ defmodule PowerModel.Ingestion.OSM.Substations do
       [max | rest] -> {max, List.last(rest)}
     end
   end
+
   defp parse_osm_voltage(_), do: {nil, nil}
 
   defp clean_name(nil, nil, osm_id), do: "OSM Substation #{osm_id}"
   defp clean_name(nil, operator, osm_id), do: "#{operator} Substation #{osm_id}"
+
   defp clean_name(name, _operator, _osm_id) when is_binary(name) do
     trimmed = String.trim(name)
     if trimmed == "", do: "OSM Substation (unnamed)", else: trimmed
@@ -199,6 +204,7 @@ defmodule PowerModel.Ingestion.OSM.Substations do
           bucket = {trunc(lon / @grid_size), trunc(lat / @grid_size)}
           entry = %{id: id, name: name, lon: lon, lat: lat, hifld_id: hifld_id}
           Map.update(acc, bucket, [entry], &[entry | &1])
+
         _ ->
           acc
       end
@@ -220,9 +226,10 @@ defmodule PowerModel.Ingestion.OSM.Substations do
         :no_match
 
       list ->
-        best = Enum.min_by(list, fn sub ->
-          haversine_approx(attrs.lon, attrs.lat, sub.lon, sub.lat)
-        end)
+        best =
+          Enum.min_by(list, fn sub ->
+            haversine_approx(attrs.lon, attrs.lat, sub.lon, sub.lat)
+          end)
 
         dist = haversine_approx(attrs.lon, attrs.lat, best.lon, best.lat)
         if dist < 1.0, do: {:match, best.id}, else: :no_match
@@ -241,16 +248,18 @@ defmodule PowerModel.Ingestion.OSM.Substations do
       |> maybe_put(:max_voltage_kv, attrs.max_voltage_kv)
       |> maybe_put(:min_voltage_kv, attrs.min_voltage_kv)
 
-    updates = if attrs.name && not String.starts_with?(attrs.name, "OSM Substation") do
-      sub = Repo.get(Substation, substation_id)
-      if sub && (sub.name == sub.hifld_id or String.starts_with?(sub.name || "", "UNKNOWN")) do
-        Map.put(updates, :name, attrs.name)
+    updates =
+      if attrs.name && not String.starts_with?(attrs.name, "OSM Substation") do
+        sub = Repo.get(Substation, substation_id)
+
+        if sub && (sub.name == sub.hifld_id or String.starts_with?(sub.name || "", "UNKNOWN")) do
+          Map.put(updates, :name, attrs.name)
+        else
+          updates
+        end
       else
         updates
       end
-    else
-      updates
-    end
 
     if map_size(updates) > 0 do
       from(s in Substation, where: s.id == ^substation_id)
@@ -283,12 +292,20 @@ defmodule PowerModel.Ingestion.OSM.Substations do
   """
   def stats do
     osm_count = Repo.one(from s in Substation, where: like(s.hifld_id, "osm_%"), select: count())
-    with_voltage = Repo.one(from s in Substation,
-      where: like(s.hifld_id, "osm_%") and not is_nil(s.max_voltage_kv),
-      select: count())
-    with_name = Repo.one(from s in Substation,
-      where: like(s.hifld_id, "osm_%") and not like(s.name, "OSM Substation%"),
-      select: count())
+
+    with_voltage =
+      Repo.one(
+        from s in Substation,
+          where: like(s.hifld_id, "osm_%") and not is_nil(s.max_voltage_kv),
+          select: count()
+      )
+
+    with_name =
+      Repo.one(
+        from s in Substation,
+          where: like(s.hifld_id, "osm_%") and not like(s.name, "OSM Substation%"),
+          select: count()
+      )
 
     %{
       total_osm: osm_count,

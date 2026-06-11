@@ -80,41 +80,62 @@ defmodule PowerModel.Solver.Harmonics.Solver do
     or `{:error, reason}`.
   """
   def solve(snapshot, fundamental_solution, harmonic_sources, opts \\ []) do
-    max_h = Keyword.get(opts, :max_harmonic, @default_max_harmonic)
-    base_mva = Keyword.get(opts, :base_mva, @default_base_mva)
+    try do
+      max_h = Keyword.get(opts, :max_harmonic, @default_max_harmonic)
+      base_mva = Keyword.get(opts, :base_mva, @default_base_mva)
 
-    harmonics = Keyword.get(opts, :harmonics, Enum.to_list(2..max_h))
+      harmonics = Keyword.get(opts, :harmonics, Enum.to_list(2..max_h))
 
-    buses = snapshot.buses
-    lines = snapshot.lines
-    transformers = snapshot.transformers
-    generators = snapshot.generators
+      buses = snapshot.buses
+      lines = snapshot.lines
+      transformers = snapshot.transformers
+      generators = snapshot.generators
 
-    n = length(buses)
-    if n == 0, do: throw({:error, :empty_grid})
+      n = length(buses)
+      if n == 0, do: throw({:error, :empty_grid})
 
-    bus_ids = Enum.map(buses, & &1.id)
-    bus_index = buses |> Enum.with_index() |> Map.new(fn {b, i} -> {b.id, i} end)
+      bus_ids = Enum.map(buses, & &1.id)
+      bus_index = buses |> Enum.with_index() |> Map.new(fn {b, i} -> {b.id, i} end)
 
-    # Solve each harmonic independently
-    results =
-      Enum.reduce(harmonics, %{}, fn h, acc ->
-        case solve_single_harmonic(buses, lines, transformers, generators,
-                                    bus_ids, bus_index, n, h, harmonic_sources, base_mva) do
-          {:ok, voltage_map} ->
-            Map.put(acc, h, voltage_map)
+      # Solve each harmonic independently
+      results =
+        Enum.reduce(harmonics, %{}, fn h, acc ->
+          case solve_single_harmonic(
+                 buses,
+                 lines,
+                 transformers,
+                 generators,
+                 bus_ids,
+                 bus_index,
+                 n,
+                 h,
+                 harmonic_sources,
+                 base_mva
+               ) do
+            {:ok, voltage_map} ->
+              Map.put(acc, h, voltage_map)
 
-          {:error, _reason} ->
-            # Skip harmonics that fail to solve (singular Y matrix, etc.)
-            acc
-        end
-      end)
+            {:error, _reason} ->
+              # Skip harmonics that fail to solve (singular Y matrix, etc.)
+              acc
+          end
+        end)
 
-    # Add fundamental frequency voltages for completeness
-    fundamental_map = build_fundamental_map(fundamental_solution)
-    results = Map.put(results, 1, fundamental_map)
+      # Add fundamental frequency voltages for completeness
+      fundamental_map = build_fundamental_map(fundamental_solution)
+      results = Map.put(results, 1, fundamental_map)
 
-    {:ok, results}
+      {:ok, results}
+    rescue
+      e ->
+        {:error, e}
+    catch
+      :throw, {:error, reason} ->
+        {:error, reason}
+
+      kind, reason ->
+        {:error, {kind, reason}}
+    end
   end
 
   @doc """
@@ -157,11 +178,12 @@ defmodule PowerModel.Solver.Harmonics.Solver do
         end)
 
       # THD = sqrt(sum(V_h^2)) / V_1 * 100%
-      thd_pct = if v1_mag > 1.0e-6 do
-        :math.sqrt(v_h_sq_sum) / v1_mag * 100.0
-      else
-        0.0
-      end
+      thd_pct =
+        if v1_mag > 1.0e-6 do
+          :math.sqrt(v_h_sq_sum) / v1_mag * 100.0
+        else
+          0.0
+        end
 
       {bus_id, thd_pct}
     end)
@@ -222,11 +244,12 @@ defmodule PowerModel.Solver.Harmonics.Solver do
         end)
 
       # THD
-      thd_pct = if v1_mag > 1.0e-6 do
-        :math.sqrt(v_h_sq_sum) / v1_mag * 100.0
-      else
-        0.0
-      end
+      thd_pct =
+        if v1_mag > 1.0e-6 do
+          :math.sqrt(v_h_sq_sum) / v1_mag * 100.0
+        else
+          0.0
+        end
 
       # Find worst individual harmonic
       {max_ind_h, max_ind_pct} =
@@ -236,11 +259,13 @@ defmodule PowerModel.Solver.Harmonics.Solver do
 
       # Check for violations
       violations = []
-      violations = if thd_pct > thd_limit do
-        [%{type: :thd, harmonic: 0, value: thd_pct, limit: thd_limit} | violations]
-      else
-        violations
-      end
+
+      violations =
+        if thd_pct > thd_limit do
+          [%{type: :thd, harmonic: 0, value: thd_pct, limit: thd_limit} | violations]
+        else
+          violations
+        end
 
       violations =
         Enum.reduce(individual_results, violations, fn {h, pct}, acc ->
@@ -313,12 +338,13 @@ defmodule PowerModel.Solver.Harmonics.Solver do
     target_idx = Map.fetch!(bus_index, bus_id)
 
     # Generate frequency points
-    freq_points = if freq_step == 1 do
-      Enum.to_list(freq_range)
-    else
-      Stream.iterate(freq_range.first, &(&1 + freq_step))
-      |> Enum.take_while(&(&1 <= freq_range.last))
-    end
+    freq_points =
+      if freq_step == 1 do
+        Enum.to_list(freq_range)
+      else
+        Stream.iterate(freq_range.first, &(&1 + freq_step))
+        |> Enum.take_while(&(&1 <= freq_range.last))
+      end
 
     Enum.map(freq_points, fn h ->
       # Build Y-bus at this harmonic frequency
@@ -350,8 +376,18 @@ defmodule PowerModel.Solver.Harmonics.Solver do
   # Private: solve a single harmonic
   # ---------------------------------------------------------------------------
 
-  defp solve_single_harmonic(buses, lines, transformers, generators,
-                              bus_ids, bus_index, n, h, harmonic_sources, base_mva) do
+  defp solve_single_harmonic(
+         buses,
+         lines,
+         transformers,
+         generators,
+         bus_ids,
+         bus_index,
+         n,
+         h,
+         harmonic_sources,
+         base_mva
+       ) do
     # Build Y-bus at harmonic h
     ybus = Impedance.build_ybus_at_harmonic(buses, lines, transformers, generators, h, base_mva)
 
@@ -359,8 +395,9 @@ defmodule PowerModel.Solver.Harmonics.Solver do
     {i_real, i_imag} = build_injection_vector(bus_ids, bus_index, n, h, harmonic_sources)
 
     # Check if there are any injections at this harmonic
-    has_injection = Enum.any?(i_real, &(abs(&1) > 1.0e-15)) or
-                    Enum.any?(i_imag, &(abs(&1) > 1.0e-15))
+    has_injection =
+      Enum.any?(i_real, &(abs(&1) > 1.0e-15)) or
+        Enum.any?(i_imag, &(abs(&1) > 1.0e-15))
 
     if not has_injection do
       # No sources at this harmonic — all voltages are zero
@@ -401,7 +438,9 @@ defmodule PowerModel.Solver.Harmonics.Solver do
     {i_real, i_imag} =
       Enum.reduce(harmonic_sources, {i_real, i_imag}, fn {bus_id, devices}, {ir, ii} ->
         case Map.get(bus_index, bus_id) do
-          nil -> {ir, ii}
+          nil ->
+            {ir, ii}
+
           idx ->
             {inj_re, inj_im} =
               PowerModel.Solver.Harmonics.Sources.aggregate_bus_injections(devices, h)
@@ -412,8 +451,7 @@ defmodule PowerModel.Solver.Harmonics.Solver do
         end
       end)
 
-    {Enum.map(0..(n - 1), &:array.get(&1, i_real)),
-     Enum.map(0..(n - 1), &:array.get(&1, i_imag))}
+    {Enum.map(0..(n - 1), &:array.get(&1, i_real)), Enum.map(0..(n - 1), &:array.get(&1, i_imag))}
   end
 
   # ---------------------------------------------------------------------------
@@ -441,16 +479,17 @@ defmodule PowerModel.Solver.Harmonics.Solver do
     rhs = i_real ++ i_imag
 
     # Try sparse LU solve first (handles asymmetric matrices)
-    result = try do
-      case Sparse.sparse_lu_solve(rows, cols, vals, rhs, dim) do
-        {:ok, solution} -> {:ok, solution}
-        {:error, reason} -> {:error, reason}
+    result =
+      try do
+        case Sparse.sparse_lu_solve(rows, cols, vals, rhs, dim) do
+          {:ok, solution} -> {:ok, solution}
+          {:error, reason} -> {:error, reason}
+        end
+      rescue
+        _e ->
+          # NIF not available — fall back to dense solve
+          solve_dense_2n(rows, cols, vals, rhs, dim)
       end
-    rescue
-      _e ->
-        # NIF not available — fall back to dense solve
-        solve_dense_2n(rows, cols, vals, rhs, dim)
-    end
 
     case result do
       {:ok, solution} ->
@@ -511,20 +550,22 @@ defmodule PowerModel.Solver.Harmonics.Solver do
       _e ->
         # Final fallback: Nx dense solve
         try do
-          solution = Sparse.solve_dense(
-            Enum.chunk_every(
-              Enum.map(0..(dim * dim - 1), fn idx ->
-                r = div(idx, dim)
-                c = rem(idx, dim)
-                # Rebuild from triplets
-                Enum.reduce(Enum.zip([rows, cols, vals]), 0.0, fn {ri, ci, vi}, acc ->
-                  if ri == r and ci == c, do: acc + vi, else: acc
-                end)
-              end),
-              dim
-            ),
-            rhs
-          )
+          solution =
+            Sparse.solve_dense(
+              Enum.chunk_every(
+                Enum.map(0..(dim * dim - 1), fn idx ->
+                  r = div(idx, dim)
+                  c = rem(idx, dim)
+                  # Rebuild from triplets
+                  Enum.reduce(Enum.zip([rows, cols, vals]), 0.0, fn {ri, ci, vi}, acc ->
+                    if ri == r and ci == c, do: acc + vi, else: acc
+                  end)
+                end),
+                dim
+              ),
+              rhs
+            )
+
           {:ok, solution}
         rescue
           _e2 -> {:error, :solve_failed}

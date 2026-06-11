@@ -27,13 +27,20 @@ defmodule PowerModel.Transient.Governor.GAST do
   """
 
   defstruct [
-    :x_gov,        # governor state (fuel valve position, pu)
-    :r,            # droop (pu)
-    :t1,           # fuel system time constant (seconds)
-    :p_ref,        # power reference setpoint (pu)
-    :p_max,        # maximum mechanical power (pu)
-    :p_min,        # minimum mechanical power (pu)
-    :load_limit    # exhaust temperature limit (pu)
+    # governor state (fuel valve position, pu)
+    :x_gov,
+    # droop (pu)
+    :r,
+    # fuel system time constant (seconds)
+    :t1,
+    # power reference setpoint (pu)
+    :p_ref,
+    # maximum mechanical power (pu)
+    :p_max,
+    # minimum mechanical power (pu)
+    :p_min,
+    # exhaust temperature limit (pu)
+    :load_limit
   ]
 
   @doc """
@@ -70,7 +77,7 @@ defmodule PowerModel.Transient.Governor.GAST do
   Returns `dx_gov/dt`.
   """
   def derivative(%__MODULE__{} = gov, omega) do
-    speed_error = (1.0 / gov.r) * (omega - 1.0)
+    speed_error = 1.0 / gov.r * (omega - 1.0)
     (gov.p_ref - speed_error - gov.x_gov) / gov.t1
   end
 

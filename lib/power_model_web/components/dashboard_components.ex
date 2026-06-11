@@ -13,14 +13,14 @@ defmodule PowerModelWeb.DashboardComponents do
   def metric_card(assigns) do
     ~H"""
     <div class="dash-metric-card">
-      <div class="dash-metric-title"><%= @title %></div>
-      <div class="dash-metric-value" style={"color: #{@color}"}><%= @value %></div>
+      <div class="dash-metric-title">{@title}</div>
+      <div class="dash-metric-value" style={"color: #{@color}"}>{@value}</div>
       <%= if @subtitle do %>
         <div class="dash-metric-subtitle">
           <%= if @trend do %>
-            <span class={"trend-icon trend-#{@trend}"}><%= trend_icon(@trend) %></span>
+            <span class={"trend-icon trend-#{@trend}"}>{trend_icon(@trend)}</span>
           <% end %>
-          <%= @subtitle %>
+          {@subtitle}
         </div>
       <% end %>
     </div>
@@ -33,13 +33,13 @@ defmodule PowerModelWeb.DashboardComponents do
   def breakdown_table(assigns) do
     ~H"""
     <div class="dash-breakdown">
-      <div class="dash-breakdown-title"><%= @title %></div>
+      <div class="dash-breakdown-title">{@title}</div>
       <div class="dash-breakdown-items">
         <%= for item <- @items do %>
           <div class="dash-breakdown-row">
             <span class="dash-breakdown-dot" style={"background: #{item[:color] || "#888"}"}></span>
-            <span class="dash-breakdown-label"><%= item.label %></span>
-            <span class="dash-breakdown-value"><%= item.value %></span>
+            <span class="dash-breakdown-label">{item.label}</span>
+            <span class="dash-breakdown-value">{item.value}</span>
           </div>
         <% end %>
       </div>
@@ -54,11 +54,13 @@ defmodule PowerModelWeb.DashboardComponents do
   def capacity_gauge(assigns) do
     pct = if assigns.total > 0, do: assigns.current / assigns.total * 100, else: 0
     pct = min(pct, 100)
-    stroke_color = cond do
-      pct < 60 -> "#2ecc71"
-      pct < 80 -> "#f1c40f"
-      true -> "#e74c3c"
-    end
+
+    stroke_color =
+      cond do
+        pct < 60 -> "#2ecc71"
+        pct < 80 -> "#f1c40f"
+        true -> "#e74c3c"
+      end
 
     assigns = assign(assigns, pct: pct, stroke_color: stroke_color)
 
@@ -80,8 +82,8 @@ defmodule PowerModelWeb.DashboardComponents do
         />
       </svg>
       <div class="gauge-text">
-        <div class="gauge-pct"><%= Float.round(@pct, 0) %>%</div>
-        <div class="gauge-label"><%= @label %></div>
+        <div class="gauge-pct">{Float.round(@pct, 0)}%</div>
+        <div class="gauge-label">{@label}</div>
       </div>
     </div>
     """

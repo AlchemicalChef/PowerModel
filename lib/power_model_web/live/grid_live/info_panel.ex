@@ -5,103 +5,103 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
     ~H"""
     <div class="info-panel">
       <div class="info-header">
-        <h3><%= component_title(@component.type) %> #<%= @component.id %></h3>
+        <h3>{component_title(@component.type)} #{@component.id}</h3>
         <button phx-click="deselect" class="close-btn">&times;</button>
       </div>
 
       <div class="info-body">
         <div class="info-row">
           <span class="info-label">Type</span>
-          <span class="info-value"><%= humanize_type(@component.type) %></span>
+          <span class="info-value">{humanize_type(@component.type)}</span>
         </div>
         <div class="info-row">
           <span class="info-label">ID</span>
-          <span class="info-value"><%= @component.id %></span>
+          <span class="info-value">{@component.id}</span>
         </div>
         <%= if @component[:capacity] do %>
           <div class="info-row">
             <span class="info-label">Capacity</span>
-            <span class="info-value"><%= format_number(@component.capacity) %> MW</span>
+            <span class="info-value">{format_number(@component.capacity)} MW</span>
           </div>
         <% end %>
         <%= if @component[:fuel_type] do %>
           <div class="info-row">
             <span class="info-label">Fuel Type</span>
-            <span class="info-value"><%= @component.fuel_type %></span>
+            <span class="info-value">{@component.fuel_type}</span>
           </div>
         <% end %>
         <%= if @component[:voltage_kv] do %>
           <div class="info-row">
             <span class="info-label">Voltage</span>
-            <span class="info-value"><%= @component.voltage_kv %> kV</span>
+            <span class="info-value">{@component.voltage_kv} kV</span>
           </div>
         <% end %>
         <%= if @component[:rating_mva] do %>
           <div class="info-row">
             <span class="info-label">Rating</span>
-            <span class="info-value"><%= @component.rating_mva %> MVA</span>
+            <span class="info-value">{@component.rating_mva} MVA</span>
           </div>
         <% end %>
         <%= if @component[:voltage] do %>
           <div class="info-row">
             <span class="info-label">Max Voltage</span>
-            <span class="info-value"><%= @component.voltage %> kV</span>
+            <span class="info-value">{@component.voltage} kV</span>
           </div>
         <% end %>
         <%!-- Critical facility fields --%>
         <%= if @component[:category] do %>
           <div class="info-row">
             <span class="info-label">Category</span>
-            <span class="info-value"><%= @component.category %></span>
+            <span class="info-value">{@component.category}</span>
           </div>
         <% end %>
         <%= if @component[:address] do %>
           <div class="info-row">
             <span class="info-label">Address</span>
-            <span class="info-value"><%= @component.address %></span>
+            <span class="info-value">{@component.address}</span>
           </div>
         <% end %>
         <%= if @component[:beds] do %>
           <div class="info-row">
             <span class="info-label">Beds</span>
-            <span class="info-value"><%= @component.beds %></span>
+            <span class="info-value">{@component.beds}</span>
           </div>
         <% end %>
         <%= if @component[:trauma] do %>
           <div class="info-row">
             <span class="info-label">Trauma Level</span>
-            <span class="info-value"><%= @component.trauma %></span>
+            <span class="info-value">{@component.trauma}</span>
           </div>
         <% end %>
         <%!-- Water facility fields --%>
         <%= if @component[:facility_type] do %>
           <div class="info-row">
             <span class="info-label">Facility</span>
-            <span class="info-value"><%= @component.facility_type %></span>
+            <span class="info-value">{@component.facility_type}</span>
           </div>
         <% end %>
         <%= if @component[:power_mw] do %>
           <div class="info-row">
             <span class="info-label">Power Draw</span>
-            <span class="info-value"><%= format_number(@component.power_mw) %> MW</span>
+            <span class="info-value">{format_number(@component.power_mw)} MW</span>
           </div>
         <% end %>
         <%= if @component[:bus_id] do %>
           <div class="info-row">
             <span class="info-label">Grid Bus</span>
-            <span class="info-value">Bus #<%= @component.bus_id %></span>
+            <span class="info-value">Bus #{@component.bus_id}</span>
           </div>
         <% end %>
         <%= if @component[:state] do %>
           <div class="info-row">
             <span class="info-label">State</span>
-            <span class="info-value"><%= state_name(@component.state) %></span>
+            <span class="info-value">{state_name(@component.state)}</span>
           </div>
         <% end %>
         <%= if @component[:data_source] do %>
           <div class="info-row info-source">
             <span class="info-label">Source</span>
-            <span class="info-value source-value"><%= @component.data_source %></span>
+            <span class="info-value source-value">{@component.data_source}</span>
           </div>
         <% end %>
       </div>
@@ -116,13 +116,23 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
           <div class="harmonic-controls">
             <div class="harmonic-row">
               <label>Source Type</label>
-              <select phx-change="harmonic_source_type"
-                      phx-value-gen-id={@component.id}>
+              <select
+                phx-change="harmonic_source_type"
+                phx-value-gen-id={@component.id}
+              >
                 <option value="none" selected={harmonic_type(@component) == "none"}>None</option>
-                <option value="pwm_inverter" selected={harmonic_type(@component) == "pwm_inverter"}>PWM Inverter</option>
-                <option value="six_pulse" selected={harmonic_type(@component) == "six_pulse"}>6-Pulse Converter</option>
-                <option value="twelve_pulse" selected={harmonic_type(@component) == "twelve_pulse"}>12-Pulse Converter</option>
-                <option value="arc_furnace" selected={harmonic_type(@component) == "arc_furnace"}>Arc Furnace</option>
+                <option value="pwm_inverter" selected={harmonic_type(@component) == "pwm_inverter"}>
+                  PWM Inverter
+                </option>
+                <option value="six_pulse" selected={harmonic_type(@component) == "six_pulse"}>
+                  6-Pulse Converter
+                </option>
+                <option value="twelve_pulse" selected={harmonic_type(@component) == "twelve_pulse"}>
+                  12-Pulse Converter
+                </option>
+                <option value="arc_furnace" selected={harmonic_type(@component) == "arc_furnace"}>
+                  Arc Furnace
+                </option>
               </select>
             </div>
 
@@ -130,42 +140,63 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
               <div class="harmonic-row">
                 <label>5th Harmonic</label>
                 <div class="slider-group">
-                  <input type="range" min="0" max="15" step="0.5"
+                  <input
+                    type="range"
+                    min="0"
+                    max="15"
+                    step="0.5"
                     value={Map.get(@component, :h5_pct, default_h5(@component))}
                     phx-change="harmonic_adjust"
                     phx-value-gen-id={@component.id}
-                    phx-value-harmonic="5" />
-                  <span class="slider-value"><%= Map.get(@component, :h5_pct, default_h5(@component)) %>%</span>
+                    phx-value-harmonic="5"
+                  />
+                  <span class="slider-value">
+                    {Map.get(@component, :h5_pct, default_h5(@component))}%
+                  </span>
                 </div>
               </div>
 
               <div class="harmonic-row">
                 <label>7th Harmonic</label>
                 <div class="slider-group">
-                  <input type="range" min="0" max="12" step="0.5"
+                  <input
+                    type="range"
+                    min="0"
+                    max="12"
+                    step="0.5"
                     value={Map.get(@component, :h7_pct, default_h7(@component))}
                     phx-change="harmonic_adjust"
                     phx-value-gen-id={@component.id}
-                    phx-value-harmonic="7" />
-                  <span class="slider-value"><%= Map.get(@component, :h7_pct, default_h7(@component)) %>%</span>
+                    phx-value-harmonic="7"
+                  />
+                  <span class="slider-value">
+                    {Map.get(@component, :h7_pct, default_h7(@component))}%
+                  </span>
                 </div>
               </div>
 
               <div class="harmonic-row">
                 <label>11th Harmonic</label>
                 <div class="slider-group">
-                  <input type="range" min="0" max="8" step="0.5"
+                  <input
+                    type="range"
+                    min="0"
+                    max="8"
+                    step="0.5"
                     value={Map.get(@component, :h11_pct, 2.0)}
                     phx-change="harmonic_adjust"
                     phx-value-gen-id={@component.id}
-                    phx-value-harmonic="11" />
-                  <span class="slider-value"><%= Map.get(@component, :h11_pct, 2.0) %>%</span>
+                    phx-value-harmonic="11"
+                  />
+                  <span class="slider-value">{Map.get(@component, :h11_pct, 2.0)}%</span>
                 </div>
               </div>
 
-              <button phx-click="run_harmonics"
-                      phx-value-gen-id={@component.id}
-                      class="harmonics-btn">
+              <button
+                phx-click="run_harmonics"
+                phx-value-gen-id={@component.id}
+                class="harmonics-btn"
+              >
                 Analyze Harmonics
               </button>
             <% end %>
@@ -176,13 +207,13 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
               <div class="info-row">
                 <span class="info-label">Bus THD</span>
                 <span class={"info-value #{if @component.thd_result > 5.0, do: "thd-violation", else: "thd-ok"}"}>
-                  <%= Float.round(@component.thd_result, 2) %>%
+                  {Float.round(@component.thd_result, 2)}%
                 </span>
               </div>
               <div class="info-row">
                 <span class="info-label">IEEE 519</span>
                 <span class={"info-value #{if @component[:ieee_519_compliant], do: "thd-ok", else: "thd-violation"}"}>
-                  <%= if @component[:ieee_519_compliant], do: "Compliant", else: "Violation" %>
+                  {if @component[:ieee_519_compliant], do: "Compliant", else: "Violation"}
                 </span>
               </div>
             </div>
@@ -204,8 +235,7 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
 
         <%= if @cascade_active do %>
           <div class="cascade-indicator">
-            <span class="cascade-dot"></span>
-            Cascade in progress...
+            <span class="cascade-dot"></span> Cascade in progress...
           </div>
         <% end %>
       </div>

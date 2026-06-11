@@ -28,12 +28,18 @@ defmodule PowerModel.Solver.Stability.CPF do
   alias PowerModel.Solver.{DCPowerFlow, NewtonRaphson}
 
   defstruct [
-    :pv_curve,          # [{lambda, voltages_map}]
-    :nose_point,        # %{lambda, min_vm_pu, total_load_mw}
-    :margin_mw,         # MW margin to collapse from base case
-    :critical_bus_id,   # bus with lowest voltage at nose point
-    :converged,         # whether the trace completed
-    :steps              # number of continuation steps taken
+    # [{lambda, voltages_map}]
+    :pv_curve,
+    # %{lambda, min_vm_pu, total_load_mw}
+    :nose_point,
+    # MW margin to collapse from base case
+    :margin_mw,
+    # bus with lowest voltage at nose point
+    :critical_bus_id,
+    # whether the trace completed
+    :converged,
+    # number of continuation steps taken
+    :steps
   ]
 
   @doc """
@@ -62,24 +68,30 @@ defmodule PowerModel.Solver.Stability.CPF do
     base_solution = solve_at_lambda(snapshot, 0.0, base_mva, solver)
 
     if base_solution == nil do
-      %__MODULE__{pv_curve: [], nose_point: nil, margin_mw: 0.0,
-                  critical_bus_id: nil, converged: false, steps: 0}
+      %__MODULE__{
+        pv_curve: [],
+        nose_point: nil,
+        margin_mw: 0.0,
+        critical_bus_id: nil,
+        converged: false,
+        steps: 0
+      }
     else
       initial_point = extract_point(base_solution, 0.0)
 
       # Trace the curve
       {curve, _nose, final_lambda, converged} =
-        do_trace(snapshot, [initial_point], 0.0, step_size, max_steps, min_step,
-                 base_mva, solver)
+        do_trace(snapshot, [initial_point], 0.0, step_size, max_steps, min_step, base_mva, solver)
 
       # Find the nose point (maximum lambda where solve converges)
       nose_point = find_nose(curve)
 
-      margin_mw = if nose_point do
-        nose_point.lambda * base_load
-      else
-        final_lambda * base_load
-      end
+      margin_mw =
+        if nose_point do
+          nose_point.lambda * base_load
+        else
+          final_lambda * base_load
+        end
 
       critical_bus = if nose_point, do: nose_point.critical_bus_id, else: nil
 
@@ -102,16 +114,20 @@ defmodule PowerModel.Solver.Stability.CPF do
   """
   def voltage_margin(cpf_result, bus_id, v_threshold \\ 0.9) do
     case cpf_result.pv_curve do
-      [] -> 0.0
+      [] ->
+        0.0
+
       curve ->
         # Find the lambda where this bus drops below threshold
-        critical = Enum.find(curve, fn point ->
-          v = Map.get(point.voltages, bus_id, 1.0)
-          v < v_threshold
-        end)
+        critical =
+          Enum.find(curve, fn point ->
+            v = Map.get(point.voltages, bus_id, 1.0)
+            v < v_threshold
+          end)
 
         case critical do
-          nil -> cpf_result.margin_mw  # Never drops below threshold
+          # Never drops below threshold
+          nil -> cpf_result.margin_mw
           point -> point.total_load_mw - hd(curve).total_load_mw
         end
     end
@@ -133,7 +149,9 @@ defmodule PowerModel.Solver.Stability.CPF do
   """
   def weak_buses(cpf_result, v_threshold \\ 0.92) do
     case cpf_result.nose_point do
-      nil -> []
+      nil ->
+        []
+
       nose ->
         nose.voltages
         |> Enum.filter(fn {_id, v} -> v < v_threshold end)
@@ -144,13 +162,12 @@ defmodule PowerModel.Solver.Stability.CPF do
 
   # --- Private ---
 
-  defp do_trace(_snapshot, curve, lambda, _step, max_steps, _min_step,
-               _base_mva, _solver) when length(curve) > max_steps do
+  defp do_trace(_snapshot, curve, lambda, _step, max_steps, _min_step, _base_mva, _solver)
+       when length(curve) > max_steps do
     {curve, nil, lambda, false}
   end
 
-  defp do_trace(snapshot, curve, lambda, step, max_steps, min_step,
-               base_mva, solver) do
+  defp do_trace(snapshot, curve, lambda, step, max_steps, min_step, base_mva, solver) do
     next_lambda = lambda + step
 
     case solve_at_lambda(snapshot, next_lambda, base_mva, solver) do
@@ -160,8 +177,7 @@ defmodule PowerModel.Solver.Stability.CPF do
           # Can't go smaller — this is approximately the nose
           {curve, nil, lambda, true}
         else
-          do_trace(snapshot, curve, lambda, step / 2.0, max_steps, min_step,
-                   base_mva, solver)
+          do_trace(snapshot, curve, lambda, step / 2.0, max_steps, min_step, base_mva, solver)
         end
 
       solution ->
@@ -177,14 +193,24 @@ defmodule PowerModel.Solver.Stability.CPF do
         else
           # Adaptive step: increase step if far from nose, decrease if voltages dropping
           prev_min = hd(curve).min_vm_pu
-          new_step = cond do
-            min_v < 0.85 -> max(step * 0.5, min_step)
-            min_v > prev_min -> min(step * 1.5, 0.2)
-            true -> step
-          end
 
-          do_trace(snapshot, new_curve, next_lambda, new_step, max_steps, min_step,
-                   base_mva, solver)
+          new_step =
+            cond do
+              min_v < 0.85 -> max(step * 0.5, min_step)
+              min_v > prev_min -> min(step * 1.5, 0.2)
+              true -> step
+            end
+
+          do_trace(
+            snapshot,
+            new_curve,
+            next_lambda,
+            new_step,
+            max_steps,
+            min_step,
+            base_mva,
+            solver
+          )
         end
     end
   end
@@ -192,13 +218,12 @@ defmodule PowerModel.Solver.Stability.CPF do
   defp solve_at_lambda(snapshot, lambda, base_mva, solver) do
     # Scale loads by (1 + lambda). Do NOT scale generator p_max_mw (capacity).
     # Let dispatch handle the generation increase naturally.
-    scaled_loads = Enum.map(snapshot.loads, fn l ->
-      %{l | p_mw: l.p_mw * (1.0 + lambda)}
-    end)
+    scaled_loads =
+      Enum.map(snapshot.loads, fn l ->
+        %{l | p_mw: l.p_mw * (1.0 + lambda)}
+      end)
 
-    scaled_snapshot = %{snapshot |
-      loads: scaled_loads
-    }
+    scaled_snapshot = %{snapshot | loads: scaled_loads}
 
     try do
       case solver do
@@ -207,7 +232,10 @@ defmodule PowerModel.Solver.Stability.CPF do
 
         :ac ->
           case NewtonRaphson.solve(scaled_snapshot,
-                 base_mva: base_mva, max_iterations: 30, tolerance: 1.0e-3) do
+                 base_mva: base_mva,
+                 max_iterations: 30,
+                 tolerance: 1.0e-3
+               ) do
             {:ok, sol} -> if sol.converged, do: sol, else: nil
             _ -> nil
           end
@@ -222,8 +250,9 @@ defmodule PowerModel.Solver.Stability.CPF do
     min_v = Enum.min(solution.vm_pu)
     total_load = Map.get(solution, :total_load_mw) || 0.0
 
-    {critical_id, _} = Enum.zip(solution.bus_ids, solution.vm_pu)
-    |> Enum.min_by(fn {_id, v} -> v end)
+    {critical_id, _} =
+      Enum.zip(solution.bus_ids, solution.vm_pu)
+      |> Enum.min_by(fn {_id, v} -> v end)
 
     %{
       lambda: lambda,
@@ -235,6 +264,7 @@ defmodule PowerModel.Solver.Stability.CPF do
   end
 
   defp find_nose(curve) when length(curve) < 2, do: nil
+
   defp find_nose(curve) do
     # The nose is the point with maximum lambda (last converged point before collapse)
     # Since curve is in reverse order (most recent first), it's the head

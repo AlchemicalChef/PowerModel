@@ -28,7 +28,7 @@ defmodule PowerModel.Failure.Protection do
   # Conductor thermal time constants by voltage class (seconds).
   # Represents time for conductor to reach thermal limit from rated temperature.
   @thermal_tau %{
-    69  => 600.0,
+    69 => 600.0,
     115 => 900.0,
     138 => 900.0,
     230 => 1200.0,
@@ -40,11 +40,11 @@ defmodule PowerModel.Failure.Protection do
   # Generator underfrequency relay 81 settings by fuel category
   @uf_relay %{
     "nuclear" => 59.0,
-    "coal"    => 58.0,
-    "gas"     => 57.5,
-    "hydro"   => 57.0,
-    "wind"    => 57.5,
-    "solar"   => 57.5
+    "coal" => 58.0,
+    "gas" => 57.5,
+    "hydro" => 57.0,
+    "wind" => 57.5,
+    "solar" => 57.5
   }
 
   @doc """
@@ -87,13 +87,16 @@ defmodule PowerModel.Failure.Protection do
       flow
     end
   end
+
   defp recompute_loading(flow), do: flow
 
   defp rating_from_flow(%{rating_a_mva: r}) when is_number(r) and r > 0, do: r
   defp rating_from_flow(%{rated_mva: r}) when is_number(r) and r > 0, do: r
+
   defp rating_from_flow(%{loading_pct: pct, p_flow_mw: p}) when pct > 0 do
     abs(p) / (pct / 100.0)
   end
+
   defp rating_from_flow(_), do: 0
 
   @doc """
@@ -123,11 +126,12 @@ defmodule PowerModel.Failure.Protection do
     line_flows
     |> Enum.filter(fn {{_type, _id}, flow} -> flow.loading_pct > @zone3_loading_min end)
     |> Enum.filter(fn {{type, id}, _flow} ->
-      component = case type do
-        :line -> Map.get(line_map, id)
-        :transformer -> Map.get(line_map, id)
-        _ -> nil
-      end
+      component =
+        case type do
+          :line -> Map.get(line_map, id)
+          :transformer -> Map.get(line_map, id)
+          _ -> nil
+        end
 
       if component do
         from_idx = Map.get(bus_index, component.from_bus_id)
@@ -177,7 +181,10 @@ defmodule PowerModel.Failure.Protection do
   """
   def zone3_trip_probability(loading_pct, v_min_pu) do
     loading_factor = min(max((loading_pct - @zone3_loading_min) / @zone3_loading_range, 0.0), 1.0)
-    voltage_factor = min(max((@zone3_voltage_threshold - v_min_pu) / @zone3_voltage_range, 0.0), 1.0)
+
+    voltage_factor =
+      min(max((@zone3_voltage_threshold - v_min_pu) / @zone3_voltage_range, 0.0), 1.0)
+
     loading_factor * voltage_factor
   end
 
@@ -194,6 +201,7 @@ defmodule PowerModel.Failure.Protection do
     |> Enum.filter(fn {_id, v} -> v < uv_threshold or v > ov_threshold end)
     |> Enum.map(fn {bus_id, v} ->
       cause = if v < uv_threshold, do: "undervoltage", else: "overvoltage"
+
       %{
         component_type: "bus",
         component_id: bus_id,
@@ -269,6 +277,61 @@ defmodule PowerModel.Failure.Protection do
   end
 
   @doc """
+  Thermal time constant (seconds) for a conductor voltage class.
+  """
+  def thermal_time_constant_s(voltage_kv), do: thermal_tau_for_kv(voltage_kv)
+
+  @doc """
+  Advance normalized conductor thermal state over `dt_s`.
+
+  `temp_norm` represents conductor thermal state where ~1.0 is nominal
+  continuous rating and larger values represent thermal stress.
+  """
+  def thermal_next_temperature(temp_norm, loading_pct, dt_s, opts \\ []) do
+    tau_s = thermal_time_constant_s(Keyword.get(opts, :voltage_kv))
+    i2 = :math.pow(max(loading_pct, 0.0) / 100.0, 2.0)
+    i2 + (temp_norm - i2) * :math.exp(-dt_s / max(tau_s, 1.0))
+  end
+
+  @doc """
+  Time to hit thermal limit from the current normalized thermal state.
+
+  Returns `:infinity` if the current loading will not reach the emergency
+  thermal limit.
+  """
+  def thermal_time_to_limit(temp_norm, loading_pct, opts \\ []) do
+    tau_s = thermal_time_constant_s(Keyword.get(opts, :voltage_kv))
+    i2 = :math.pow(max(loading_pct, 0.0) / 100.0, 2.0)
+    i_limit = emergency_ratio(opts)
+    limit2 = i_limit * i_limit
+
+    cond do
+      temp_norm >= limit2 ->
+        0.0
+
+      i2 <= limit2 ->
+        :infinity
+
+      true ->
+        # T(t) = I^2 + (T0 - I^2) e^(-t/tau), solve for T(t)=T_limit.
+        num = limit2 - i2
+        den = temp_norm - i2
+
+        if den == 0.0 do
+          0.0
+        else
+          ratio = num / den
+
+          if ratio <= 0.0 do
+            0.0
+          else
+            max(-tau_s * :math.log(ratio), 0.0)
+          end
+        end
+    end
+  end
+
+  @doc """
   Conductor thermal trip time using thermal model.
 
   Uses `t = tau * ln((I^2 - 1) / (I^2 - I_max^2))` where I is the current
@@ -291,16 +354,16 @@ defmodule PowerModel.Failure.Protection do
     if loading_pct <= 100.0 do
       :infinity
     else
-      voltage_kv = Keyword.get(opts, :voltage_kv)
       rating_a = Keyword.get(opts, :rating_a_mva)
       rating_c = Keyword.get(opts, :rating_c_mva)
 
       # Emergency ratio: Rate C / Rate A (default 1.5x)
-      i_max = if rating_a && rating_a > 0 && rating_c && rating_c > 0 do
-        rating_c / rating_a
-      else
-        1.5
-      end
+      i_max =
+        if rating_a && rating_a > 0 && rating_c && rating_c > 0 do
+          rating_c / rating_a
+        else
+          1.5
+        end
 
       i = loading_pct / 100.0
       i_sq = i * i
@@ -308,11 +371,13 @@ defmodule PowerModel.Failure.Protection do
 
       # Determine emergency rating ratio for Rate B (30 min) tier
       rating_b = Keyword.get(opts, :rating_b_mva)
-      i_rate_b = if rating_a && rating_a > 0 && rating_b && rating_b > 0 do
-        rating_b / rating_a
-      else
-        1.2
-      end
+
+      i_rate_b =
+        if rating_a && rating_a > 0 && rating_b && rating_b > 0 do
+          rating_b / rating_a
+        else
+          1.2
+        end
 
       cond do
         i_sq >= i_max_sq ->
@@ -356,8 +421,10 @@ defmodule PowerModel.Failure.Protection do
     cond do
       elapsed_s < 30.0 ->
         Map.get(line, :rating_c_mva) || rate_a * 1.5
+
       elapsed_s < 1800.0 ->
         Map.get(line, :rating_b_mva) || rate_a * 1.2
+
       true ->
         rate_a
     end
@@ -379,18 +446,20 @@ defmodule PowerModel.Failure.Protection do
         trip_hz = Map.get(@uf_relay, fuel, 57.5)
 
         if frequency_hz < trip_hz do
-          [%{
-            component_type: "generator",
-            component_id: gen.id,
-            failure_cause: "relay_81_uf",
-            details: %{
-              frequency_hz: frequency_hz,
-              trip_setpoint_hz: trip_hz,
-              fuel_type: fuel,
-              p_mw: gen.p_max_mw
-            },
-            trip_time_s: 0.5
-          }]
+          [
+            %{
+              component_type: "generator",
+              component_id: gen.id,
+              failure_cause: "relay_81_uf",
+              details: %{
+                frequency_hz: frequency_hz,
+                trip_setpoint_hz: trip_hz,
+                fuel_type: fuel,
+                p_mw: gen.p_max_mw
+              },
+              trip_time_s: 0.5
+            }
+          ]
         else
           []
         end
@@ -399,6 +468,7 @@ defmodule PowerModel.Failure.Protection do
   end
 
   defp thermal_tau_for_kv(nil), do: 900.0
+
   defp thermal_tau_for_kv(kv) do
     # Find closest voltage class
     {_best_kv, tau} =
@@ -408,9 +478,22 @@ defmodule PowerModel.Failure.Protection do
     tau
   end
 
+  defp emergency_ratio(opts) do
+    rating_a = Keyword.get(opts, :rating_a_mva) || Keyword.get(opts, :rated_mva)
+    rating_c = Keyword.get(opts, :rating_c_mva)
+
+    if rating_a && rating_a > 0 && rating_c && rating_c > 0 do
+      max(rating_c / rating_a, 1.01)
+    else
+      1.5
+    end
+  end
+
   defp normalize_gen_fuel(nil), do: "gas"
+
   defp normalize_gen_fuel(fuel) when is_binary(fuel) do
     f = String.downcase(fuel)
+
     cond do
       f in ["nuc", "nuclear"] -> "nuclear"
       f in ["col", "coal", "bit", "sub", "lig"] -> "coal"

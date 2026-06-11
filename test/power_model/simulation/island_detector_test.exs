@@ -89,7 +89,7 @@ defmodule PowerModel.Simulation.Cascading.IslandDetectorTest do
       islands = IslandDetector.detect(Enum.map(buses, & &1.id), active_lines, [])
 
       assert length(islands) == 2
-      island_sets = Enum.map(islands, &MapSet.to_list(&1) |> Enum.sort())
+      island_sets = Enum.map(islands, &(MapSet.to_list(&1) |> Enum.sort()))
       assert [1, 2] in island_sets
       assert [3] in island_sets
     end
@@ -153,12 +153,13 @@ defmodule PowerModel.Simulation.Cascading.IslandDetectorTest do
       # 1 --line-- 2    3 --line-- 4  (transformer 2-3 removed)
       _buses = [bus(1), bus(2), bus(3), bus(4)]
       lines = [line(1, 1, 2), line(2, 3, 4)]
-      xfmrs = []  # transformer removed
+      # transformer removed
+      xfmrs = []
 
       islands = IslandDetector.detect([1, 2, 3, 4], lines, xfmrs)
 
       assert length(islands) == 2
-      island_sets = Enum.map(islands, &MapSet.to_list(&1) |> Enum.sort())
+      island_sets = Enum.map(islands, &(MapSet.to_list(&1) |> Enum.sort()))
       assert [1, 2] in island_sets
       assert [3, 4] in island_sets
     end
@@ -208,13 +209,17 @@ defmodule PowerModel.Simulation.Cascading.IslandDetectorTest do
 
     test "generators and loads outside the island are ignored" do
       island = MapSet.new([1])
+
       gens = [
         generator(1, 1, p_max_mw: 100.0),
-        generator(2, 99, p_max_mw: 500.0)  # bus 99 not in island
+        # bus 99 not in island
+        generator(2, 99, p_max_mw: 500.0)
       ]
+
       loads = [
         load(1, 1, p_mw: 60.0),
-        load(2, 99, p_mw: 300.0)  # bus 99 not in island
+        # bus 99 not in island
+        load(2, 99, p_mw: 300.0)
       ]
 
       assert {:ok, surplus} = IslandDetector.island_balance(island, gens, loads)
@@ -263,8 +268,10 @@ defmodule PowerModel.Simulation.Cascading.IslandDetectorTest do
 
       generators = [
         generator(1, 1, p_max_mw: 50.0),
-        generator(2, 2, p_max_mw: 200.0),  # largest in island 0
-        generator(3, 3, p_max_mw: 300.0),  # largest in island 1
+        # largest in island 0
+        generator(2, 2, p_max_mw: 200.0),
+        # largest in island 1
+        generator(3, 3, p_max_mw: 300.0),
         generator(4, 4, p_max_mw: 100.0)
       ]
 

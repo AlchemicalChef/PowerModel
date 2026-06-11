@@ -38,11 +38,16 @@ defmodule PowerModel.Solver.Stability.SmallSignal do
 
   defstruct [
     :n_gen,
-    :eigenvalues,      # [{real, imag}]
-    :modes,            # [%{freq_hz, damping_ratio, type, participation}]
-    :stable,           # boolean
-    :a_matrix,         # the linearized state matrix (for debugging)
-    :gen_ids           # ordered generator IDs
+    # [{real, imag}]
+    :eigenvalues,
+    # [%{freq_hz, damping_ratio, type, participation}]
+    :modes,
+    # boolean
+    :stable,
+    # the linearized state matrix (for debugging)
+    :a_matrix,
+    # ordered generator IDs
+    :gen_ids
   ]
 
   @doc """
@@ -60,14 +65,18 @@ defmodule PowerModel.Solver.Stability.SmallSignal do
   ## Returns
     `%SmallSignal{}` with eigenvalues, oscillation modes, and stability flag.
   """
-  def analyze(generators, y_red_data, base_angles, e_prime, opts \\ []) do
+  def analyze(generators, y_red_data, base_angles, e_prime, _opts \\ []) do
     n = length(generators)
     gen_ids = Enum.map(generators, & &1.id)
 
     if n < 2 do
       %__MODULE__{
-        n_gen: n, eigenvalues: [], modes: [], stable: true,
-        a_matrix: nil, gen_ids: gen_ids
+        n_gen: n,
+        eigenvalues: [],
+        modes: [],
+        stable: true,
+        a_matrix: nil,
+        gen_ids: gen_ids
       }
     else
       h_vals = Enum.map(generators, fn g -> Map.get(g, :inertia_h) || 3.0 end)
@@ -134,13 +143,15 @@ defmodule PowerModel.Solver.Stability.SmallSignal do
   """
   def classify_modes(%__MODULE__{modes: modes}) do
     Enum.map(modes, fn mode ->
-      type = cond do
-        mode.freq_hz < 0.05 -> :non_oscillatory
-        mode.freq_hz < 1.0 -> :inter_area
-        mode.freq_hz < 3.0 -> :local
-        mode.freq_hz < 5.0 -> :intra_plant
-        true -> :torsional
-      end
+      type =
+        cond do
+          mode.freq_hz < 0.05 -> :non_oscillatory
+          mode.freq_hz < 1.0 -> :inter_area
+          mode.freq_hz < 3.0 -> :local
+          mode.freq_hz < 5.0 -> :intra_plant
+          true -> :torsional
+        end
+
       %{mode | type: type}
     end)
   end
@@ -149,37 +160,39 @@ defmodule PowerModel.Solver.Stability.SmallSignal do
   # K_ij = dP_elec_i / d(delta_j)
   defp build_k_matrix(n, angles, e_prime, {rows, cols, g_vals, b_vals}) do
     # Build sparse Y_red lookup
-    y_map = Enum.zip([rows, cols, g_vals, b_vals])
-    |> Enum.reduce(%{}, fn {r, c, g, b}, acc ->
-      Map.update(acc, {r, c}, {g, b}, fn {g0, b0} -> {g0 + g, b0 + b} end)
-    end)
+    y_map =
+      Enum.zip([rows, cols, g_vals, b_vals])
+      |> Enum.reduce(%{}, fn {r, c, g, b}, acc ->
+        Map.update(acc, {r, c}, {g, b}, fn {g0, b0} -> {g0 + g, b0 + b} end)
+      end)
 
     # K is dense n x n
-    k = for i <- 0..(n - 1) do
-      for j <- 0..(n - 1) do
-        if i == j do
-          # K_ii = sum_{k≠i} E_i * E_k * (B_ik * cos(d_i - d_k) - G_ik * sin(d_i - d_k))
-          Enum.reduce(0..(n - 1), 0.0, fn k, acc ->
-            if k == i do
-              acc
-            else
-              {g_ik, b_ik} = Map.get(y_map, {i, k}, {0.0, 0.0})
-              ei = Enum.at(e_prime, i)
-              ek = Enum.at(e_prime, k)
-              d_ik = Enum.at(angles, i) - Enum.at(angles, k)
-              acc + ei * ek * (b_ik * :math.cos(d_ik) - g_ik * :math.sin(d_ik))
-            end
-          end)
-        else
-          # K_ij = -E_i * E_j * (B_ij * cos(d_i - d_j) - G_ij * sin(d_i - d_j))
-          {g_ij, b_ij} = Map.get(y_map, {i, j}, {0.0, 0.0})
-          ei = Enum.at(e_prime, i)
-          ej = Enum.at(e_prime, j)
-          d_ij = Enum.at(angles, i) - Enum.at(angles, j)
-          -ei * ej * (b_ij * :math.cos(d_ij) - g_ij * :math.sin(d_ij))
+    k =
+      for i <- 0..(n - 1) do
+        for j <- 0..(n - 1) do
+          if i == j do
+            # K_ii = sum_{k≠i} E_i * E_k * (B_ik * cos(d_i - d_k) - G_ik * sin(d_i - d_k))
+            Enum.reduce(0..(n - 1), 0.0, fn k, acc ->
+              if k == i do
+                acc
+              else
+                {g_ik, b_ik} = Map.get(y_map, {i, k}, {0.0, 0.0})
+                ei = Enum.at(e_prime, i)
+                ek = Enum.at(e_prime, k)
+                d_ik = Enum.at(angles, i) - Enum.at(angles, k)
+                acc + ei * ek * (b_ik * :math.cos(d_ik) - g_ik * :math.sin(d_ik))
+              end
+            end)
+          else
+            # K_ij = -E_i * E_j * (B_ij * cos(d_i - d_j) - G_ij * sin(d_i - d_j))
+            {g_ij, b_ij} = Map.get(y_map, {i, j}, {0.0, 0.0})
+            ei = Enum.at(e_prime, i)
+            ej = Enum.at(e_prime, j)
+            d_ij = Enum.at(angles, i) - Enum.at(angles, j)
+            -ei * ej * (b_ij * :math.cos(d_ij) - g_ij * :math.sin(d_ij))
+          end
         end
       end
-    end
 
     k
   end
@@ -194,7 +207,8 @@ defmodule PowerModel.Solver.Stability.SmallSignal do
       for j <- 0..(dim - 1) do
         cond do
           # Top-left (n x n): zeros
-          i < n and j < n -> 0.0
+          i < n and j < n ->
+            0.0
 
           # Top-right (n x n): omega_base * I
           i < n and j >= n ->
@@ -212,6 +226,7 @@ defmodule PowerModel.Solver.Stability.SmallSignal do
           i >= n and j >= n ->
             gi = i - n
             gj = j - n
+
             if gi == gj do
               h = Enum.at(h_vals, gi)
               d = Enum.at(d_vals, gi)
@@ -266,6 +281,7 @@ defmodule PowerModel.Solver.Stability.SmallSignal do
   # A Hessenberg matrix has zeros below the first subdiagonal, which makes
   # QR iterations much faster (O(n^2) per step instead of O(n^3)).
   defp hessenberg_reduce(a, n) when n <= 2, do: a
+
   defp hessenberg_reduce(a, n) do
     Enum.reduce(0..(n - 3), a, fn k, acc ->
       # Extract column below diagonal
@@ -273,6 +289,7 @@ defmodule PowerModel.Solver.Stability.SmallSignal do
       col_vec = Nx.tensor(col_vals, type: :f64)
 
       norm = Nx.to_number(Nx.LinAlg.norm(col_vec))
+
       if norm < 1.0e-14 do
         acc
       else
@@ -291,8 +308,10 @@ defmodule PowerModel.Solver.Stability.SmallSignal do
           # Apply Householder from left: A = (I - 2vv^T/||v||^2) * A
           # Only rows k+1..n-1 are affected
           sub_rows = Nx.slice(acc, [k + 1, 0], [m, n])
-          vt_a = Nx.dot(Nx.reshape(v, {1, m}), sub_rows)  # {1, n}
-          update_left = Nx.dot(Nx.reshape(v, {m, 1}), vt_a)  # {m, n}
+          # {1, n}
+          vt_a = Nx.dot(Nx.reshape(v, {1, m}), sub_rows)
+          # {m, n}
+          update_left = Nx.dot(Nx.reshape(v, {m, 1}), vt_a)
           scale = 2.0 / v_norm_sq
           new_sub_rows = Nx.subtract(sub_rows, Nx.multiply(scale, update_left))
           acc = put_submatrix(acc, k + 1, 0, new_sub_rows)
@@ -300,8 +319,10 @@ defmodule PowerModel.Solver.Stability.SmallSignal do
           # Apply Householder from right: A = A * (I - 2vv^T/||v||^2)
           # All rows, columns k+1..n-1
           sub_cols = Nx.slice(acc, [0, k + 1], [n, m])
-          a_v = Nx.dot(sub_cols, Nx.reshape(v, {m, 1}))  # {n, 1}
-          update_right = Nx.dot(a_v, Nx.reshape(v, {1, m}))  # {n, m}
+          # {n, 1}
+          a_v = Nx.dot(sub_cols, Nx.reshape(v, {m, 1}))
+          # {n, m}
+          update_right = Nx.dot(a_v, Nx.reshape(v, {1, m}))
           new_sub_cols = Nx.subtract(sub_cols, Nx.multiply(scale, update_right))
           put_submatrix(acc, 0, k + 1, new_sub_cols)
         end
@@ -330,41 +351,45 @@ defmodule PowerModel.Solver.Stability.SmallSignal do
   end
 
   # QR iteration with Wilkinson shift for convergence
-  defp qr_iterate(a, dim, 0), do: a
+  defp qr_iterate(a, _dim, 0), do: a
+
   defp qr_iterate(a, dim, iters_left) do
     # Check if subdiagonal elements are small enough (converged)
-    converged = Enum.all?(0..(dim - 2), fn i ->
-      abs(Nx.to_number(a[i + 1][i])) < 1.0e-10
-    end)
+    converged =
+      Enum.all?(0..(dim - 2), fn i ->
+        abs(Nx.to_number(a[i + 1][i])) < 1.0e-10
+      end)
 
     if converged do
       a
     else
       # Wilkinson shift: eigenvalue of bottom-right 2x2 block closest to a_{n,n}
       a_nn = Nx.to_number(a[dim - 1][dim - 1])
-      shift = if dim >= 2 do
-        a_nm = Nx.to_number(a[dim - 2][dim - 2])
-        a_sub = Nx.to_number(a[dim - 1][dim - 2])
-        a_sup = Nx.to_number(a[dim - 2][dim - 1])
 
-        # Eigenvalues of 2x2 block
-        trace = a_nm + a_nn
-        det = a_nm * a_nn - a_sub * a_sup
-        disc = trace * trace - 4.0 * det
+      shift =
+        if dim >= 2 do
+          a_nm = Nx.to_number(a[dim - 2][dim - 2])
+          a_sub = Nx.to_number(a[dim - 1][dim - 2])
+          a_sup = Nx.to_number(a[dim - 2][dim - 1])
 
-        if disc >= 0.0 do
-          sqrt_disc = :math.sqrt(disc)
-          e1 = (trace + sqrt_disc) / 2.0
-          e2 = (trace - sqrt_disc) / 2.0
-          # Pick the eigenvalue closest to a_nn
-          if abs(e1 - a_nn) < abs(e2 - a_nn), do: e1, else: e2
+          # Eigenvalues of 2x2 block
+          trace = a_nm + a_nn
+          det = a_nm * a_nn - a_sub * a_sup
+          disc = trace * trace - 4.0 * det
+
+          if disc >= 0.0 do
+            sqrt_disc = :math.sqrt(disc)
+            e1 = (trace + sqrt_disc) / 2.0
+            e2 = (trace - sqrt_disc) / 2.0
+            # Pick the eigenvalue closest to a_nn
+            if abs(e1 - a_nn) < abs(e2 - a_nn), do: e1, else: e2
+          else
+            # Complex eigenvalues — use real part of shift
+            trace / 2.0
+          end
         else
-          # Complex eigenvalues — use real part of shift
-          trace / 2.0
+          a_nn
         end
-      else
-        a_nn
-      end
 
       # Shifted QR step: A - sigma*I = Q*R, then A_new = R*Q + sigma*I
       shift_matrix = Nx.multiply(shift, Nx.eye(dim, type: :f64))
@@ -431,10 +456,12 @@ defmodule PowerModel.Solver.Stability.SmallSignal do
     for i <- 0..(dim - 1) do
       row = Enum.at(a_matrix, i)
       center = Enum.at(row, i)
-      radius = Enum.with_index(row)
-      |> Enum.reduce(0.0, fn {val, j}, acc ->
-        if j == i, do: acc, else: acc + abs(val)
-      end)
+
+      radius =
+        Enum.with_index(row)
+        |> Enum.reduce(0.0, fn {val, j}, acc ->
+          if j == i, do: acc, else: acc + abs(val)
+        end)
 
       {center, radius * 0.5}
     end

@@ -41,9 +41,12 @@ defmodule Mix.Tasks.PowerModel.RestoreDb do
     Mix.shell().info("Restoring from #{dump_path} (38 MB)...")
 
     args = [
-      "-U", username,
-      "-h", hostname,
-      "-d", db,
+      "-U",
+      username,
+      "-h",
+      hostname,
+      "-d",
+      db,
       "--no-owner",
       "--no-acl",
       "--clean",

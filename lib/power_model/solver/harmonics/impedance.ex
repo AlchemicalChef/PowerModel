@@ -168,12 +168,15 @@ defmodule PowerModel.Solver.Harmonics.Impedance do
           idx = Map.fetch!(bus_index_map, bus.id)
 
           # Standard shunt susceptance (capacitor banks): scales linearly with h
-          acc2 = case Map.get(bus, :b_shunt_mvar) || 0.0 do
-            bs when bs != 0.0 ->
-              bs_pu = bs / base_mva * h
-              add_to_ybus_map(acc2, idx, idx, 0.0, bs_pu)
-            _ -> acc2
-          end
+          acc2 =
+            case Map.get(bus, :b_shunt_mvar) || 0.0 do
+              bs when bs != 0.0 ->
+                bs_pu = bs / base_mva * h
+                add_to_ybus_map(acc2, idx, idx, 0.0, bs_pu)
+
+              _ ->
+                acc2
+            end
 
           # Per-harmonic filter shunts: pre-computed (g_pu, b_pu) for each h
           # These are set by the filter module when a passive filter is installed
@@ -182,9 +185,13 @@ defmodule PowerModel.Solver.Harmonics.Impedance do
               case Map.get(shunts, h) do
                 {g_pu, b_pu} when abs(g_pu) > 1.0e-15 or abs(b_pu) > 1.0e-15 ->
                   add_to_ybus_map(acc2, idx, idx, g_pu, b_pu)
-                _ -> acc2
+
+                _ ->
+                  acc2
               end
-            _ -> acc2
+
+            _ ->
+              acc2
           end
         end)
       end)
@@ -238,8 +245,12 @@ defmodule PowerModel.Solver.Harmonics.Impedance do
 
     # Skip lines whose buses aren't in the index (shouldn't happen in a clean snapshot)
     case {Map.get(bus_index_map, from_id), Map.get(bus_index_map, to_id)} do
-      {nil, _} -> map
-      {_, nil} -> map
+      {nil, _} ->
+        map
+
+      {_, nil} ->
+        map
+
       {i, j} ->
         {r_h, x_h, b_h} = line_impedance_at_harmonic(line, h)
 
@@ -265,8 +276,12 @@ defmodule PowerModel.Solver.Harmonics.Impedance do
     to_id = xfmr.to_bus_id
 
     case {Map.get(bus_index_map, from_id), Map.get(bus_index_map, to_id)} do
-      {nil, _} -> map
-      {_, nil} -> map
+      {nil, _} ->
+        map
+
+      {_, nil} ->
+        map
+
       {i, j} ->
         {r_h, x_h} = transformer_impedance_at_harmonic(xfmr, h)
         a = xfmr.tap_ratio || 1.0
@@ -308,7 +323,9 @@ defmodule PowerModel.Solver.Harmonics.Impedance do
       bus_id = gen.bus_id
 
       case Map.get(bus_index_map, bus_id) do
-        nil -> acc
+        nil ->
+          acc
+
         idx ->
           {r_h, x_h} = generator_impedance_at_harmonic(gen, h)
           denom = r_h * r_h + x_h * x_h

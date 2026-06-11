@@ -22,8 +22,7 @@ defmodule PowerModel.Grid.Substation do
 
   def changeset(substation, attrs) do
     substation
-    |> cast(attrs, [:name, :max_voltage_kv, :min_voltage_kv, :coordinates,
-                     :hifld_id, :status])
+    |> cast(attrs, [:name, :max_voltage_kv, :min_voltage_kv, :coordinates, :hifld_id, :status])
     |> validate_required([:name])
     |> unique_constraint(:hifld_id)
   end

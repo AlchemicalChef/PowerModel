@@ -10,6 +10,7 @@ defmodule PowerModel.Engine.Cache do
     if :ets.info(@table) == :undefined do
       :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
     end
+
     :ok
   end
 

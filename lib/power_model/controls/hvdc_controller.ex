@@ -28,13 +28,20 @@ defmodule PowerModel.Controls.HVDCController do
   """
 
   defstruct [
-    :p_order_mw,       # current power order (MW)
-    :p_schedule_mw,    # scheduled power transfer (MW)
-    :p_max_mw,         # maximum power rating (MW)
-    :k_freq,           # frequency droop gain (MW/Hz)
-    :ramp_rate_mw_s,   # ramp rate limit (MW/s)
-    :mode,             # :constant_power | :frequency_support | :emergency_runback
-    :runback_target    # target MW for runback (usually 0)
+    # current power order (MW)
+    :p_order_mw,
+    # scheduled power transfer (MW)
+    :p_schedule_mw,
+    # maximum power rating (MW)
+    :p_max_mw,
+    # frequency droop gain (MW/Hz)
+    :k_freq,
+    # ramp rate limit (MW/s)
+    :ramp_rate_mw_s,
+    # :constant_power | :frequency_support | :emergency_runback
+    :mode,
+    # target MW for runback (usually 0)
+    :runback_target
   ]
 
   @doc """
@@ -53,11 +60,12 @@ defmodule PowerModel.Controls.HVDCController do
     rated = Map.get(hvdc_line, :rated_mw, 500.0)
     p_schedule = Map.get(hvdc_line, :p_schedule_mw) || rated * 0.8
 
-    mode = case Map.get(hvdc_line, :control_mode, "constant_power") do
-      "frequency_support" -> :frequency_support
-      "emergency_runback" -> :emergency_runback
-      _ -> :constant_power
-    end
+    mode =
+      case Map.get(hvdc_line, :control_mode, "constant_power") do
+        "frequency_support" -> :frequency_support
+        "emergency_runback" -> :emergency_runback
+        _ -> :constant_power
+      end
 
     k_freq = Keyword.get(opts, :k_freq, rated * 0.05)
     ramp_rate = Keyword.get(opts, :ramp_rate_mw_s, rated * 0.1)
@@ -118,7 +126,8 @@ defmodule PowerModel.Controls.HVDCController do
     * `:frequency_support` — modulate based on frequency
     * `:emergency_runback` — ramp down to zero
   """
-  def set_mode(%__MODULE__{} = state, mode) when mode in [:constant_power, :frequency_support, :emergency_runback] do
+  def set_mode(%__MODULE__{} = state, mode)
+      when mode in [:constant_power, :frequency_support, :emergency_runback] do
     %{state | mode: mode}
   end
 

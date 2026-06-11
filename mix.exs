@@ -11,7 +11,13 @@ defmodule PowerModel.MixProject do
       aliases: aliases(),
       deps: deps(),
       compilers: [:phoenix_live_view] ++ Mix.compilers(),
-      listeners: [Phoenix.CodeReloader]
+      listeners: [Phoenix.CodeReloader],
+      releases: [
+        power_model: [
+          include_executables_for: [:unix],
+          applications: [runtime_tools: :permanent]
+        ]
+      ]
     ]
   end
 
@@ -72,7 +78,7 @@ defmodule PowerModel.MixProject do
       {:nimble_csv, "~> 1.2"},
       {:exshape, "~> 2.0"},
       {:nx, "~> 0.9"},
-      {:exla, "~> 0.9"},
+      {:exla, "~> 0.9", only: [:dev, :test]},
       {:rustler, "~> 0.36"},
       {:flow, "~> 1.2"}
     ]

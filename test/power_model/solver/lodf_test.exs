@@ -8,30 +8,43 @@ defmodule PowerModel.Solver.LODFTest do
   # ===========================================================================
 
   defp bus(id, opts \\ []) do
-    %{id: id, bus_type: Keyword.get(opts, :bus_type, 1), base_kv: 138.0,
-      vm_pu: 1.0, va_rad: 0.0, b_shunt_mvar: 0.0}
+    %{
+      id: id,
+      bus_type: Keyword.get(opts, :bus_type, 1),
+      base_kv: 138.0,
+      vm_pu: 1.0,
+      va_rad: 0.0,
+      b_shunt_mvar: 0.0
+    }
   end
 
   defp line(id, from, to, opts \\ []) do
-    %{id: id, from_bus_id: from, to_bus_id: to,
-      voltage_kv: 138.0, r_pu: 0.01,
+    %{
+      id: id,
+      from_bus_id: from,
+      to_bus_id: to,
+      voltage_kv: 138.0,
+      r_pu: 0.01,
       x_pu: Keyword.get(opts, :x_pu, 0.1),
       b_pu: 0.02,
-      rating_a_mva: Keyword.get(opts, :rating_a_mva, 100.0)}
+      rating_a_mva: Keyword.get(opts, :rating_a_mva, 100.0)
+    }
   end
 
   defp generator(id, bus_id, opts) do
-    %{id: id, bus_id: bus_id,
+    %{
+      id: id,
+      bus_id: bus_id,
       p_max_mw: Keyword.get(opts, :p_max_mw, 100.0),
       capacity_factor: 1.0,
-      fuel_type: "NG", status: "in_service",
-      marginal_cost_per_mwh: 35.0}
+      fuel_type: "NG",
+      status: "in_service",
+      marginal_cost_per_mwh: 35.0
+    }
   end
 
   defp load(id, bus_id, opts) do
-    %{id: id, bus_id: bus_id,
-      p_mw: Keyword.get(opts, :p_mw, 50.0),
-      q_mvar: 0.0}
+    %{id: id, bus_id: bus_id, p_mw: Keyword.get(opts, :p_mw, 50.0), q_mvar: 0.0}
   end
 
   # ===========================================================================
@@ -53,19 +66,26 @@ defmodule PowerModel.Solver.LODFTest do
 
   defp diamond_snapshot do
     buses = [bus(1, bus_type: 3), bus(2), bus(3), bus(4), bus(5)]
+
     lines = [
-      line(1, 1, 2, x_pu: 0.1),   # L1: 1→2
-      line(2, 1, 3, x_pu: 0.15),  # L2: 1→3
-      line(3, 1, 4, x_pu: 0.2),   # L3: 1→4
-      line(4, 2, 5, x_pu: 0.1),   # L4: 2→5
-      line(5, 3, 5, x_pu: 0.15),  # L5: 3→5
-      line(6, 4, 5, x_pu: 0.2),   # L6: 4→5
+      # L1: 1→2
+      line(1, 1, 2, x_pu: 0.1),
+      # L2: 1→3
+      line(2, 1, 3, x_pu: 0.15),
+      # L3: 1→4
+      line(3, 1, 4, x_pu: 0.2),
+      # L4: 2→5
+      line(4, 2, 5, x_pu: 0.1),
+      # L5: 3→5
+      line(5, 3, 5, x_pu: 0.15),
+      # L6: 4→5
+      line(6, 4, 5, x_pu: 0.2)
     ]
+
     gens = [generator(1, 1, p_max_mw: 200.0)]
     loads = [load(1, 5, p_mw: 100.0)]
 
-    %{buses: buses, lines: lines, transformers: [],
-      generators: gens, loads: loads}
+    %{buses: buses, lines: lines, transformers: [], generators: gens, loads: loads}
   end
 
   # ===========================================================================
@@ -93,8 +113,10 @@ defmodule PowerModel.Solver.LODFTest do
         lodf_flow = Map.get(lodf_flows, key)
 
         if lodf_flow do
-          assert_in_delta lodf_flow.p_flow_mw, resolve_flow.p_flow_mw, 0.1,
-            "Flow mismatch on #{inspect(key)}: LODF=#{lodf_flow.p_flow_mw}, DC=#{resolve_flow.p_flow_mw}"
+          assert_in_delta lodf_flow.p_flow_mw,
+                          resolve_flow.p_flow_mw,
+                          0.1,
+                          "Flow mismatch on #{inspect(key)}: LODF=#{lodf_flow.p_flow_mw}, DC=#{resolve_flow.p_flow_mw}"
         end
       end
     end
@@ -113,8 +135,10 @@ defmodule PowerModel.Solver.LODFTest do
         lodf_flow = Map.get(lodf_flows, key)
 
         if lodf_flow do
-          assert_in_delta lodf_flow.p_flow_mw, resolve_flow.p_flow_mw, 0.1,
-            "Flow mismatch on #{inspect(key)}"
+          assert_in_delta lodf_flow.p_flow_mw,
+                          resolve_flow.p_flow_mw,
+                          0.1,
+                          "Flow mismatch on #{inspect(key)}"
         end
       end
     end
@@ -134,9 +158,12 @@ defmodule PowerModel.Solver.LODFTest do
 
             for {key, resolve_flow} <- resolve_solution.line_flows do
               lodf_flow = Map.get(lodf_flows, key)
+
               if lodf_flow do
-                assert_in_delta lodf_flow.p_flow_mw, resolve_flow.p_flow_mw, 0.5,
-                  "Line #{line_id} trip: flow mismatch on #{inspect(key)}"
+                assert_in_delta lodf_flow.p_flow_mw,
+                                resolve_flow.p_flow_mw,
+                                0.5,
+                                "Line #{line_id} trip: flow mismatch on #{inspect(key)}"
               end
             end
 
@@ -194,6 +221,7 @@ defmodule PowerModel.Solver.LODFTest do
       # Flows should be identical
       for {key, f1} <- flows1 do
         f2 = Map.get(flows2, key)
+
         if f2 do
           assert_in_delta f1.p_flow_mw, f2.p_flow_mw, 0.001
         end
@@ -216,7 +244,11 @@ defmodule PowerModel.Solver.LODFTest do
       refute LODF.needs_refactorize?(lodf, max_cumulative_trips: 3)
 
       # Simulate 4 trips (manually add to cumulative_trips)
-      lodf = %{lodf | cumulative_trips: MapSet.new([{:line, 1}, {:line, 2}, {:line, 3}, {:line, 4}])}
+      lodf = %{
+        lodf
+        | cumulative_trips: MapSet.new([{:line, 1}, {:line, 2}, {:line, 3}, {:line, 4}])
+      }
+
       assert LODF.needs_refactorize?(lodf, max_cumulative_trips: 3)
     end
   end
@@ -238,9 +270,12 @@ defmodule PowerModel.Solver.LODFTest do
 
       for {key, resolve_flow} <- resolve_solution.line_flows do
         lodf_flow = Map.get(lodf_flows, key)
+
         if lodf_flow && resolve_flow.loading_pct > 0.0 do
-          assert_in_delta lodf_flow.loading_pct, resolve_flow.loading_pct, 1.0,
-            "Loading mismatch on #{inspect(key)}"
+          assert_in_delta lodf_flow.loading_pct,
+                          resolve_flow.loading_pct,
+                          1.0,
+                          "Loading mismatch on #{inspect(key)}"
         end
       end
     end

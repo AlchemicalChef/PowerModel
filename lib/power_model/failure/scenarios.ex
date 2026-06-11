@@ -20,21 +20,19 @@ defmodule PowerModel.Failure.Scenarios do
       cascade  = Scenarios.apply_scenario(cascade_state, scenario)
   """
 
-  defstruct [
-    line_deratings: %{},
-    load_multipliers: %{},
-    forced_trips: [],
-    generator_deratings: %{},
-    description: ""
-  ]
+  defstruct line_deratings: %{},
+            load_multipliers: %{},
+            forced_trips: [],
+            generator_deratings: %{},
+            description: ""
 
   @type t :: %__MODULE__{
-    line_deratings: %{integer() => float()},
-    load_multipliers: %{integer() => float()},
-    forced_trips: [integer()],
-    generator_deratings: %{integer() => float()},
-    description: String.t()
-  }
+          line_deratings: %{integer() => float()},
+          load_multipliers: %{integer() => float()},
+          forced_trips: [integer()],
+          generator_deratings: %{integer() => float()},
+          description: String.t()
+        }
 
   # ---------------------------------------------------------------------------
   # Coordinate helpers
@@ -58,9 +56,12 @@ defmodule PowerModel.Failure.Scenarios do
     r = 6371.0
     dlat = deg_to_rad(lat2 - lat1)
     dlon = deg_to_rad(lon2 - lon1)
-    a = :math.sin(dlat / 2) * :math.sin(dlat / 2) +
+
+    a =
+      :math.sin(dlat / 2) * :math.sin(dlat / 2) +
         :math.cos(deg_to_rad(lat1)) * :math.cos(deg_to_rad(lat2)) *
-        :math.sin(dlon / 2) * :math.sin(dlon / 2)
+          :math.sin(dlon / 2) * :math.sin(dlon / 2)
+
     c = 2 * :math.atan2(:math.sqrt(a), :math.sqrt(1 - a))
     r * c
   end
@@ -123,7 +124,8 @@ defmodule PowerModel.Failure.Scenarios do
     in_region? = fn bus_id ->
       if has_bbox do
         case Map.get(bus_coords_map, bus_id) do
-          nil -> true  # no coords => include (conservative)
+          # no coords => include (conservative)
+          nil -> true
           coords -> in_bbox?(coords, north, south, east, west)
         end
       else
@@ -157,17 +159,19 @@ defmodule PowerModel.Failure.Scenarios do
         {id, det_random(id, 0.92, 0.98)}
       end)
 
-    region_desc = if has_bbox,
-      do: "region [#{south}-#{north}N, #{west}-#{east}E]",
-      else: "system-wide"
+    region_desc =
+      if has_bbox,
+        do: "region [#{south}-#{north}N, #{west}-#{east}E]",
+        else: "system-wide"
 
     %__MODULE__{
       line_deratings: line_deratings,
       load_multipliers: load_multipliers,
       forced_trips: [],
       generator_deratings: gen_deratings,
-      description: "Heat wave: #{map_size(line_deratings)} lines derated, " <>
-        "#{map_size(load_multipliers)} loads increased, #{region_desc}"
+      description:
+        "Heat wave: #{map_size(line_deratings)} lines derated, " <>
+          "#{map_size(load_multipliers)} loads increased, #{region_desc}"
     }
   end
 
@@ -237,6 +241,7 @@ defmodule PowerModel.Failure.Scenarios do
     # Loads increase due to electric heating demand (5-15% based on severity)
     load_increase_lo = 0.05 + (severity - 1) * 0.025
     load_increase_hi = load_increase_lo + 0.05
+
     load_multipliers =
       load_bus_ids(Map.get(snapshot, :loads, []))
       |> Enum.filter(fn {_id, bus_id} -> in_region?.(bus_id) end)
@@ -244,17 +249,19 @@ defmodule PowerModel.Failure.Scenarios do
         {id, 1.0 + det_random(id, load_increase_lo, load_increase_hi)}
       end)
 
-    region_desc = if has_bbox,
-      do: "region [#{south}-#{north}N, #{west}-#{east}E]",
-      else: "system-wide"
+    region_desc =
+      if has_bbox,
+        do: "region [#{south}-#{north}N, #{west}-#{east}E]",
+        else: "system-wide"
 
     %__MODULE__{
       line_deratings: line_deratings,
       load_multipliers: load_multipliers,
       forced_trips: forced_trips,
       generator_deratings: %{},
-      description: "Ice storm (severity #{severity}): #{length(forced_trips)} lines tripped, " <>
-        "#{map_size(line_deratings)} derated, #{region_desc}"
+      description:
+        "Ice storm (severity #{severity}): #{length(forced_trips)} lines tripped, " <>
+          "#{map_size(line_deratings)} derated, #{region_desc}"
     }
   end
 
@@ -290,10 +297,11 @@ defmodule PowerModel.Failure.Scenarios do
         from_coords = Map.get(bus_coords_map, from_id)
         to_coords = Map.get(bus_coords_map, to_id)
 
-        min_dist = min(
-          (if from_coords, do: haversine_km(center, from_coords), else: :infinity),
-          (if to_coords, do: haversine_km(center, to_coords), else: :infinity)
-        )
+        min_dist =
+          min(
+            if(from_coords, do: haversine_km(center, from_coords), else: :infinity),
+            if(to_coords, do: haversine_km(center, to_coords), else: :infinity)
+          )
 
         {id, min_dist}
       end)
@@ -307,7 +315,9 @@ defmodule PowerModel.Failure.Scenarios do
     # Lines within 2x radius are derated (smoke reduces cooling)
     line_deratings =
       lines_with_distance
-      |> Enum.filter(fn {id, dist} -> dist > radius_km and dist <= radius_km * 2.0 and id not in forced_trips end)
+      |> Enum.filter(fn {id, dist} ->
+        dist > radius_km and dist <= radius_km * 2.0 and id not in forced_trips
+      end)
       |> Map.new(fn {id, dist} ->
         # Closer to fire => more derate (0.85 at edge of fire, 0.95 at 2x radius)
         frac = (dist - radius_km) / radius_km
@@ -320,8 +330,9 @@ defmodule PowerModel.Failure.Scenarios do
       load_multipliers: %{},
       forced_trips: forced_trips,
       generator_deratings: %{},
-      description: "Wildfire at (#{center_lat}, #{center_lon}) r=#{radius_km}km: " <>
-        "#{length(forced_trips)} lines tripped, #{map_size(line_deratings)} derated"
+      description:
+        "Wildfire at (#{center_lat}, #{center_lon}) r=#{radius_km}km: " <>
+          "#{length(forced_trips)} lines tripped, #{map_size(line_deratings)} derated"
     }
   end
 
@@ -367,7 +378,7 @@ defmodule PowerModel.Failure.Scenarios do
       Map.get(snapshot, :lines, [])
       |> Enum.filter(fn line ->
         MapSet.member?(damaged_bus_ids, line.from_bus_id) or
-        MapSet.member?(damaged_bus_ids, line.to_bus_id)
+          MapSet.member?(damaged_bus_ids, line.to_bus_id)
       end)
       |> Enum.map(& &1.id)
 
@@ -382,9 +393,10 @@ defmodule PowerModel.Failure.Scenarios do
       load_multipliers: %{},
       forced_trips: forced_trips,
       generator_deratings: gen_deratings,
-      description: "Earthquake M#{magnitude} at (#{epicenter_lat}, #{epicenter_lon}): " <>
-        "#{MapSet.size(damaged_bus_ids)} buses damaged, #{length(forced_trips)} lines tripped, " <>
-        "r=#{Float.round(damage_radius_km, 1)}km"
+      description:
+        "Earthquake M#{magnitude} at (#{epicenter_lat}, #{epicenter_lon}): " <>
+          "#{MapSet.size(damaged_bus_ids)} buses damaged, #{length(forced_trips)} lines tripped, " <>
+          "r=#{Float.round(damage_radius_km, 1)}km"
     }
   end
 
@@ -406,7 +418,9 @@ defmodule PowerModel.Failure.Scenarios do
     updated_lines =
       Enum.map(cascade_state.lines, fn line ->
         case Map.get(scenario.line_deratings, line.id) do
-          nil -> line
+          nil ->
+            line
+
           factor ->
             rating = Map.get(line, :rating_a_mva) || 0.0
             %{line | rating_a_mva: rating * factor}
@@ -417,7 +431,9 @@ defmodule PowerModel.Failure.Scenarios do
     updated_loads =
       Enum.map(cascade_state.loads, fn load ->
         case Map.get(scenario.load_multipliers, load.id) do
-          nil -> load
+          nil ->
+            load
+
           mult ->
             q = Map.get(load, :q_mvar) || 0.0
             %{load | p_mw: load.p_mw * mult, q_mvar: q * mult}
@@ -428,22 +444,26 @@ defmodule PowerModel.Failure.Scenarios do
     updated_generators =
       Enum.map(cascade_state.generators, fn gen ->
         case Map.get(scenario.generator_deratings, gen.id) do
-          nil -> gen
+          nil ->
+            gen
+
           factor ->
             %{gen | p_max_mw: gen.p_max_mw * factor}
         end
       end)
 
     # Add forced trips
-    new_tripped = Enum.reduce(scenario.forced_trips, cascade_state.tripped_lines, fn line_id, acc ->
-      MapSet.put(acc, line_id)
-    end)
+    new_tripped =
+      Enum.reduce(scenario.forced_trips, cascade_state.tripped_lines, fn line_id, acc ->
+        MapSet.put(acc, line_id)
+      end)
 
-    %{cascade_state |
-      lines: updated_lines,
-      loads: updated_loads,
-      generators: updated_generators,
-      tripped_lines: new_tripped
+    %{
+      cascade_state
+      | lines: updated_lines,
+        loads: updated_loads,
+        generators: updated_generators,
+        tripped_lines: new_tripped
     }
   end
 end

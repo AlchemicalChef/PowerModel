@@ -66,10 +66,14 @@ defmodule PowerModel.Transient.Simulator do
     :tripped_gens,
 
     # Extended state
-    :gov_states,   # [gov_struct | nil] per generator
-    :pss_states,   # [pss_struct | nil] per generator
-    :ibr_states,   # [ibr_struct | nil] per generator (mutually exclusive with sync)
-    :gen_types     # [:sync | :ibr] per generator
+    # [gov_struct | nil] per generator
+    :gov_states,
+    # [pss_struct | nil] per generator
+    :pss_states,
+    # [ibr_struct | nil] per generator (mutually exclusive with sync)
+    :ibr_states,
+    # [:sync | :ibr] per generator
+    :gen_types
   ]
 
   @doc """
@@ -93,12 +97,13 @@ defmodule PowerModel.Transient.Simulator do
     pss_map = Keyword.get(opts, :pss_map, %{})
 
     # Sort generators to match State ordering
-    sorted_gens = generators
-    |> Enum.filter(fn g ->
-      h = Map.get(g, :inertia_h) || 0.0
-      h > 0.0 and Map.get(g, :status, "in_service") == "in_service"
-    end)
-    |> Enum.sort_by(& &1.id)
+    sorted_gens =
+      generators
+      |> Enum.filter(fn g ->
+        h = Map.get(g, :inertia_h) || 0.0
+        h > 0.0 and Map.get(g, :status, "in_service") == "in_service"
+      end)
+      |> Enum.sort_by(& &1.id)
 
     # Build per-generator auxiliary state
     {gov_states, pss_states, ibr_states, gen_types} =
@@ -117,18 +122,20 @@ defmodule PowerModel.Transient.Simulator do
           {nil, nil, ibr, :ibr}
         else
           # Governor
-          gov = cond do
-            Map.has_key?(gov_map, idx) -> Map.get(gov_map, idx)
-            enable_gov == :none -> nil
-            true -> auto_governor(gen_with_pmech)
-          end
+          gov =
+            cond do
+              Map.has_key?(gov_map, idx) -> Map.get(gov_map, idx)
+              enable_gov == :none -> nil
+              true -> auto_governor(gen_with_pmech)
+            end
 
           # PSS
-          pss = cond do
-            Map.has_key?(pss_map, idx) -> Map.get(pss_map, idx)
-            enable_pss == :none -> nil
-            true -> auto_pss(gen)
-          end
+          pss =
+            cond do
+              Map.has_key?(pss_map, idx) -> Map.get(pss_map, idx)
+              enable_pss == :none -> nil
+              true -> auto_pss(gen)
+            end
 
           {gov, pss, nil, :sync}
         end
@@ -182,59 +189,99 @@ defmodule PowerModel.Transient.Simulator do
         p_mech_events = apply_events(st.p_mech, events, t, st.dt)
 
         # 2. Compute P_elec from Y_reduced (classical model)
-        p_elec = Classical.compute_p_elec(
-          st.delta, st.e_prime,
-          st.y_red_rows, st.y_red_cols,
-          st.y_red_g, st.y_red_b, st.n_gen
-        )
+        p_elec =
+          Classical.compute_p_elec(
+            st.delta,
+            st.e_prime,
+            st.y_red_rows,
+            st.y_red_cols,
+            st.y_red_g,
+            st.y_red_b,
+            st.n_gen
+          )
 
         # 3. Update governor states → get new P_mech values
-        {gov_states_0, p_mech_gov} = update_governors(st.gov_states, st.omega, p_mech_events, st.gen_types)
+        {gov_states_0, p_mech_gov} =
+          update_governors(st.gov_states, st.omega, p_mech_events, st.gen_types)
 
         # 4. Get PSS damping contribution
         pss_damping = compute_pss_damping(st.pss_states, st.omega)
 
         # 5. Compute swing equation derivatives with governor P_mech and PSS damping
         effective_d = add_pss_damping(st.d, pss_damping)
-        {d_delta_0, d_omega_0} = Classical.derivatives(
-          st.delta, st.omega, p_mech_gov, p_elec, st.h, effective_d, st.n_gen
-        )
+
+        {d_delta_0, d_omega_0} =
+          Classical.derivatives(
+            st.delta,
+            st.omega,
+            p_mech_gov,
+            p_elec,
+            st.h,
+            effective_d,
+            st.n_gen
+          )
 
         # 6. Euler predictor step
-        {pred_delta, pred_omega} = Classical.euler_step(st.delta, st.omega, d_delta_0, d_omega_0, st.dt)
+        {pred_delta, pred_omega} =
+          Classical.euler_step(st.delta, st.omega, d_delta_0, d_omega_0, st.dt)
 
         # Euler predict governor and PSS states
         gov_states_pred = euler_step_governors(gov_states_0, st.omega, st.dt, st.gen_types)
         pss_states_pred = euler_step_pss(st.pss_states, st.omega, st.dt)
 
         # 7. Recompute at predicted state
-        p_elec_pred = Classical.compute_p_elec(
-          pred_delta, st.e_prime,
-          st.y_red_rows, st.y_red_cols,
-          st.y_red_g, st.y_red_b, st.n_gen
-        )
+        p_elec_pred =
+          Classical.compute_p_elec(
+            pred_delta,
+            st.e_prime,
+            st.y_red_rows,
+            st.y_red_cols,
+            st.y_red_g,
+            st.y_red_b,
+            st.n_gen
+          )
 
-        {_gov_states_pred2, p_mech_pred} = update_governors(gov_states_pred, pred_omega, p_mech_events, st.gen_types)
+        {_gov_states_pred2, p_mech_pred} =
+          update_governors(gov_states_pred, pred_omega, p_mech_events, st.gen_types)
+
         pss_damping_pred = compute_pss_damping(pss_states_pred, pred_omega)
         effective_d_pred = add_pss_damping(st.d, pss_damping_pred)
 
-        {d_delta_1, d_omega_1} = Classical.derivatives(
-          pred_delta, pred_omega, p_mech_pred, p_elec_pred, st.h, effective_d_pred, st.n_gen
-        )
+        {d_delta_1, d_omega_1} =
+          Classical.derivatives(
+            pred_delta,
+            pred_omega,
+            p_mech_pred,
+            p_elec_pred,
+            st.h,
+            effective_d_pred,
+            st.n_gen
+          )
 
         # 8. Trapezoidal corrector
         new_delta = Classical.trapezoidal_correct(st.delta, d_delta_0, d_delta_1, st.dt)
         new_omega = Classical.trapezoidal_correct(st.omega, d_omega_0, d_omega_1, st.dt)
 
         # Trapezoidal correct governor states
-        new_gov_states = trapezoidal_step_governors(
-          gov_states_0, gov_states_pred, st.omega, new_omega, st.dt, st.gen_types
-        )
+        new_gov_states =
+          trapezoidal_step_governors(
+            gov_states_0,
+            gov_states_pred,
+            st.omega,
+            new_omega,
+            st.dt,
+            st.gen_types
+          )
 
         # Trapezoidal correct PSS states
-        new_pss_states = trapezoidal_step_pss(
-          st.pss_states, pss_states_pred, st.omega, new_omega, st.dt
-        )
+        new_pss_states =
+          trapezoidal_step_pss(
+            st.pss_states,
+            pss_states_pred,
+            st.omega,
+            new_omega,
+            st.dt
+          )
 
         # 9. Step IBR models
         {new_ibr_states, _ibr_p, _ibr_q} = step_ibr_models(st.ibr_states, st.e_prime, st.dt)
@@ -242,14 +289,15 @@ defmodule PowerModel.Transient.Simulator do
         # Update mechanical power from governors for next step
         new_p_mech = build_p_mech(new_gov_states, p_mech_events, st.gen_types)
 
-        st = %{st |
-          delta: new_delta,
-          omega: new_omega,
-          p_mech: new_p_mech,
-          t: t,
-          gov_states: new_gov_states,
-          pss_states: new_pss_states,
-          ibr_states: new_ibr_states
+        st = %{
+          st
+          | delta: new_delta,
+            omega: new_omega,
+            p_mech: new_p_mech,
+            t: t,
+            gov_states: new_gov_states,
+            pss_states: new_pss_states,
+            ibr_states: new_ibr_states
         }
 
         if rem(step, output_every) == 0 do
@@ -296,6 +344,7 @@ defmodule PowerModel.Transient.Simulator do
     |> Enum.with_index()
     |> Enum.map(fn {gov, idx} ->
       w = Enum.at(omega, idx)
+
       case {gov, Enum.at(gen_types, idx)} do
         {nil, _} -> nil
         {%TGOV1{} = g, :sync} -> TGOV1.step_euler(g, w, dt)
@@ -312,6 +361,7 @@ defmodule PowerModel.Transient.Simulator do
     |> Enum.map(fn {{gn, gp}, idx} ->
       wn = Enum.at(omega_n, idx)
       wp = Enum.at(omega_pred, idx)
+
       case {gn, Enum.at(gen_types, idx)} do
         {nil, _} -> nil
         {%TGOV1{}, :sync} -> TGOV1.step_trapezoidal(gn, gp, wn, wp, dt)
@@ -343,7 +393,9 @@ defmodule PowerModel.Transient.Simulator do
     |> Enum.with_index()
     |> Enum.map(fn {pss, idx} ->
       case pss do
-        nil -> 0.0
+        nil ->
+          0.0
+
         %PSS{} = p ->
           # PSS output acts as additional damping torque.
           # v_pss is proportional to speed deviation, so it effectively adds
@@ -370,7 +422,9 @@ defmodule PowerModel.Transient.Simulator do
     |> Enum.with_index()
     |> Enum.map(fn {pss, idx} ->
       case pss do
-        nil -> nil
+        nil ->
+          nil
+
         %PSS{} = p ->
           omega_dev = Enum.at(omega, idx) - 1.0
           PSS.step_euler(p, omega_dev, dt)
@@ -383,7 +437,9 @@ defmodule PowerModel.Transient.Simulator do
     |> Enum.with_index()
     |> Enum.map(fn {{pn, pp}, idx} ->
       case pn do
-        nil -> nil
+        nil ->
+          nil
+
         %PSS{} ->
           omega_dev_n = Enum.at(omega_n, idx) - 1.0
           omega_dev_pred = Enum.at(omega_pred, idx) - 1.0
@@ -456,7 +512,25 @@ defmodule PowerModel.Transient.Simulator do
         GAST.init(gen)
 
       # Steam units (coal, nuclear, oil, geothermal, biomass, waste)
-      fuel in ["NUC", "COL", "DFO", "RFO", "PET", "GEO", "WDS", "BLQ", "PC", "LIG", "SUB", "BIT", "AB", "MSW", "OBS", "WDL", "TDF"] ->
+      fuel in [
+        "NUC",
+        "COL",
+        "DFO",
+        "RFO",
+        "PET",
+        "GEO",
+        "WDS",
+        "BLQ",
+        "PC",
+        "LIG",
+        "SUB",
+        "BIT",
+        "AB",
+        "MSW",
+        "OBS",
+        "WDL",
+        "TDF"
+      ] ->
         TGOV1.init(gen)
 
       # Combined cycle steam portion

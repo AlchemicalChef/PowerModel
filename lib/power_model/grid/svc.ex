@@ -26,8 +26,14 @@ defmodule PowerModel.Grid.SVC do
   end
 
   @cast_fields [
-    :name, :q_max_mvar, :q_min_mvar, :v_set_pu,
-    :control_mode, :slope_pct, :status, :bus_id
+    :name,
+    :q_max_mvar,
+    :q_min_mvar,
+    :v_set_pu,
+    :control_mode,
+    :slope_pct,
+    :status,
+    :bus_id
   ]
 
   def changeset(svc, attrs) do

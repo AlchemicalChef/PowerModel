@@ -29,9 +29,9 @@ defmodule Mix.Tasks.PowerModel.AssignLoadTypes do
   @shortdoc "Assign ZIP load types based on bus voltage level"
 
   @voltage_bands %{
-    distribution:     {["residential", "commercial", "industrial"], [0.60, 0.85, 1.00]},
+    distribution: {["residential", "commercial", "industrial"], [0.60, 0.85, 1.00]},
     sub_transmission: {["residential", "commercial", "industrial"], [0.30, 0.70, 1.00]},
-    transmission:     {["residential", "commercial", "industrial"], [0.10, 0.40, 1.00]}
+    transmission: {["residential", "commercial", "industrial"], [0.10, 0.40, 1.00]}
   }
 
   @impl Mix.Task
@@ -42,10 +42,7 @@ defmodule Mix.Tasks.PowerModel.AssignLoadTypes do
 
     # Fetch all loads with their bus voltage level
     loads_with_kv =
-      from(l in Load,
-        join: b in Bus, on: l.bus_id == b.id,
-        select: {l.id, l.bus_id, b.base_kv}
-      )
+      from(l in Load, join: b in Bus, on: l.bus_id == b.id, select: {l.id, l.bus_id, b.base_kv})
       |> Repo.all()
 
     total = length(loads_with_kv)

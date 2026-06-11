@@ -65,6 +65,14 @@
   border-color: rgba(78, 205, 196, 0.6);
 }
 
+.hour-profile-form {
+  margin: 0;
+}
+
+.hour-select {
+  min-width: 110px;
+}
+
 .lookup-form {
   display: flex;
   gap: 0;

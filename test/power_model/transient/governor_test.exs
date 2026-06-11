@@ -23,8 +23,10 @@ defmodule PowerModel.Transient.GovernorTest do
       gov = TGOV1.init(%{p_mech_pu: 0.8})
       dx = TGOV1.derivative(gov, 1.0)
 
-      assert_in_delta dx, 0.0, 1.0e-10,
-        "Governor should have zero derivative at synchronous speed"
+      assert_in_delta dx,
+                      0.0,
+                      1.0e-10,
+                      "Governor should have zero derivative at synchronous speed"
     end
 
     test "uses default parameters when not specified" do
@@ -39,12 +41,14 @@ defmodule PowerModel.Transient.GovernorTest do
     test "governor picks up load after frequency drop" do
       # Start at 0.8 pu, then speed drops to 0.99 pu (underspeed)
       gov = TGOV1.init(%{droop_pct: 5.0, gov_time_constant_s: 0.5, p_mech_pu: 0.8})
-      omega_low = 0.99  # 1% underspeed
+      # 1% underspeed
+      omega_low = 0.99
 
       # Simulate for 5 seconds at 1ms steps
-      final_gov = Enum.reduce(1..5000, gov, fn _step, g ->
-        TGOV1.step_euler(g, omega_low, 0.001)
-      end)
+      final_gov =
+        Enum.reduce(1..5000, gov, fn _step, g ->
+          TGOV1.step_euler(g, omega_low, 0.001)
+        end)
 
       p_out = TGOV1.p_mech(final_gov)
 
@@ -52,26 +56,30 @@ defmodule PowerModel.Transient.GovernorTest do
       # = (1/0.05) * 0.01 = 0.2 pu increase
       # Expected p_mech ≈ 0.8 + 0.2 = 1.0
       assert p_out > 0.8,
-        "Governor should increase power output when speed drops"
+             "Governor should increase power output when speed drops"
 
-      assert_in_delta p_out, 1.0, 0.05,
-        "Steady-state power increase should match droop characteristic"
+      assert_in_delta p_out,
+                      1.0,
+                      0.05,
+                      "Steady-state power increase should match droop characteristic"
     end
 
     test "governor reduces power when frequency rises" do
       gov = TGOV1.init(%{droop_pct: 5.0, gov_time_constant_s: 0.5, p_mech_pu: 0.8})
-      omega_high = 1.01  # 1% overspeed
+      # 1% overspeed
+      omega_high = 1.01
 
-      final_gov = Enum.reduce(1..5000, gov, fn _step, g ->
-        TGOV1.step_euler(g, omega_high, 0.001)
-      end)
+      final_gov =
+        Enum.reduce(1..5000, gov, fn _step, g ->
+          TGOV1.step_euler(g, omega_high, 0.001)
+        end)
 
       p_out = TGOV1.p_mech(final_gov)
 
       # Expected: delta_P = -(1/0.05) * 0.01 = -0.2
       # p_mech ≈ 0.8 - 0.2 = 0.6
       assert p_out < 0.8,
-        "Governor should decrease power output when speed rises"
+             "Governor should decrease power output when speed rises"
 
       assert_in_delta p_out, 0.6, 0.05
     end
@@ -82,18 +90,21 @@ defmodule PowerModel.Transient.GovernorTest do
       omega = 0.99
 
       # After 0.5 seconds
-      gov_fast_500ms = Enum.reduce(1..500, gov_fast, fn _, g ->
-        TGOV1.step_euler(g, omega, 0.001)
-      end)
-      gov_slow_500ms = Enum.reduce(1..500, gov_slow, fn _, g ->
-        TGOV1.step_euler(g, omega, 0.001)
-      end)
+      gov_fast_500ms =
+        Enum.reduce(1..500, gov_fast, fn _, g ->
+          TGOV1.step_euler(g, omega, 0.001)
+        end)
+
+      gov_slow_500ms =
+        Enum.reduce(1..500, gov_slow, fn _, g ->
+          TGOV1.step_euler(g, omega, 0.001)
+        end)
 
       p_fast = TGOV1.p_mech(gov_fast_500ms)
       p_slow = TGOV1.p_mech(gov_slow_500ms)
 
       assert p_fast > p_slow,
-        "Fast governor should respond more quickly than slow governor"
+             "Fast governor should respond more quickly than slow governor"
     end
   end
 
@@ -124,21 +135,25 @@ defmodule PowerModel.Transient.GovernorTest do
       # Hydro governor should show initial inverse response:
       # when gate opens (frequency drop), water power briefly decreases
       # before increasing (water hammer / inertia effect).
-      gov = HYGOV.init(%{
-        droop_pct: 5.0,
-        gov_time_constant_s: 0.2,
-        tw_s: 1.5,
-        p_mech_pu: 0.6
-      })
-      omega_low = 0.99  # Underspeed
+      gov =
+        HYGOV.init(%{
+          droop_pct: 5.0,
+          gov_time_constant_s: 0.2,
+          tw_s: 1.5,
+          p_mech_pu: 0.6
+        })
+
+      # Underspeed
+      omega_low = 0.99
 
       # Track power output over time
-      {_final, trajectory} = Enum.reduce(1..3000, {gov, []}, fn step, {g, traj} ->
-        new_g = HYGOV.step_euler(g, omega_low, 0.001)
-        t = step * 0.001
-        p = HYGOV.p_mech(new_g)
-        {new_g, [{t, p} | traj]}
-      end)
+      {_final, trajectory} =
+        Enum.reduce(1..3000, {gov, []}, fn step, {g, traj} ->
+          new_g = HYGOV.step_euler(g, omega_low, 0.001)
+          t = step * 0.001
+          p = HYGOV.p_mech(new_g)
+          {new_g, [{t, p} | traj]}
+        end)
 
       trajectory = Enum.reverse(trajectory)
 
@@ -152,35 +167,40 @@ defmodule PowerModel.Transient.GovernorTest do
       # The simplified HYGOV model may not perfectly reproduce inverse response
       # depending on time constants; verify power does change from initial value
       assert p_min < 0.65,
-        "Hydro power should be near or below initial during transient"
+             "Hydro power should be near or below initial during transient"
 
       assert p_final > 0.6,
-        "Hydro should eventually increase power above initial setpoint"
+             "Hydro should eventually increase power above initial setpoint"
 
       assert p_final > p_min,
-        "Final power should be higher than the initial dip"
+             "Final power should be higher than the initial dip"
     end
 
     test "hydro reaches steady state matching droop characteristic" do
-      gov = HYGOV.init(%{
-        droop_pct: 5.0,
-        gov_time_constant_s: 0.2,
-        tw_s: 1.5,
-        p_mech_pu: 0.6
-      })
+      gov =
+        HYGOV.init(%{
+          droop_pct: 5.0,
+          gov_time_constant_s: 0.2,
+          tw_s: 1.5,
+          p_mech_pu: 0.6
+        })
+
       omega_low = 0.99
 
       # Run for 15 seconds to reach steady state (hydro is slow)
-      final_gov = Enum.reduce(1..15000, gov, fn _step, g ->
-        HYGOV.step_euler(g, omega_low, 0.001)
-      end)
+      final_gov =
+        Enum.reduce(1..15000, gov, fn _step, g ->
+          HYGOV.step_euler(g, omega_low, 0.001)
+        end)
 
       p_final = HYGOV.p_mech(final_gov)
 
       # Same droop math: delta_P = (1/R) * delta_omega = 20 * 0.01 = 0.2
       # Expected: 0.6 + 0.2 = 0.8
-      assert_in_delta p_final, 0.8, 0.1,
-        "Hydro should eventually match droop characteristic in steady state"
+      assert_in_delta p_final,
+                      0.8,
+                      0.1,
+                      "Hydro should eventually match droop characteristic in steady state"
     end
   end
 
@@ -206,38 +226,45 @@ defmodule PowerModel.Transient.GovernorTest do
       omega = 0.99
 
       # After 0.3 seconds
-      gast_300ms = Enum.reduce(1..300, gast, fn _, g ->
-        GAST.step_euler(g, omega, 0.001)
-      end)
-      tgov_300ms = Enum.reduce(1..300, tgov, fn _, g ->
-        TGOV1.step_euler(g, omega, 0.001)
-      end)
+      gast_300ms =
+        Enum.reduce(1..300, gast, fn _, g ->
+          GAST.step_euler(g, omega, 0.001)
+        end)
+
+      tgov_300ms =
+        Enum.reduce(1..300, tgov, fn _, g ->
+          TGOV1.step_euler(g, omega, 0.001)
+        end)
 
       p_gas = GAST.p_mech(gast_300ms)
       p_steam = TGOV1.p_mech(tgov_300ms)
 
       assert p_gas > p_steam,
-        "Gas turbine should respond faster than steam turbine"
+             "Gas turbine should respond faster than steam turbine"
     end
 
     test "temperature limit caps output" do
-      gov = GAST.init(%{
-        droop_pct: 4.0,
-        gov_time_constant_s: 0.2,
-        load_limit_pu: 0.9,
-        p_mech_pu: 0.7
-      })
-      omega_very_low = 0.95  # Large underspeed
+      gov =
+        GAST.init(%{
+          droop_pct: 4.0,
+          gov_time_constant_s: 0.2,
+          load_limit_pu: 0.9,
+          p_mech_pu: 0.7
+        })
+
+      # Large underspeed
+      omega_very_low = 0.95
 
       # Run until settled
-      final = Enum.reduce(1..5000, gov, fn _, g ->
-        GAST.step_euler(g, omega_very_low, 0.001)
-      end)
+      final =
+        Enum.reduce(1..5000, gov, fn _, g ->
+          GAST.step_euler(g, omega_very_low, 0.001)
+        end)
 
       p_out = GAST.p_mech(final)
 
       assert p_out <= 0.9 + 1.0e-10,
-        "Gas turbine output should be limited by temperature/load limit"
+             "Gas turbine output should be limited by temperature/load limit"
     end
   end
 
@@ -280,19 +307,32 @@ defmodule PowerModel.Transient.GovernorTest do
 
       # Build simulator with explicit governor for gen 0, none for infinite bus
       gen1 = %{
-        id: 1, fuel_type: "COL", prime_mover: "ST",
-        droop_pct: 5.0, gov_time_constant_s: 0.5,
-        p_mech_pu: p_mech, inertia_h: 5.0, status: "in_service",
-        p_max_mw: 10.0  # Small, no PSS
-      }
-      gen2 = %{
-        id: 2, fuel_type: "COL", prime_mover: "ST",
-        droop_pct: 5.0, gov_time_constant_s: 0.5,
-        p_mech_pu: -p_mech, inertia_h: 10000.0, status: "in_service",
+        id: 1,
+        fuel_type: "COL",
+        prime_mover: "ST",
+        droop_pct: 5.0,
+        gov_time_constant_s: 0.5,
+        p_mech_pu: p_mech,
+        inertia_h: 5.0,
+        status: "in_service",
+        # Small, no PSS
         p_max_mw: 10.0
       }
 
-      sim_state = Simulator.from_state(base_state, [gen1, gen2], governors: :auto, pss: :none, ibr: :none)
+      gen2 = %{
+        id: 2,
+        fuel_type: "COL",
+        prime_mover: "ST",
+        droop_pct: 5.0,
+        gov_time_constant_s: 0.5,
+        p_mech_pu: -p_mech,
+        inertia_h: 10000.0,
+        status: "in_service",
+        p_max_mw: 10.0
+      }
+
+      sim_state =
+        Simulator.from_state(base_state, [gen1, gen2], governors: :auto, pss: :none, ibr: :none)
 
       # Simulate 10 seconds
       trajectory = Simulator.simulate(sim_state, 2000, output_every: 10)
@@ -312,7 +352,7 @@ defmodule PowerModel.Transient.GovernorTest do
       # (omega closer to 1.0 than at t=2s, or at least not diverging)
       # With governor action, the frequency deviation should be bounded
       assert abs(gen_omega_10s - 1.0) < 0.1,
-        "Generator frequency should stay bounded with governor action. Got omega = #{gen_omega_10s}"
+             "Generator frequency should stay bounded with governor action. Got omega = #{gen_omega_10s}"
     end
   end
 
@@ -324,8 +364,7 @@ defmodule PowerModel.Transient.GovernorTest do
     test "PSS output is zero at steady state" do
       pss = PSS.init()
 
-      assert_in_delta PSS.v_pss(pss), 0.0, 1.0e-10,
-        "PSS output should be zero at steady state"
+      assert_in_delta PSS.v_pss(pss), 0.0, 1.0e-10, "PSS output should be zero at steady state"
     end
 
     test "PSS derivatives are zero with no speed deviation" do
@@ -338,51 +377,57 @@ defmodule PowerModel.Transient.GovernorTest do
 
     test "PSS responds to speed deviation" do
       pss = PSS.init(%{k_pss: 10.0, t_washout: 5.0, t1: 0.1, t2: 0.05})
-      omega_dev = 0.01  # 1% speed deviation
+      # 1% speed deviation
+      omega_dev = 0.01
 
       # Step for 0.5 seconds
-      final_pss = Enum.reduce(1..500, pss, fn _step, p ->
-        PSS.step_euler(p, omega_dev, 0.001)
-      end)
+      final_pss =
+        Enum.reduce(1..500, pss, fn _step, p ->
+          PSS.step_euler(p, omega_dev, 0.001)
+        end)
 
       v = PSS.v_pss(final_pss, omega_dev)
 
       assert v != 0.0,
-        "PSS should produce non-zero output during speed deviation"
+             "PSS should produce non-zero output during speed deviation"
     end
 
     test "PSS output is limited" do
       pss = PSS.init(%{k_pss: 100.0, v_pss_max: 0.1, v_pss_min: -0.1})
-      omega_dev = 0.1  # Large deviation
+      # Large deviation
+      omega_dev = 0.1
 
       # Step for 2 seconds — should hit limit
-      final_pss = Enum.reduce(1..2000, pss, fn _step, p ->
-        PSS.step_euler(p, omega_dev, 0.001)
-      end)
+      final_pss =
+        Enum.reduce(1..2000, pss, fn _step, p ->
+          PSS.step_euler(p, omega_dev, 0.001)
+        end)
 
       v = PSS.v_pss(final_pss, omega_dev)
 
       assert v <= 0.1 + 1.0e-10,
-        "PSS output should be limited to v_pss_max"
+             "PSS output should be limited to v_pss_max"
     end
 
     test "washout filter removes DC component" do
       pss = PSS.init(%{k_pss: 10.0, t_washout: 1.0})
-      omega_dev = 0.01  # Constant speed deviation
+      # Constant speed deviation
+      omega_dev = 0.01
 
       # With a constant input and T_washout = 1.0s, after several
       # time constants the washout should drive output toward zero.
       # The washout output v_wo = K_pss*omega_dev - x_washout → 0,
       # so the lead-lag output also → 0.
-      final_pss = Enum.reduce(1..20000, pss, fn _step, p ->
-        PSS.step_euler(p, omega_dev, 0.001)
-      end)
+      final_pss =
+        Enum.reduce(1..20000, pss, fn _step, p ->
+          PSS.step_euler(p, omega_dev, 0.001)
+        end)
 
       v = PSS.v_pss(final_pss, omega_dev)
 
       # After 20 seconds with T_washout = 1.0, DC should be washed out
       assert abs(v) < 0.05,
-        "Washout filter should attenuate sustained (DC) speed deviation. Got v_pss = #{v}"
+             "Washout filter should attenuate sustained (DC) speed deviation. Got v_pss = #{v}"
     end
   end
 

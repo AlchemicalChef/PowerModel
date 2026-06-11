@@ -23,14 +23,36 @@ defmodule PowerModel.Solver.Sparse do
   def lu_solve(_l, _u, _perm, _rhs), do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Add a branch (4 element updates) to triplet arrays"
-  def csr_add_branch(_rows, _cols, _reals, _imags, _from, _to,
-                     _y_series_re, _y_series_im, _y_shunt_re, _y_shunt_im, _n),
-    do: :erlang.nif_error(:nif_not_loaded)
+  def csr_add_branch(
+        _rows,
+        _cols,
+        _reals,
+        _imags,
+        _from,
+        _to,
+        _y_series_re,
+        _y_series_im,
+        _y_shunt_re,
+        _y_shunt_im,
+        _n
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
 
   @doc "Remove a branch (negate contributions) from triplet arrays"
-  def csr_remove_branch(_rows, _cols, _reals, _imags, _from, _to,
-                        _y_series_re, _y_series_im, _y_shunt_re, _y_shunt_im, _n),
-    do: :erlang.nif_error(:nif_not_loaded)
+  def csr_remove_branch(
+        _rows,
+        _cols,
+        _reals,
+        _imags,
+        _from,
+        _to,
+        _y_series_re,
+        _y_series_im,
+        _y_shunt_re,
+        _y_shunt_im,
+        _n
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
   Solve a sparse symmetric positive definite system Ax = b via LDL^T factorization.
@@ -173,11 +195,25 @@ defmodule PowerModel.Solver.Sparse do
   Raises `:nif_not_loaded` when the Rust NIF is unavailable.
   """
   def transient_classical_simulate(
-        _n_gen, _delta_init, _omega_init, _p_mech, _e_prime, _h, _d,
-        _y_red_rows, _y_red_cols, _y_red_g, _y_red_b,
-        _dt, _n_steps, _event_times, _event_gen_indices, _event_p_mech_new,
-        _output_every),
-    do: :erlang.nif_error(:nif_not_loaded)
+        _n_gen,
+        _delta_init,
+        _omega_init,
+        _p_mech,
+        _e_prime,
+        _h,
+        _d,
+        _y_red_rows,
+        _y_red_cols,
+        _y_red_g,
+        _y_red_b,
+        _dt,
+        _n_steps,
+        _event_times,
+        _event_gen_indices,
+        _event_p_mech_new,
+        _output_every
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
 
   @doc """
   Pure Elixir fallback: solve dense system using Nx.

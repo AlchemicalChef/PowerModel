@@ -25,19 +25,32 @@ defmodule PowerModel.Controls.FACTSController do
   """
 
   defstruct [
-    :device_type,        # "TCSC" | "phase_shifter"
-    :x_set_pu,           # current effective reactance (TCSC)
-    :angle_set_deg,      # current phase angle (phase shifter)
-    :x_line_pu,          # nominal line reactance (TCSC)
-    :x_min_pu,           # minimum effective reactance
-    :x_max_pu,           # maximum effective reactance
-    :angle_min_deg,      # minimum phase angle
-    :angle_max_deg,      # maximum phase angle
-    :target_mw,          # power flow target (MW)
-    :kp,                 # proportional gain
-    :ki,                 # integral gain
-    :integral,           # integral accumulator
-    :tau_s               # response time constant (seconds)
+    # "TCSC" | "phase_shifter"
+    :device_type,
+    # current effective reactance (TCSC)
+    :x_set_pu,
+    # current phase angle (phase shifter)
+    :angle_set_deg,
+    # nominal line reactance (TCSC)
+    :x_line_pu,
+    # minimum effective reactance
+    :x_min_pu,
+    # maximum effective reactance
+    :x_max_pu,
+    # minimum phase angle
+    :angle_min_deg,
+    # maximum phase angle
+    :angle_max_deg,
+    # power flow target (MW)
+    :target_mw,
+    # proportional gain
+    :kp,
+    # integral gain
+    :ki,
+    # integral accumulator
+    :integral,
+    # response time constant (seconds)
+    :tau_s
   ]
 
   @doc """

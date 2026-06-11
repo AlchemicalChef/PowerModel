@@ -30,7 +30,6 @@ defmodule PowerModel.Failure.CascadeTest do
     }
   end
 
-
   defp generator(id, bus_id, opts) do
     %{
       id: id,
@@ -228,14 +227,25 @@ defmodule PowerModel.Failure.CascadeTest do
       state = Cascade.init(snapshot)
 
       # Trip both lines, isolating bus 2
-      state = %{state |
-        tripped_lines: MapSet.new([1, 2]),
-        events: [
-          %{step: 0, component_type: "transmission_line", component_id: 1,
-            failure_cause: "manual_trip", details: %{}},
-          %{step: 0, component_type: "transmission_line", component_id: 2,
-            failure_cause: "manual_trip", details: %{}}
-        ]
+      state = %{
+        state
+        | tripped_lines: MapSet.new([1, 2]),
+          events: [
+            %{
+              step: 0,
+              component_type: "transmission_line",
+              component_id: 1,
+              failure_cause: "manual_trip",
+              details: %{}
+            },
+            %{
+              step: 0,
+              component_type: "transmission_line",
+              component_id: 2,
+              failure_cause: "manual_trip",
+              details: %{}
+            }
+          ]
       }
 
       {final_state, _step_results} = Cascade.run_cascade(state)
@@ -262,11 +272,13 @@ defmodule PowerModel.Failure.CascadeTest do
       # Line3 is overloaded (100 > 60) => trips.
       # After line3 trips, bus3 isolated => blackout.
       buses = [bus(1, bus_type: 3), bus(2), bus(3)]
+
       lines = [
         line(1, 1, 2, rating_a_mva: 60.0, x_pu: 0.1),
         line(2, 1, 2, rating_a_mva: 60.0, x_pu: 0.1),
         line(3, 2, 3, rating_a_mva: 60.0, x_pu: 0.1)
       ]
+
       gens = [generator(1, 1, p_max_mw: 200.0)]
       loads = [load(1, 3, p_mw: 100.0)]
 

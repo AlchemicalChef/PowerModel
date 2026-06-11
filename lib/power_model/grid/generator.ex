@@ -48,13 +48,37 @@ defmodule PowerModel.Grid.Generator do
 
   def changeset(generator, attrs) do
     generator
-    |> cast(attrs, [:eia_plant_id, :fuel_type, :prime_mover, :p_max_mw, :p_min_mw,
-                     :q_max_mvar, :q_min_mvar, :capacity_factor, :coordinates,
-                     :status, :bus_id, :inertia_h, :droop_pct, :gov_time_constant_s,
-                     :ramp_rate_mw_per_min, :marginal_cost_per_mwh, :v_set_pu,
-                     :agc_participation_factor, :x_d_pu, :x_d_prime_pu,
-                     :x_q_pu, :x_q_prime_pu, :t_d0_prime_s, :t_q0_prime_s,
-                     :ra_pu, :d_factor, :mva_base, :exciter_model, :governor_model])
+    |> cast(attrs, [
+      :eia_plant_id,
+      :fuel_type,
+      :prime_mover,
+      :p_max_mw,
+      :p_min_mw,
+      :q_max_mvar,
+      :q_min_mvar,
+      :capacity_factor,
+      :coordinates,
+      :status,
+      :bus_id,
+      :inertia_h,
+      :droop_pct,
+      :gov_time_constant_s,
+      :ramp_rate_mw_per_min,
+      :marginal_cost_per_mwh,
+      :v_set_pu,
+      :agc_participation_factor,
+      :x_d_pu,
+      :x_d_prime_pu,
+      :x_q_pu,
+      :x_q_prime_pu,
+      :t_d0_prime_s,
+      :t_q0_prime_s,
+      :ra_pu,
+      :d_factor,
+      :mva_base,
+      :exciter_model,
+      :governor_model
+    ])
     |> validate_required([:p_max_mw])
     |> foreign_key_constraint(:bus_id)
   end

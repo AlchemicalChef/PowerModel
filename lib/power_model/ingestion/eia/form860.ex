@@ -23,11 +23,12 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
       Plant_Y*.csv
     ))
 
-    plant_coords = if plant_path do
-      build_plant_coords(plant_path)
-    else
-      %{}
-    end
+    plant_coords =
+      if plant_path do
+        build_plant_coords(plant_path)
+      else
+        %{}
+      end
 
     if generators_path do
       generators_path
@@ -71,22 +72,28 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
   defp parse_generator(row, plant_coords) do
     try do
       plant_id = Map.get(row, "Plant Code") || Map.get(row, "Plant ID")
-      nameplate = parse_float(Map.get(row, "Nameplate Capacity (MW)") ||
-                              Map.get(row, "Capacity (MW)"))
+
+      nameplate =
+        parse_float(
+          Map.get(row, "Nameplate Capacity (MW)") ||
+            Map.get(row, "Capacity (MW)")
+        )
 
       if plant_id && nameplate && nameplate > 0 do
         lat = parse_float(Map.get(row, "Latitude"))
         lon = parse_float(Map.get(row, "Longitude"))
 
-        {lon, lat} = case {lon, lat} do
-          {nil, _} -> Map.get(plant_coords, to_string(plant_id), {nil, nil})
-          {_, nil} -> Map.get(plant_coords, to_string(plant_id), {nil, nil})
-          pair -> pair
-        end
+        {lon, lat} =
+          case {lon, lat} do
+            {nil, _} -> Map.get(plant_coords, to_string(plant_id), {nil, nil})
+            {_, nil} -> Map.get(plant_coords, to_string(plant_id), {nil, nil})
+            pair -> pair
+          end
 
-        coords = if lat && lon do
-          %Geo.Point{coordinates: {lon, lat}, srid: 4326}
-        end
+        coords =
+          if lat && lon do
+            %Geo.Point{coordinates: {lon, lat}, srid: 4326}
+          end
 
         %{
           eia_plant_id: to_string(plant_id),
@@ -105,6 +112,7 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
   end
 
   defp insert_generator(nil), do: :ok
+
   defp insert_generator(attrs) do
     %Generator{}
     |> Generator.changeset(attrs)
@@ -114,6 +122,7 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
   defp find_file(path, patterns) do
     Enum.find_value(patterns, fn pattern ->
       full = Path.join(path, pattern)
+
       case Path.wildcard(full) do
         [found | _] -> found
         [] -> nil
@@ -123,8 +132,10 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
 
   defp parse_float(nil), do: nil
   defp parse_float(val) when is_number(val), do: val * 1.0
+
   defp parse_float(val) when is_binary(val) do
     cleaned = String.trim(val)
+
     case Float.parse(cleaned) do
       {f, _} -> f
       :error -> nil
@@ -132,6 +143,7 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
   end
 
   defp parse_status(nil), do: "in_service"
+
   defp parse_status(status) when is_binary(status) do
     case String.upcase(String.trim(status)) do
       s when s in ~w(OP OPERATING) -> "in_service"

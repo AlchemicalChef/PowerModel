@@ -52,11 +52,15 @@ defmodule PowerModel.Transient.IBRTest do
       # Step at nominal voltage (1.0 pu)
       {new_ibr, p, q} = IBR.step(ibr, 1.0, 0.005)
 
-      assert_in_delta p, 0.5, 1.0e-10,
-        "Grid-following should inject constant P at nominal voltage"
+      assert_in_delta p,
+                      0.5,
+                      1.0e-10,
+                      "Grid-following should inject constant P at nominal voltage"
 
-      assert_in_delta q, 0.1, 1.0e-10,
-        "Grid-following should inject constant Q at nominal voltage"
+      assert_in_delta q,
+                      0.1,
+                      1.0e-10,
+                      "Grid-following should inject constant Q at nominal voltage"
 
       refute IBR.tripped?(new_ibr)
     end
@@ -66,10 +70,11 @@ defmodule PowerModel.Transient.IBRTest do
       ibr = IBR.init(gen)
 
       # Run for 100 steps at nominal voltage
-      {final_ibr, _} = Enum.reduce(1..100, {ibr, nil}, fn _step, {i, _} ->
-        {new_i, p, _q} = IBR.step(i, 1.0, 0.005)
-        {new_i, p}
-      end)
+      {final_ibr, _} =
+        Enum.reduce(1..100, {ibr, nil}, fn _step, {i, _} ->
+          {new_i, p, _q} = IBR.step(i, 1.0, 0.005)
+          {new_i, p}
+        end)
 
       {_, p_final, q_final} = IBR.step(final_ibr, 1.0, 0.005)
 
@@ -86,11 +91,16 @@ defmodule PowerModel.Transient.IBRTest do
 
       # Expected: scale = 0.5 / 0.7 ≈ 0.714
       expected_scale = 0.5 / 0.7
-      assert_in_delta p, 1.0 * expected_scale, 0.01,
-        "P should be reduced proportionally below 0.7 pu"
 
-      assert_in_delta q, 0.2 * expected_scale, 0.01,
-        "Q should be reduced proportionally below 0.7 pu"
+      assert_in_delta p,
+                      1.0 * expected_scale,
+                      0.01,
+                      "P should be reduced proportionally below 0.7 pu"
+
+      assert_in_delta q,
+                      0.2 * expected_scale,
+                      0.01,
+                      "Q should be reduced proportionally below 0.7 pu"
     end
 
     test "full output at voltage >= 0.7 pu" do
@@ -118,15 +128,17 @@ defmodule PowerModel.Transient.IBRTest do
 
       # Expose to V = 0.10 pu for 0.20 seconds (exceeds 0.16s limit)
       dt = 0.005
-      n_steps = round(0.20 / dt)  # 40 steps
+      # 40 steps
+      n_steps = round(0.20 / dt)
 
-      final_ibr = Enum.reduce(1..n_steps, ibr, fn _step, i ->
-        {new_i, _p, _q} = IBR.step(i, 0.10, dt)
-        new_i
-      end)
+      final_ibr =
+        Enum.reduce(1..n_steps, ibr, fn _step, i ->
+          {new_i, _p, _q} = IBR.step(i, 0.10, dt)
+          new_i
+        end)
 
       assert IBR.tripped?(final_ibr),
-        "IBR should trip after V < 0.15 for > 0.16 seconds"
+             "IBR should trip after V < 0.15 for > 0.16 seconds"
 
       # Verify zero injection after trip
       {_, p, q} = IBR.step(final_ibr, 1.0, dt)
@@ -140,15 +152,17 @@ defmodule PowerModel.Transient.IBRTest do
 
       # V = 0.10 pu for only 0.10 seconds (below 0.16s limit)
       dt = 0.005
-      n_steps = round(0.10 / dt)  # 20 steps
+      # 20 steps
+      n_steps = round(0.10 / dt)
 
-      final_ibr = Enum.reduce(1..n_steps, ibr, fn _step, i ->
-        {new_i, _p, _q} = IBR.step(i, 0.10, dt)
-        new_i
-      end)
+      final_ibr =
+        Enum.reduce(1..n_steps, ibr, fn _step, i ->
+          {new_i, _p, _q} = IBR.step(i, 0.10, dt)
+          new_i
+        end)
 
       refute IBR.tripped?(final_ibr),
-        "IBR should ride through brief severe voltage dip"
+             "IBR should ride through brief severe voltage dip"
     end
 
     test "trips on sustained voltage below 0.45 pu for > 1.0s" do
@@ -157,15 +171,17 @@ defmodule PowerModel.Transient.IBRTest do
 
       # V = 0.30 pu for 1.2 seconds
       dt = 0.005
-      n_steps = round(1.2 / dt)  # 240 steps
+      # 240 steps
+      n_steps = round(1.2 / dt)
 
-      final_ibr = Enum.reduce(1..n_steps, ibr, fn _step, i ->
-        {new_i, _p, _q} = IBR.step(i, 0.30, dt)
-        new_i
-      end)
+      final_ibr =
+        Enum.reduce(1..n_steps, ibr, fn _step, i ->
+          {new_i, _p, _q} = IBR.step(i, 0.30, dt)
+          new_i
+        end)
 
       assert IBR.tripped?(final_ibr),
-        "IBR should trip after V < 0.45 for > 1.0 seconds"
+             "IBR should trip after V < 0.45 for > 1.0 seconds"
     end
 
     test "does not trip for moderate voltage dip below 0.45 pu for < 1.0s" do
@@ -176,13 +192,14 @@ defmodule PowerModel.Transient.IBRTest do
       dt = 0.005
       n_steps = round(0.5 / dt)
 
-      final_ibr = Enum.reduce(1..n_steps, ibr, fn _step, i ->
-        {new_i, _p, _q} = IBR.step(i, 0.30, dt)
-        new_i
-      end)
+      final_ibr =
+        Enum.reduce(1..n_steps, ibr, fn _step, i ->
+          {new_i, _p, _q} = IBR.step(i, 0.30, dt)
+          new_i
+        end)
 
       refute IBR.tripped?(final_ibr),
-        "IBR should ride through sub-1.0s moderate voltage dip"
+             "IBR should ride through sub-1.0s moderate voltage dip"
     end
 
     test "timer resets when voltage recovers" do
@@ -192,30 +209,35 @@ defmodule PowerModel.Transient.IBRTest do
 
       # V = 0.10 pu for 0.10 seconds (almost at tier 1 limit)
       n_low = round(0.10 / dt)
-      ibr = Enum.reduce(1..n_low, ibr, fn _, i ->
-        {new_i, _, _} = IBR.step(i, 0.10, dt)
-        new_i
-      end)
+
+      ibr =
+        Enum.reduce(1..n_low, ibr, fn _, i ->
+          {new_i, _, _} = IBR.step(i, 0.10, dt)
+          new_i
+        end)
 
       # Recover to 1.0 pu for 0.5 seconds
       n_recover = round(0.5 / dt)
-      ibr = Enum.reduce(1..n_recover, ibr, fn _, i ->
-        {new_i, _, _} = IBR.step(i, 1.0, dt)
-        new_i
-      end)
+
+      ibr =
+        Enum.reduce(1..n_recover, ibr, fn _, i ->
+          {new_i, _, _} = IBR.step(i, 1.0, dt)
+          new_i
+        end)
 
       # Timer should have reset
       assert ibr.low_v_timer == 0.0
       assert ibr.low_v_threshold == :none
 
       # Another 0.10s at low V should not trip (timer was reset)
-      ibr = Enum.reduce(1..n_low, ibr, fn _, i ->
-        {new_i, _, _} = IBR.step(i, 0.10, dt)
-        new_i
-      end)
+      ibr =
+        Enum.reduce(1..n_low, ibr, fn _, i ->
+          {new_i, _, _} = IBR.step(i, 0.10, dt)
+          new_i
+        end)
 
       refute IBR.tripped?(ibr),
-        "Timer should reset on voltage recovery"
+             "Timer should reset on voltage recovery"
     end
   end
 
@@ -232,6 +254,7 @@ defmodule PowerModel.Transient.IBRTest do
         h_synthetic: 4.0,
         x_virtual_pu: 0.2
       }
+
       ibr = IBR.init(gen)
 
       assert ibr.mode == :grid_forming
@@ -260,13 +283,16 @@ defmodule PowerModel.Transient.IBRTest do
         d_virtual: 2.0,
         droop: 0.05
       }
+
       ibr = IBR.init(gen)
 
       # Step at nominal voltage — should be stable
       {ibr_1, _p1, _q1} = IBR.step(ibr, 1.0, 0.005)
 
-      assert_in_delta ibr_1.omega, 1.0, 0.01,
-        "Grid-forming should stay near synchronous speed at nominal V"
+      assert_in_delta ibr_1.omega,
+                      1.0,
+                      0.01,
+                      "Grid-forming should stay near synchronous speed at nominal V"
 
       # Step at slightly reduced voltage — angle and power should adjust
       {ibr_low, p_low, _} = IBR.step(ibr_1, 0.95, 0.005)
@@ -283,13 +309,15 @@ defmodule PowerModel.Transient.IBRTest do
 
       # V = 0.10 pu for 0.20 seconds
       n_steps = round(0.20 / dt)
-      final = Enum.reduce(1..n_steps, ibr, fn _, i ->
-        {new_i, _, _} = IBR.step(i, 0.10, dt)
-        new_i
-      end)
+
+      final =
+        Enum.reduce(1..n_steps, ibr, fn _, i ->
+          {new_i, _, _} = IBR.step(i, 0.10, dt)
+          new_i
+        end)
 
       assert IBR.tripped?(final),
-        "Grid-forming should also trip on sustained severe low voltage"
+             "Grid-forming should also trip on sustained severe low voltage"
     end
   end
 
@@ -305,10 +333,12 @@ defmodule PowerModel.Transient.IBRTest do
       # Force trip by sustained low voltage
       dt = 0.005
       n_steps = round(0.20 / dt)
-      tripped_ibr = Enum.reduce(1..n_steps, ibr, fn _, i ->
-        {new_i, _, _} = IBR.step(i, 0.10, dt)
-        new_i
-      end)
+
+      tripped_ibr =
+        Enum.reduce(1..n_steps, ibr, fn _, i ->
+          {new_i, _, _} = IBR.step(i, 0.10, dt)
+          new_i
+        end)
 
       assert IBR.tripped?(tripped_ibr)
 

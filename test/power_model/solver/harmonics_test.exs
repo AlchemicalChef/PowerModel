@@ -122,8 +122,11 @@ defmodule PowerModel.Solver.HarmonicsTest do
       for h <- [5, 7, 11, 13, 25] do
         {r_h, _x_h, _b_h} = Impedance.line_impedance_at_harmonic(line_map, h)
         expected_r = 0.01 * :math.sqrt(h)
-        assert_in_delta r_h, expected_r, 1.0e-10,
-          "R at h=#{h}: expected #{expected_r}, got #{r_h}"
+
+        assert_in_delta r_h,
+                        expected_r,
+                        1.0e-10,
+                        "R at h=#{h}: expected #{expected_r}, got #{r_h}"
       end
     end
 
@@ -133,8 +136,11 @@ defmodule PowerModel.Solver.HarmonicsTest do
       for h <- [3, 5, 7, 11, 25] do
         {_r_h, x_h, _b_h} = Impedance.line_impedance_at_harmonic(line_map, h)
         expected_x = 0.1 * h
-        assert_in_delta x_h, expected_x, 1.0e-10,
-          "X at h=#{h}: expected #{expected_x}, got #{x_h}"
+
+        assert_in_delta x_h,
+                        expected_x,
+                        1.0e-10,
+                        "X at h=#{h}: expected #{expected_x}, got #{x_h}"
       end
     end
 
@@ -144,8 +150,11 @@ defmodule PowerModel.Solver.HarmonicsTest do
       for h <- [5, 7, 11] do
         {_r_h, _x_h, b_h} = Impedance.line_impedance_at_harmonic(line_map, h)
         expected_b = 0.02 * h
-        assert_in_delta b_h, expected_b, 1.0e-10,
-          "B at h=#{h}: expected #{expected_b}, got #{b_h}"
+
+        assert_in_delta b_h,
+                        expected_b,
+                        1.0e-10,
+                        "B at h=#{h}: expected #{expected_b}, got #{b_h}"
       end
     end
   end
@@ -170,8 +179,10 @@ defmodule PowerModel.Solver.HarmonicsTest do
 
       # At h=5, generator should present h * X"d impedance
       {r5, x5} = Impedance.generator_impedance_at_harmonic(gen_map, 5)
-      assert_in_delta x5, 5 * 0.15, 1.0e-10  # h * X"d
-      assert_in_delta r5, 0.1 * 0.15 * :math.sqrt(5), 1.0e-10  # 10% of X"d * sqrt(h) skin effect
+      # h * X"d
+      assert_in_delta x5, 5 * 0.15, 1.0e-10
+      # 10% of X"d * sqrt(h) skin effect
+      assert_in_delta r5, 0.1 * 0.15 * :math.sqrt(5), 1.0e-10
     end
 
     test "falls back to default X scaled by h when no data available" do
@@ -199,9 +210,15 @@ defmodule PowerModel.Solver.HarmonicsTest do
   describe "Impedance.build_ybus_at_harmonic/6" do
     test "returns valid Y-bus struct with correct dimensions" do
       snap = snapshot_3bus()
-      ybus = Impedance.build_ybus_at_harmonic(
-        snap.buses, snap.lines, snap.transformers, snap.generators, 5
-      )
+
+      ybus =
+        Impedance.build_ybus_at_harmonic(
+          snap.buses,
+          snap.lines,
+          snap.transformers,
+          snap.generators,
+          5
+        )
 
       assert ybus.n == 3
       assert is_map(ybus.bus_index_map)
@@ -211,27 +228,41 @@ defmodule PowerModel.Solver.HarmonicsTest do
 
     test "Y-bus at h=1 has smaller off-diagonal magnitudes than at h=5" do
       snap = snapshot_3bus()
-      ybus_1 = Impedance.build_ybus_at_harmonic(
-        snap.buses, snap.lines, snap.transformers, snap.generators, 1
-      )
-      ybus_5 = Impedance.build_ybus_at_harmonic(
-        snap.buses, snap.lines, snap.transformers, snap.generators, 5
-      )
+
+      ybus_1 =
+        Impedance.build_ybus_at_harmonic(
+          snap.buses,
+          snap.lines,
+          snap.transformers,
+          snap.generators,
+          1
+        )
+
+      ybus_5 =
+        Impedance.build_ybus_at_harmonic(
+          snap.buses,
+          snap.lines,
+          snap.transformers,
+          snap.generators,
+          5
+        )
 
       # At higher harmonics, series admittance decreases (impedance increases)
       # So off-diagonal magnitudes should be smaller
-      off_diag_1 = ybus_1.triplets
+      off_diag_1 =
+        ybus_1.triplets
         |> Enum.filter(fn {r, c, _} -> r != c end)
         |> Enum.map(fn {_, _, {re, im}} -> :math.sqrt(re * re + im * im) end)
         |> Enum.sum()
 
-      off_diag_5 = ybus_5.triplets
+      off_diag_5 =
+        ybus_5.triplets
         |> Enum.filter(fn {r, c, _} -> r != c end)
         |> Enum.map(fn {_, _, {re, im}} -> :math.sqrt(re * re + im * im) end)
         |> Enum.sum()
 
       assert off_diag_1 > off_diag_5,
-        "Off-diagonal Y at h=1 (#{off_diag_1}) should be > at h=5 (#{off_diag_5})"
+             "Off-diagonal Y at h=1 (#{off_diag_1}) should be > at h=5 (#{off_diag_5})"
     end
   end
 
@@ -265,8 +296,9 @@ defmodule PowerModel.Solver.HarmonicsTest do
 
       # Each successive magnitude should be smaller
       pairs = Enum.zip(mags, tl(mags))
+
       assert Enum.all?(pairs, fn {a, b} -> a >= b end),
-        "Magnitudes should decrease: #{inspect(mags)}"
+             "Magnitudes should decrease: #{inspect(mags)}"
     end
 
     test "5th harmonic magnitude follows I_1/h^alpha model" do
@@ -332,8 +364,9 @@ defmodule PowerModel.Solver.HarmonicsTest do
       Enum.each(spectrum, fn {h, mag, _angle} ->
         # All harmonics should be less than 5% of fundamental current
         pct = mag / 100.0 * 100.0
+
         assert pct <= 5.0,
-          "h=#{h} is #{pct}% of fundamental, should be <= 5%"
+               "h=#{h} is #{pct}% of fundamental, should be <= 5%"
       end)
     end
 
@@ -342,12 +375,14 @@ defmodule PowerModel.Solver.HarmonicsTest do
 
       # Default spectrum: 5th = 4%, should be the largest
       {_h5, mag_5, _} = Enum.find(spectrum, fn {h, _, _} -> h == 5 end)
-      other_mags = spectrum
+
+      other_mags =
+        spectrum
         |> Enum.reject(fn {h, _, _} -> h == 5 end)
         |> Enum.map(&elem(&1, 1))
 
       assert Enum.all?(other_mags, &(&1 <= mag_5)),
-        "5th harmonic (#{mag_5}) should be >= all others"
+             "5th harmonic (#{mag_5}) should be >= all others"
     end
   end
 
@@ -367,12 +402,14 @@ defmodule PowerModel.Solver.HarmonicsTest do
       spectrum = Sources.arc_furnace_spectrum(50.0, phase: :melting)
 
       {_h, mag_2, _} = Enum.find(spectrum, fn {h, _, _} -> h == 2 end)
-      other_mags = spectrum
+
+      other_mags =
+        spectrum
         |> Enum.reject(fn {h, _, _} -> h == 2 end)
         |> Enum.map(&elem(&1, 1))
 
       assert Enum.all?(other_mags, &(&1 <= mag_2)),
-        "2nd harmonic should be dominant in melting phase"
+             "2nd harmonic should be dominant in melting phase"
     end
   end
 
@@ -440,7 +477,7 @@ defmodule PowerModel.Solver.HarmonicsTest do
       v7_bus3 = voltages[7][3] |> elem(0)
 
       assert v5_bus3 < v1_bus3,
-        "V_5 at bus 3 (#{v5_bus3}) should be << V_1 (#{v1_bus3})"
+             "V_5 at bus 3 (#{v5_bus3}) should be << V_1 (#{v1_bus3})"
 
       # All harmonic voltages should be non-zero (harmonics propagate through network)
       assert v5_bus3 > 0.0, "V_5 should be non-zero"
@@ -456,7 +493,9 @@ defmodule PowerModel.Solver.HarmonicsTest do
       # Verify all harmonic voltages are finite and non-negative.
       Enum.each([5, 7, 11, 13], fn h ->
         case voltages[h] do
-          nil -> :ok
+          nil ->
+            :ok
+
           bus_voltages ->
             {v_h, _} = bus_voltages[3]
             assert v_h >= 0.0, "V_#{h} should be non-negative"
@@ -480,7 +519,8 @@ defmodule PowerModel.Solver.HarmonicsTest do
     test "bus without harmonic source has lower distortion" do
       snap = snapshot_3bus()
       fund = fundamental_solution_3bus()
-      sources = harmonic_sources_3bus()  # source only at bus 2
+      # source only at bus 2
+      sources = harmonic_sources_3bus()
 
       {:ok, voltages} = Solver.solve(snap, fund, sources, max_harmonic: 13)
 
@@ -566,11 +606,16 @@ defmodule PowerModel.Solver.HarmonicsTest do
       # Create voltages with THD > 5% at a 138 kV bus (limit = 2.5%)
       voltages = %{
         1 => %{1 => {1.0, 0.0}},
-        5 => %{1 => {0.02, 0.0}},   # 2%
-        7 => %{1 => {0.015, 0.0}},  # 1.5%
-        11 => %{1 => {0.010, 0.0}}, # 1.0%
-        13 => %{1 => {0.008, 0.0}}  # 0.8%
+        # 2%
+        5 => %{1 => {0.02, 0.0}},
+        # 1.5%
+        7 => %{1 => {0.015, 0.0}},
+        # 1.0%
+        11 => %{1 => {0.010, 0.0}},
+        # 0.8%
+        13 => %{1 => {0.008, 0.0}}
       }
+
       # THD = sqrt(0.02^2 + 0.015^2 + 0.01^2 + 0.008^2) / 1.0 * 100
       #     = sqrt(0.0004 + 0.000225 + 0.0001 + 0.000064) * 100
       #     = sqrt(0.000789) * 100 = 2.81%
@@ -590,9 +635,12 @@ defmodule PowerModel.Solver.HarmonicsTest do
     test "passes compliance at low-distortion bus" do
       voltages = %{
         1 => %{1 => {1.0, 0.0}},
-        5 => %{1 => {0.005, 0.0}},  # 0.5%
-        7 => %{1 => {0.003, 0.0}}   # 0.3%
+        # 0.5%
+        5 => %{1 => {0.005, 0.0}},
+        # 0.3%
+        7 => %{1 => {0.003, 0.0}}
       }
+
       # THD = sqrt(0.005^2 + 0.003^2) * 100 = 0.58%
 
       buses = [%{id: 1, base_kv: 138.0}]
@@ -606,7 +654,8 @@ defmodule PowerModel.Solver.HarmonicsTest do
     test "applies correct limits based on voltage level" do
       voltages = %{
         1 => %{1 => {1.0, 0.0}, 2 => {1.0, 0.0}},
-        5 => %{1 => {0.06, 0.0}, 2 => {0.06, 0.0}}  # 6% individual
+        # 6% individual
+        5 => %{1 => {0.06, 0.0}, 2 => {0.06, 0.0}}
       }
 
       # Bus 1: 13.8 kV (distribution) — individual limit = 3.0%
@@ -615,6 +664,7 @@ defmodule PowerModel.Solver.HarmonicsTest do
         %{id: 1, base_kv: 13.8},
         %{id: 2, base_kv: 0.48}
       ]
+
       results = Solver.check_ieee_519(voltages, buses)
 
       # Both should have violations, but with different limits
@@ -624,23 +674,29 @@ defmodule PowerModel.Solver.HarmonicsTest do
       assert result_1.individual_limit_pct == 3.0
       assert result_2.individual_limit_pct == 5.0
 
-      refute result_1.compliant  # 6% > 3%
-      refute result_2.compliant  # 6% > 5%
+      # 6% > 3%
+      refute result_1.compliant
+      # 6% > 5%
+      refute result_2.compliant
     end
 
     test "detects individual harmonic violation" do
       voltages = %{
         1 => %{1 => {1.0, 0.0}},
-        5 => %{1 => {0.035, 0.0}}  # 3.5% — exceeds 3% limit for 69 kV < V <= 161 kV
+        # 3.5% — exceeds 3% limit for 69 kV < V <= 161 kV
+        5 => %{1 => {0.035, 0.0}}
       }
 
       buses = [%{id: 1, base_kv: 138.0}]
       results = Solver.check_ieee_519(voltages, buses)
 
       [result] = results
-      assert result.max_individual_pct > 1.5  # 138 kV limit = 1.5%
+      # 138 kV limit = 1.5%
+      assert result.max_individual_pct > 1.5
+
       individual_violations =
         Enum.filter(result.violations, &(&1.type == :individual))
+
       assert length(individual_violations) > 0
     end
   end
@@ -665,7 +721,7 @@ defmodule PowerModel.Solver.HarmonicsTest do
       z_at_10 = List.last(magnitudes)
 
       assert z_at_10 > z_at_1,
-        "Z at h=10 (#{z_at_10}) should be > Z at h=1 (#{z_at_1}) for inductive system"
+             "Z at h=10 (#{z_at_10}) should be > Z at h=1 (#{z_at_1}) for inductive system"
     end
 
     test "returns correct number of frequency points" do
@@ -681,7 +737,7 @@ defmodule PowerModel.Solver.HarmonicsTest do
 
       Enum.each(results, fn {h, z_mag, _angle} ->
         assert z_mag > 0.0 or z_mag == :infinity,
-          "Z at h=#{h} should be positive, got #{z_mag}"
+               "Z at h=#{h} should be positive, got #{z_mag}"
       end)
     end
   end
@@ -713,7 +769,8 @@ defmodule PowerModel.Solver.HarmonicsTest do
 
       # Reactive compensation should be close to desired
       assert filter.q_mvar_actual > 0.0
-      assert filter.q_mvar_actual < 30.0  # slightly less due to inductor
+      # slightly less due to inductor
+      assert filter.q_mvar_actual < 30.0
     end
 
     test "X_C at fundamental equals V^2/Q" do
@@ -748,7 +805,7 @@ defmodule PowerModel.Solver.HarmonicsTest do
       filter_broad = Filter.design_single_tuned(5, 138.0, 30.0, q_factor: 15.0)
 
       assert filter_sharp.bandwidth_hz < filter_broad.bandwidth_hz,
-        "Higher Q should give narrower bandwidth"
+             "Higher Q should give narrower bandwidth"
     end
   end
 
@@ -767,7 +824,7 @@ defmodule PowerModel.Solver.HarmonicsTest do
       filter_high_q = Filter.design_high_pass(11, 138.0, 20.0, q_factor: 2.0)
 
       assert filter_high_q.r_ohm > filter_low_q.r_ohm,
-        "Higher Q should give higher damping resistance"
+             "Higher Q should give higher damping resistance"
     end
   end
 
@@ -789,6 +846,7 @@ defmodule PowerModel.Solver.HarmonicsTest do
 
       assert is_map(thd)
       assert map_size(thd) == 3
+
       Enum.each(thd, fn {_bus_id, thd_pct} ->
         assert is_float(thd_pct)
         assert thd_pct >= 0.0
@@ -798,6 +856,7 @@ defmodule PowerModel.Solver.HarmonicsTest do
       compliance = Solver.check_ieee_519(voltages, snap.buses)
 
       assert length(compliance) == 3
+
       Enum.each(compliance, fn result ->
         assert is_boolean(result.compliant)
         assert is_float(result.thd_pct)

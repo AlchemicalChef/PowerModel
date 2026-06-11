@@ -4,31 +4,50 @@ defmodule PowerModel.Solver.OPFTest do
   alias PowerModel.Solver.OPF
 
   defp bus(id, opts \\ []) do
-    %{id: id, bus_type: Keyword.get(opts, :bus_type, 1), base_kv: 138.0,
-      vm_pu: 1.0, va_rad: 0.0, b_shunt_mvar: 0.0}
+    %{
+      id: id,
+      bus_type: Keyword.get(opts, :bus_type, 1),
+      base_kv: 138.0,
+      vm_pu: 1.0,
+      va_rad: 0.0,
+      b_shunt_mvar: 0.0
+    }
   end
 
   defp line(id, from, to, opts \\ []) do
-    %{id: id, from_bus_id: from, to_bus_id: to,
-      voltage_kv: 138.0, r_pu: 0.01,
+    %{
+      id: id,
+      from_bus_id: from,
+      to_bus_id: to,
+      voltage_kv: 138.0,
+      r_pu: 0.01,
       x_pu: Keyword.get(opts, :x_pu, 0.1),
       b_pu: 0.02,
-      rating_a_mva: Keyword.get(opts, :rating_a_mva, 100.0)}
+      rating_a_mva: Keyword.get(opts, :rating_a_mva, 100.0)
+    }
   end
 
   defp generator(id, bus_id, opts) do
-    %{id: id, bus_id: bus_id,
+    %{
+      id: id,
+      bus_id: bus_id,
       p_max_mw: Keyword.get(opts, :p_max_mw, 100.0),
       p_min_mw: Keyword.get(opts, :p_min_mw, 0.0),
       capacity_factor: 1.0,
-      fuel_type: "NG", status: "in_service",
-      marginal_cost_per_mwh: Keyword.get(opts, :cost, 35.0)}
+      fuel_type: "NG",
+      status: "in_service",
+      marginal_cost_per_mwh: Keyword.get(opts, :cost, 35.0)
+    }
   end
 
   defp load(id, bus_id, opts) do
-    %{id: id, bus_id: bus_id,
+    %{
+      id: id,
+      bus_id: bus_id,
       p_mw: Keyword.get(opts, :p_mw, 50.0),
-      q_mvar: 0.0, status: "in_service"}
+      q_mvar: 0.0,
+      status: "in_service"
+    }
   end
 
   describe "basic OPF" do
@@ -41,8 +60,10 @@ defmodule PowerModel.Solver.OPFTest do
         ],
         transformers: [],
         generators: [
-          generator(1, 1, p_max_mw: 100.0, cost: 20.0),  # cheap
-          generator(2, 3, p_max_mw: 100.0, cost: 50.0)   # expensive
+          # cheap
+          generator(1, 1, p_max_mw: 100.0, cost: 20.0),
+          # expensive
+          generator(2, 3, p_max_mw: 100.0, cost: 50.0)
         ],
         loads: [load(1, 2, p_mw: 80.0)]
       }

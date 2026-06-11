@@ -62,18 +62,22 @@ defmodule PowerModel.Solver.Harmonics.Sources do
     #                         positive-sequence (7th, 13th, 19th, ...)
     1..div(max_h, 6)
     |> Enum.flat_map(fn k ->
-      h_minus = 6 * k - 1  # 5, 11, 17, ...
-      h_plus = 6 * k + 1   # 7, 13, 19, ...
+      # 5, 11, 17, ...
+      h_minus = 6 * k - 1
+      # 7, 13, 19, ...
+      h_plus = 6 * k + 1
 
       entries = []
-      entries = if h_minus <= max_h do
-        # Negative-sequence harmonics: phase angle ~= -pi/2 * (k-1) (simplified)
-        mag = i_fundamental_pu / :math.pow(h_minus, alpha)
-        angle = -:math.pi() / 2.0 * (k - 1)
-        [{h_minus, mag, angle} | entries]
-      else
-        entries
-      end
+
+      entries =
+        if h_minus <= max_h do
+          # Negative-sequence harmonics: phase angle ~= -pi/2 * (k-1) (simplified)
+          mag = i_fundamental_pu / :math.pow(h_minus, alpha)
+          angle = -:math.pi() / 2.0 * (k - 1)
+          [{h_minus, mag, angle} | entries]
+        else
+          entries
+        end
 
       if h_plus <= max_h do
         mag = i_fundamental_pu / :math.pow(h_plus, alpha)
@@ -112,17 +116,21 @@ defmodule PowerModel.Solver.Harmonics.Sources do
     # Characteristic harmonics: h = 12k +/- 1 for k = 1, 2, 3, ...
     1..div(max_h, 12)
     |> Enum.flat_map(fn k ->
-      h_minus = 12 * k - 1  # 11, 23, 35, ...
-      h_plus = 12 * k + 1   # 13, 25, 37, ...
+      # 11, 23, 35, ...
+      h_minus = 12 * k - 1
+      # 13, 25, 37, ...
+      h_plus = 12 * k + 1
 
       entries = []
-      entries = if h_minus <= max_h do
-        mag = i_fundamental_pu / :math.pow(h_minus, alpha)
-        angle = -:math.pi() / 3.0 * (k - 1)
-        [{h_minus, mag, angle} | entries]
-      else
-        entries
-      end
+
+      entries =
+        if h_minus <= max_h do
+          mag = i_fundamental_pu / :math.pow(h_minus, alpha)
+          angle = -:math.pi() / 3.0 * (k - 1)
+          [{h_minus, mag, angle} | entries]
+        else
+          entries
+        end
 
       if h_plus <= max_h do
         mag = i_fundamental_pu / :math.pow(h_plus, alpha)
@@ -167,15 +175,24 @@ defmodule PowerModel.Solver.Harmonics.Sources do
     # Default spectrum based on EPRI/IEEE field measurements of utility-scale inverters
     # Values are percentage of fundamental current
     default_spectrum = %{
-      2 => 0.5,    # small even harmonic from asymmetry
-      3 => 2.0,    # triplen (reduced by 3-phase cancellation in balanced systems)
-      5 => 4.0,    # dominant low-order odd harmonic
-      7 => 3.0,    # second characteristic harmonic
-      9 => 1.0,    # triplen
-      11 => 2.0,   # third characteristic
-      13 => 1.5,   # fourth characteristic
-      15 => 0.5,   # triplen
-      17 => 1.0,   # near switching frequency sidebands
+      # small even harmonic from asymmetry
+      2 => 0.5,
+      # triplen (reduced by 3-phase cancellation in balanced systems)
+      3 => 2.0,
+      # dominant low-order odd harmonic
+      5 => 4.0,
+      # second characteristic harmonic
+      7 => 3.0,
+      # triplen
+      9 => 1.0,
+      # third characteristic
+      11 => 2.0,
+      # fourth characteristic
+      13 => 1.5,
+      # triplen
+      15 => 0.5,
+      # near switching frequency sidebands
+      17 => 1.0,
       19 => 0.8,
       23 => 0.5,
       25 => 0.3
@@ -219,14 +236,16 @@ defmodule PowerModel.Solver.Harmonics.Sources do
 
     # Typical EAF harmonic current as % of fundamental (IEEE Std 519, Table E.1)
     # Melting phase has higher harmonics than refining phase
-    {even_scale, odd_scale} = case phase do
-      :refining -> {0.5, 0.6}
-      _melting -> {1.0, 1.0}
-    end
+    {even_scale, odd_scale} =
+      case phase do
+        :refining -> {0.5, 0.6}
+        _melting -> {1.0, 1.0}
+      end
 
     # Base spectrum (% of fundamental) — from field measurements
     base_spectrum = %{
-      2 => 7.7 * even_scale,    # even harmonics are significant in EAF
+      # even harmonics are significant in EAF
+      2 => 7.7 * even_scale,
       3 => 5.8 * odd_scale,
       4 => 2.5 * even_scale,
       5 => 4.5 * odd_scale,
@@ -281,37 +300,39 @@ defmodule PowerModel.Solver.Harmonics.Sources do
     # Spectrum depends on saturation mechanism
     # GIC: half-cycle saturation produces strong even harmonics
     # Overexcitation: symmetric saturation produces only odd harmonics
-    spectrum = case sat_type do
-      :gic ->
-        %{
-          2 => 63.0,    # dominant component in GIC-driven saturation
-          3 => 26.0,
-          4 => 19.0,
-          5 => 8.5,
-          6 => 7.2,
-          7 => 3.5,
-          8 => 3.0,
-          9 => 1.5,
-          10 => 1.2,
-          11 => 0.8,
-          13 => 0.5,
-          15 => 0.3
-        }
+    spectrum =
+      case sat_type do
+        :gic ->
+          %{
+            # dominant component in GIC-driven saturation
+            2 => 63.0,
+            3 => 26.0,
+            4 => 19.0,
+            5 => 8.5,
+            6 => 7.2,
+            7 => 3.5,
+            8 => 3.0,
+            9 => 1.5,
+            10 => 1.2,
+            11 => 0.8,
+            13 => 0.5,
+            15 => 0.3
+          }
 
-      :overexcitation ->
-        # Symmetric saturation: only odd harmonics
-        %{
-          3 => 42.0,
-          5 => 13.0,
-          7 => 6.0,
-          9 => 3.5,
-          11 => 2.0,
-          13 => 1.2,
-          15 => 0.8,
-          17 => 0.5,
-          19 => 0.3
-        }
-    end
+        :overexcitation ->
+          # Symmetric saturation: only odd harmonics
+          %{
+            3 => 42.0,
+            5 => 13.0,
+            7 => 6.0,
+            9 => 3.5,
+            11 => 2.0,
+            13 => 1.2,
+            15 => 0.8,
+            17 => 0.5,
+            19 => 0.3
+          }
+      end
 
     spectrum
     |> Enum.filter(fn {h, _pct} -> h <= max_h and h >= 2 end)

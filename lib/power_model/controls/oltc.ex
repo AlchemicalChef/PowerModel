@@ -16,17 +16,28 @@ defmodule PowerModel.Controls.OLTC do
   """
 
   defstruct [
-    :tap,            # current tap ratio (pu)
-    :timer,          # accumulated time outside deadband (seconds)
-    :enabled,        # whether the OLTC is active
-    :v_target_pu,    # voltage setpoint (pu)
-    :v_deadband_pu,  # voltage error threshold (pu, +/-)
-    :tap_step_pct,   # tap step size (percent)
-    :tap_min,        # minimum tap ratio
-    :tap_max,        # maximum tap ratio
-    :delay_s,        # delay before first tap change (seconds)
-    :step_delay_s,   # delay between successive tap changes (seconds)
-    :first_step_done # whether the first tap change has occurred
+    # current tap ratio (pu)
+    :tap,
+    # accumulated time outside deadband (seconds)
+    :timer,
+    # whether the OLTC is active
+    :enabled,
+    # voltage setpoint (pu)
+    :v_target_pu,
+    # voltage error threshold (pu, +/-)
+    :v_deadband_pu,
+    # tap step size (percent)
+    :tap_step_pct,
+    # minimum tap ratio
+    :tap_min,
+    # maximum tap ratio
+    :tap_max,
+    # delay before first tap change (seconds)
+    :delay_s,
+    # delay between successive tap changes (seconds)
+    :step_delay_s,
+    # whether the first tap change has occurred
+    :first_step_done
   ]
 
   @default_params %{
@@ -99,11 +110,7 @@ defmodule PowerModel.Controls.OLTC do
           # At limit, no further action possible
           {%{state | timer: 0.0}, :no_change}
         else
-          new_state = %{state |
-            tap: new_tap,
-            timer: 0.0,
-            first_step_done: true
-          }
+          new_state = %{state | tap: new_tap, timer: 0.0, first_step_done: true}
           {new_state, {:tap_change, new_tap}}
         end
       else

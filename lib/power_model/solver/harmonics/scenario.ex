@@ -108,16 +108,21 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
     ]
 
     @type t :: %__MODULE__{
-      id: term(),
-      bus_id: integer(),
-      device_type: :six_pulse | :twelve_pulse | :pwm_inverter |
-                   :arc_furnace | :saturated_transformer | :custom,
-      p_mw: float(),
-      v_pu: float(),
-      params: map(),
-      filter: map() | nil,
-      active: boolean()
-    }
+            id: term(),
+            bus_id: integer(),
+            device_type:
+              :six_pulse
+              | :twelve_pulse
+              | :pwm_inverter
+              | :arc_furnace
+              | :saturated_transformer
+              | :custom,
+            p_mw: float(),
+            v_pu: float(),
+            params: map(),
+            filter: map() | nil,
+            active: boolean()
+          }
   end
 
   defmodule HarmonicScenario do
@@ -132,19 +137,17 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
     - `base_mva` — system MVA base (default 100.0)
     """
 
-    defstruct [
-      devices: [],
-      filters: %{},
-      max_harmonic: 25,
-      base_mva: 100.0
-    ]
+    defstruct devices: [],
+              filters: %{},
+              max_harmonic: 25,
+              base_mva: 100.0
 
     @type t :: %__MODULE__{
-      devices: [PowerModel.Solver.Harmonics.Scenario.HarmonicDevice.t()],
-      filters: map(),
-      max_harmonic: pos_integer(),
-      base_mva: float()
-    }
+            devices: [PowerModel.Solver.Harmonics.Scenario.HarmonicDevice.t()],
+            filters: map(),
+            max_harmonic: pos_integer(),
+            base_mva: float()
+          }
   end
 
   # ---------------------------------------------------------------------------
@@ -313,7 +316,14 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
   Updated scenario with the filter added. If a filter already exists at
   the bus, it is replaced.
   """
-  def add_filter(%HarmonicScenario{} = scenario, bus_id, filter_type, target_harmonic, q_mvar, opts \\ []) do
+  def add_filter(
+        %HarmonicScenario{} = scenario,
+        bus_id,
+        filter_type,
+        target_harmonic,
+        q_mvar,
+        opts \\ []
+      ) do
     bus_kv = Keyword.get(opts, :bus_kv, 138.0)
 
     filter_spec =
@@ -321,14 +331,18 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
         :single_tuned ->
           q_factor = Keyword.get(opts, :q_factor, 40.0)
           detune_pct = Keyword.get(opts, :detune_pct, 4.0)
-          design = Filter.design_single_tuned(target_harmonic, bus_kv, q_mvar,
-                     q_factor: q_factor, detune_pct: detune_pct)
+
+          design =
+            Filter.design_single_tuned(target_harmonic, bus_kv, q_mvar,
+              q_factor: q_factor,
+              detune_pct: detune_pct
+            )
+
           Map.put(design, :filter_type, :single_tuned)
 
         :high_pass ->
           q_factor = Keyword.get(opts, :q_factor, 1.0)
-          design = Filter.design_high_pass(target_harmonic, bus_kv, q_mvar,
-                     q_factor: q_factor)
+          design = Filter.design_high_pass(target_harmonic, bus_kv, q_mvar, q_factor: q_factor)
           Map.put(design, :filter_type, :high_pass)
       end
 
@@ -396,8 +410,9 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
 
     # Run the harmonic solver
     case Solver.solve(filtered_snapshot, fundamental_solution, harmonic_sources,
-                      max_harmonic: scenario.max_harmonic,
-                      base_mva: scenario.base_mva) do
+           max_harmonic: scenario.max_harmonic,
+           base_mva: scenario.base_mva
+         ) do
       {:ok, harmonic_voltages} ->
         # Compute THD at each bus
         thd = Solver.compute_thd(harmonic_voltages)
@@ -410,9 +425,12 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
 
         impedance_scans =
           Map.new(scan_bus_ids, fn bus_id ->
-            scan = Solver.impedance_scan(filtered_snapshot, bus_id,
-                     freq_range: 1..scenario.max_harmonic,
-                     base_mva: scenario.base_mva)
+            scan =
+              Solver.impedance_scan(filtered_snapshot, bus_id,
+                freq_range: 1..scenario.max_harmonic,
+                base_mva: scenario.base_mva
+              )
+
             {bus_id, scan}
           end)
 
@@ -431,18 +449,19 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
         # Compute individual harmonic distortion at each bus
         individual_hd = compute_individual_hd(harmonic_voltages)
 
-        {:ok, %{
-          harmonic_voltages: harmonic_voltages,
-          thd: thd,
-          individual_hd: individual_hd,
-          ieee_519: ieee_519,
-          impedance_scans: impedance_scans,
-          devices: scenario.devices,
-          filters: scenario.filters,
-          max_harmonic: scenario.max_harmonic,
-          worst_bus: worst_bus,
-          total_violations: total_violations
-        }}
+        {:ok,
+         %{
+           harmonic_voltages: harmonic_voltages,
+           thd: thd,
+           individual_hd: individual_hd,
+           ieee_519: ieee_519,
+           impedance_scans: impedance_scans,
+           devices: scenario.devices,
+           filters: scenario.filters,
+           max_harmonic: scenario.max_harmonic,
+           worst_bus: worst_bus,
+           total_violations: total_violations
+         }}
 
       {:error, reason} ->
         {:error, reason}
@@ -481,10 +500,11 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
     thd_before = result_before.thd
     thd_after = result_after.thd
 
-    all_bus_ids = MapSet.union(
-      MapSet.new(Map.keys(thd_before)),
-      MapSet.new(Map.keys(thd_after))
-    )
+    all_bus_ids =
+      MapSet.union(
+        MapSet.new(Map.keys(thd_before)),
+        MapSet.new(Map.keys(thd_after))
+      )
 
     # Absolute THD improvement (positive = better)
     thd_improvement =
@@ -500,11 +520,13 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
         before_val = Map.get(thd_before, bus_id, 0.0)
         after_val = Map.get(thd_after, bus_id, 0.0)
 
-        pct = if before_val > 1.0e-6 do
-          (before_val - after_val) / before_val * 100.0
-        else
-          0.0
-        end
+        pct =
+          if before_val > 1.0e-6 do
+            (before_val - after_val) / before_val * 100.0
+          else
+            0.0
+          end
+
         {bus_id, pct}
       end)
 
@@ -612,11 +634,12 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
             nil
           end
 
-        {:ok, %{
-          baseline: baseline_result,
-          modified: modified_result,
-          comparison: comparison
-        }}
+        {:ok,
+         %{
+           baseline: baseline_result,
+           modified: modified_result,
+           comparison: comparison
+         }}
 
       {:error, reason} ->
         {:error, reason}
@@ -730,7 +753,8 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
         p_mw: Map.get(load, :p_mw) || 0.0,
         v_pu: 1.0,
         params: %{phase: :melting},
-        active: false  # inactive by default — user must opt in
+        # inactive by default — user must opt in
+        active: false
       }
     end)
   end
@@ -847,6 +871,7 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
     z_base = bus_kv * bus_kv / base_mva
 
     max_h = 25
+
     harmonic_shunts =
       Map.new(1..max_h, fn h ->
         omega_h = omega_0 * h
@@ -891,8 +916,10 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
 
     snapshot
     |> Map.put(:buses, modified_buses)
-    |> Map.put(:harmonic_filters,
-         [filter_data | Map.get(snapshot, :harmonic_filters, [])])
+    |> Map.put(
+      :harmonic_filters,
+      [filter_data | Map.get(snapshot, :harmonic_filters, [])]
+    )
   end
 
   # ---------------------------------------------------------------------------
@@ -936,6 +963,7 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
   defp build_flat_start(snapshot) do
     bus_ids = Enum.map(snapshot.buses, & &1.id)
     n = length(bus_ids)
+
     %{
       bus_ids: bus_ids,
       vm_pu: List.duplicate(1.0, n),
@@ -969,6 +997,7 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
           case Map.get(bus_voltages, bus_id) do
             {v_h_mag, _angle} when v1_mag > 1.0e-6 ->
               Map.put(acc, h, v_h_mag / v1_mag * 100.0)
+
             _ ->
               acc
           end
@@ -979,6 +1008,7 @@ defmodule PowerModel.Solver.Harmonics.Scenario do
   end
 
   defp safe_average([]), do: 0.0
+
   defp safe_average(values) do
     Enum.sum(values) / length(values)
   end

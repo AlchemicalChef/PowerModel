@@ -9,70 +9,130 @@ defmodule PowerModel.Ingestion.GeneratorDefaults do
   alias PowerModel.Grid.Generator
 
   @inertia_h %{
-    "NUC" => 6.0, "COL" => 4.5, "NG" => 3.5, "WAT" => 3.0,
-    "WND" => 0.0, "SUN" => 0.0, "PET" => 3.0, "GEO" => 4.0,
-    "BIT" => 4.5, "SUB" => 4.5, "LIG" => 4.0, "OG" => 3.5,
-    "DFO" => 3.0, "RFO" => 3.5, "WH" => 3.0
+    "NUC" => 6.0,
+    "COL" => 4.5,
+    "NG" => 3.5,
+    "WAT" => 3.0,
+    "WND" => 0.0,
+    "SUN" => 0.0,
+    "PET" => 3.0,
+    "GEO" => 4.0,
+    "BIT" => 4.5,
+    "SUB" => 4.5,
+    "LIG" => 4.0,
+    "OG" => 3.5,
+    "DFO" => 3.0,
+    "RFO" => 3.5,
+    "WH" => 3.0
   }
 
   # Nuclear plants do not provide upward governor response (NRC regulations);
   # droop 0.0 disables their participation in frequency response.
   @droop_pct %{
-    "NUC" => 0.0, "COL" => 4.0, "NG" => 4.0, "WAT" => 3.0,
-    "WND" => 0.0, "SUN" => 0.0
+    "NUC" => 0.0,
+    "COL" => 4.0,
+    "NG" => 4.0,
+    "WAT" => 3.0,
+    "WND" => 0.0,
+    "SUN" => 0.0
   }
 
   # Governor time constants represent effective mechanical power delivery time,
   # not just servo response. Includes boiler/turbine/water column dynamics.
   @gov_time_constant_s %{
-    "NUC" => 999.0, "COL" => 8.0, "NG" => 1.5, "WAT" => 3.0,
-    "WND" => 0.0, "SUN" => 0.0
+    "NUC" => 999.0,
+    "COL" => 8.0,
+    "NG" => 1.5,
+    "WAT" => 3.0,
+    "WND" => 0.0,
+    "SUN" => 0.0
   }
 
   @ramp_rate_mult %{
-    "NUC" => 0.01, "COL" => 0.02, "NG" => 0.08, "WAT" => 0.5,
-    "WND" => 1.0, "SUN" => 1.0
+    "NUC" => 0.01,
+    "COL" => 0.02,
+    "NG" => 0.08,
+    "WAT" => 0.5,
+    "WND" => 1.0,
+    "SUN" => 1.0
   }
 
   @marginal_cost %{
-    "NUC" => 10.0, "COL" => 25.0, "WAT" => 5.0, "WND" => 0.0,
-    "SUN" => 0.0, "PET" => 80.0, "GEO" => 5.0, "BIT" => 28.0,
-    "SUB" => 22.0, "LIG" => 20.0, "OG" => 50.0, "DFO" => 90.0,
-    "RFO" => 70.0, "WH" => 5.0
+    "NUC" => 10.0,
+    "COL" => 25.0,
+    "WAT" => 5.0,
+    "WND" => 0.0,
+    "SUN" => 0.0,
+    "PET" => 80.0,
+    "GEO" => 5.0,
+    "BIT" => 28.0,
+    "SUB" => 22.0,
+    "LIG" => 20.0,
+    "OG" => 50.0,
+    "DFO" => 90.0,
+    "RFO" => 70.0,
+    "WH" => 5.0
   }
 
   # p_min as fraction of p_max when EIA Minimum Load data is missing
   @p_min_fraction %{
-    "NUC" => 1.0,   # nuclear runs at 100% or is offline
-    "COL" => 0.35,  # coal minimum stable load ~35%
-    "NG"  => 0.30,  # gas CT ~30%, CC ~40% (use 30% conservative)
-    "WAT" => 0.10,  # hydro ~10%
+    # nuclear runs at 100% or is offline
+    "NUC" => 1.0,
+    # coal minimum stable load ~35%
+    "COL" => 0.35,
+    # gas CT ~30%, CC ~40% (use 30% conservative)
+    "NG" => 0.30,
+    # hydro ~10%
+    "WAT" => 0.10,
     "WND" => 0.0,
     "SUN" => 0.0,
     "PET" => 0.25,
-    "GEO" => 0.70,  # geothermal baseload, high minimum
+    # geothermal baseload, high minimum
+    "GEO" => 0.70,
     "BIT" => 0.35,
     "SUB" => 0.35,
     "LIG" => 0.35,
-    "OG"  => 0.30,
+    "OG" => 0.30,
     "DFO" => 0.25,
     "RFO" => 0.30,
-    "WH"  => 0.10
+    "WH" => 0.10
   }
 
   # Transient stability defaults by fuel type
   @x_d_prime %{
-    "NUC" => 0.20, "COL" => 0.25, "NG" => 0.30, "WAT" => 0.35,
-    "WND" => 0.0, "SUN" => 0.0, "PET" => 0.30, "GEO" => 0.25,
-    "BIT" => 0.25, "SUB" => 0.25, "LIG" => 0.25, "OG" => 0.30,
-    "DFO" => 0.30, "RFO" => 0.30, "WH" => 0.35
+    "NUC" => 0.20,
+    "COL" => 0.25,
+    "NG" => 0.30,
+    "WAT" => 0.35,
+    "WND" => 0.0,
+    "SUN" => 0.0,
+    "PET" => 0.30,
+    "GEO" => 0.25,
+    "BIT" => 0.25,
+    "SUB" => 0.25,
+    "LIG" => 0.25,
+    "OG" => 0.30,
+    "DFO" => 0.30,
+    "RFO" => 0.30,
+    "WH" => 0.35
   }
 
   @x_d %{
-    "NUC" => 1.10, "COL" => 1.00, "NG" => 1.20, "WAT" => 0.90,
-    "WND" => 0.0, "SUN" => 0.0, "PET" => 1.20, "GEO" => 1.00,
-    "BIT" => 1.00, "SUB" => 1.00, "LIG" => 1.00, "OG" => 1.20,
-    "DFO" => 1.20, "RFO" => 1.20, "WH" => 0.90
+    "NUC" => 1.10,
+    "COL" => 1.00,
+    "NG" => 1.20,
+    "WAT" => 0.90,
+    "WND" => 0.0,
+    "SUN" => 0.0,
+    "PET" => 1.20,
+    "GEO" => 1.00,
+    "BIT" => 1.00,
+    "SUB" => 1.00,
+    "LIG" => 1.00,
+    "OG" => 1.20,
+    "DFO" => 1.20,
+    "RFO" => 1.20,
+    "WH" => 0.90
   }
 
   @ng_ct_movers MapSet.new(["CA", "CT"])
@@ -150,6 +210,7 @@ defmodule PowerModel.Ingestion.GeneratorDefaults do
           gen
           |> Generator.changeset(attrs)
           |> Repo.update!()
+
           {count + 1, 0}
         else
           {count, 0}
@@ -181,7 +242,9 @@ defmodule PowerModel.Ingestion.GeneratorDefaults do
         |> Repo.update!()
       end)
 
-      IO.puts("[GeneratorDefaults] Set AGC participation for #{length(eligible)} generators (total capacity: #{Float.round(total_agc_capacity, 1)} MW)")
+      IO.puts(
+        "[GeneratorDefaults] Set AGC participation for #{length(eligible)} generators (total capacity: #{Float.round(total_agc_capacity, 1)} MW)"
+      )
     else
       IO.puts("[GeneratorDefaults] No AGC-eligible generators found.")
     end

@@ -18,12 +18,18 @@ defmodule PowerModel.Controls.SVCController do
   """
 
   defstruct [
-    :q_inject,  # current reactive injection (MVAr, positive = capacitive)
-    :v_set,     # voltage setpoint (pu)
-    :slope,     # droop slope (pu voltage / pu reactive on device base)
-    :q_min,     # minimum reactive output (MVAr, typically negative = inductive)
-    :q_max,     # maximum reactive output (MVAr, typically positive = capacitive)
-    :tau_s      # response time constant (seconds)
+    # current reactive injection (MVAr, positive = capacitive)
+    :q_inject,
+    # voltage setpoint (pu)
+    :v_set,
+    # droop slope (pu voltage / pu reactive on device base)
+    :slope,
+    # minimum reactive output (MVAr, typically negative = inductive)
+    :q_min,
+    # maximum reactive output (MVAr, typically positive = capacitive)
+    :q_max,
+    # response time constant (seconds)
+    :tau_s
   ]
 
   @doc """

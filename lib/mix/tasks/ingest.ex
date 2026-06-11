@@ -39,7 +39,10 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       ["substations", "--osm"] ->
         Mix.shell().info("Ingesting substations from OpenStreetMap Overpass API...")
         {:ok, result} = PowerModel.Ingestion.OSM.Substations.ingest()
-        Mix.shell().info("Done. Enriched: #{result.enriched}, New: #{result.inserted}, Failed states: #{result.failed_states}")
+
+        Mix.shell().info(
+          "Done. Enriched: #{result.enriched}, New: #{result.inserted}, Failed states: #{result.failed_states}"
+        )
 
       ["substations", path] ->
         Mix.shell().info("Ingesting substations from #{path}...")
@@ -147,16 +150,23 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       ["fix_self_loops"] ->
         Mix.shell().info("Fixing self-loop transmission lines...")
         {:ok, result} = PowerModel.Ingestion.SelfLoopFix.run()
-        Mix.shell().info("Before: #{result.before}, Fixed: #{result.fixed}, Remaining: #{result.remaining}")
+
+        Mix.shell().info(
+          "Before: #{result.before}, Fixed: #{result.fixed}, Remaining: #{result.remaining}"
+        )
 
       ["backfill_generator_dynamics"] ->
-        Mix.shell().info("Backfilling generator dynamic parameters (inertia, droop, ramp, cost)...")
+        Mix.shell().info(
+          "Backfilling generator dynamic parameters (inertia, droop, ramp, cost)..."
+        )
+
         PowerModel.Ingestion.GeneratorDefaults.backfill()
         Mix.shell().info("Done.")
 
       ["matpower", path | rest] ->
         opts = parse_matpower_opts(rest)
         Mix.shell().info("Importing MATPOWER case: #{path}")
+
         case PowerModel.Ingestion.Matpower.import(path, opts) do
           {:ok, result} ->
             Mix.shell().info("""
@@ -168,6 +178,7 @@ defmodule Mix.Tasks.PowerModel.Ingest do
               Loads:        #{result.loads}
               Substations:  #{result.substations}
             """)
+
           {:error, reason} ->
             Mix.shell().error("Import failed: #{inspect(reason)}")
         end
@@ -178,7 +189,7 @@ defmodule Mix.Tasks.PowerModel.Ingest do
         Mix.shell().info("Done.")
 
       ["critical_facilities", category]
-          when category in ~w(hospital fire_station police_station ems_station) ->
+      when category in ~w(hospital fire_station police_station ems_station) ->
         cat = String.to_atom(category)
         Mix.shell().info("Ingesting #{category} from HIFLD API...")
         PowerModel.Ingestion.HIFLD.CriticalFacilities.ingest(cat)
@@ -270,12 +281,15 @@ defmodule Mix.Tasks.PowerModel.Ingest do
   end
 
   defp parse_matpower_opts([], acc), do: acc
+
   defp parse_matpower_opts(["--clear" | rest], acc) do
     parse_matpower_opts(rest, [{:clear_existing, true} | acc])
   end
+
   defp parse_matpower_opts(["--interconnection", name | rest], acc) do
     parse_matpower_opts(rest, [{:interconnection, name} | acc])
   end
+
   defp parse_matpower_opts([_ | rest], acc) do
     parse_matpower_opts(rest, acc)
   end

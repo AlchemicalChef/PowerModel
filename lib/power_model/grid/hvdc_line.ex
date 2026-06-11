@@ -28,9 +28,18 @@ defmodule PowerModel.Grid.HVDCLine do
   end
 
   @cast_fields [
-    :name, :rated_mw, :voltage_kv, :p_schedule_mw, :control_mode,
-    :converter_loss_pct, :converter_q_factor, :status, :source, :source_id,
-    :rectifier_bus_id, :inverter_bus_id
+    :name,
+    :rated_mw,
+    :voltage_kv,
+    :p_schedule_mw,
+    :control_mode,
+    :converter_loss_pct,
+    :converter_q_factor,
+    :status,
+    :source,
+    :source_id,
+    :rectifier_bus_id,
+    :inverter_bus_id
   ]
 
   def changeset(hvdc, attrs) do

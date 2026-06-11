@@ -26,102 +26,261 @@ defmodule PowerModel.Solver.IEEE14BusTest do
 
   # Bus types: 3 = slack, 2 = PV, 1 = PQ
   @buses [
-    %{id: 1,  bus_type: 3, base_kv: 132.0, vm_pu: 1.060, va_rad: 0.0},
-    %{id: 2,  bus_type: 2, base_kv: 132.0, vm_pu: 1.045, va_rad: 0.0},
-    %{id: 3,  bus_type: 2, base_kv: 132.0, vm_pu: 1.010, va_rad: 0.0},
-    %{id: 4,  bus_type: 1, base_kv: 132.0, vm_pu: 1.0,   va_rad: 0.0},
-    %{id: 5,  bus_type: 1, base_kv: 132.0, vm_pu: 1.0,   va_rad: 0.0},
-    %{id: 6,  bus_type: 2, base_kv: 12.0,  vm_pu: 1.070, va_rad: 0.0},
-    %{id: 7,  bus_type: 1, base_kv: 12.0,  vm_pu: 1.0,   va_rad: 0.0},
-    %{id: 8,  bus_type: 2, base_kv: 12.0,  vm_pu: 1.090, va_rad: 0.0},
-    %{id: 9,  bus_type: 1, base_kv: 12.0,  vm_pu: 1.0,   va_rad: 0.0},
-    %{id: 10, bus_type: 1, base_kv: 12.0,  vm_pu: 1.0,   va_rad: 0.0},
-    %{id: 11, bus_type: 1, base_kv: 12.0,  vm_pu: 1.0,   va_rad: 0.0},
-    %{id: 12, bus_type: 1, base_kv: 12.0,  vm_pu: 1.0,   va_rad: 0.0},
-    %{id: 13, bus_type: 1, base_kv: 12.0,  vm_pu: 1.0,   va_rad: 0.0},
-    %{id: 14, bus_type: 1, base_kv: 12.0,  vm_pu: 1.0,   va_rad: 0.0}
+    %{id: 1, bus_type: 3, base_kv: 132.0, vm_pu: 1.060, va_rad: 0.0},
+    %{id: 2, bus_type: 2, base_kv: 132.0, vm_pu: 1.045, va_rad: 0.0},
+    %{id: 3, bus_type: 2, base_kv: 132.0, vm_pu: 1.010, va_rad: 0.0},
+    %{id: 4, bus_type: 1, base_kv: 132.0, vm_pu: 1.0, va_rad: 0.0},
+    %{id: 5, bus_type: 1, base_kv: 132.0, vm_pu: 1.0, va_rad: 0.0},
+    %{id: 6, bus_type: 2, base_kv: 12.0, vm_pu: 1.070, va_rad: 0.0},
+    %{id: 7, bus_type: 1, base_kv: 12.0, vm_pu: 1.0, va_rad: 0.0},
+    %{id: 8, bus_type: 2, base_kv: 12.0, vm_pu: 1.090, va_rad: 0.0},
+    %{id: 9, bus_type: 1, base_kv: 12.0, vm_pu: 1.0, va_rad: 0.0},
+    %{id: 10, bus_type: 1, base_kv: 12.0, vm_pu: 1.0, va_rad: 0.0},
+    %{id: 11, bus_type: 1, base_kv: 12.0, vm_pu: 1.0, va_rad: 0.0},
+    %{id: 12, bus_type: 1, base_kv: 12.0, vm_pu: 1.0, va_rad: 0.0},
+    %{id: 13, bus_type: 1, base_kv: 12.0, vm_pu: 1.0, va_rad: 0.0},
+    %{id: 14, bus_type: 1, base_kv: 12.0, vm_pu: 1.0, va_rad: 0.0}
   ]
 
   # Generators: bus 1 is slack (its P is solved for); buses 3, 6, 8 are
   # synchronous condensers (P = 0). Bus 2 dispatches 40 MW.
   @generators [
-    %{id: 1, bus_id: 1, p_max_mw: 332.4, capacity_factor: 0.7,
-      q_max_mvar: 10.0,  q_min_mvar: 0.0},
-    %{id: 2, bus_id: 2, p_max_mw: 40.0,  capacity_factor: 1.0,
-      q_max_mvar: 50.0,  q_min_mvar: -40.0},
-    %{id: 3, bus_id: 3, p_max_mw: 0.0,   capacity_factor: 1.0,
-      q_max_mvar: 40.0,  q_min_mvar: 0.0},
-    %{id: 4, bus_id: 6, p_max_mw: 0.0,   capacity_factor: 1.0,
-      q_max_mvar: 24.0,  q_min_mvar: -6.0},
-    %{id: 5, bus_id: 8, p_max_mw: 0.0,   capacity_factor: 1.0,
-      q_max_mvar: 24.0,  q_min_mvar: -6.0}
+    %{id: 1, bus_id: 1, p_max_mw: 332.4, capacity_factor: 0.7, q_max_mvar: 10.0, q_min_mvar: 0.0},
+    %{
+      id: 2,
+      bus_id: 2,
+      p_max_mw: 40.0,
+      capacity_factor: 1.0,
+      q_max_mvar: 50.0,
+      q_min_mvar: -40.0
+    },
+    %{id: 3, bus_id: 3, p_max_mw: 0.0, capacity_factor: 1.0, q_max_mvar: 40.0, q_min_mvar: 0.0},
+    %{id: 4, bus_id: 6, p_max_mw: 0.0, capacity_factor: 1.0, q_max_mvar: 24.0, q_min_mvar: -6.0},
+    %{id: 5, bus_id: 8, p_max_mw: 0.0, capacity_factor: 1.0, q_max_mvar: 24.0, q_min_mvar: -6.0}
   ]
 
   @loads [
-    %{id: 1,  bus_id: 2,  p_mw: 21.7, q_mvar: 12.7},
-    %{id: 2,  bus_id: 3,  p_mw: 94.2, q_mvar: 19.0},
-    %{id: 3,  bus_id: 4,  p_mw: 47.8, q_mvar: -3.9},
-    %{id: 4,  bus_id: 5,  p_mw: 7.6,  q_mvar: 1.6},
-    %{id: 5,  bus_id: 6,  p_mw: 11.2, q_mvar: 7.5},
-    %{id: 6,  bus_id: 9,  p_mw: 29.5, q_mvar: 16.6},
-    %{id: 7,  bus_id: 10, p_mw: 9.0,  q_mvar: 5.8},
-    %{id: 8,  bus_id: 11, p_mw: 3.5,  q_mvar: 1.8},
-    %{id: 9,  bus_id: 12, p_mw: 6.1,  q_mvar: 1.6},
+    %{id: 1, bus_id: 2, p_mw: 21.7, q_mvar: 12.7},
+    %{id: 2, bus_id: 3, p_mw: 94.2, q_mvar: 19.0},
+    %{id: 3, bus_id: 4, p_mw: 47.8, q_mvar: -3.9},
+    %{id: 4, bus_id: 5, p_mw: 7.6, q_mvar: 1.6},
+    %{id: 5, bus_id: 6, p_mw: 11.2, q_mvar: 7.5},
+    %{id: 6, bus_id: 9, p_mw: 29.5, q_mvar: 16.6},
+    %{id: 7, bus_id: 10, p_mw: 9.0, q_mvar: 5.8},
+    %{id: 8, bus_id: 11, p_mw: 3.5, q_mvar: 1.8},
+    %{id: 9, bus_id: 12, p_mw: 6.1, q_mvar: 1.6},
     %{id: 10, bus_id: 13, p_mw: 13.5, q_mvar: 5.8},
     %{id: 11, bus_id: 14, p_mw: 14.9, q_mvar: 5.0}
   ]
 
   # Transmission lines (non-transformer branches)
   @lines [
-    %{id: 1,  from_bus_id: 1,  to_bus_id: 2,  voltage_kv: 132.0,
-      r_pu: 0.01938, x_pu: 0.05917, b_pu: 0.0528, rating_a_mva: 200.0},
-    %{id: 2,  from_bus_id: 1,  to_bus_id: 5,  voltage_kv: 132.0,
-      r_pu: 0.05403, x_pu: 0.22304, b_pu: 0.0492, rating_a_mva: 200.0},
-    %{id: 3,  from_bus_id: 2,  to_bus_id: 3,  voltage_kv: 132.0,
-      r_pu: 0.04699, x_pu: 0.19797, b_pu: 0.0438, rating_a_mva: 200.0},
-    %{id: 4,  from_bus_id: 2,  to_bus_id: 4,  voltage_kv: 132.0,
-      r_pu: 0.05811, x_pu: 0.17632, b_pu: 0.0340, rating_a_mva: 200.0},
-    %{id: 5,  from_bus_id: 2,  to_bus_id: 5,  voltage_kv: 132.0,
-      r_pu: 0.05695, x_pu: 0.17388, b_pu: 0.0346, rating_a_mva: 200.0},
-    %{id: 6,  from_bus_id: 3,  to_bus_id: 4,  voltage_kv: 132.0,
-      r_pu: 0.06701, x_pu: 0.17103, b_pu: 0.0128, rating_a_mva: 200.0},
-    %{id: 7,  from_bus_id: 4,  to_bus_id: 5,  voltage_kv: 132.0,
-      r_pu: 0.01335, x_pu: 0.04211, b_pu: 0.0,    rating_a_mva: 200.0},
-    %{id: 8,  from_bus_id: 6,  to_bus_id: 11, voltage_kv: 12.0,
-      r_pu: 0.09498, x_pu: 0.19890, b_pu: 0.0,    rating_a_mva: 50.0},
-    %{id: 9,  from_bus_id: 6,  to_bus_id: 12, voltage_kv: 12.0,
-      r_pu: 0.12291, x_pu: 0.25581, b_pu: 0.0,    rating_a_mva: 50.0},
-    %{id: 10, from_bus_id: 6,  to_bus_id: 13, voltage_kv: 12.0,
-      r_pu: 0.06615, x_pu: 0.13027, b_pu: 0.0,    rating_a_mva: 50.0},
-    %{id: 11, from_bus_id: 7,  to_bus_id: 8,  voltage_kv: 12.0,
-      r_pu: 0.0,     x_pu: 0.17615, b_pu: 0.0,    rating_a_mva: 50.0},
-    %{id: 12, from_bus_id: 7,  to_bus_id: 9,  voltage_kv: 12.0,
-      r_pu: 0.11001, x_pu: 0.20640, b_pu: 0.0,    rating_a_mva: 50.0},
-    %{id: 13, from_bus_id: 9,  to_bus_id: 10, voltage_kv: 12.0,
-      r_pu: 0.03181, x_pu: 0.08450, b_pu: 0.0,    rating_a_mva: 50.0},
-    %{id: 14, from_bus_id: 9,  to_bus_id: 14, voltage_kv: 12.0,
-      r_pu: 0.12711, x_pu: 0.27038, b_pu: 0.0,    rating_a_mva: 50.0},
-    %{id: 15, from_bus_id: 10, to_bus_id: 11, voltage_kv: 12.0,
-      r_pu: 0.08205, x_pu: 0.19207, b_pu: 0.0,    rating_a_mva: 50.0},
-    %{id: 16, from_bus_id: 12, to_bus_id: 13, voltage_kv: 12.0,
-      r_pu: 0.22092, x_pu: 0.19988, b_pu: 0.0,    rating_a_mva: 50.0},
-    %{id: 17, from_bus_id: 13, to_bus_id: 14, voltage_kv: 12.0,
-      r_pu: 0.17093, x_pu: 0.34802, b_pu: 0.0,    rating_a_mva: 50.0}
+    %{
+      id: 1,
+      from_bus_id: 1,
+      to_bus_id: 2,
+      voltage_kv: 132.0,
+      r_pu: 0.01938,
+      x_pu: 0.05917,
+      b_pu: 0.0528,
+      rating_a_mva: 200.0
+    },
+    %{
+      id: 2,
+      from_bus_id: 1,
+      to_bus_id: 5,
+      voltage_kv: 132.0,
+      r_pu: 0.05403,
+      x_pu: 0.22304,
+      b_pu: 0.0492,
+      rating_a_mva: 200.0
+    },
+    %{
+      id: 3,
+      from_bus_id: 2,
+      to_bus_id: 3,
+      voltage_kv: 132.0,
+      r_pu: 0.04699,
+      x_pu: 0.19797,
+      b_pu: 0.0438,
+      rating_a_mva: 200.0
+    },
+    %{
+      id: 4,
+      from_bus_id: 2,
+      to_bus_id: 4,
+      voltage_kv: 132.0,
+      r_pu: 0.05811,
+      x_pu: 0.17632,
+      b_pu: 0.0340,
+      rating_a_mva: 200.0
+    },
+    %{
+      id: 5,
+      from_bus_id: 2,
+      to_bus_id: 5,
+      voltage_kv: 132.0,
+      r_pu: 0.05695,
+      x_pu: 0.17388,
+      b_pu: 0.0346,
+      rating_a_mva: 200.0
+    },
+    %{
+      id: 6,
+      from_bus_id: 3,
+      to_bus_id: 4,
+      voltage_kv: 132.0,
+      r_pu: 0.06701,
+      x_pu: 0.17103,
+      b_pu: 0.0128,
+      rating_a_mva: 200.0
+    },
+    %{
+      id: 7,
+      from_bus_id: 4,
+      to_bus_id: 5,
+      voltage_kv: 132.0,
+      r_pu: 0.01335,
+      x_pu: 0.04211,
+      b_pu: 0.0,
+      rating_a_mva: 200.0
+    },
+    %{
+      id: 8,
+      from_bus_id: 6,
+      to_bus_id: 11,
+      voltage_kv: 12.0,
+      r_pu: 0.09498,
+      x_pu: 0.19890,
+      b_pu: 0.0,
+      rating_a_mva: 50.0
+    },
+    %{
+      id: 9,
+      from_bus_id: 6,
+      to_bus_id: 12,
+      voltage_kv: 12.0,
+      r_pu: 0.12291,
+      x_pu: 0.25581,
+      b_pu: 0.0,
+      rating_a_mva: 50.0
+    },
+    %{
+      id: 10,
+      from_bus_id: 6,
+      to_bus_id: 13,
+      voltage_kv: 12.0,
+      r_pu: 0.06615,
+      x_pu: 0.13027,
+      b_pu: 0.0,
+      rating_a_mva: 50.0
+    },
+    %{
+      id: 11,
+      from_bus_id: 7,
+      to_bus_id: 8,
+      voltage_kv: 12.0,
+      r_pu: 0.0,
+      x_pu: 0.17615,
+      b_pu: 0.0,
+      rating_a_mva: 50.0
+    },
+    %{
+      id: 12,
+      from_bus_id: 7,
+      to_bus_id: 9,
+      voltage_kv: 12.0,
+      r_pu: 0.11001,
+      x_pu: 0.20640,
+      b_pu: 0.0,
+      rating_a_mva: 50.0
+    },
+    %{
+      id: 13,
+      from_bus_id: 9,
+      to_bus_id: 10,
+      voltage_kv: 12.0,
+      r_pu: 0.03181,
+      x_pu: 0.08450,
+      b_pu: 0.0,
+      rating_a_mva: 50.0
+    },
+    %{
+      id: 14,
+      from_bus_id: 9,
+      to_bus_id: 14,
+      voltage_kv: 12.0,
+      r_pu: 0.12711,
+      x_pu: 0.27038,
+      b_pu: 0.0,
+      rating_a_mva: 50.0
+    },
+    %{
+      id: 15,
+      from_bus_id: 10,
+      to_bus_id: 11,
+      voltage_kv: 12.0,
+      r_pu: 0.08205,
+      x_pu: 0.19207,
+      b_pu: 0.0,
+      rating_a_mva: 50.0
+    },
+    %{
+      id: 16,
+      from_bus_id: 12,
+      to_bus_id: 13,
+      voltage_kv: 12.0,
+      r_pu: 0.22092,
+      x_pu: 0.19988,
+      b_pu: 0.0,
+      rating_a_mva: 50.0
+    },
+    %{
+      id: 17,
+      from_bus_id: 13,
+      to_bus_id: 14,
+      voltage_kv: 12.0,
+      r_pu: 0.17093,
+      x_pu: 0.34802,
+      b_pu: 0.0,
+      rating_a_mva: 50.0
+    }
   ]
 
   # Transformers (branches with tap ratios)
   @transformers [
-    %{id: 1, from_bus_id: 4, to_bus_id: 7, r_pu: 0.0, x_pu: 0.20912,
-      rated_mva: 100.0, tap_ratio: 0.978},
-    %{id: 2, from_bus_id: 4, to_bus_id: 9, r_pu: 0.0, x_pu: 0.55618,
-      rated_mva: 100.0, tap_ratio: 0.969},
-    %{id: 3, from_bus_id: 5, to_bus_id: 6, r_pu: 0.0, x_pu: 0.25202,
-      rated_mva: 100.0, tap_ratio: 0.932}
+    %{
+      id: 1,
+      from_bus_id: 4,
+      to_bus_id: 7,
+      r_pu: 0.0,
+      x_pu: 0.20912,
+      rated_mva: 100.0,
+      tap_ratio: 0.978
+    },
+    %{
+      id: 2,
+      from_bus_id: 4,
+      to_bus_id: 9,
+      r_pu: 0.0,
+      x_pu: 0.55618,
+      rated_mva: 100.0,
+      tap_ratio: 0.969
+    },
+    %{
+      id: 3,
+      from_bus_id: 5,
+      to_bus_id: 6,
+      r_pu: 0.0,
+      x_pu: 0.25202,
+      rated_mva: 100.0,
+      tap_ratio: 0.932
+    }
   ]
 
   # Published IEEE 14-bus DC power flow angles (radians, approximate)
   @expected_dc_angles %{
-    1 =>  0.0,
+    1 => 0.0,
     2 => -0.087,
     3 => -0.222,
     4 => -0.180,
@@ -139,15 +298,15 @@ defmodule PowerModel.Solver.IEEE14BusTest do
 
   # Published IEEE 14-bus AC solution voltage magnitudes (pu)
   @expected_ac_vm %{
-    1  => 1.060,
-    2  => 1.045,
-    3  => 1.010,
-    4  => 1.018,
-    5  => 1.020,
-    6  => 1.070,
-    7  => 1.062,
-    8  => 1.090,
-    9  => 1.056,
+    1 => 1.060,
+    2 => 1.045,
+    3 => 1.010,
+    4 => 1.018,
+    5 => 1.020,
+    6 => 1.070,
+    7 => 1.062,
+    8 => 1.090,
+    9 => 1.056,
     10 => 1.051,
     11 => 1.057,
     12 => 1.055,
@@ -205,16 +364,20 @@ defmodule PowerModel.Solver.IEEE14BusTest do
     test "all non-slack bus angles are negative (power flows away from slack)", %{solution: sol} do
       for bus_id <- 2..14 do
         angle = angle_for(sol, bus_id)
+
         assert angle < 0.0,
-          "Expected negative angle for bus #{bus_id}, got #{angle}"
+               "Expected negative angle for bus #{bus_id}, got #{angle}"
       end
     end
 
     test "voltage angles are within 0.05 rad of expected DC values", %{solution: sol} do
       for {bus_id, expected} <- @expected_dc_angles do
         actual = angle_for(sol, bus_id)
-        assert_in_delta actual, expected, 0.05,
-          "DC angle mismatch at bus #{bus_id}: expected ~#{expected} rad, got #{actual} rad"
+
+        assert_in_delta actual,
+                        expected,
+                        0.05,
+                        "DC angle mismatch at bus #{bus_id}: expected ~#{expected} rad, got #{actual} rad"
       end
     end
 
@@ -233,7 +396,7 @@ defmodule PowerModel.Solver.IEEE14BusTest do
 
       for key <- line_keys ++ xfmr_keys do
         assert Map.has_key?(sol.line_flows, key),
-          "Missing flow for #{inspect(key)}"
+               "Missing flow for #{inspect(key)}"
       end
 
       assert map_size(sol.line_flows) == n_lines + n_xfmrs
@@ -259,20 +422,21 @@ defmodule PowerModel.Solver.IEEE14BusTest do
       assert flow != nil
       # Line 1-2 should carry substantial flow (slack bus export)
       assert abs(flow.p_flow_mw) > 50.0,
-        "Expected >50 MW on line 1-2, got #{flow.p_flow_mw} MW"
+             "Expected >50 MW on line 1-2, got #{flow.p_flow_mw} MW"
     end
 
     test "power balance: net injection at non-slack buses matches DC flow", %{solution: _sol} do
       # For DC, the sum of flows out of each bus should equal net injection.
       # Verify total generation roughly covers total load.
       total_load = Enum.sum(Enum.map(@loads, & &1.p_mw))
-      total_gen = Enum.sum(
-        Enum.map(@generators, fn g -> g.p_max_mw * (g.capacity_factor || 1.0) end)
-      )
+
+      total_gen =
+        Enum.sum(Enum.map(@generators, fn g -> g.p_max_mw * (g.capacity_factor || 1.0) end))
+
       # Slack bus makes up the difference; generation should exceed or
       # equal load in DC (lossless) approximation.
       assert total_gen >= total_load * 0.8,
-        "Total generation #{total_gen} MW is far below load #{total_load} MW"
+             "Total generation #{total_gen} MW is far below load #{total_load} MW"
     end
   end
 
@@ -293,18 +457,18 @@ defmodule PowerModel.Solver.IEEE14BusTest do
 
     test "solver converges", %{solution: sol} do
       assert sol.converged == true,
-        "Newton-Raphson did not converge after #{sol.iterations} iterations " <>
-        "(max mismatch: #{sol.max_mismatch})"
+             "Newton-Raphson did not converge after #{sol.iterations} iterations " <>
+               "(max mismatch: #{sol.max_mismatch})"
     end
 
     test "converges within 20 iterations", %{solution: sol} do
       assert sol.iterations <= 20,
-        "Took #{sol.iterations} iterations to converge"
+             "Took #{sol.iterations} iterations to converge"
     end
 
     test "final mismatch is below tolerance", %{solution: sol} do
       assert sol.max_mismatch < 1.0e-4,
-        "Max mismatch #{sol.max_mismatch} exceeds 1e-4"
+             "Max mismatch #{sol.max_mismatch} exceeds 1e-4"
     end
 
     test "solution contains all 14 buses", %{solution: sol} do
@@ -317,17 +481,19 @@ defmodule PowerModel.Solver.IEEE14BusTest do
       assert angle_for(sol, 1) == 0.0
     end
 
-    test "voltage magnitudes are within physically reasonable range (0.8-1.2 pu)", %{solution: sol} do
+    test "voltage magnitudes are within physically reasonable range (0.8-1.2 pu)", %{
+      solution: sol
+    } do
       for {bus_id, vm} <- Enum.zip(sol.bus_ids, sol.vm_pu) do
         assert vm >= 0.8 and vm <= 1.2,
-          "Voltage at bus #{bus_id} = #{vm} pu is outside [0.8, 1.2]"
+               "Voltage at bus #{bus_id} = #{vm} pu is outside [0.8, 1.2]"
       end
     end
 
     test "voltage angles are within reasonable range (< 1 rad)", %{solution: sol} do
       for {bus_id, va} <- Enum.zip(sol.bus_ids, sol.va_rad) do
         assert abs(va) < 1.0,
-          "Angle at bus #{bus_id} = #{va} rad exceeds 1 radian"
+               "Angle at bus #{bus_id} = #{va} rad exceeds 1 radian"
       end
     end
 
@@ -368,16 +534,18 @@ defmodule PowerModel.Solver.IEEE14BusTest do
       for {bus_id, expected_vm} <- @expected_ac_vm do
         actual_vm = vm_for(sol, bus_id)
         pct_error = abs(actual_vm - expected_vm) / expected_vm * 100.0
+
         assert pct_error < 5.0,
-          "Vm at bus #{bus_id}: expected ~#{expected_vm} pu, " <>
-          "got #{Float.round(actual_vm, 4)} pu (#{Float.round(pct_error, 2)}% error)"
+               "Vm at bus #{bus_id}: expected ~#{expected_vm} pu, " <>
+                 "got #{Float.round(actual_vm, 4)} pu (#{Float.round(pct_error, 2)}% error)"
       end
     end
 
     test "PQ bus voltages within 5% of published IEEE values", %{solution: sol} do
       # PQ buses should converge reasonably close to published values.
       # Our simplified NR (no Q limits on PV buses) yields ~3-5% error on some buses.
-      pq_bus_ids = @buses
+      pq_bus_ids =
+        @buses
         |> Enum.filter(&(&1.bus_type == 1))
         |> Enum.map(& &1.id)
 
@@ -385,9 +553,10 @@ defmodule PowerModel.Solver.IEEE14BusTest do
         expected_vm = Map.fetch!(@expected_ac_vm, bus_id)
         actual_vm = vm_for(sol, bus_id)
         pct_error = abs(actual_vm - expected_vm) / expected_vm * 100.0
+
         assert pct_error < 5.0,
-          "PQ bus #{bus_id} Vm: expected ~#{expected_vm} pu, " <>
-          "got #{Float.round(actual_vm, 4)} pu (#{Float.round(pct_error, 2)}% error)"
+               "PQ bus #{bus_id} Vm: expected ~#{expected_vm} pu, " <>
+                 "got #{Float.round(actual_vm, 4)} pu (#{Float.round(pct_error, 2)}% error)"
       end
     end
 
@@ -400,14 +569,14 @@ defmodule PowerModel.Solver.IEEE14BusTest do
     test "apparent power flows are non-negative", %{solution: sol} do
       for {key, flow} <- sol.line_flows do
         assert flow.s_flow_mva >= 0.0,
-          "Negative apparent power #{flow.s_flow_mva} MVA for #{inspect(key)}"
+               "Negative apparent power #{flow.s_flow_mva} MVA for #{inspect(key)}"
       end
     end
 
     test "loading percentages are non-negative", %{solution: sol} do
       for {key, flow} <- sol.line_flows do
         assert flow.loading_pct >= 0.0,
-          "Negative loading #{flow.loading_pct}% for #{inspect(key)}"
+               "Negative loading #{flow.loading_pct}% for #{inspect(key)}"
       end
     end
   end
@@ -567,7 +736,7 @@ defmodule PowerModel.Solver.IEEE14BusTest do
         ac_sign = if ac_angle >= 0, do: :non_neg, else: :neg
 
         assert dc_sign == ac_sign,
-          "Sign mismatch at bus #{bus_id}: DC=#{dc_angle}, AC=#{ac_angle}"
+               "Sign mismatch at bus #{bus_id}: DC=#{dc_angle}, AC=#{ac_angle}"
       end
     end
 
@@ -578,8 +747,8 @@ defmodule PowerModel.Solver.IEEE14BusTest do
         diff = abs(dc_angle - ac_angle)
 
         assert diff < 0.15,
-          "Angle difference at bus #{bus_id}: DC=#{Float.round(dc_angle, 4)}, " <>
-          "AC=#{Float.round(ac_angle, 4)}, diff=#{Float.round(diff, 4)} rad"
+               "Angle difference at bus #{bus_id}: DC=#{Float.round(dc_angle, 4)}, " <>
+                 "AC=#{Float.round(ac_angle, 4)}, diff=#{Float.round(diff, 4)} rad"
       end
     end
 
@@ -595,7 +764,7 @@ defmodule PowerModel.Solver.IEEE14BusTest do
       ac_dir = if ac_flow.p_flow_mw >= 0, do: :positive, else: :negative
 
       assert dc_dir == ac_dir,
-        "Flow direction mismatch on line 1-2: DC=#{dc_flow.p_flow_mw} MW, AC=#{ac_flow.p_flow_mw} MW"
+             "Flow direction mismatch on line 1-2: DC=#{dc_flow.p_flow_mw} MW, AC=#{ac_flow.p_flow_mw} MW"
     end
   end
 end

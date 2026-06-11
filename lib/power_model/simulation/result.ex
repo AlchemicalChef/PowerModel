@@ -22,8 +22,16 @@ defmodule PowerModel.Simulation.Result do
 
   def changeset(result, attrs) do
     result
-    |> cast(attrs, [:vm_pu, :va_rad, :p_gen_mw, :q_gen_mvar,
-                     :p_load_mw, :q_load_mvar, :scenario_id, :bus_id])
+    |> cast(attrs, [
+      :vm_pu,
+      :va_rad,
+      :p_gen_mw,
+      :q_gen_mvar,
+      :p_load_mw,
+      :q_load_mvar,
+      :scenario_id,
+      :bus_id
+    ])
     |> validate_required([:scenario_id, :bus_id])
     |> foreign_key_constraint(:scenario_id)
     |> foreign_key_constraint(:bus_id)

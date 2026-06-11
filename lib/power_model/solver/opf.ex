@@ -29,16 +29,21 @@ defmodule PowerModel.Solver.OPF do
   alias PowerModel.Solver.{DCPowerFlow, EconomicDispatch, Sparse}
 
   defstruct [
-    :dispatch,          # %{gen_id => p_mw}
-    :lmps,              # %{bus_id => $/MWh}
-    :congested_lines,   # [%{line_id, flow_mw, limit_mw, shadow_price}]
-    :total_cost,        # $/hr
+    # %{gen_id => p_mw}
+    :dispatch,
+    # %{bus_id => $/MWh}
+    :lmps,
+    # [%{line_id, flow_mw, limit_mw, shadow_price}]
+    :congested_lines,
+    # $/hr
+    :total_cost,
     :converged,
     :iterations
   ]
 
   @max_iterations 20
-  @congestion_tolerance 1.02  # Allow 2% over rating before re-dispatching
+  # Allow 2% over rating before re-dispatching
+  @congestion_tolerance 1.02
 
   @doc """
   Solve DC Optimal Power Flow.
@@ -62,14 +67,16 @@ defmodule PowerModel.Solver.OPF do
       iterate_opf(snapshot, dispatch, base_mva, max_iter, 0)
 
     # Compute total cost
-    gen_cost_map = Map.new(snapshot.generators, fn g ->
-      {g.id, Map.get(g, :marginal_cost_per_mwh) || 40.0}
-    end)
+    gen_cost_map =
+      Map.new(snapshot.generators, fn g ->
+        {g.id, Map.get(g, :marginal_cost_per_mwh) || 40.0}
+      end)
 
-    total_cost = Enum.reduce(final_dispatch, 0.0, fn {gen_id, p_mw}, acc ->
-      cost = Map.get(gen_cost_map, gen_id, 40.0)
-      acc + cost * p_mw
-    end)
+    total_cost =
+      Enum.reduce(final_dispatch, 0.0, fn {gen_id, p_mw}, acc ->
+        cost = Map.get(gen_cost_map, gen_id, 40.0)
+        acc + cost * p_mw
+      end)
 
     # Compute LMPs from the final power flow solution
     lmps = compute_lmps(snapshot, final_dispatch, congested, base_mva)
@@ -91,10 +98,11 @@ defmodule PowerModel.Solver.OPF do
     base_mva = Keyword.get(opts, :base_mva, 100.0)
 
     # Apply dispatch to generators
-    dispatched_gens = Enum.map(snapshot.generators, fn g ->
-      d = Map.get(dispatch, g.id, 0.0)
-      %{g | p_max_mw: d, capacity_factor: 1.0}
-    end)
+    dispatched_gens =
+      Enum.map(snapshot.generators, fn g ->
+        d = Map.get(dispatch, g.id, 0.0)
+        %{g | p_max_mw: d, capacity_factor: 1.0}
+      end)
 
     pf_snapshot = %{snapshot | generators: dispatched_gens}
 
@@ -122,16 +130,18 @@ defmodule PowerModel.Solver.OPF do
   # Iterative OPF: re-dispatch to relieve congestion
   defp iterate_opf(snapshot, dispatch, base_mva, max_iter, iter, shadow_prices \\ %{})
 
-  defp iterate_opf(_snapshot, dispatch, _base_mva, max_iter, iter, _shadow_prices) when iter >= max_iter do
+  defp iterate_opf(_snapshot, dispatch, _base_mva, max_iter, iter, _shadow_prices)
+       when iter >= max_iter do
     {dispatch, [], false, iter}
   end
 
   defp iterate_opf(snapshot, dispatch, base_mva, max_iter, iter, shadow_prices) do
     # Apply dispatch and solve power flow
-    dispatched_gens = Enum.map(snapshot.generators, fn g ->
-      d = Map.get(dispatch, g.id, 0.0)
-      %{g | p_max_mw: d, capacity_factor: 1.0}
-    end)
+    dispatched_gens =
+      Enum.map(snapshot.generators, fn g ->
+        d = Map.get(dispatch, g.id, 0.0)
+        %{g | p_max_mw: d, capacity_factor: 1.0}
+      end)
 
     pf_snapshot = %{snapshot | generators: dispatched_gens}
 
@@ -139,29 +149,43 @@ defmodule PowerModel.Solver.OPF do
       solution = DCPowerFlow.solve(pf_snapshot, base_mva: base_mva)
 
       # Find overloaded lines
-      overloaded = solution.line_flows
-      |> Enum.filter(fn {_key, flow} ->
-        flow.loading_pct > 100.0 * @congestion_tolerance
-      end)
-      |> Enum.sort_by(fn {_key, flow} -> -flow.loading_pct end)
+      overloaded =
+        solution.line_flows
+        |> Enum.filter(fn {_key, flow} ->
+          flow.loading_pct > 100.0 * @congestion_tolerance
+        end)
+        |> Enum.sort_by(fn {_key, flow} -> -flow.loading_pct end)
 
       if Enum.empty?(overloaded) do
         # All lines within limits — converged
-        congested = solution.line_flows
-        |> Enum.filter(fn {_key, flow} -> flow.loading_pct > 90.0 end)
-        |> Enum.map(fn {{type, id}, flow} ->
-          sp = Map.get(shadow_prices, {type, id}, 0.0)
-          %{type: type, line_id: id, flow_mw: abs(flow.p_flow_mw),
-            loading_pct: flow.loading_pct, shadow_price: sp,
-            from_bus_id: flow.from_bus_id, to_bus_id: flow.to_bus_id}
-        end)
+        congested =
+          solution.line_flows
+          |> Enum.filter(fn {_key, flow} -> flow.loading_pct > 90.0 end)
+          |> Enum.map(fn {{type, id}, flow} ->
+            sp = Map.get(shadow_prices, {type, id}, 0.0)
+
+            %{
+              type: type,
+              line_id: id,
+              flow_mw: abs(flow.p_flow_mw),
+              loading_pct: flow.loading_pct,
+              shadow_price: sp,
+              from_bus_id: flow.from_bus_id,
+              to_bus_id: flow.to_bus_id
+            }
+          end)
 
         {dispatch, congested, true, iter + 1}
       else
         # Re-dispatch to relieve the most overloaded line
-        {new_dispatch, line_shadow} = relieve_congestion(
-          snapshot, dispatch, overloaded, solution, base_mva
-        )
+        {new_dispatch, line_shadow} =
+          relieve_congestion(
+            snapshot,
+            dispatch,
+            overloaded,
+            solution,
+            base_mva
+          )
 
         updated_shadows = Map.merge(shadow_prices, line_shadow)
 
@@ -190,8 +214,10 @@ defmodule PowerModel.Solver.OPF do
     # For the most overloaded line, compute GSFs for all generators
     {{worst_type, worst_id}, worst_flow} = hd(overloaded)
 
-    excess_mw = abs(worst_flow.p_flow_mw) -
-      (abs(worst_flow.p_flow_mw) / worst_flow.loading_pct * 95.0)
+    excess_mw =
+      abs(worst_flow.p_flow_mw) -
+        abs(worst_flow.p_flow_mw) / worst_flow.loading_pct * 95.0
+
     excess_mw = max(excess_mw, 1.0)
 
     # Congested line susceptance
@@ -201,29 +227,46 @@ defmodule PowerModel.Solver.OPF do
     to_reduced = Map.get(remap, to_idx)
 
     # Solve B'^{-1} * (e_from - e_to) for the congested line's endpoints
-    sensitivity = compute_ptdf_sensitivity(
-      b_rows, b_cols, b_vals, n_reduced, from_reduced, to_reduced
-    )
+    sensitivity =
+      compute_ptdf_sensitivity(
+        b_rows,
+        b_cols,
+        b_vals,
+        n_reduced,
+        from_reduced,
+        to_reduced
+      )
 
     # Compute line susceptance (b = 1/x)
     b_line = compute_congested_line_b(snapshot, worst_flow)
 
     # Compute GSF for each generator: GSF[g] = b_line * (x[gen_bus] - x[to_bus])
     # Positive GSF means the generator increases flow on the congested line
-    gen_gsfs = compute_generator_gsfs(
-      snapshot.generators, dispatch, bus_index, remap, sensitivity, b_line, to_reduced
-    )
+    gen_gsfs =
+      compute_generator_gsfs(
+        snapshot.generators,
+        dispatch,
+        bus_index,
+        remap,
+        sensitivity,
+        b_line,
+        to_reduced
+      )
 
     # Sort by GSF: positive GSF generators increase congestion, negative decrease it
     # Reduce positive-GSF generators (they push flow onto the congested line)
     # Increase negative-GSF generators (they pull flow off)
-    positive_gsf = gen_gsfs
+    positive_gsf =
+      gen_gsfs
       |> Enum.filter(fn g -> g.gsf > 0.01 end)
-      |> Enum.sort_by(fn g -> -g.gsf end)  # highest sensitivity first
+      # highest sensitivity first
+      |> Enum.sort_by(fn g -> -g.gsf end)
 
-    negative_gsf = gen_gsfs
+    negative_gsf =
+      gen_gsfs
       |> Enum.filter(fn g -> g.gsf < -0.01 end)
-      |> Enum.sort_by(fn g -> g.gsf end)  # most negative first
+      # most negative first
+      |> Enum.sort_by(fn g -> g.gsf end)
 
     # Compute shadow price: cost difference between expensive generator backed down
     # and cheap generator increased (approximation of congestion rent)
@@ -236,31 +279,51 @@ defmodule PowerModel.Solver.OPF do
     # If no PTDF-based generators found, fall back to endpoint generators
     if Enum.empty?(positive_gsf) and Enum.empty?(negative_gsf) do
       gen_by_bus = Enum.group_by(snapshot.generators, & &1.bus_id)
-      {sending_bus, receiving_bus} = if worst_flow.p_flow_mw > 0 do
-        {worst_flow.from_bus_id, worst_flow.to_bus_id}
-      else
-        {worst_flow.to_bus_id, worst_flow.from_bus_id}
-      end
+
+      {sending_bus, receiving_bus} =
+        if worst_flow.p_flow_mw > 0 do
+          {worst_flow.from_bus_id, worst_flow.to_bus_id}
+        else
+          {worst_flow.to_bus_id, worst_flow.from_bus_id}
+        end
 
       sending = find_nearby_generators(sending_bus, gen_by_bus, dispatch)
       receiving = find_nearby_generators(receiving_bus, gen_by_bus, dispatch)
       shadow = compute_shadow.(sending, receiving)
-      new_dispatch = shift_generation(dispatch, sending, receiving, excess_mw, snapshot.generators)
+
+      new_dispatch =
+        shift_generation(dispatch, sending, receiving, excess_mw, snapshot.generators)
+
       {new_dispatch, %{{worst_type, worst_id} => shadow}}
     else
       # Scale shift amount by GSF magnitude for effectiveness
-      sending = Enum.map(positive_gsf, fn g ->
-        %{id: g.id, dispatch: g.dispatch, p_max_mw: g.p_max_mw,
-          p_min_mw: g.p_min_mw, cost: g.cost}
-      end)
+      sending =
+        Enum.map(positive_gsf, fn g ->
+          %{
+            id: g.id,
+            dispatch: g.dispatch,
+            p_max_mw: g.p_max_mw,
+            p_min_mw: g.p_min_mw,
+            cost: g.cost
+          }
+        end)
 
-      receiving = Enum.map(negative_gsf, fn g ->
-        %{id: g.id, dispatch: g.dispatch, p_max_mw: g.p_max_mw,
-          p_min_mw: g.p_min_mw, cost: g.cost}
-      end)
+      receiving =
+        Enum.map(negative_gsf, fn g ->
+          %{
+            id: g.id,
+            dispatch: g.dispatch,
+            p_max_mw: g.p_max_mw,
+            p_min_mw: g.p_min_mw,
+            cost: g.cost
+          }
+        end)
 
       shadow = compute_shadow.(sending, receiving)
-      new_dispatch = shift_generation(dispatch, sending, receiving, excess_mw, snapshot.generators)
+
+      new_dispatch =
+        shift_generation(dispatch, sending, receiving, excess_mw, snapshot.generators)
+
       {new_dispatch, %{{worst_type, worst_id} => shadow}}
     end
   end
@@ -268,9 +331,13 @@ defmodule PowerModel.Solver.OPF do
   defp find_nearby_generators(bus_id, gen_by_bus, dispatch) do
     Map.get(gen_by_bus, bus_id, [])
     |> Enum.map(fn g ->
-      %{id: g.id, dispatch: Map.get(dispatch, g.id, 0.0),
-        p_max_mw: g.p_max_mw, p_min_mw: Map.get(g, :p_min_mw) || 0.0,
-        cost: Map.get(g, :marginal_cost_per_mwh) || 40.0}
+      %{
+        id: g.id,
+        dispatch: Map.get(dispatch, g.id, 0.0),
+        p_max_mw: g.p_max_mw,
+        p_min_mw: Map.get(g, :p_min_mw) || 0.0,
+        cost: Map.get(g, :marginal_cost_per_mwh) || 40.0
+      }
     end)
     |> Enum.sort_by(& &1.cost)
   end
@@ -279,17 +346,19 @@ defmodule PowerModel.Solver.OPF do
   defp compute_ptdf_sensitivity(b_rows, b_cols, b_vals, n_reduced, from_reduced, to_reduced) do
     rhs = List.duplicate(0.0, n_reduced)
 
-    rhs = if from_reduced != nil do
-      List.replace_at(rhs, from_reduced, 1.0)
-    else
-      rhs
-    end
+    rhs =
+      if from_reduced != nil do
+        List.replace_at(rhs, from_reduced, 1.0)
+      else
+        rhs
+      end
 
-    rhs = if to_reduced != nil do
-      List.replace_at(rhs, to_reduced, -1.0)
-    else
-      rhs
-    end
+    rhs =
+      if to_reduced != nil do
+        List.replace_at(rhs, to_reduced, -1.0)
+      else
+        rhs
+      end
 
     try do
       case Sparse.sparse_solve(b_rows, b_cols, b_vals, rhs, n_reduced) do
@@ -303,26 +372,37 @@ defmodule PowerModel.Solver.OPF do
 
   # Compute susceptance of the congested line
   defp compute_congested_line_b(snapshot, worst_flow) do
-    line = Enum.find(snapshot.lines, fn l ->
-      l.from_bus_id == worst_flow.from_bus_id and l.to_bus_id == worst_flow.to_bus_id
-    end)
-
-    xfmr = if line == nil do
-      Enum.find(snapshot.transformers, fn t ->
-        t.from_bus_id == worst_flow.from_bus_id and t.to_bus_id == worst_flow.to_bus_id
+    line =
+      Enum.find(snapshot.lines, fn l ->
+        l.from_bus_id == worst_flow.from_bus_id and l.to_bus_id == worst_flow.to_bus_id
       end)
-    end
+
+    xfmr =
+      if line == nil do
+        Enum.find(snapshot.transformers, fn t ->
+          t.from_bus_id == worst_flow.from_bus_id and t.to_bus_id == worst_flow.to_bus_id
+        end)
+      end
 
     cond do
       line != nil -> 1.0 / (line.x_pu || 0.001)
       xfmr != nil -> 1.0 / (xfmr.x_pu || 0.001)
-      true -> 100.0  # fallback
+      # fallback
+      true -> 100.0
     end
   end
 
   # Compute Generation Shift Factors for all dispatched generators
   # GSF[g] = b_line * (sensitivity[gen_bus] - sensitivity[to_bus])
-  defp compute_generator_gsfs(generators, dispatch, bus_index, remap, sensitivity, b_line, to_reduced) do
+  defp compute_generator_gsfs(
+         generators,
+         dispatch,
+         bus_index,
+         remap,
+         sensitivity,
+         b_line,
+         to_reduced
+       ) do
     if sensitivity == nil do
       []
     else
@@ -356,65 +436,77 @@ defmodule PowerModel.Solver.OPF do
     case Enum.find(buses, &(&1.bus_type == 3)) do
       nil ->
         gen_by_bus = Enum.group_by(generators, & &1.bus_id)
-        {max_bus_id, _} = Enum.max_by(gen_by_bus, fn {_id, gens} ->
-          Enum.sum_by(gens, & &1.p_max_mw)
-        end, fn -> {hd(buses).id, []} end)
+
+        {max_bus_id, _} =
+          Enum.max_by(
+            gen_by_bus,
+            fn {_id, gens} ->
+              Enum.sum_by(gens, & &1.p_max_mw)
+            end,
+            fn -> {hd(buses).id, []} end
+          )
+
         Map.fetch!(bus_index, max_bus_id)
+
       slack ->
         Map.fetch!(bus_index, slack.id)
     end
   end
 
   defp build_remap(n, slack_idx) do
-    {remap, inv, _} = Enum.reduce(0..(n - 1), {%{}, %{}, 0}, fn i, {m, inv, ri} ->
-      if i == slack_idx do
-        {m, inv, ri}
-      else
-        {Map.put(m, i, ri), Map.put(inv, ri, i), ri + 1}
-      end
-    end)
+    {remap, inv, _} =
+      Enum.reduce(0..(n - 1), {%{}, %{}, 0}, fn i, {m, inv, ri} ->
+        if i == slack_idx do
+          {m, inv, ri}
+        else
+          {Map.put(m, i, ri), Map.put(inv, ri, i), ri + 1}
+        end
+      end)
+
     {remap, inv}
   end
 
   defp build_b_prime_coo(lines, transformers, bus_index, slack_idx, remap) do
     triplets = %{}
 
-    triplets = Enum.reduce(lines, triplets, fn line, bt ->
-      i = Map.get(bus_index, line.from_bus_id)
-      j = Map.get(bus_index, line.to_bus_id)
+    triplets =
+      Enum.reduce(lines, triplets, fn line, bt ->
+        i = Map.get(bus_index, line.from_bus_id)
+        j = Map.get(bus_index, line.to_bus_id)
 
-      if i == nil or j == nil do
-        bt
-      else
-        x = line.x_pu || 0.001
-        b = 1.0 / x
+        if i == nil or j == nil do
+          bt
+        else
+          x = line.x_pu || 0.001
+          b = 1.0 / x
 
-        bt
-        |> maybe_add_triplet(i, i, b, slack_idx, remap)
-        |> maybe_add_triplet(j, j, b, slack_idx, remap)
-        |> maybe_add_triplet(i, j, -b, slack_idx, remap)
-        |> maybe_add_triplet(j, i, -b, slack_idx, remap)
-      end
-    end)
+          bt
+          |> maybe_add_triplet(i, i, b, slack_idx, remap)
+          |> maybe_add_triplet(j, j, b, slack_idx, remap)
+          |> maybe_add_triplet(i, j, -b, slack_idx, remap)
+          |> maybe_add_triplet(j, i, -b, slack_idx, remap)
+        end
+      end)
 
-    triplets = Enum.reduce(transformers, triplets, fn xfmr, bt ->
-      i = Map.get(bus_index, xfmr.from_bus_id)
-      j = Map.get(bus_index, xfmr.to_bus_id)
+    triplets =
+      Enum.reduce(transformers, triplets, fn xfmr, bt ->
+        i = Map.get(bus_index, xfmr.from_bus_id)
+        j = Map.get(bus_index, xfmr.to_bus_id)
 
-      if i == nil or j == nil do
-        bt
-      else
-        x = xfmr.x_pu || 0.001
-        t = xfmr.tap_ratio || 1.0
-        y = 1.0 / x
+        if i == nil or j == nil do
+          bt
+        else
+          x = xfmr.x_pu || 0.001
+          t = xfmr.tap_ratio || 1.0
+          y = 1.0 / x
 
-        bt
-        |> maybe_add_triplet(i, i, y / (t * t), slack_idx, remap)
-        |> maybe_add_triplet(j, j, y, slack_idx, remap)
-        |> maybe_add_triplet(i, j, -y / t, slack_idx, remap)
-        |> maybe_add_triplet(j, i, -y / t, slack_idx, remap)
-      end
-    end)
+          bt
+          |> maybe_add_triplet(i, i, y / (t * t), slack_idx, remap)
+          |> maybe_add_triplet(j, j, y, slack_idx, remap)
+          |> maybe_add_triplet(i, j, -y / t, slack_idx, remap)
+          |> maybe_add_triplet(j, i, -y / t, slack_idx, remap)
+        end
+      end)
 
     Enum.reduce(triplets, {[], [], []}, fn {{r, c}, v}, {rs, cs, vs} ->
       if abs(v) > 1.0e-15 do
@@ -474,13 +566,14 @@ defmodule PowerModel.Solver.OPF do
   # adjusted for congestion shadow prices
   defp compute_lmps(snapshot, dispatch, congested_lines, _base_mva) do
     # Find the marginal generator (most expensive dispatched generator not at limit)
-    marginal_cost = snapshot.generators
-    |> Enum.filter(fn g ->
-      d = Map.get(dispatch, g.id, 0.0)
-      d > 0.0 and d < g.p_max_mw * 0.99
-    end)
-    |> Enum.map(fn g -> Map.get(g, :marginal_cost_per_mwh) || 40.0 end)
-    |> Enum.max(fn -> 40.0 end)
+    marginal_cost =
+      snapshot.generators
+      |> Enum.filter(fn g ->
+        d = Map.get(dispatch, g.id, 0.0)
+        d > 0.0 and d < g.p_max_mw * 0.99
+      end)
+      |> Enum.map(fn g -> Map.get(g, :marginal_cost_per_mwh) || 40.0 end)
+      |> Enum.max(fn -> 40.0 end)
 
     # Base LMP = marginal cost at every bus
     bus_ids = Enum.map(snapshot.buses, & &1.id)
@@ -497,10 +590,12 @@ defmodule PowerModel.Solver.OPF do
   defp compute_congestion_adders(congested_lines) do
     Enum.reduce(congested_lines, %{}, fn line, acc ->
       shadow = Map.get(line, :shadow_price, 0.0)
+
       if shadow > 0.0 do
         # Add shadow price to receiving end, subtract from sending end
         from = Map.get(line, :from_bus_id)
         to = Map.get(line, :to_bus_id)
+
         acc
         |> Map.update(to, shadow, &(&1 + shadow))
         |> Map.update(from, -shadow, &(&1 - shadow))

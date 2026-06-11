@@ -54,14 +54,16 @@ defmodule PowerModel.Engine.Interconnection do
         snapshot = Grid.get_grid_snapshot(interconnection.id)
 
         if length(snapshot.buses) > 0 do
-          warm_start = case Map.get(dc_solutions, interconnection.id) do
-            {:ok, sol} -> sol
-            _ -> nil
-          end
+          warm_start =
+            case Map.get(dc_solutions, interconnection.id) do
+              {:ok, sol} -> sol
+              _ -> nil
+            end
 
           case NewtonRaphson.solve(snapshot,
                  base_mva: base_mva,
-                 warm_start: warm_start) do
+                 warm_start: warm_start
+               ) do
             {:ok, solution} -> {interconnection.id, {:ok, solution}}
             error -> {interconnection.id, error}
           end

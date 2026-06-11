@@ -46,8 +46,14 @@ defmodule PowerModel.Controls.ControlsTest do
   describe "AGC frequency error correction" do
     test "produces negative ACE when frequency is high (over-generation)" do
       gens = [
-        %{id: 1, p_max_mw: 500.0, agc_participation_factor: 1.0,
-          dispatch_mw: 400.0, ramp_rate_mw_per_min: 60.0, p_min_mw: 100.0}
+        %{
+          id: 1,
+          p_max_mw: 500.0,
+          agc_participation_factor: 1.0,
+          dispatch_mw: 400.0,
+          ramp_rate_mw_per_min: 60.0,
+          p_min_mw: 100.0
+        }
       ]
 
       agc = AGC.init(gens, bias_mw: 10.0, ki: 0.1, p_scheduled: 0.0)
@@ -57,7 +63,7 @@ defmodule PowerModel.Controls.ControlsTest do
 
       # ACE = (410-400-0) + 10*10*(60.05-60) = 10 + 5 = 15
       assert new_agc.ace > 0,
-        "ACE should be positive when frequency is high and generation exceeds load"
+             "ACE should be positive when frequency is high and generation exceeds load"
 
       # Correction should be negative (reduce generation)
       delta = Map.get(adjustments, 1)
@@ -66,8 +72,14 @@ defmodule PowerModel.Controls.ControlsTest do
 
     test "produces positive ACE when frequency is low (under-generation)" do
       gens = [
-        %{id: 1, p_max_mw: 500.0, agc_participation_factor: 1.0,
-          dispatch_mw: 400.0, ramp_rate_mw_per_min: 60.0, p_min_mw: 100.0}
+        %{
+          id: 1,
+          p_max_mw: 500.0,
+          agc_participation_factor: 1.0,
+          dispatch_mw: 400.0,
+          ramp_rate_mw_per_min: 60.0,
+          p_min_mw: 100.0
+        }
       ]
 
       agc = AGC.init(gens, bias_mw: 10.0, ki: 0.1, p_scheduled: 0.0)
@@ -77,7 +89,7 @@ defmodule PowerModel.Controls.ControlsTest do
 
       # ACE = (390-400-0) + 10*10*(59.95-60) = -10 + (-5) = -15
       assert new_agc.ace < 0,
-        "ACE should be negative when frequency is low"
+             "ACE should be negative when frequency is low"
 
       delta = Map.get(adjustments, 1)
       assert delta > 0, "AGC should signal generation increase for low frequency"
@@ -85,10 +97,22 @@ defmodule PowerModel.Controls.ControlsTest do
 
     test "distributes corrections by participation factor" do
       gens = [
-        %{id: 1, p_max_mw: 500.0, agc_participation_factor: 0.7,
-          dispatch_mw: 300.0, ramp_rate_mw_per_min: 120.0, p_min_mw: 50.0},
-        %{id: 2, p_max_mw: 300.0, agc_participation_factor: 0.3,
-          dispatch_mw: 200.0, ramp_rate_mw_per_min: 120.0, p_min_mw: 50.0}
+        %{
+          id: 1,
+          p_max_mw: 500.0,
+          agc_participation_factor: 0.7,
+          dispatch_mw: 300.0,
+          ramp_rate_mw_per_min: 120.0,
+          p_min_mw: 50.0
+        },
+        %{
+          id: 2,
+          p_max_mw: 300.0,
+          agc_participation_factor: 0.3,
+          dispatch_mw: 200.0,
+          ramp_rate_mw_per_min: 120.0,
+          p_min_mw: 50.0
+        }
       ]
 
       agc = AGC.init(gens, bias_mw: 10.0, ki: 0.1, p_scheduled: 0.0)
@@ -101,8 +125,11 @@ defmodule PowerModel.Controls.ControlsTest do
       # Gen 1 should get 70% of correction, Gen 2 should get 30%
       if abs(delta_1) > 1.0e-10 and abs(delta_2) > 1.0e-10 do
         ratio = abs(delta_1) / abs(delta_2)
-        assert_in_delta ratio, 0.7 / 0.3, 0.1,
-          "Corrections should be proportional to participation factors"
+
+        assert_in_delta ratio,
+                        0.7 / 0.3,
+                        0.1,
+                        "Corrections should be proportional to participation factors"
       end
     end
   end
@@ -110,8 +137,14 @@ defmodule PowerModel.Controls.ControlsTest do
   describe "AGC ramp rate limiting" do
     test "clamps adjustment to ramp rate" do
       gens = [
-        %{id: 1, p_max_mw: 500.0, agc_participation_factor: 1.0,
-          dispatch_mw: 300.0, ramp_rate_mw_per_min: 6.0, p_min_mw: 50.0}
+        %{
+          id: 1,
+          p_max_mw: 500.0,
+          agc_participation_factor: 1.0,
+          dispatch_mw: 300.0,
+          ramp_rate_mw_per_min: 6.0,
+          p_min_mw: 50.0
+        }
       ]
 
       agc = AGC.init(gens, bias_mw: 100.0, ki: 10.0, p_scheduled: 0.0)
@@ -123,13 +156,18 @@ defmodule PowerModel.Controls.ControlsTest do
 
       # Ramp rate = 6 MW/min, dt = 4s => max delta = 6 * 4/60 = 0.4 MW
       assert abs(delta) <= 0.4 + 1.0e-6,
-        "Adjustment should be clamped to ramp rate. Got #{delta}"
+             "Adjustment should be clamped to ramp rate. Got #{delta}"
     end
 
     test "generators without ramp rate have no ramp limit" do
       gens = [
-        %{id: 1, p_max_mw: 500.0, agc_participation_factor: 1.0,
-          dispatch_mw: 300.0, p_min_mw: 50.0}
+        %{
+          id: 1,
+          p_max_mw: 500.0,
+          agc_participation_factor: 1.0,
+          dispatch_mw: 300.0,
+          p_min_mw: 50.0
+        }
         # No ramp_rate_mw_per_min field
       ]
 
@@ -141,7 +179,7 @@ defmodule PowerModel.Controls.ControlsTest do
 
       # Should be able to make a large adjustment
       assert abs(delta) > 0.4,
-        "Generator without ramp rate should allow larger adjustments"
+             "Generator without ramp rate should allow larger adjustments"
     end
   end
 
@@ -306,9 +344,10 @@ defmodule PowerModel.Controls.ControlsTest do
       ctrl = SVCController.init(svc)
 
       # Step multiple times to reach steady state
-      {final, q} = Enum.reduce(1..100, {ctrl, 0.0}, fn _i, {c, _q} ->
-        SVCController.step(c, 0.95, 0.01)
-      end)
+      {final, q} =
+        Enum.reduce(1..100, {ctrl, 0.0}, fn _i, {c, _q} ->
+          SVCController.step(c, 0.95, 0.01)
+        end)
 
       # V_error = 1.0 - 0.95 = 0.05, Q = 0.05 / 0.03 = 1.667 pu
       # In MVAr: depends on interpretation, but Q should be positive (capacitive)
@@ -320,9 +359,10 @@ defmodule PowerModel.Controls.ControlsTest do
       svc = %{q_max_mvar: 200.0, q_min_mvar: -100.0, v_set_pu: 1.0, slope_pct: 3.0}
       ctrl = SVCController.init(svc)
 
-      {final, q} = Enum.reduce(1..100, {ctrl, 0.0}, fn _i, {c, _q} ->
-        SVCController.step(c, 1.05, 0.01)
-      end)
+      {final, q} =
+        Enum.reduce(1..100, {ctrl, 0.0}, fn _i, {c, _q} ->
+          SVCController.step(c, 1.05, 0.01)
+        end)
 
       assert final.q_inject < 0, "SVC should absorb Q (inductive) for high voltage"
       assert q < 0
@@ -334,8 +374,7 @@ defmodule PowerModel.Controls.ControlsTest do
 
       {_final, q} = SVCController.step(ctrl, 1.0, 0.01)
 
-      assert_in_delta q, 0.0, 1.0e-6,
-        "SVC should not inject Q when voltage is at setpoint"
+      assert_in_delta q, 0.0, 1.0e-6, "SVC should not inject Q when voltage is at setpoint"
     end
   end
 
@@ -345,12 +384,12 @@ defmodule PowerModel.Controls.ControlsTest do
       ctrl = SVCController.init(svc)
 
       # Very low voltage => large Q target, but clamped
-      {final, q} = Enum.reduce(1..200, {ctrl, 0.0}, fn _i, {c, _q} ->
-        SVCController.step(c, 0.5, 0.01)
-      end)
+      {final, q} =
+        Enum.reduce(1..200, {ctrl, 0.0}, fn _i, {c, _q} ->
+          SVCController.step(c, 0.5, 0.01)
+        end)
 
-      assert_in_delta final.q_inject, 50.0, 0.1,
-        "SVC output should be clamped to q_max"
+      assert_in_delta final.q_inject, 50.0, 0.1, "SVC output should be clamped to q_max"
       assert_in_delta q, 50.0, 0.1
     end
 
@@ -358,12 +397,12 @@ defmodule PowerModel.Controls.ControlsTest do
       svc = %{q_max_mvar: 50.0, q_min_mvar: -50.0, v_set_pu: 1.0, slope_pct: 1.0}
       ctrl = SVCController.init(svc)
 
-      {final, q} = Enum.reduce(1..200, {ctrl, 0.0}, fn _i, {c, _q} ->
-        SVCController.step(c, 1.5, 0.01)
-      end)
+      {final, q} =
+        Enum.reduce(1..200, {ctrl, 0.0}, fn _i, {c, _q} ->
+          SVCController.step(c, 1.5, 0.01)
+        end)
 
-      assert_in_delta final.q_inject, -50.0, 0.1,
-        "SVC output should be clamped to q_min"
+      assert_in_delta final.q_inject, -50.0, 0.1, "SVC output should be clamped to q_min"
       assert_in_delta q, -50.0, 0.1
     end
   end
@@ -382,8 +421,10 @@ defmodule PowerModel.Controls.ControlsTest do
       q_target = 200.0
       expected_63pct = q_target * (1.0 - :math.exp(-1.0))
 
-      assert_in_delta ctrl_50ms.q_inject, expected_63pct, 1.0,
-        "After one time constant, output should be ~63% of target"
+      assert_in_delta ctrl_50ms.q_inject,
+                      expected_63pct,
+                      1.0,
+                      "After one time constant, output should be ~63% of target"
     end
   end
 
@@ -409,6 +450,7 @@ defmodule PowerModel.Controls.ControlsTest do
         x_line_pu: 0.05,
         target_mw: 200.0
       }
+
       ctrl = FACTSController.init(device, kp: 0.5, ki: 0.1, tau_s: 0.05)
 
       # Flow is 150 MW, target is 200 MW => need to reduce reactance
@@ -416,7 +458,8 @@ defmodule PowerModel.Controls.ControlsTest do
 
       # Controller should reduce x to increase flow
       assert new_x != ctrl.x_set_pu,
-        "TCSC should adjust reactance when flow deviates from target"
+             "TCSC should adjust reactance when flow deviates from target"
+
       assert is_float(new_ctrl.integral)
     end
 
@@ -429,6 +472,7 @@ defmodule PowerModel.Controls.ControlsTest do
         x_line_pu: 0.05,
         target_mw: 200.0
       }
+
       ctrl = FACTSController.init(device, kp: 100.0, ki: 100.0, tau_s: 0.001)
 
       # Large error to drive to limit
@@ -449,12 +493,13 @@ defmodule PowerModel.Controls.ControlsTest do
         angle_max_deg: 20.0,
         target_mw: 300.0
       }
+
       ctrl = FACTSController.init(device, kp: 0.5, ki: 0.1, tau_s: 0.05)
 
       {_new_ctrl, {:angle_deg, new_angle}} = FACTSController.step(ctrl, 250.0, 300.0, 0.1)
 
       assert new_angle != 0.0,
-        "Phase shifter should adjust angle when flow deviates from target"
+             "Phase shifter should adjust angle when flow deviates from target"
     end
 
     test "respects angle limits" do
@@ -465,6 +510,7 @@ defmodule PowerModel.Controls.ControlsTest do
         angle_max_deg: 10.0,
         target_mw: 500.0
       }
+
       ctrl = FACTSController.init(device, kp: 100.0, ki: 100.0, tau_s: 0.001)
 
       {_new_ctrl, {:angle_deg, angle}} = FACTSController.step(ctrl, 0.0, 500.0, 1.0)
@@ -504,8 +550,7 @@ defmodule PowerModel.Controls.ControlsTest do
 
       {new_ctrl, p} = HVDCController.step(ctrl, 60.0, 0.1)
 
-      assert_in_delta p, 800.0, 1.0,
-        "Should maintain scheduled power in constant mode"
+      assert_in_delta p, 800.0, 1.0, "Should maintain scheduled power in constant mode"
       assert_in_delta new_ctrl.p_order_mw, 800.0, 1.0
     end
 
@@ -516,8 +561,7 @@ defmodule PowerModel.Controls.ControlsTest do
       {_ctrl_low, p_low} = HVDCController.step(ctrl, 59.5, 1.0)
       {_ctrl_high, p_high} = HVDCController.step(ctrl, 60.5, 1.0)
 
-      assert_in_delta p_low, p_high, 1.0,
-        "Constant power mode should not respond to frequency"
+      assert_in_delta p_low, p_high, 1.0, "Constant power mode should not respond to frequency"
     end
   end
 
@@ -531,7 +575,7 @@ defmodule PowerModel.Controls.ControlsTest do
 
       # Target = 500 + 200 * 0.5 = 600 MW
       assert p > 500.0,
-        "Should increase power transfer when frequency is high"
+             "Should increase power transfer when frequency is high"
     end
 
     test "decreases power when frequency is low" do
@@ -542,7 +586,7 @@ defmodule PowerModel.Controls.ControlsTest do
 
       # Target = 500 + 200 * (-0.5) = 400 MW
       assert p < 500.0,
-        "Should decrease power transfer when frequency is low"
+             "Should decrease power transfer when frequency is low"
     end
 
     test "clamps to zero (no reverse power)" do
@@ -566,7 +610,8 @@ defmodule PowerModel.Controls.ControlsTest do
 
       # Max change = 50 MW/s * 1s = 50 MW
       assert abs(p - 500.0) <= 50.0 + 1.0e-6,
-        "Power change should be limited by ramp rate. Got #{p}"
+             "Power change should be limited by ramp rate. Got #{p}"
+
       assert new_ctrl.p_order_mw == p
     end
   end
@@ -589,8 +634,7 @@ defmodule PowerModel.Controls.ControlsTest do
           HVDCController.step(c, 60.0, 1.0)
         end)
 
-      assert_in_delta p_final, 0.0, 1.0,
-        "Should reach zero after sufficient runback time"
+      assert_in_delta p_final, 0.0, 1.0, "Should reach zero after sufficient runback time"
     end
   end
 
@@ -642,15 +686,22 @@ defmodule PowerModel.Controls.ControlsTest do
 
   describe "RAS trigger matching" do
     test "fires on matching line trip event" do
-      ras_list = RAS.init([
-        %{
-          name: "Line 42 RAS",
-          trigger: %{type: :line_trip, component_id: 42},
-          actions: [%{type: :trip_generator, target_id: 99, delay_s: 0.1}]
-        }
-      ])
+      ras_list =
+        RAS.init([
+          %{
+            name: "Line 42 RAS",
+            trigger: %{type: :line_trip, component_id: 42},
+            actions: [%{type: :trip_generator, target_id: 99, delay_s: 0.1}]
+          }
+        ])
 
-      events = [%{component_type: "transmission_line", component_id: 42, failure_cause: "thermal_overload"}]
+      events = [
+        %{
+          component_type: "transmission_line",
+          component_id: 42,
+          failure_cause: "thermal_overload"
+        }
+      ]
 
       {updated, actions} = RAS.check(ras_list, events)
 
@@ -661,13 +712,14 @@ defmodule PowerModel.Controls.ControlsTest do
     end
 
     test "does not fire on non-matching event" do
-      ras_list = RAS.init([
-        %{
-          name: "Line 42 RAS",
-          trigger: %{type: :line_trip, component_id: 42},
-          actions: [%{type: :trip_generator, target_id: 99}]
-        }
-      ])
+      ras_list =
+        RAS.init([
+          %{
+            name: "Line 42 RAS",
+            trigger: %{type: :line_trip, component_id: 42},
+            actions: [%{type: :trip_generator, target_id: 99}]
+          }
+        ])
 
       events = [%{component_type: "transmission_line", component_id: 99}]
 
@@ -678,13 +730,14 @@ defmodule PowerModel.Controls.ControlsTest do
     end
 
     test "fires on generator trip event" do
-      ras_list = RAS.init([
-        %{
-          name: "Gen 10 RAS",
-          trigger: %{type: :generator_trip, component_id: 10},
-          actions: [%{type: :shed_load, target_ids: [201], fraction: 0.5, delay_s: 0.3}]
-        }
-      ])
+      ras_list =
+        RAS.init([
+          %{
+            name: "Gen 10 RAS",
+            trigger: %{type: :generator_trip, component_id: 10},
+            actions: [%{type: :shed_load, target_ids: [201], fraction: 0.5, delay_s: 0.3}]
+          }
+        ])
 
       events = [%{component_type: "generator", component_id: 10}]
       {_updated, actions} = RAS.check(ras_list, events)
@@ -694,13 +747,14 @@ defmodule PowerModel.Controls.ControlsTest do
     end
 
     test "fires on underfrequency trigger" do
-      ras_list = RAS.init([
-        %{
-          name: "UFLS Stage 3",
-          trigger: %{type: :underfrequency, threshold_hz: 59.0},
-          actions: [%{type: :shed_load, target_ids: [301, 302], fraction: 0.15}]
-        }
-      ])
+      ras_list =
+        RAS.init([
+          %{
+            name: "UFLS Stage 3",
+            trigger: %{type: :underfrequency, threshold_hz: 59.0},
+            actions: [%{type: :shed_load, target_ids: [301, 302], fraction: 0.15}]
+          }
+        ])
 
       {_updated, actions} = RAS.check(ras_list, [], frequency_hz: 58.5)
 
@@ -708,13 +762,14 @@ defmodule PowerModel.Controls.ControlsTest do
     end
 
     test "does not fire on underfrequency when above threshold" do
-      ras_list = RAS.init([
-        %{
-          name: "UFLS Stage 3",
-          trigger: %{type: :underfrequency, threshold_hz: 59.0},
-          actions: [%{type: :shed_load, target_ids: [301], fraction: 0.15}]
-        }
-      ])
+      ras_list =
+        RAS.init([
+          %{
+            name: "UFLS Stage 3",
+            trigger: %{type: :underfrequency, threshold_hz: 59.0},
+            actions: [%{type: :shed_load, target_ids: [301], fraction: 0.15}]
+          }
+        ])
 
       {_updated, actions} = RAS.check(ras_list, [], frequency_hz: 59.5)
 
@@ -722,13 +777,14 @@ defmodule PowerModel.Controls.ControlsTest do
     end
 
     test "fires on undervoltage trigger" do
-      ras_list = RAS.init([
-        %{
-          name: "Bus 5 UVLS",
-          trigger: %{type: :undervoltage, bus_id: 5, threshold_pu: 0.9},
-          actions: [%{type: :shed_load, target_ids: [501], fraction: 0.25}]
-        }
-      ])
+      ras_list =
+        RAS.init([
+          %{
+            name: "Bus 5 UVLS",
+            trigger: %{type: :undervoltage, bus_id: 5, threshold_pu: 0.9},
+            actions: [%{type: :shed_load, target_ids: [501], fraction: 0.25}]
+          }
+        ])
 
       {_updated, actions} = RAS.check(ras_list, [], bus_voltages: %{5 => 0.85})
       assert length(actions) == 1
@@ -737,13 +793,14 @@ defmodule PowerModel.Controls.ControlsTest do
 
   describe "RAS latching behavior" do
     test "fires at most once" do
-      ras_list = RAS.init([
-        %{
-          name: "Latching RAS",
-          trigger: %{type: :line_trip, component_id: 42},
-          actions: [%{type: :trip_generator, target_id: 99}]
-        }
-      ])
+      ras_list =
+        RAS.init([
+          %{
+            name: "Latching RAS",
+            trigger: %{type: :line_trip, component_id: 42},
+            actions: [%{type: :trip_generator, target_id: 99}]
+          }
+        ])
 
       events = [%{component_type: "transmission_line", component_id: 42}]
 
@@ -757,14 +814,15 @@ defmodule PowerModel.Controls.ControlsTest do
     end
 
     test "disabled RAS does not fire" do
-      ras_list = RAS.init([
-        %{
-          name: "Disabled RAS",
-          trigger: %{type: :line_trip, component_id: 42},
-          actions: [%{type: :trip_generator, target_id: 99}],
-          enabled: false
-        }
-      ])
+      ras_list =
+        RAS.init([
+          %{
+            name: "Disabled RAS",
+            trigger: %{type: :line_trip, component_id: 42},
+            actions: [%{type: :trip_generator, target_id: 99}],
+            enabled: false
+          }
+        ])
 
       events = [%{component_type: "transmission_line", component_id: 42}]
 
@@ -775,18 +833,19 @@ defmodule PowerModel.Controls.ControlsTest do
 
   describe "RAS multiple schemes" do
     test "multiple RAS can fire from different events" do
-      ras_list = RAS.init([
-        %{
-          name: "RAS A",
-          trigger: %{type: :line_trip, component_id: 1},
-          actions: [%{type: :trip_generator, target_id: 10}]
-        },
-        %{
-          name: "RAS B",
-          trigger: %{type: :line_trip, component_id: 2},
-          actions: [%{type: :shed_load, target_ids: [20], fraction: 0.5}]
-        }
-      ])
+      ras_list =
+        RAS.init([
+          %{
+            name: "RAS A",
+            trigger: %{type: :line_trip, component_id: 1},
+            actions: [%{type: :trip_generator, target_id: 10}]
+          },
+          %{
+            name: "RAS B",
+            trigger: %{type: :line_trip, component_id: 2},
+            actions: [%{type: :shed_load, target_ids: [20], fraction: 0.5}]
+          }
+        ])
 
       events = [
         %{component_type: "transmission_line", component_id: 1},
@@ -800,18 +859,19 @@ defmodule PowerModel.Controls.ControlsTest do
     end
 
     test "only matching RAS fire" do
-      ras_list = RAS.init([
-        %{
-          name: "RAS A",
-          trigger: %{type: :line_trip, component_id: 1},
-          actions: [%{type: :trip_generator, target_id: 10}]
-        },
-        %{
-          name: "RAS B",
-          trigger: %{type: :line_trip, component_id: 2},
-          actions: [%{type: :shed_load, target_ids: [20], fraction: 0.5}]
-        }
-      ])
+      ras_list =
+        RAS.init([
+          %{
+            name: "RAS A",
+            trigger: %{type: :line_trip, component_id: 1},
+            actions: [%{type: :trip_generator, target_id: 10}]
+          },
+          %{
+            name: "RAS B",
+            trigger: %{type: :line_trip, component_id: 2},
+            actions: [%{type: :shed_load, target_ids: [20], fraction: 0.5}]
+          }
+        ])
 
       events = [%{component_type: "transmission_line", component_id: 1}]
 
@@ -828,13 +888,14 @@ defmodule PowerModel.Controls.ControlsTest do
 
   describe "RAS action metadata" do
     test "triggered actions include ras_name" do
-      ras_list = RAS.init([
-        %{
-          name: "My RAS",
-          trigger: %{type: :line_trip, component_id: 42},
-          actions: [%{type: :trip_generator, target_id: 99, delay_s: 0.1}]
-        }
-      ])
+      ras_list =
+        RAS.init([
+          %{
+            name: "My RAS",
+            trigger: %{type: :line_trip, component_id: 42},
+            actions: [%{type: :trip_generator, target_id: 99, delay_s: 0.1}]
+          }
+        ])
 
       events = [%{component_type: "transmission_line", component_id: 42}]
       {_updated, actions} = RAS.check(ras_list, events)

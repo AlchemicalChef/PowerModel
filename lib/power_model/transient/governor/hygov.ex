@@ -31,15 +31,24 @@ defmodule PowerModel.Transient.Governor.HYGOV do
   """
 
   defstruct [
-    :x_gate,   # gate position state (pu)
-    :x_water,  # water column power state (pu)
-    :dx_gate,  # gate position rate of change (pu/s) for water column effect
-    :r,        # droop (pu)
-    :tg,       # gate servo time constant (seconds)
-    :tw,       # water starting time (seconds)
-    :p_ref,    # power reference setpoint (pu)
-    :p_max,    # maximum mechanical power (pu)
-    :p_min     # minimum mechanical power (pu)
+    # gate position state (pu)
+    :x_gate,
+    # water column power state (pu)
+    :x_water,
+    # gate position rate of change (pu/s) for water column effect
+    :dx_gate,
+    # droop (pu)
+    :r,
+    # gate servo time constant (seconds)
+    :tg,
+    # water starting time (seconds)
+    :tw,
+    # power reference setpoint (pu)
+    :p_ref,
+    # maximum mechanical power (pu)
+    :p_max,
+    # minimum mechanical power (pu)
+    :p_min
   ]
 
   @doc """
@@ -79,7 +88,7 @@ defmodule PowerModel.Transient.Governor.HYGOV do
   Returns `{dx_gate, dx_water}`.
   """
   def derivatives(%__MODULE__{} = gov, omega) do
-    speed_error = (1.0 / gov.r) * (omega - 1.0)
+    speed_error = 1.0 / gov.r * (omega - 1.0)
     dx_gate = (gov.p_ref - speed_error - gov.x_gate) / gov.tg
 
     # Water column dynamics: water follows gate with lag and inverse response
@@ -110,10 +119,11 @@ defmodule PowerModel.Transient.Governor.HYGOV do
   def step_euler(%__MODULE__{} = gov, omega, dt) do
     {dx_gate, dx_water} = derivatives(gov, omega)
 
-    %{gov |
-      x_gate: gov.x_gate + dx_gate * dt,
-      x_water: gov.x_water + dx_water * dt,
-      dx_gate: dx_gate
+    %{
+      gov
+      | x_gate: gov.x_gate + dx_gate * dt,
+        x_water: gov.x_water + dx_water * dt,
+        dx_gate: dx_gate
     }
   end
 
@@ -128,10 +138,11 @@ defmodule PowerModel.Transient.Governor.HYGOV do
 
     avg_dx_gate = (dx_gate_n + dx_gate_pred) / 2.0
 
-    %{gov_n |
-      x_gate: gov_n.x_gate + dt * avg_dx_gate,
-      x_water: gov_n.x_water + dt / 2.0 * (dx_water_n + dx_water_pred),
-      dx_gate: avg_dx_gate
+    %{
+      gov_n
+      | x_gate: gov_n.x_gate + dt * avg_dx_gate,
+        x_water: gov_n.x_water + dt / 2.0 * (dx_water_n + dx_water_pred),
+        dx_gate: avg_dx_gate
     }
   end
 end

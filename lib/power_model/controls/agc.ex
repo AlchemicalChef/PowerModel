@@ -16,12 +16,18 @@ defmodule PowerModel.Controls.AGC do
   """
 
   defstruct [
-    :ace,         # current Area Control Error (MW)
-    :integral,    # accumulated ACE integral (MW*s)
-    :generators,  # list of participating generator maps
-    :bias_mw,     # area frequency bias B (MW/0.1 Hz)
-    :ki,          # integral gain (1/s)
-    :p_scheduled  # scheduled net interchange (MW)
+    # current Area Control Error (MW)
+    :ace,
+    # accumulated ACE integral (MW*s)
+    :integral,
+    # list of participating generator maps
+    :generators,
+    # area frequency bias B (MW/0.1 Hz)
+    :bias_mw,
+    # integral gain (1/s)
+    :ki,
+    # scheduled net interchange (MW)
+    :p_scheduled
   ]
 
   @doc """
@@ -85,7 +91,7 @@ defmodule PowerModel.Controls.AGC do
     p_actual = total_gen_mw - total_load_mw
     freq_error = frequency_hz - 60.0
 
-    ace = (p_actual - state.p_scheduled) + 10.0 * state.bias_mw * freq_error
+    ace = p_actual - state.p_scheduled + 10.0 * state.bias_mw * freq_error
 
     # PI controller: correction = -Ki * integral(ACE)
     new_integral = state.integral + ace * dt_s

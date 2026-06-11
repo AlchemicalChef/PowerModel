@@ -37,20 +37,22 @@ defmodule Mix.Tasks.PowerModel.ExportGridData do
     generators = PowerModel.Grid.export_generators()
     count = length(generators)
 
-    binary = <<count::unsigned-little-32>> <>
-      Enum.reduce(generators, <<>>, fn gen, acc ->
-        {lon, lat} = extract_coords(gen.coordinates)
-        fuel_code = fuel_type_code(gen.fuel_type)
+    binary =
+      <<count::unsigned-little-32>> <>
+        Enum.reduce(generators, <<>>, fn gen, acc ->
+          {lon, lat} = extract_coords(gen.coordinates)
+          fuel_code = fuel_type_code(gen.fuel_type)
 
-        acc <> <<
-          gen.id::unsigned-little-32,
-          lon::float-little-32,
-          lat::float-little-32,
-          (gen.p_max_mw || 0.0)::float-little-32,
-          fuel_code::unsigned-8,
-          0::unsigned-8
-        >>
-      end)
+          acc <>
+            <<
+              gen.id::unsigned-little-32,
+              lon::float-little-32,
+              lat::float-little-32,
+              gen.p_max_mw || 0.0::float-little-32,
+              fuel_code::unsigned-8,
+              0::unsigned-8
+            >>
+        end)
 
     File.write!(Path.join(@output_dir, "generators.bin"), binary)
     Mix.shell().info("  generators.bin: #{count} records, #{byte_size(binary)} bytes")
@@ -60,25 +62,27 @@ defmodule Mix.Tasks.PowerModel.ExportGridData do
     lines = PowerModel.Grid.export_transmission_lines()
     count = length(lines)
 
-    binary = <<count::unsigned-little-32>> <>
-      Enum.reduce(lines, <<>>, fn line, acc ->
-        coords = extract_line_coords(line.geometry)
-        num_points = length(coords)
+    binary =
+      <<count::unsigned-little-32>> <>
+        Enum.reduce(lines, <<>>, fn line, acc ->
+          coords = extract_line_coords(line.geometry)
+          num_points = length(coords)
 
-        line_header = <<
-          line.id::unsigned-little-32,
-          (line.voltage_kv || 0.0)::float-little-32,
-          (line.rating_a_mva || 0.0)::float-little-32,
-          num_points::unsigned-little-16,
-          0::unsigned-8
-        >>
+          line_header = <<
+            line.id::unsigned-little-32,
+            line.voltage_kv || 0.0::float-little-32,
+            line.rating_a_mva || 0.0::float-little-32,
+            num_points::unsigned-little-16,
+            0::unsigned-8
+          >>
 
-        point_data = Enum.reduce(coords, <<>>, fn {lon, lat}, pa ->
-          pa <> <<lon::float-little-32, lat::float-little-32>>
+          point_data =
+            Enum.reduce(coords, <<>>, fn {lon, lat}, pa ->
+              pa <> <<lon::float-little-32, lat::float-little-32>>
+            end)
+
+          acc <> line_header <> point_data
         end)
-
-        acc <> line_header <> point_data
-      end)
 
     File.write!(Path.join(@output_dir, "transmission.bin"), binary)
     Mix.shell().info("  transmission.bin: #{count} records, #{byte_size(binary)} bytes")
@@ -88,18 +92,20 @@ defmodule Mix.Tasks.PowerModel.ExportGridData do
     substations = PowerModel.Grid.export_substations()
     count = length(substations)
 
-    binary = <<count::unsigned-little-32>> <>
-      Enum.reduce(substations, <<>>, fn sub, acc ->
-        {lon, lat} = extract_coords(sub.coordinates)
+    binary =
+      <<count::unsigned-little-32>> <>
+        Enum.reduce(substations, <<>>, fn sub, acc ->
+          {lon, lat} = extract_coords(sub.coordinates)
 
-        acc <> <<
-          sub.id::unsigned-little-32,
-          lon::float-little-32,
-          lat::float-little-32,
-          (sub.max_voltage_kv || 0.0)::float-little-32,
-          0::unsigned-8
-        >>
-      end)
+          acc <>
+            <<
+              sub.id::unsigned-little-32,
+              lon::float-little-32,
+              lat::float-little-32,
+              sub.max_voltage_kv || 0.0::float-little-32,
+              0::unsigned-8
+            >>
+        end)
 
     File.write!(Path.join(@output_dir, "substations.bin"), binary)
     Mix.shell().info("  substations.bin: #{count} records, #{byte_size(binary)} bytes")
@@ -109,24 +115,27 @@ defmodule Mix.Tasks.PowerModel.ExportGridData do
     facilities = PowerModel.Grid.export_water_facilities()
     count = length(facilities)
 
-    json = Jason.encode!(%{
-      count: count,
-      facilities: Enum.map(facilities, fn f ->
-        {lon, lat} = extract_coords(f.coordinates)
-        %{
-          id: f.id,
-          lon: lon,
-          lat: lat,
-          name: f.name,
-          facilityType: water_facility_type_code(f.facility_type),
-          capacityMgd: f.capacity_mgd || 0.0,
-          powerMw: f.power_consumption_mw || 0.0,
-          storageAcreFeet: f.storage_acre_feet || 0.0,
-          busId: f.bus_id,
-          state: 0
-        }
-      end)
-    })
+    json =
+      Jason.encode!(%{
+        count: count,
+        facilities:
+          Enum.map(facilities, fn f ->
+            {lon, lat} = extract_coords(f.coordinates)
+
+            %{
+              id: f.id,
+              lon: lon,
+              lat: lat,
+              name: f.name,
+              facilityType: water_facility_type_code(f.facility_type),
+              capacityMgd: f.capacity_mgd || 0.0,
+              powerMw: f.power_consumption_mw || 0.0,
+              storageAcreFeet: f.storage_acre_feet || 0.0,
+              busId: f.bus_id,
+              state: 0
+            }
+          end)
+      })
 
     File.write!(Path.join(@output_dir, "water_facilities.json"), json)
     Mix.shell().info("  water_facilities.json: #{count} records, #{byte_size(json)} bytes")
@@ -137,15 +146,18 @@ defmodule Mix.Tasks.PowerModel.ExportGridData do
   defp extract_coords(_), do: {0.0, 0.0}
 
   defp extract_line_coords(nil), do: []
+
   defp extract_line_coords(%Geo.LineString{coordinates: coords}) do
     Enum.map(coords, fn
       {lon, lat} -> {lon, lat}
       {lon, lat, _} -> {lon, lat}
     end)
   end
+
   defp extract_line_coords(_), do: []
 
   defp fuel_type_code(nil), do: 0
+
   defp fuel_type_code(ft) do
     case String.upcase(ft) do
       "NG" -> 1
@@ -168,25 +180,28 @@ defmodule Mix.Tasks.PowerModel.ExportGridData do
     facilities = PowerModel.Grid.export_critical_facilities()
     count = length(facilities)
 
-    json = Jason.encode!(%{
-      count: count,
-      facilities: Enum.map(facilities, fn f ->
-        {lon, lat} = extract_coords(f.coordinates)
-        %{
-          id: f.id,
-          lon: lon,
-          lat: lat,
-          name: f.name,
-          category: critical_facility_category_code(f.category),
-          facilityType: f.facility_type,
-          beds: f.beds,
-          trauma: f.trauma,
-          powerMw: f.estimated_power_mw || 0.0,
-          busId: f.bus_id,
-          state: 0
-        }
-      end)
-    })
+    json =
+      Jason.encode!(%{
+        count: count,
+        facilities:
+          Enum.map(facilities, fn f ->
+            {lon, lat} = extract_coords(f.coordinates)
+
+            %{
+              id: f.id,
+              lon: lon,
+              lat: lat,
+              name: f.name,
+              category: critical_facility_category_code(f.category),
+              facilityType: f.facility_type,
+              beds: f.beds,
+              trauma: f.trauma,
+              powerMw: f.estimated_power_mw || 0.0,
+              busId: f.bus_id,
+              state: 0
+            }
+          end)
+      })
 
     File.write!(Path.join(@output_dir, "critical_facilities.json"), json)
     Mix.shell().info("  critical_facilities.json: #{count} records, #{byte_size(json)} bytes")

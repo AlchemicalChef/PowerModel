@@ -31,24 +31,26 @@ defmodule PowerModel.Transient.Machine.Classical do
     p_elec = :array.new(n_gen, default: 0.0)
 
     # Process each non-zero entry in Y_red
-    p_elec = Enum.zip([y_red_rows, y_red_cols, y_red_g, y_red_b])
-    |> Enum.reduce(p_elec, fn {i, j, g_ij, b_ij}, acc ->
-      ei = Enum.at(delta, i)  # Will use arrays for perf
-      ej = Enum.at(delta, j)
-      e_i = Enum.at(e_prime, i)
-      e_j = Enum.at(e_prime, j)
+    p_elec =
+      Enum.zip([y_red_rows, y_red_cols, y_red_g, y_red_b])
+      |> Enum.reduce(p_elec, fn {i, j, g_ij, b_ij}, acc ->
+        # Will use arrays for perf
+        ei = Enum.at(delta, i)
+        ej = Enum.at(delta, j)
+        e_i = Enum.at(e_prime, i)
+        e_j = Enum.at(e_prime, j)
 
-      if i == j do
-        # Diagonal: P += E_i^2 * G_ii
-        p_add = e_i * e_i * g_ij
-        array_add(acc, i, p_add)
-      else
-        # Off-diagonal: P_i += E_i * E_j * (B_ij * sin(d_i - d_j) + G_ij * cos(d_i - d_j))
-        d_ij = ei - ej
-        p_add = e_i * e_j * (b_ij * :math.sin(d_ij) + g_ij * :math.cos(d_ij))
-        array_add(acc, i, p_add)
-      end
-    end)
+        if i == j do
+          # Diagonal: P += E_i^2 * G_ii
+          p_add = e_i * e_i * g_ij
+          array_add(acc, i, p_add)
+        else
+          # Off-diagonal: P_i += E_i * E_j * (B_ij * sin(d_i - d_j) + G_ij * cos(d_i - d_j))
+          d_ij = ei - ej
+          p_add = e_i * e_j * (b_ij * :math.sin(d_ij) + g_ij * :math.cos(d_ij))
+          array_add(acc, i, p_add)
+        end
+      end)
 
     :array.to_list(p_elec)
   end
@@ -57,18 +59,22 @@ defmodule PowerModel.Transient.Machine.Classical do
   Compute derivatives (d_delta/dt, d_omega/dt) for all generators.
   """
   def derivatives(_delta, omega, p_mech, p_elec, h, d_coeff, n_gen) do
-    d_delta = for i <- 0..(n_gen - 1) do
-      @omega_base * (Enum.at(omega, i) - 1.0)
-    end
-
-    d_omega = for i <- 0..(n_gen - 1) do
-      hi = Enum.at(h, i)
-      if hi > 0.0 do
-        (Enum.at(p_mech, i) - Enum.at(p_elec, i) - Enum.at(d_coeff, i) * (Enum.at(omega, i) - 1.0)) / (2.0 * hi)
-      else
-        0.0
+    d_delta =
+      for i <- 0..(n_gen - 1) do
+        @omega_base * (Enum.at(omega, i) - 1.0)
       end
-    end
+
+    d_omega =
+      for i <- 0..(n_gen - 1) do
+        hi = Enum.at(h, i)
+
+        if hi > 0.0 do
+          (Enum.at(p_mech, i) - Enum.at(p_elec, i) -
+             Enum.at(d_coeff, i) * (Enum.at(omega, i) - 1.0)) / (2.0 * hi)
+        else
+          0.0
+        end
+      end
 
     {d_delta, d_omega}
   end
@@ -109,21 +115,39 @@ defmodule PowerModel.Transient.Machine.Classical do
         p_mech = apply_events(st.p_mech, events, t, st.dt)
 
         # Compute P_elec at current state
-        p_elec = compute_p_elec(st.delta, st.e_prime,
-                                st.y_red_rows, st.y_red_cols,
-                                st.y_red_g, st.y_red_b, st.n_gen)
+        p_elec =
+          compute_p_elec(
+            st.delta,
+            st.e_prime,
+            st.y_red_rows,
+            st.y_red_cols,
+            st.y_red_g,
+            st.y_red_b,
+            st.n_gen
+          )
 
         # Euler predictor
-        {d_delta_0, d_omega_0} = derivatives(st.delta, st.omega, p_mech, p_elec, st.h, st.d, st.n_gen)
+        {d_delta_0, d_omega_0} =
+          derivatives(st.delta, st.omega, p_mech, p_elec, st.h, st.d, st.n_gen)
+
         {pred_delta, pred_omega} = euler_step(st.delta, st.omega, d_delta_0, d_omega_0, st.dt)
 
         # Compute P_elec at predicted state
-        p_elec_pred = compute_p_elec(pred_delta, st.e_prime,
-                                     st.y_red_rows, st.y_red_cols,
-                                     st.y_red_g, st.y_red_b, st.n_gen)
+        p_elec_pred =
+          compute_p_elec(
+            pred_delta,
+            st.e_prime,
+            st.y_red_rows,
+            st.y_red_cols,
+            st.y_red_g,
+            st.y_red_b,
+            st.n_gen
+          )
 
         # Trapezoidal corrector
-        {d_delta_1, d_omega_1} = derivatives(pred_delta, pred_omega, p_mech, p_elec_pred, st.h, st.d, st.n_gen)
+        {d_delta_1, d_omega_1} =
+          derivatives(pred_delta, pred_omega, p_mech, p_elec_pred, st.h, st.d, st.n_gen)
+
         new_delta = trapezoidal_correct(st.delta, d_delta_0, d_delta_1, st.dt)
         new_omega = trapezoidal_correct(st.omega, d_omega_0, d_omega_1, st.dt)
 

@@ -7,7 +7,7 @@ defmodule PowerModelWeb.GridLive.AffectedList do
       <div class="affected-header">
         <h4>Affected Components</h4>
         <span class="affected-count">
-          <%= length(@events) + length(@compensating_lines) %>
+          {length(@events) + length(@compensating_lines)}
         </span>
       </div>
 
@@ -15,13 +15,13 @@ defmodule PowerModelWeb.GridLive.AffectedList do
         <%!-- Tripped components (from cascade) --%>
         <%= for event <- Enum.take(@events, 20) do %>
           <div class={"affected-item " <> cause_class(event.failure_cause)}>
-            <div class="affected-icon"><%= type_icon(event.component_type) %></div>
+            <div class="affected-icon">{type_icon(event.component_type)}</div>
             <div class="affected-info">
-              <span class="affected-type"><%= humanize(event.component_type) %></span>
-              <span class="affected-id">#<%= event.component_id %></span>
+              <span class="affected-type">{humanize(event.component_type)}</span>
+              <span class="affected-id">#{event.component_id}</span>
             </div>
             <div class="affected-cause">
-              <span class="cause-badge"><%= humanize(event.failure_cause) %></span>
+              <span class="cause-badge">{humanize(event.failure_cause)}</span>
             </div>
           </div>
         <% end %>
@@ -30,7 +30,7 @@ defmodule PowerModelWeb.GridLive.AffectedList do
         <%= if @compensating_lines != [] do %>
           <div class="affected-section-header">
             Compensating Lines
-            <span class="affected-section-count"><%= length(@compensating_lines) %></span>
+            <span class="affected-section-count">{length(@compensating_lines)}</span>
           </div>
 
           <%= for line <- Enum.take(@compensating_lines, 50) do %>
@@ -38,21 +38,23 @@ defmodule PowerModelWeb.GridLive.AffectedList do
               <div class="affected-icon">⚡</div>
               <div class="affected-info">
                 <span class="comp-route">
-                  <%= line.sub_1 || "?" %> → <%= line.sub_2 || "?" %>
+                  {line.sub_1 || "?"} → {line.sub_2 || "?"}
                 </span>
                 <span class="comp-meta">
-                  <%= if line.voltage_kv, do: "#{round(line.voltage_kv)} kV", else: "" %>
-                  <%= if line.owner, do: " · #{line.owner}", else: "" %>
+                  {if line.voltage_kv, do: "#{round(line.voltage_kv)} kV", else: ""}
+                  {if line.owner, do: " · #{line.owner}", else: ""}
                 </span>
               </div>
               <div class="comp-loading">
                 <div class="comp-bar-container">
-                  <div class={"comp-bar " <> (line.status || "compensating")}
-                       style={"width: #{min(line.loading_pct, 100)}%"}>
+                  <div
+                    class={"comp-bar " <> (line.status || "compensating")}
+                    style={"width: #{min(line.loading_pct, 100)}%"}
+                  >
                   </div>
                 </div>
-                <span class="comp-pct"><%= line.loading_pct %>%</span>
-                <span class="comp-delta">+<%= line.delta %>%</span>
+                <span class="comp-pct">{line.loading_pct}%</span>
+                <span class="comp-delta">+{line.delta}%</span>
               </div>
             </div>
           <% end %>
@@ -60,7 +62,7 @@ defmodule PowerModelWeb.GridLive.AffectedList do
 
         <%= if length(@events) > 20 do %>
           <div class="affected-overflow">
-            + <%= length(@events) - 20 %> more tripped
+            + {length(@events) - 20} more tripped
           </div>
         <% end %>
       </div>
@@ -89,5 +91,6 @@ defmodule PowerModelWeb.GridLive.AffectedList do
   defp humanize(str) when is_binary(str) do
     str |> String.replace("_", " ") |> String.capitalize()
   end
+
   defp humanize(_), do: ""
 end

@@ -22,12 +22,18 @@ defmodule PowerModel.Transient.Exciter.SEXS do
   """
 
   defstruct [
-    :e_fd,       # field voltage (pu)
-    :v_ref,      # voltage reference setpoint (pu)
-    :k,          # exciter gain
-    :t_e,        # exciter time constant (seconds)
-    :e_fd_min,   # field voltage lower limit
-    :e_fd_max    # field voltage upper limit
+    # field voltage (pu)
+    :e_fd,
+    # voltage reference setpoint (pu)
+    :v_ref,
+    # exciter gain
+    :k,
+    # exciter time constant (seconds)
+    :t_e,
+    # field voltage lower limit
+    :e_fd_min,
+    # field voltage upper limit
+    :e_fd_max
   ]
 
   @default_k 100.0

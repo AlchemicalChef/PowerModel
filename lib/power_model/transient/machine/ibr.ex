@@ -29,34 +29,55 @@ defmodule PowerModel.Transient.Machine.IBR do
   """
 
   defstruct [
-    :mode,            # :grid_following or :grid_forming
-    :p_set_pu,        # active power setpoint (pu)
-    :q_set_pu,        # reactive power setpoint (pu)
-    :p_inject_pu,     # current active power injection (pu)
-    :q_inject_pu,     # current reactive power injection (pu)
-    :v_terminal,      # last terminal voltage magnitude (pu)
-    :tripped,         # whether the IBR has tripped offline
-    :low_v_timer,     # accumulated time below LVRT thresholds (seconds)
-    :low_v_threshold, # which LVRT tier is active (:none, :tier1, :tier2)
+    # :grid_following or :grid_forming
+    :mode,
+    # active power setpoint (pu)
+    :p_set_pu,
+    # reactive power setpoint (pu)
+    :q_set_pu,
+    # current active power injection (pu)
+    :p_inject_pu,
+    # current reactive power injection (pu)
+    :q_inject_pu,
+    # last terminal voltage magnitude (pu)
+    :v_terminal,
+    # whether the IBR has tripped offline
+    :tripped,
+    # accumulated time below LVRT thresholds (seconds)
+    :low_v_timer,
+    # which LVRT tier is active (:none, :tier1, :tier2)
+    :low_v_threshold,
 
     # Grid-forming parameters (VSM mode)
-    :delta,           # virtual rotor angle (radians)
-    :omega,           # virtual rotor speed (pu)
-    :h_synthetic,     # synthetic inertia constant (seconds)
-    :d_virtual,       # virtual damping coefficient
-    :x_virtual_pu,    # virtual impedance (pu)
-    :p_ref,           # power reference for droop (pu)
-    :droop            # frequency droop (pu)
+    # virtual rotor angle (radians)
+    :delta,
+    # virtual rotor speed (pu)
+    :omega,
+    # synthetic inertia constant (seconds)
+    :h_synthetic,
+    # virtual damping coefficient
+    :d_virtual,
+    # virtual impedance (pu)
+    :x_virtual_pu,
+    # power reference for droop (pu)
+    :p_ref,
+    # frequency droop (pu)
+    :droop
   ]
 
   @omega_base 2.0 * :math.pi() * 60.0
 
   # LVRT thresholds per IEEE 1547-2018 Category III
-  @lvrt_tier1_v 0.15    # voltage threshold for fast trip
-  @lvrt_tier1_t 0.16    # time limit for tier 1 (seconds)
-  @lvrt_tier2_v 0.45    # voltage threshold for slow trip
-  @lvrt_tier2_t 1.0     # time limit for tier 2 (seconds)
-  @lvrt_reduce_v 0.70   # voltage below which output is reduced
+  # voltage threshold for fast trip
+  @lvrt_tier1_v 0.15
+  # time limit for tier 1 (seconds)
+  @lvrt_tier1_t 0.16
+  # voltage threshold for slow trip
+  @lvrt_tier2_v 0.45
+  # time limit for tier 2 (seconds)
+  @lvrt_tier2_t 1.0
+  # voltage below which output is reduced
+  @lvrt_reduce_v 0.70
 
   # Fuel types that indicate IBR technology
   # Note: WDS (wood/wood waste) is a conventional steam plant, NOT an IBR
@@ -81,14 +102,19 @@ defmodule PowerModel.Transient.Machine.IBR do
     p_set = Map.get(gen, :p_mech_pu, 0.0)
     q_set = Map.get(gen, :q_set_pu, 0.0)
 
-    mode = case Map.get(gen, :ibr_mode) do
-      :grid_forming -> :grid_forming
-      :grid_following -> :grid_following
-      nil ->
-        # Default: IBR fuel types get grid-following
-        fuel = Map.get(gen, :fuel_type, "")
-        if fuel in @ibr_fuel_types, do: :grid_following, else: :grid_following
-    end
+    mode =
+      case Map.get(gen, :ibr_mode) do
+        :grid_forming ->
+          :grid_forming
+
+        :grid_following ->
+          :grid_following
+
+        nil ->
+          # Default: IBR fuel types get grid-following
+          fuel = Map.get(gen, :fuel_type, "")
+          if fuel in @ibr_fuel_types, do: :grid_following, else: :grid_following
+      end
 
     base = %__MODULE__{
       mode: mode,
@@ -164,10 +190,12 @@ defmodule PowerModel.Transient.Machine.IBR do
       p_elec = v_terminal * :math.sin(ibr.delta) / max(ibr.x_virtual_pu, 0.001)
 
       # Droop: P_ref adjusted by frequency deviation
-      p_ref_droop = ibr.p_ref - (1.0 / max(ibr.droop, 0.001)) * (ibr.omega - 1.0)
+      p_ref_droop = ibr.p_ref - 1.0 / max(ibr.droop, 0.001) * (ibr.omega - 1.0)
 
       # Swing equation: d_omega/dt = (P_ref - P_elec - D*(omega-1)) / (2*H)
-      d_omega = (p_ref_droop - p_elec - ibr.d_virtual * (ibr.omega - 1.0)) / (2.0 * ibr.h_synthetic)
+      d_omega =
+        (p_ref_droop - p_elec - ibr.d_virtual * (ibr.omega - 1.0)) / (2.0 * ibr.h_synthetic)
+
       d_delta = @omega_base * (ibr.omega - 1.0)
 
       # Euler integration (sufficient for IBR with synthetic inertia)
@@ -178,11 +206,12 @@ defmodule PowerModel.Transient.Machine.IBR do
       p_inject = v_terminal * :math.sin(new_delta) / max(ibr.x_virtual_pu, 0.001)
       q_inject = ibr.q_set_pu
 
-      ibr = %{ibr |
-        omega: new_omega,
-        delta: new_delta,
-        p_inject_pu: p_inject,
-        q_inject_pu: q_inject
+      ibr = %{
+        ibr
+        | omega: new_omega,
+          delta: new_delta,
+          p_inject_pu: p_inject,
+          q_inject_pu: q_inject
       }
 
       {ibr, p_inject, q_inject}
@@ -208,11 +237,12 @@ defmodule PowerModel.Transient.Machine.IBR do
     cond do
       v_terminal < @lvrt_tier1_v ->
         # Severe voltage depression — fast trip timer
-        new_timer = if ibr.low_v_threshold == :tier1 do
-          ibr.low_v_timer + dt
-        else
-          dt
-        end
+        new_timer =
+          if ibr.low_v_threshold == :tier1 do
+            ibr.low_v_timer + dt
+          else
+            dt
+          end
 
         if new_timer >= @lvrt_tier1_t do
           %{ibr | tripped: true, low_v_timer: new_timer, low_v_threshold: :tier1}
@@ -222,11 +252,12 @@ defmodule PowerModel.Transient.Machine.IBR do
 
       v_terminal < @lvrt_tier2_v ->
         # Moderate voltage depression — slow trip timer
-        new_timer = if ibr.low_v_threshold in [:tier1, :tier2] do
-          ibr.low_v_timer + dt
-        else
-          dt
-        end
+        new_timer =
+          if ibr.low_v_threshold in [:tier1, :tier2] do
+            ibr.low_v_timer + dt
+          else
+            dt
+          end
 
         if new_timer >= @lvrt_tier2_t do
           %{ibr | tripped: true, low_v_timer: new_timer, low_v_threshold: :tier2}

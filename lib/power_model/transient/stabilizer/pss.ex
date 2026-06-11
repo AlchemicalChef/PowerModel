@@ -42,14 +42,22 @@ defmodule PowerModel.Transient.Stabilizer.PSS do
   """
 
   defstruct [
-    :x_washout,   # washout filter state
-    :x_lead,      # lead-lag compensator state
-    :k_pss,       # stabilizer gain
-    :t_washout,   # washout time constant (seconds)
-    :t1,          # lead time constant (seconds)
-    :t2,          # lag time constant (seconds)
-    :v_pss_max,   # maximum PSS output (pu)
-    :v_pss_min    # minimum PSS output (pu)
+    # washout filter state
+    :x_washout,
+    # lead-lag compensator state
+    :x_lead,
+    # stabilizer gain
+    :k_pss,
+    # washout time constant (seconds)
+    :t_washout,
+    # lead time constant (seconds)
+    :t1,
+    # lag time constant (seconds)
+    :t2,
+    # maximum PSS output (pu)
+    :v_pss_max,
+    # minimum PSS output (pu)
+    :v_pss_min
   ]
 
   @default_k_pss 10.0
@@ -116,14 +124,15 @@ defmodule PowerModel.Transient.Stabilizer.PSS do
   def v_pss(%__MODULE__{} = pss, omega_dev \\ nil) do
     # When omega_dev is available, compute full lead-lag output
     # Otherwise, use x_lead as approximation (for backward compat)
-    raw = case omega_dev do
-      nil ->
-        pss.x_lead
+    raw =
+      case omega_dev do
+        nil ->
+          pss.x_lead
 
-      dev ->
-        v_wo = washout_output(pss, dev)
-        pss.x_lead + (pss.t1 / pss.t2) * (v_wo - pss.x_lead)
-    end
+        dev ->
+          v_wo = washout_output(pss, dev)
+          pss.x_lead + pss.t1 / pss.t2 * (v_wo - pss.x_lead)
+      end
 
     raw
     |> max(pss.v_pss_min)
@@ -136,22 +145,26 @@ defmodule PowerModel.Transient.Stabilizer.PSS do
   def step_euler(%__MODULE__{} = pss, omega_dev, dt) do
     {dx_washout, dx_lead} = derivatives(pss, omega_dev)
 
-    %{pss |
-      x_washout: pss.x_washout + dx_washout * dt,
-      x_lead: pss.x_lead + dx_lead * dt
-    }
+    %{pss | x_washout: pss.x_washout + dx_washout * dt, x_lead: pss.x_lead + dx_lead * dt}
   end
 
   @doc """
   Advance PSS state by one trapezoidal corrector step.
   """
-  def step_trapezoidal(%__MODULE__{} = pss_n, %__MODULE__{} = pss_pred, omega_dev_n, omega_dev_pred, dt) do
+  def step_trapezoidal(
+        %__MODULE__{} = pss_n,
+        %__MODULE__{} = pss_pred,
+        omega_dev_n,
+        omega_dev_pred,
+        dt
+      ) do
     {dx_wo_n, dx_lead_n} = derivatives(pss_n, omega_dev_n)
     {dx_wo_pred, dx_lead_pred} = derivatives(pss_pred, omega_dev_pred)
 
-    %{pss_n |
-      x_washout: pss_n.x_washout + dt / 2.0 * (dx_wo_n + dx_wo_pred),
-      x_lead: pss_n.x_lead + dt / 2.0 * (dx_lead_n + dx_lead_pred)
+    %{
+      pss_n
+      | x_washout: pss_n.x_washout + dt / 2.0 * (dx_wo_n + dx_wo_pred),
+        x_lead: pss_n.x_lead + dt / 2.0 * (dx_lead_n + dx_lead_pred)
     }
   end
 end

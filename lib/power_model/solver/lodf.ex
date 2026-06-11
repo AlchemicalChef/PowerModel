@@ -24,22 +24,35 @@ defmodule PowerModel.Solver.LODF do
   alias PowerModel.Solver.Sparse
 
   defstruct [
-    :n,                  # total bus count
-    :n_reduced,          # non-slack bus count (n - 1)
-    :slack_idx,          # slack bus index in original ordering
-    :remap,              # %{original_idx => reduced_idx}
-    :inv_remap,          # %{reduced_idx => original_idx}
-    :bus_index,          # %{bus_id => original_idx}
+    # total bus count
+    :n,
+    # non-slack bus count (n - 1)
+    :n_reduced,
+    # slack bus index in original ordering
+    :slack_idx,
+    # %{original_idx => reduced_idx}
+    :remap,
+    # %{reduced_idx => original_idx}
+    :inv_remap,
+    # %{bus_id => original_idx}
+    :bus_index,
     :base_mva,
-    :b_coo_rows,         # B' matrix COO (reduced coordinates)
+    # B' matrix COO (reduced coordinates)
+    :b_coo_rows,
     :b_coo_cols,
     :b_coo_vals,
-    :branches,           # [%{key, from_idx, to_idx, b_susceptance, rating}]
-    :base_flows,         # %{branch_key => flow_mw}
-    :base_loading,       # %{branch_key => loading_pct}
-    :cumulative_trips,   # MapSet of tripped branch keys
-    :factor_handle,      # ResourceArc for cached LDL^T (nil if not available)
-    :ptdf_cache          # %{reduced_idx => solution_vector} cache of B'^{-1} columns
+    # [%{key, from_idx, to_idx, b_susceptance, rating}]
+    :branches,
+    # %{branch_key => flow_mw}
+    :base_flows,
+    # %{branch_key => loading_pct}
+    :base_loading,
+    # MapSet of tripped branch keys
+    :cumulative_trips,
+    # ResourceArc for cached LDL^T (nil if not available)
+    :factor_handle,
+    # %{reduced_idx => solution_vector} cache of B'^{-1} columns
+    :ptdf_cache
   ]
 
   @island_split_threshold 1.0e-8
@@ -71,13 +84,15 @@ defmodule PowerModel.Solver.LODF do
     branches = build_branch_list(lines, transformers, bus_index, slack_idx, remap, base_mva)
 
     # Extract base flows from solution
-    base_flows = Map.new(base_solution.line_flows, fn {key, flow} ->
-      {key, flow.p_flow_mw}
-    end)
+    base_flows =
+      Map.new(base_solution.line_flows, fn {key, flow} ->
+        {key, flow.p_flow_mw}
+      end)
 
-    base_loading = Map.new(base_solution.line_flows, fn {key, flow} ->
-      {key, flow.loading_pct}
-    end)
+    base_loading =
+      Map.new(base_solution.line_flows, fn {key, flow} ->
+        {key, flow.loading_pct}
+      end)
 
     # Try to cache the factorization
     factor_handle = try_cache_factor(b_rows, b_cols, b_vals, n_reduced)
@@ -154,28 +169,41 @@ defmodule PowerModel.Solver.LODF do
 
             branch_map = Map.new(state.branches, fn b -> {b.key, b} end)
 
-            updated_flows = Map.new(state.base_flows, fn {bkey, f_l} ->
-              if bkey == branch_key or MapSet.member?(state.cumulative_trips, bkey) do
-                {bkey, f_l}
-              else
-                case Map.get(branch_map, bkey) do
-                  nil -> {bkey, f_l}
-                  br ->
-                    xa = if br.from_reduced == nil, do: 0.0, else: :array.get(br.from_reduced, sens_arr)
-                    xb = if br.to_reduced == nil, do: 0.0, else: :array.get(br.to_reduced, sens_arr)
-                    ptdf_lk = br.b_susceptance * (xa - xb)
-                    lodf_lk = ptdf_lk / denom
-                    {bkey, f_l + lodf_lk * f_k}
+            updated_flows =
+              Map.new(state.base_flows, fn {bkey, f_l} ->
+                if bkey == branch_key or MapSet.member?(state.cumulative_trips, bkey) do
+                  {bkey, f_l}
+                else
+                  case Map.get(branch_map, bkey) do
+                    nil ->
+                      {bkey, f_l}
+
+                    br ->
+                      xa =
+                        if br.from_reduced == nil,
+                          do: 0.0,
+                          else: :array.get(br.from_reduced, sens_arr)
+
+                      xb =
+                        if br.to_reduced == nil,
+                          do: 0.0,
+                          else: :array.get(br.to_reduced, sens_arr)
+
+                      ptdf_lk = br.b_susceptance * (xa - xb)
+                      lodf_lk = ptdf_lk / denom
+                      {bkey, f_l + lodf_lk * f_k}
+                  end
                 end
-              end
-            end)
+              end)
 
             updated_flows = Map.delete(updated_flows, branch_key)
 
-            state = %{state |
-              base_flows: updated_flows,
-              base_loading: compute_loading_from_flows(updated_flows, state.branches, state.base_mva),
-              cumulative_trips: MapSet.put(state.cumulative_trips, branch_key)
+            state = %{
+              state
+              | base_flows: updated_flows,
+                base_loading:
+                  compute_loading_from_flows(updated_flows, state.branches, state.base_mva),
+                cumulative_trips: MapSet.put(state.cumulative_trips, branch_key)
             }
 
             {:ok, state, rebuild_flow_map(state)}
@@ -199,55 +227,67 @@ defmodule PowerModel.Solver.LODF do
     case Enum.find(buses, &(&1.bus_type == 3)) do
       nil ->
         gen_by_bus = Enum.group_by(generators, & &1.bus_id)
-        {max_bus_id, _} = Enum.max_by(gen_by_bus, fn {_id, gens} ->
-          Enum.sum_by(gens, & &1.p_max_mw)
-        end, fn -> {hd(buses).id, []} end)
+
+        {max_bus_id, _} =
+          Enum.max_by(
+            gen_by_bus,
+            fn {_id, gens} ->
+              Enum.sum_by(gens, & &1.p_max_mw)
+            end,
+            fn -> {hd(buses).id, []} end
+          )
+
         Map.fetch!(bus_index, max_bus_id)
+
       slack ->
         Map.fetch!(bus_index, slack.id)
     end
   end
 
   defp build_remap(n, slack_idx) do
-    {remap, inv, _} = Enum.reduce(0..(n - 1), {%{}, %{}, 0}, fn i, {m, inv, ri} ->
-      if i == slack_idx do
-        {m, inv, ri}
-      else
-        {Map.put(m, i, ri), Map.put(inv, ri, i), ri + 1}
-      end
-    end)
+    {remap, inv, _} =
+      Enum.reduce(0..(n - 1), {%{}, %{}, 0}, fn i, {m, inv, ri} ->
+        if i == slack_idx do
+          {m, inv, ri}
+        else
+          {Map.put(m, i, ri), Map.put(inv, ri, i), ri + 1}
+        end
+      end)
+
     {remap, inv}
   end
 
   defp build_b_prime_coo(lines, transformers, bus_index, slack_idx, remap) do
     triplets = %{}
 
-    triplets = Enum.reduce(lines, triplets, fn line, bt ->
-      i = Map.fetch!(bus_index, line.from_bus_id)
-      j = Map.fetch!(bus_index, line.to_bus_id)
-      x = line.x_pu || 0.001
-      b = 1.0 / x
+    triplets =
+      Enum.reduce(lines, triplets, fn line, bt ->
+        i = Map.fetch!(bus_index, line.from_bus_id)
+        j = Map.fetch!(bus_index, line.to_bus_id)
+        x = line.x_pu || 0.001
+        b = 1.0 / x
 
-      bt
-      |> maybe_add_triplet(i, i, b, slack_idx, remap)
-      |> maybe_add_triplet(j, j, b, slack_idx, remap)
-      |> maybe_add_triplet(i, j, -b, slack_idx, remap)
-      |> maybe_add_triplet(j, i, -b, slack_idx, remap)
-    end)
+        bt
+        |> maybe_add_triplet(i, i, b, slack_idx, remap)
+        |> maybe_add_triplet(j, j, b, slack_idx, remap)
+        |> maybe_add_triplet(i, j, -b, slack_idx, remap)
+        |> maybe_add_triplet(j, i, -b, slack_idx, remap)
+      end)
 
-    triplets = Enum.reduce(transformers, triplets, fn xfmr, bt ->
-      i = Map.fetch!(bus_index, xfmr.from_bus_id)
-      j = Map.fetch!(bus_index, xfmr.to_bus_id)
-      x = xfmr.x_pu
-      t = xfmr.tap_ratio || 1.0
-      y = 1.0 / x
+    triplets =
+      Enum.reduce(transformers, triplets, fn xfmr, bt ->
+        i = Map.fetch!(bus_index, xfmr.from_bus_id)
+        j = Map.fetch!(bus_index, xfmr.to_bus_id)
+        x = xfmr.x_pu
+        t = xfmr.tap_ratio || 1.0
+        y = 1.0 / x
 
-      bt
-      |> maybe_add_triplet(i, i, y / (t * t), slack_idx, remap)
-      |> maybe_add_triplet(j, j, y, slack_idx, remap)
-      |> maybe_add_triplet(i, j, -y / t, slack_idx, remap)
-      |> maybe_add_triplet(j, i, -y / t, slack_idx, remap)
-    end)
+        bt
+        |> maybe_add_triplet(i, i, y / (t * t), slack_idx, remap)
+        |> maybe_add_triplet(j, j, y, slack_idx, remap)
+        |> maybe_add_triplet(i, j, -y / t, slack_idx, remap)
+        |> maybe_add_triplet(j, i, -y / t, slack_idx, remap)
+      end)
 
     Enum.reduce(triplets, {[], [], []}, fn {{r, c}, v}, {rs, cs, vs} ->
       if abs(v) > 1.0e-15 do
@@ -269,40 +309,42 @@ defmodule PowerModel.Solver.LODF do
   end
 
   defp build_branch_list(lines, transformers, bus_index, slack_idx, remap, _base_mva) do
-    line_branches = Enum.map(lines, fn line ->
-      i = Map.fetch!(bus_index, line.from_bus_id)
-      j = Map.fetch!(bus_index, line.to_bus_id)
-      b = 1.0 / (line.x_pu || 0.001)
+    line_branches =
+      Enum.map(lines, fn line ->
+        i = Map.fetch!(bus_index, line.from_bus_id)
+        j = Map.fetch!(bus_index, line.to_bus_id)
+        b = 1.0 / (line.x_pu || 0.001)
 
-      %{
-        key: {:line, line.id},
-        from_idx: i,
-        to_idx: j,
-        from_reduced: Map.get(remap, i),
-        to_reduced: Map.get(remap, j),
-        b_susceptance: b,
-        rating: line.rating_a_mva || 0.0,
-        is_slack_connected: i == slack_idx or j == slack_idx
-      }
-    end)
+        %{
+          key: {:line, line.id},
+          from_idx: i,
+          to_idx: j,
+          from_reduced: Map.get(remap, i),
+          to_reduced: Map.get(remap, j),
+          b_susceptance: b,
+          rating: line.rating_a_mva || 0.0,
+          is_slack_connected: i == slack_idx or j == slack_idx
+        }
+      end)
 
-    xfmr_branches = Enum.map(transformers, fn xfmr ->
-      i = Map.fetch!(bus_index, xfmr.from_bus_id)
-      j = Map.fetch!(bus_index, xfmr.to_bus_id)
-      t = xfmr.tap_ratio || 1.0
-      b = 1.0 / (xfmr.x_pu * t)
+    xfmr_branches =
+      Enum.map(transformers, fn xfmr ->
+        i = Map.fetch!(bus_index, xfmr.from_bus_id)
+        j = Map.fetch!(bus_index, xfmr.to_bus_id)
+        t = xfmr.tap_ratio || 1.0
+        b = 1.0 / (xfmr.x_pu * t)
 
-      %{
-        key: {:transformer, xfmr.id},
-        from_idx: i,
-        to_idx: j,
-        from_reduced: Map.get(remap, i),
-        to_reduced: Map.get(remap, j),
-        b_susceptance: b,
-        rating: xfmr.rated_mva || 0.0,
-        is_slack_connected: i == slack_idx or j == slack_idx
-      }
-    end)
+        %{
+          key: {:transformer, xfmr.id},
+          from_idx: i,
+          to_idx: j,
+          from_reduced: Map.get(remap, i),
+          to_reduced: Map.get(remap, j),
+          b_susceptance: b,
+          rating: xfmr.rated_mva || 0.0,
+          is_slack_connected: i == slack_idx or j == slack_idx
+        }
+      end)
 
     line_branches ++ xfmr_branches
   end
@@ -312,17 +354,19 @@ defmodule PowerModel.Solver.LODF do
   defp compute_sensitivity(state, from_reduced, to_reduced) do
     rhs = List.duplicate(0.0, state.n_reduced)
 
-    rhs = if from_reduced != nil do
-      List.replace_at(rhs, from_reduced, 1.0)
-    else
-      rhs
-    end
+    rhs =
+      if from_reduced != nil do
+        List.replace_at(rhs, from_reduced, 1.0)
+      else
+        rhs
+      end
 
-    rhs = if to_reduced != nil do
-      List.replace_at(rhs, to_reduced, -1.0)
-    else
-      rhs
-    end
+    rhs =
+      if to_reduced != nil do
+        List.replace_at(rhs, to_reduced, -1.0)
+      else
+        rhs
+      end
 
     solve_with_cache(state, rhs)
   end
@@ -340,56 +384,19 @@ defmodule PowerModel.Solver.LODF do
 
   defp solve_with_cache(state, rhs) do
     try do
-      case Sparse.sparse_solve(state.b_coo_rows, state.b_coo_cols, state.b_coo_vals, rhs, state.n_reduced) do
+      case Sparse.sparse_solve(
+             state.b_coo_rows,
+             state.b_coo_cols,
+             state.b_coo_vals,
+             rhs,
+             state.n_reduced
+           ) do
         {:ok, x} -> x
         _ -> nil
       end
     rescue
       _ -> nil
     end
-  end
-
-  defp ptdf_at(_ptdf_col, nil), do: 0.0
-  defp ptdf_at(ptdf_col, idx), do: Enum.at(ptdf_col, idx, 0.0)
-
-  defp update_all_flows(state, tripped_branch, ptdf_from, ptdf_to, f_k, denom) do
-    Map.new(state.base_flows, fn {branch_key, f_l} ->
-      if MapSet.member?(state.cumulative_trips, branch_key) do
-        {branch_key, f_l}
-      else
-        branch = Enum.find(state.branches, fn b -> b.key == branch_key end)
-
-        if branch == nil do
-          {branch_key, f_l}
-        else
-          # LODF[l,k] = b_l * (ptdf[from_l, from_k] - ptdf[from_l, to_k]
-          #                    - ptdf[to_l, from_k] + ptdf[to_l, to_k]) / denom
-          # Simplified using PTDF columns at tripped line endpoints:
-          lodf = compute_lodf_entry(branch, tripped_branch, ptdf_from, ptdf_to, denom)
-
-          {branch_key, f_l + lodf * f_k}
-        end
-      end
-    end)
-  end
-
-  defp compute_lodf_entry(branch_l, _tripped, ptdf_from, ptdf_to, denom) do
-    # PTDF[l, from_k] - PTDF[l, to_k] gives the sensitivity of line l's flow
-    # to injection at from_k withdrawn at to_k.
-    # For line l with endpoints (a, b) and susceptance b_l:
-    # flow_l = b_l * (theta_a - theta_b)
-    # delta_flow_l = b_l * (delta_theta_a - delta_theta_b)
-    # where delta_theta = B'^{-1} * (e_from - e_to) scaled by f_k
-
-    ptdf_a_from = ptdf_at(ptdf_from, branch_l.from_reduced)
-    ptdf_a_to = ptdf_at(ptdf_to, branch_l.from_reduced)
-    ptdf_b_from = ptdf_at(ptdf_from, branch_l.to_reduced)
-    ptdf_b_to = ptdf_at(ptdf_to, branch_l.to_reduced)
-
-    # Sensitivity of line l to injection at tripped line endpoints
-    sensitivity = branch_l.b_susceptance * ((ptdf_a_from - ptdf_a_to) - (ptdf_b_from - ptdf_b_to))
-
-    sensitivity / denom
   end
 
   defp compute_loading_from_flows(flows, branches, _base_mva) do
@@ -410,11 +417,12 @@ defmodule PowerModel.Solver.LODF do
       rating = if branch, do: branch.rating, else: 0.0
       loading = if rating > 0.0, do: abs(flow_mw) / rating * 100.0, else: 0.0
 
-      {key, %{
-        p_flow_mw: flow_mw,
-        loading_pct: loading,
-        overloaded: rating > 0.0 and abs(flow_mw) > rating
-      }}
+      {key,
+       %{
+         p_flow_mw: flow_mw,
+         loading_pct: loading,
+         overloaded: rating > 0.0 and abs(flow_mw) > rating
+       }}
     end)
   end
 

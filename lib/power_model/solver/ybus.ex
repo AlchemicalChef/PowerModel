@@ -37,6 +37,7 @@ defmodule PowerModel.Solver.YBus do
         # Add bus shunt susceptance (Bs from MATPOWER = MVAr at 1.0 pu voltage)
         Enum.reduce(buses, acc, fn bus, acc2 ->
           bs_mvar = Map.get(bus, :b_shunt_mvar) || 0.0
+
           if bs_mvar != 0.0 do
             idx = Map.fetch!(bus_index_map, bus.id)
             bs_pu = bs_mvar / base_mva
@@ -63,16 +64,18 @@ defmodule PowerModel.Solver.YBus do
 
   @doc "Remove a branch and return updated triplets (for cascade simulation)"
   def remove_branch(%__MODULE__{} = ybus, %TransmissionLine{} = line) do
-    anti_triplets = line_triplets(line, ybus.bus_index_map)
-    |> Enum.map(fn {r, c, {re, im}} -> {r, c, {-re, -im}} end)
+    anti_triplets =
+      line_triplets(line, ybus.bus_index_map)
+      |> Enum.map(fn {r, c, {re, im}} -> {r, c, {-re, -im}} end)
 
     updated = consolidate_triplets(ybus.triplets ++ anti_triplets, ybus.n)
     %{ybus | triplets: updated}
   end
 
   def remove_branch(%__MODULE__{} = ybus, %Transformer{} = xfmr) do
-    anti_triplets = transformer_triplets(xfmr, ybus.bus_index_map)
-    |> Enum.map(fn {r, c, {re, im}} -> {r, c, {-re, -im}} end)
+    anti_triplets =
+      transformer_triplets(xfmr, ybus.bus_index_map)
+      |> Enum.map(fn {r, c, {re, im}} -> {r, c, {-re, -im}} end)
 
     updated = consolidate_triplets(ybus.triplets ++ anti_triplets, ybus.n)
     %{ybus | triplets: updated}
@@ -80,7 +83,12 @@ defmodule PowerModel.Solver.YBus do
 
   @doc "Convert to dense Nx matrix (for small systems / testing)"
   def to_dense(%__MODULE__{n: n, triplets: triplets}) do
-    real = Nx.broadcast(0.0, {n, n}) |> Nx.to_batched(1) |> Enum.map(&Nx.to_flat_list/1) |> List.flatten()
+    real =
+      Nx.broadcast(0.0, {n, n})
+      |> Nx.to_batched(1)
+      |> Enum.map(&Nx.to_flat_list/1)
+      |> List.flatten()
+
     imag = List.duplicate(0.0, n * n)
 
     {real_list, imag_list} =
@@ -231,9 +239,11 @@ defmodule PowerModel.Solver.YBus do
     triplets
     |> Enum.group_by(fn {r, c, _} -> {r, c} end)
     |> Enum.map(fn {{r, c}, entries} ->
-      {re_sum, im_sum} = Enum.reduce(entries, {0.0, 0.0}, fn {_, _, {re, im}}, {ra, ia} ->
-        {ra + re, ia + im}
-      end)
+      {re_sum, im_sum} =
+        Enum.reduce(entries, {0.0, 0.0}, fn {_, _, {re, im}}, {ra, ia} ->
+          {ra + re, ia + im}
+        end)
+
       {r, c, {re_sum, im_sum}}
     end)
     |> Enum.reject(fn {_, _, {re, im}} -> abs(re) < 1.0e-15 and abs(im) < 1.0e-15 end)

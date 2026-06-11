@@ -20,8 +20,15 @@ defmodule PowerModel.Grid.HourlyLoadProfile do
 
   def changeset(profile, attrs) do
     profile
-    |> cast(attrs, [:ba_code, :ba_name, :period, :demand_mw, :generation_mw,
-                     :interchange_mw, :forecast_mw])
+    |> cast(attrs, [
+      :ba_code,
+      :ba_name,
+      :period,
+      :demand_mw,
+      :generation_mw,
+      :interchange_mw,
+      :forecast_mw
+    ])
     |> validate_required([:ba_code, :period])
     |> unique_constraint([:ba_code, :period])
   end

@@ -7,25 +7,44 @@ defmodule PowerModel.Transient.State do
   """
 
   defstruct [
-    :t,              # current simulation time (seconds)
-    :dt,             # timestep size (seconds)
-    :n_gen,          # number of generators
-    :gen_ids,        # ordered list of generator IDs
-    :gen_bus_ids,    # ordered list of bus IDs (parallel to gen_ids)
-    :delta,          # rotor angles [n_gen] (radians)
-    :omega,          # rotor speeds [n_gen] (pu, 1.0 = synchronous)
-    :p_mech,         # mechanical power [n_gen] (pu on system base)
-    :e_prime,        # internal voltage magnitude [n_gen] (pu)
-    :h,              # inertia constants [n_gen] (seconds)
-    :d,              # damping coefficients [n_gen]
-    :y_red_rows,     # reduced Y-bus COO row indices
-    :y_red_cols,     # reduced Y-bus COO column indices
-    :y_red_g,        # reduced Y-bus conductance values
-    :y_red_b,        # reduced Y-bus susceptance values
-    :base_mva,       # system MVA base
-    :events,         # list of %{time: float, gen_index: int, p_mech_new: float}
-    :trajectory,     # accumulated [{t, deltas, omegas}]
-    :tripped_gens    # MapSet of gen indices that have been tripped (OOS/relay)
+    # current simulation time (seconds)
+    :t,
+    # timestep size (seconds)
+    :dt,
+    # number of generators
+    :n_gen,
+    # ordered list of generator IDs
+    :gen_ids,
+    # ordered list of bus IDs (parallel to gen_ids)
+    :gen_bus_ids,
+    # rotor angles [n_gen] (radians)
+    :delta,
+    # rotor speeds [n_gen] (pu, 1.0 = synchronous)
+    :omega,
+    # mechanical power [n_gen] (pu on system base)
+    :p_mech,
+    # internal voltage magnitude [n_gen] (pu)
+    :e_prime,
+    # inertia constants [n_gen] (seconds)
+    :h,
+    # damping coefficients [n_gen]
+    :d,
+    # reduced Y-bus COO row indices
+    :y_red_rows,
+    # reduced Y-bus COO column indices
+    :y_red_cols,
+    # reduced Y-bus conductance values
+    :y_red_g,
+    # reduced Y-bus susceptance values
+    :y_red_b,
+    # system MVA base
+    :base_mva,
+    # list of %{time: float, gen_index: int, p_mech_new: float}
+    :events,
+    # accumulated [{t, deltas, omegas}]
+    :trajectory,
+    # MapSet of gen indices that have been tripped (OOS/relay)
+    :tripped_gens
   ]
 
   @omega_base 2.0 * :math.pi() * 60.0
@@ -41,12 +60,13 @@ defmodule PowerModel.Transient.State do
     dt = Keyword.get(opts, :dt, 0.005)
 
     # Only include synchronous generators (inertia > 0)
-    sync_gens = generators
-    |> Enum.filter(fn g ->
-      h = Map.get(g, :inertia_h) || 0.0
-      h > 0.0 and (Map.get(g, :status, "in_service") == "in_service")
-    end)
-    |> Enum.sort_by(& &1.id)
+    sync_gens =
+      generators
+      |> Enum.filter(fn g ->
+        h = Map.get(g, :inertia_h) || 0.0
+        h > 0.0 and Map.get(g, :status, "in_service") == "in_service"
+      end)
+      |> Enum.sort_by(& &1.id)
 
     n_gen = length(sync_gens)
     gen_ids = Enum.map(sync_gens, & &1.id)
@@ -68,9 +88,15 @@ defmodule PowerModel.Transient.State do
         # Compute internal voltage and angle
         # E' = sqrt((V + Q*X'd/V)^2 + (P*X'd/V)^2)
         # For simplicity with DC solution (V=1, Q=0): E' ≈ sqrt(1 + (P*X'd)^2)
-        q_pu = 0.0  # DC solution doesn't give Q; approximate
-        e_prime = :math.sqrt(:math.pow(vm + q_pu * x_d_prime / max(vm, 0.01), 2) +
-                             :math.pow(p_pu * x_d_prime / max(vm, 0.01), 2))
+        # DC solution doesn't give Q; approximate
+        q_pu = 0.0
+
+        e_prime =
+          :math.sqrt(
+            :math.pow(vm + q_pu * x_d_prime / max(vm, 0.01), 2) +
+              :math.pow(p_pu * x_d_prime / max(vm, 0.01), 2)
+          )
+
         e_prime = max(e_prime, 0.5)
 
         # Rotor angle: delta = va + arcsin(P * X'd / (E' * V))
@@ -81,8 +107,8 @@ defmodule PowerModel.Transient.State do
         h_val = Map.get(g, :inertia_h) || 3.0
         d_val = Map.get(g, :d_factor) || 0.0
 
-        {ds ++ [delta], ws ++ [1.0], ps ++ [p_pu], es ++ [e_prime],
-         hs ++ [h_val], dvals ++ [d_val]}
+        {ds ++ [delta], ws ++ [1.0], ps ++ [p_pu], es ++ [e_prime], hs ++ [h_val],
+         dvals ++ [d_val]}
       end)
 
     %__MODULE__{
@@ -119,7 +145,9 @@ defmodule PowerModel.Transient.State do
   @doc "Schedule a fault event (change P_mech of a generator at a given time)"
   def add_event(%__MODULE__{} = state, time_s, gen_id, new_p_mech_pu) do
     case gen_index(state, gen_id) do
-      nil -> state
+      nil ->
+        state
+
       idx ->
         event = %{time: time_s, gen_index: idx, p_mech_new: new_p_mech_pu}
         %{state | events: [event | state.events]}

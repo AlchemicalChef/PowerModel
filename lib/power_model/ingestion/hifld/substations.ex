@@ -28,28 +28,30 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
   def derive_from_api do
     IO.puts("Deriving substations from transmission line endpoints...")
 
-    sub_data = @service
-    |> API.stream_features(fields: "SUB_1,SUB_2,VOLTAGE,VOLT_CLASS")
-    |> Stream.flat_map(&extract_sub_refs/1)
-    |> Enum.reduce(%{}, fn {name, lon, lat, voltage}, acc ->
-      existing = Map.get(acc, name, %{lons: [], lats: [], voltages: []})
+    sub_data =
+      @service
+      |> API.stream_features(fields: "SUB_1,SUB_2,VOLTAGE,VOLT_CLASS")
+      |> Stream.flat_map(&extract_sub_refs/1)
+      |> Enum.reduce(%{}, fn {name, lon, lat, voltage}, acc ->
+        existing = Map.get(acc, name, %{lons: [], lats: [], voltages: []})
 
-      Map.put(acc, name, %{
-        lons: [lon | existing.lons],
-        lats: [lat | existing.lats],
-        voltages: if(voltage, do: [voltage | existing.voltages], else: existing.voltages)
-      })
-    end)
+        Map.put(acc, name, %{
+          lons: [lon | existing.lons],
+          lats: [lat | existing.lats],
+          voltages: if(voltage, do: [voltage | existing.voltages], else: existing.voltages)
+        })
+      end)
 
     IO.puts("Found #{map_size(sub_data)} unique substation references.")
 
-    sub_data = sub_data
-    |> Enum.reject(fn {name, _} ->
-      is_nil(name) or name == "" or
-      String.starts_with?(String.upcase(name), "UNKNOWN") or
-      String.starts_with?(String.upcase(name), "TAP")
-    end)
-    |> Map.new()
+    sub_data =
+      sub_data
+      |> Enum.reject(fn {name, _} ->
+        is_nil(name) or name == "" or
+          String.starts_with?(String.upcase(name), "UNKNOWN") or
+          String.starts_with?(String.upcase(name), "TAP")
+      end)
+      |> Map.new()
 
     IO.puts("After filtering unknowns: #{map_size(sub_data)} substations.")
 
@@ -58,9 +60,10 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
     sub_data
     |> Enum.chunk_every(500)
     |> Enum.each(fn batch ->
-      entries = Enum.map(batch, fn {name, data} ->
-        build_substation(name, data)
-      end)
+      entries =
+        Enum.map(batch, fn {name, data} ->
+          build_substation(name, data)
+        end)
 
       insert_batch(entries)
       :counters.add(counter, 1, length(batch))
@@ -111,8 +114,11 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
       end)
 
       total = :counters.get(counter, 1) + :counters.get(counter, 2)
+
       if rem(total, 1000) < 500 do
-        Logger.info("  processed #{total} (#{:counters.get(counter, 1)} enriched, #{:counters.get(counter, 2)} new)...")
+        Logger.info(
+          "  processed #{total} (#{:counters.get(counter, 1)} enriched, #{:counters.get(counter, 2)} new)..."
+        )
       end
     end)
 
@@ -126,13 +132,17 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
     Stream.resource(
       fn -> 0 end,
       fn
-        :done -> {:halt, :done}
+        :done ->
+          {:halt, :done}
+
         offset ->
           case fetch_rutgers_page(offset) do
             {:ok, features} when length(features) < @rutgers_page_size ->
               {features, :done}
+
             {:ok, features} ->
               {features, offset + @rutgers_page_size}
+
             {:error, reason} ->
               Logger.warning("Rutgers API error at offset #{offset}: #{inspect(reason)}")
               {:halt, :done}
@@ -146,7 +156,8 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
   defp fetch_rutgers_page(offset) do
     params = [
       where: "1=1",
-      outFields: "NAME,CITY,STATE,ZIP,TYPE,STATUS,COUNTY,LATITUDE,LONGITUDE,NAICS_CODE,NAICS_DESC,SOURCE,LINES,MAX_VOLT,MIN_VOLT,MAX_INFER,MIN_INFER",
+      outFields:
+        "NAME,CITY,STATE,ZIP,TYPE,STATUS,COUNTY,LATITUDE,LONGITUDE,NAICS_CODE,NAICS_DESC,SOURCE,LINES,MAX_VOLT,MIN_VOLT,MAX_INFER,MIN_INFER",
       f: "json",
       resultRecordCount: @rutgers_page_size,
       resultOffset: offset,
@@ -154,13 +165,21 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
       outSR: "4326"
     ]
 
-    case Req.get(@rutgers_url, params: params, receive_timeout: 60_000, retry: :transient, max_retries: 3) do
+    case Req.get(@rutgers_url,
+           params: params,
+           receive_timeout: 60_000,
+           retry: :transient,
+           max_retries: 3
+         ) do
       {:ok, %{status: 200, body: %{"features" => features}}} when is_list(features) ->
         {:ok, features}
+
       {:ok, %{status: 200, body: %{"error" => error}}} ->
         {:error, error}
+
       {:ok, resp} ->
         {:error, "HTTP #{resp.status}"}
+
       {:error, err} ->
         {:error, err}
     end
@@ -195,11 +214,14 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
       }
     end
   end
+
   defp parse_rutgers_feature(_), do: nil
 
   defp clean_name(nil), do: nil
+
   defp clean_name(name) when is_binary(name) do
     trimmed = String.trim(name)
+
     if trimmed == "" or String.upcase(trimmed) in ["UNKNOWN", "NOT AVAILABLE", "N/A"],
       do: nil,
       else: trimmed
@@ -207,23 +229,27 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
 
   defp parse_float_val(nil), do: nil
   defp parse_float_val(val) when is_number(val) and val > 0, do: val * 1.0
+
   defp parse_float_val(val) when is_binary(val) do
     case Float.parse(String.trim(val)) do
       {f, _} when f > 0 -> f
       _ -> nil
     end
   end
+
   defp parse_float_val(_), do: nil
 
   defp parse_int_val(nil), do: nil
   defp parse_int_val(val) when is_integer(val), do: val
   defp parse_int_val(val) when is_float(val), do: round(val)
+
   defp parse_int_val(val) when is_binary(val) do
     case Integer.parse(val) do
       {n, _} -> n
       :error -> nil
     end
   end
+
   defp parse_int_val(_), do: nil
 
   @grid_size 0.01
@@ -235,6 +261,7 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
           bucket = {trunc(lon / @grid_size), trunc(lat / @grid_size)}
           entry = %{id: id, name: name, lon: lon, lat: lat, hifld_id: hifld_id}
           Map.update(acc, bucket, [entry], &[entry | &1])
+
         _ ->
           acc
       end
@@ -256,9 +283,10 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
         :no_match
 
       list ->
-        best = Enum.min_by(list, fn sub ->
-          haversine_approx(attrs.lon, attrs.lat, sub.lon, sub.lat)
-        end)
+        best =
+          Enum.min_by(list, fn sub ->
+            haversine_approx(attrs.lon, attrs.lat, sub.lon, sub.lat)
+          end)
 
         dist = haversine_approx(attrs.lon, attrs.lat, best.lon, best.lat)
         if dist < 1.0, do: {:match, best.id}, else: :no_match
@@ -277,16 +305,18 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
       |> maybe_put(:max_voltage_kv, attrs.max_voltage_kv)
       |> maybe_put(:min_voltage_kv, attrs.min_voltage_kv)
 
-    updates = if attrs.name do
-      sub = Repo.get(Substation, substation_id)
-      if sub && sub.name == sub.hifld_id do
-        Map.put(updates, :name, attrs.name)
+    updates =
+      if attrs.name do
+        sub = Repo.get(Substation, substation_id)
+
+        if sub && sub.name == sub.hifld_id do
+          Map.put(updates, :name, attrs.name)
+        else
+          updates
+        end
       else
         updates
       end
-    else
-      updates
-    end
 
     if map_size(updates) > 0 do
       from(s in Substation, where: s.id == ^substation_id)
@@ -333,39 +363,51 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
 
     refs = []
 
-    refs = case {attrs["SUB_1"], first_point(paths)} do
-      {name, {lon, lat}} when is_binary(name) and name != "" ->
-        [{name, lon, lat, voltage} | refs]
-      _ -> refs
-    end
+    refs =
+      case {attrs["SUB_1"], first_point(paths)} do
+        {name, {lon, lat}} when is_binary(name) and name != "" ->
+          [{name, lon, lat, voltage} | refs]
 
-    refs = case {attrs["SUB_2"], last_point(paths)} do
-      {name, {lon, lat}} when is_binary(name) and name != "" ->
-        [{name, lon, lat, voltage} | refs]
-      _ -> refs
-    end
+        _ ->
+          refs
+      end
+
+    refs =
+      case {attrs["SUB_2"], last_point(paths)} do
+        {name, {lon, lat}} when is_binary(name) and name != "" ->
+          [{name, lon, lat, voltage} | refs]
+
+        _ ->
+          refs
+      end
 
     refs
   end
+
   defp extract_sub_refs(_), do: []
 
   defp first_point([]), do: nil
+
   defp first_point([path | _]) when is_list(path) do
     case path do
       [[lon, lat | _] | _] -> {lon, lat}
       _ -> nil
     end
   end
+
   defp first_point(_), do: nil
 
   defp last_point([]), do: nil
+
   defp last_point(paths) when is_list(paths) do
     path = List.last(paths)
+
     case List.last(path || []) do
       [lon, lat | _] -> {lon, lat}
       _ -> nil
     end
   end
+
   defp last_point(_), do: nil
 
   defp build_substation(name, data) do
@@ -398,10 +440,12 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
 
   defp read_shapefile(path) do
     shp_path = Path.join(path, "Electric_Substations.shp")
+
     if File.exists?(shp_path) do
       Exshape.from_zip(shp_path)
     else
       zip_path = Path.join(path, "Electric_Substations.zip")
+
       if File.exists?(zip_path) do
         Exshape.from_zip(zip_path)
       else
@@ -434,6 +478,7 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
   end
 
   defp insert_substation(nil), do: :ok
+
   defp insert_substation(attrs) do
     %Substation{}
     |> Substation.changeset(attrs)
@@ -443,15 +488,18 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
   defp extract_point(%Exshape.Shp.Point{x: lon, y: lat}) do
     %Geo.Point{coordinates: {lon, lat}, srid: 4326}
   end
+
   defp extract_point(_), do: nil
 
   defp get_field(row, field_name) when is_map(row) do
     Map.get(row, field_name) || Map.get(row, String.downcase(field_name))
   end
+
   defp get_field(_, _), do: nil
 
   defp parse_float(nil), do: nil
   defp parse_float(val) when is_number(val), do: val * 1.0
+
   defp parse_float(val) when is_binary(val) do
     case Float.parse(val) do
       {f, _} -> f
@@ -461,32 +509,41 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
 
   defp parse_voltage(nil, volt_class), do: parse_volt_class(volt_class)
   defp parse_voltage(val, _) when is_number(val) and val > 0, do: val * 1.0
+
   defp parse_voltage(val, volt_class) when is_binary(val) do
     case Float.parse(String.trim(val)) do
       {f, _} when f > 0 -> f
       _ -> parse_volt_class(volt_class)
     end
   end
+
   defp parse_voltage(_, volt_class), do: parse_volt_class(volt_class)
 
   defp parse_volt_class(nil), do: nil
+
   defp parse_volt_class(val) when is_binary(val) do
     case Regex.run(~r/(\d+)\s*[-–]\s*(\d+)/, val) do
       [_, low, high] ->
         {l, _} = Integer.parse(low)
         {h, _} = Integer.parse(high)
         (l + h) / 2.0
-      _ -> nil
+
+      _ ->
+        nil
     end
   end
+
   defp parse_volt_class(_), do: nil
 
   defp parse_status(nil), do: "in_service"
+
   defp parse_status(status) when is_binary(status) do
     normalized = status |> String.upcase() |> String.trim()
+
     if normalized in ["IN SERVICE", "ACTIVE", "OPERATIONAL"],
       do: "in_service",
       else: "out_of_service"
   end
+
   defp parse_status(_), do: "in_service"
 end

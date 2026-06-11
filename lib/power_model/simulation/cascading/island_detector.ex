@@ -30,17 +30,19 @@ defmodule PowerModel.Simulation.Cascading.IslandDetector do
   Returns map of island_index => slack_bus_id.
   """
   def assign_slack_buses(islands, generators) do
-    gen_capacity = Enum.group_by(generators, & &1.bus_id)
-    |> Map.new(fn {bus_id, gens} ->
-      {bus_id, Enum.sum(Enum.map(gens, & &1.p_max_mw))}
-    end)
+    gen_capacity =
+      Enum.group_by(generators, & &1.bus_id)
+      |> Map.new(fn {bus_id, gens} ->
+        {bus_id, Enum.sum(Enum.map(gens, & &1.p_max_mw))}
+      end)
 
     islands
     |> Enum.with_index()
     |> Enum.map(fn {island, idx} ->
-      slack = island
-      |> MapSet.to_list()
-      |> Enum.max_by(fn bus_id -> Map.get(gen_capacity, bus_id, 0.0) end, fn -> nil end)
+      slack =
+        island
+        |> MapSet.to_list()
+        |> Enum.max_by(fn bus_id -> Map.get(gen_capacity, bus_id, 0.0) end, fn -> nil end)
 
       {idx, slack}
     end)
@@ -54,13 +56,15 @@ defmodule PowerModel.Simulation.Cascading.IslandDetector do
   def island_balance(island, generators, loads) do
     island_set = if is_struct(island, MapSet), do: island, else: MapSet.new(island)
 
-    gen_mw = generators
-    |> Enum.filter(&MapSet.member?(island_set, &1.bus_id))
-    |> Enum.sum_by(fn g -> g.p_max_mw * (g.capacity_factor || 1.0) end)
+    gen_mw =
+      generators
+      |> Enum.filter(&MapSet.member?(island_set, &1.bus_id))
+      |> Enum.sum_by(fn g -> g.p_max_mw * (g.capacity_factor || 1.0) end)
 
-    load_mw = loads
-    |> Enum.filter(&MapSet.member?(island_set, &1.bus_id))
-    |> Enum.sum_by(& &1.p_mw)
+    load_mw =
+      loads
+      |> Enum.filter(&MapSet.member?(island_set, &1.bus_id))
+      |> Enum.sum_by(& &1.p_mw)
 
     balance = gen_mw - load_mw
     if balance >= 0, do: {:ok, balance}, else: {:deficit, abs(balance)}
@@ -71,16 +75,33 @@ defmodule PowerModel.Simulation.Cascading.IslandDetector do
   defp build_adjacency(lines, transformers) do
     adj = %{}
 
-    adj = Enum.reduce(lines, adj, fn line, acc ->
-      acc
-      |> Map.update(line.from_bus_id, MapSet.new([line.to_bus_id]), &MapSet.put(&1, line.to_bus_id))
-      |> Map.update(line.to_bus_id, MapSet.new([line.from_bus_id]), &MapSet.put(&1, line.from_bus_id))
-    end)
+    adj =
+      Enum.reduce(lines, adj, fn line, acc ->
+        acc
+        |> Map.update(
+          line.from_bus_id,
+          MapSet.new([line.to_bus_id]),
+          &MapSet.put(&1, line.to_bus_id)
+        )
+        |> Map.update(
+          line.to_bus_id,
+          MapSet.new([line.from_bus_id]),
+          &MapSet.put(&1, line.from_bus_id)
+        )
+      end)
 
     Enum.reduce(transformers, adj, fn xfmr, acc ->
       acc
-      |> Map.update(xfmr.from_bus_id, MapSet.new([xfmr.to_bus_id]), &MapSet.put(&1, xfmr.to_bus_id))
-      |> Map.update(xfmr.to_bus_id, MapSet.new([xfmr.from_bus_id]), &MapSet.put(&1, xfmr.from_bus_id))
+      |> Map.update(
+        xfmr.from_bus_id,
+        MapSet.new([xfmr.to_bus_id]),
+        &MapSet.put(&1, xfmr.to_bus_id)
+      )
+      |> Map.update(
+        xfmr.to_bus_id,
+        MapSet.new([xfmr.from_bus_id]),
+        &MapSet.put(&1, xfmr.from_bus_id)
+      )
     end)
   end
 
@@ -90,9 +111,12 @@ defmodule PowerModel.Simulation.Cascading.IslandDetector do
 
   defp bfs_loop(queue, visited, adj, valid_buses) do
     case :queue.out(queue) do
-      {:empty, _} -> visited
+      {:empty, _} ->
+        visited
+
       {{:value, node}, queue} ->
         neighbors = Map.get(adj, node, MapSet.new())
+
         {queue, visited} =
           Enum.reduce(MapSet.to_list(neighbors), {queue, visited}, fn neighbor, {q, v} ->
             if MapSet.member?(v, neighbor) or not MapSet.member?(valid_buses, neighbor) do
@@ -101,6 +125,7 @@ defmodule PowerModel.Simulation.Cascading.IslandDetector do
               {:queue.in(neighbor, q), MapSet.put(v, neighbor)}
             end
           end)
+
         bfs_loop(queue, visited, adj, valid_buses)
     end
   end

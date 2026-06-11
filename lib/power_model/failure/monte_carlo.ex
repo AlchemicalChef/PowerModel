@@ -18,13 +18,13 @@ defmodule PowerModel.Failure.MonteCarlo do
   alias PowerModel.Solver.LODF
 
   @type contingency_result :: %{
-    tripped: [{:line, integer()}],
-    max_loading_pct: float(),
-    overloaded_count: integer(),
-    mw_at_risk: float(),
-    island_split: boolean(),
-    score: float()
-  }
+          tripped: [{:line, integer()}],
+          max_loading_pct: float(),
+          overloaded_count: integer(),
+          mw_at_risk: float(),
+          island_split: boolean(),
+          score: float()
+        }
 
   # ---------------------------------------------------------------------------
   # N-2 screening
@@ -194,10 +194,11 @@ defmodule PowerModel.Failure.MonteCarlo do
     overloaded_count = Enum.count(flow_results, &elem(&1, 2))
     mw_at_risk = flow_results |> Enum.map(&elem(&1, 3)) |> Enum.sum()
 
-    score = max_loading * 0.4 +
-            overloaded_count * 10.0 +
-            mw_at_risk * 0.1 +
-            if(island_split, do: 500.0, else: 0.0)
+    score =
+      max_loading * 0.4 +
+        overloaded_count * 10.0 +
+        mw_at_risk * 0.1 +
+        if(island_split, do: 500.0, else: 0.0)
 
     %{
       tripped: tripped_keys,
@@ -275,19 +276,23 @@ defmodule PowerModel.Failure.MonteCarlo do
   end
 
   defp ensure_k_unique(indices, k, _n) when length(indices) >= k, do: Enum.take(indices, k)
+
   defp ensure_k_unique(indices, k, n) do
     used = MapSet.new(indices)
-    extras = Enum.reduce_while(0..(n - 1), {indices, used}, fn i, {acc, set} ->
-      if length(acc) >= k do
-        {:halt, {acc, set}}
-      else
-        if MapSet.member?(set, i) do
-          {:cont, {acc, set}}
+
+    extras =
+      Enum.reduce_while(0..(n - 1), {indices, used}, fn i, {acc, set} ->
+        if length(acc) >= k do
+          {:halt, {acc, set}}
         else
-          {:cont, {[i | acc], MapSet.put(set, i)}}
+          if MapSet.member?(set, i) do
+            {:cont, {acc, set}}
+          else
+            {:cont, {[i | acc], MapSet.put(set, i)}}
+          end
         end
-      end
-    end)
+      end)
+
     elem(extras, 0) |> Enum.take(k)
   end
 
@@ -298,7 +303,9 @@ defmodule PowerModel.Failure.MonteCarlo do
       |> Enum.reject(fn line -> line.id in scenario.forced_trips end)
       |> Enum.map(fn line ->
         case Map.get(scenario.line_deratings, line.id) do
-          nil -> line
+          nil ->
+            line
+
           factor ->
             rating = Map.get(line, :rating_a_mva) || 0.0
             %{line | rating_a_mva: rating * factor}
@@ -309,7 +316,9 @@ defmodule PowerModel.Failure.MonteCarlo do
       Map.get(snapshot, :loads, [])
       |> Enum.map(fn load ->
         case Map.get(scenario.load_multipliers, load.id) do
-          nil -> load
+          nil ->
+            load
+
           mult ->
             q = Map.get(load, :q_mvar) || 0.0
             %{load | p_mw: load.p_mw * mult, q_mvar: q * mult}
@@ -325,10 +334,6 @@ defmodule PowerModel.Failure.MonteCarlo do
         end
       end)
 
-    %{snapshot |
-      lines: updated_lines,
-      loads: updated_loads,
-      generators: updated_gens
-    }
+    %{snapshot | lines: updated_lines, loads: updated_loads, generators: updated_gens}
   end
 end

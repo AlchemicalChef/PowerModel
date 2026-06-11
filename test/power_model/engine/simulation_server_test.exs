@@ -44,7 +44,7 @@ defmodule PowerModel.Engine.SimulationServerTest do
       capacity_factor: Keyword.get(opts, :capacity_factor, 1.0),
       q_max_mvar: Keyword.get(opts, :q_max_mvar, 50.0),
       q_min_mvar: Keyword.get(opts, :q_min_mvar, -50.0),
-      fuel_type: "NG",
+      fuel_type: Keyword.get(opts, :fuel_type, "NG"),
       marginal_cost: Keyword.get(opts, :marginal_cost, 30.0)
     }
   end
@@ -78,7 +78,6 @@ defmodule PowerModel.Engine.SimulationServerTest do
       water_facilities: []
     }
   end
-
 
   # ---------------------------------------------------------------------------
   # Cascade + SimulationServer logic tests
@@ -153,12 +152,13 @@ defmodule PowerModel.Engine.SimulationServerTest do
       cascade = PowerModel.Failure.Cascade.init(snapshot, 100.0)
 
       # Build dispatched snapshot (same logic as SimulationServer.dispatched_snapshot)
-      active_gens = cascade.generators
-      |> Enum.reject(&MapSet.member?(cascade.tripped_generators, &1.id))
-      |> Enum.map(fn g ->
-        d = Map.get(cascade.dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
-        %{g | p_max_mw: d, capacity_factor: 1.0}
-      end)
+      active_gens =
+        cascade.generators
+        |> Enum.reject(&MapSet.member?(cascade.tripped_generators, &1.id))
+        |> Enum.map(fn g ->
+          d = Map.get(cascade.dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
+          %{g | p_max_mw: d, capacity_factor: 1.0}
+        end)
 
       dc_snapshot = %{
         buses: cascade.buses,
@@ -181,16 +181,21 @@ defmodule PowerModel.Engine.SimulationServerTest do
 
       {tripped_cascade, _} = PowerModel.Failure.Cascade.trip_line(cascade, 1)
 
-      active_gens = tripped_cascade.generators
-      |> Enum.reject(&MapSet.member?(tripped_cascade.tripped_generators, &1.id))
-      |> Enum.map(fn g ->
-        d = Map.get(tripped_cascade.dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
-        %{g | p_max_mw: d, capacity_factor: 1.0}
-      end)
+      active_gens =
+        tripped_cascade.generators
+        |> Enum.reject(&MapSet.member?(tripped_cascade.tripped_generators, &1.id))
+        |> Enum.map(fn g ->
+          d = Map.get(tripped_cascade.dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
+          %{g | p_max_mw: d, capacity_factor: 1.0}
+        end)
 
       dc_snapshot = %{
         buses: tripped_cascade.buses,
-        lines: Enum.reject(tripped_cascade.lines, &MapSet.member?(tripped_cascade.tripped_lines, &1.id)),
+        lines:
+          Enum.reject(
+            tripped_cascade.lines,
+            &MapSet.member?(tripped_cascade.tripped_lines, &1.id)
+          ),
         transformers: [],
         generators: active_gens,
         loads: tripped_cascade.loads
@@ -200,8 +205,9 @@ defmodule PowerModel.Engine.SimulationServerTest do
 
       assert solution.converged == true
       # Line 1 is tripped, so we should have fewer line flows
-      line_flow_count = solution.line_flows
-      |> Enum.count(fn {{type, _}, _} -> type == :line end)
+      line_flow_count =
+        solution.line_flows
+        |> Enum.count(fn {{type, _}, _} -> type == :line end)
 
       assert line_flow_count <= 3
     end
@@ -245,9 +251,12 @@ defmodule PowerModel.Engine.SimulationServerTest do
       ]
 
       base_loading = %{
-        {:line, 1} => 350.0,  # > 200% => data artifact, should be bumped
-        {:line, 2} => 150.0,  # 100-200% => genuinely stressed, keep as-is
-        {:line, 3} => 50.0    # < 100% => keep as-is
+        # > 200% => data artifact, should be bumped
+        {:line, 1} => 350.0,
+        # 100-200% => genuinely stressed, keep as-is
+        {:line, 2} => 150.0,
+        # < 100% => keep as-is
+        {:line, 3} => 50.0
       }
 
       calibrated = PowerModel.Failure.Cascade.calibrate_ratings(lines, base_loading)
@@ -277,15 +286,33 @@ defmodule PowerModel.Engine.SimulationServerTest do
   describe "calibrate_transformer_ratings/2" do
     test "bumps transformer ratings for clear data artifacts (>200%)" do
       xfmrs = [
-        %{id: 1, from_bus_id: 1, to_bus_id: 2, x_pu: 0.01, tap_ratio: 1.0,
-          phase_shift_deg: 0.0, rated_mva: 100.0, status: "in_service"},
-        %{id: 2, from_bus_id: 3, to_bus_id: 4, x_pu: 0.05, tap_ratio: 1.0,
-          phase_shift_deg: 0.0, rated_mva: 200.0, status: "in_service"}
+        %{
+          id: 1,
+          from_bus_id: 1,
+          to_bus_id: 2,
+          x_pu: 0.01,
+          tap_ratio: 1.0,
+          phase_shift_deg: 0.0,
+          rated_mva: 100.0,
+          status: "in_service"
+        },
+        %{
+          id: 2,
+          from_bus_id: 3,
+          to_bus_id: 4,
+          x_pu: 0.05,
+          tap_ratio: 1.0,
+          phase_shift_deg: 0.0,
+          rated_mva: 200.0,
+          status: "in_service"
+        }
       ]
 
       base_loading = %{
-        {:transformer, 1} => 500.0,  # > 200% => should be bumped
-        {:transformer, 2} => 150.0   # < 200% => keep as-is
+        # > 200% => should be bumped
+        {:transformer, 1} => 500.0,
+        # < 200% => keep as-is
+        {:transformer, 2} => 150.0
       }
 
       calibrated = PowerModel.Failure.Cascade.calibrate_transformer_ratings(xfmrs, base_loading)
@@ -297,6 +324,55 @@ defmodule PowerModel.Engine.SimulationServerTest do
 
       # Xfmr 2: unchanged
       assert cal2.rated_mva == 200.0
+    end
+  end
+
+  describe "week 6 hourly generation mix scaling" do
+    test "compute_generation_mix_ratios/2 normalizes fuel labels and returns ratios" do
+      avg_mix = %{"NG" => 1000.0, "SUN" => 200.0, "COL" => 500.0, "WAT" => 100.0}
+      hour_mix = %{"Natural Gas" => 900.0, "solar" => 20.0, "coal" => 650.0, "hydro" => 120.0}
+
+      ratios = PowerModel.Engine.SimulationServer.compute_generation_mix_ratios(avg_mix, hour_mix)
+
+      assert_in_delta Map.fetch!(ratios, :gas), 0.9, 1.0e-6
+      assert_in_delta Map.fetch!(ratios, :solar), 0.1, 1.0e-6
+      assert_in_delta Map.fetch!(ratios, :coal), 1.3, 1.0e-6
+      assert_in_delta Map.fetch!(ratios, :hydro), 1.2, 1.0e-6
+    end
+
+    test "compute_generation_mix_ratios/2 defaults missing hourly fuels to neutral scaling" do
+      avg_mix = %{"SUN" => 100.0, "WND" => 250.0}
+      hour_mix = %{"WND" => 150.0}
+
+      ratios = PowerModel.Engine.SimulationServer.compute_generation_mix_ratios(avg_mix, hour_mix)
+
+      assert_in_delta Map.fetch!(ratios, :solar), 1.0, 1.0e-6
+      assert_in_delta Map.fetch!(ratios, :wind), 0.6, 1.0e-6
+    end
+
+    test "scale_generators_by_mix/2 scales and clamps capacity factors by fuel group" do
+      snapshot = %{
+        buses: [],
+        lines: [],
+        transformers: [],
+        loads: [],
+        generators: [
+          generator(1, 1, fuel_type: "NG", capacity_factor: 0.8),
+          generator(2, 2, fuel_type: "SUN", capacity_factor: 0.9),
+          generator(3, 3, fuel_type: "COL", capacity_factor: 0.7),
+          generator(4, 4, fuel_type: "WND", capacity_factor: 0.6)
+        ]
+      }
+
+      ratios = %{gas: 0.5, solar: 0.1, coal: 1.8}
+
+      scaled = PowerModel.Engine.SimulationServer.scale_generators_by_mix(snapshot, ratios)
+      [g1, g2, g3, g4] = scaled.generators
+
+      assert_in_delta g1.capacity_factor, 0.4, 1.0e-6
+      assert_in_delta g2.capacity_factor, 0.09, 1.0e-6
+      assert_in_delta g3.capacity_factor, 1.0, 1.0e-6
+      assert_in_delta g4.capacity_factor, 0.6, 1.0e-6
     end
   end
 end

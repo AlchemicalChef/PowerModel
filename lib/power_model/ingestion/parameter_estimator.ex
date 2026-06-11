@@ -14,14 +14,14 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   alias PowerModel.Grid.{TransmissionLine, Generator, Bus}
 
   @line_params %{
-    69   => {0.170, 0.450, 2.7, 130.0,  1},
-    115  => {0.100, 0.420, 2.9, 200.0,  1},
-    138  => {0.075, 0.400, 3.0, 250.0,  1},
-    161  => {0.060, 0.390, 3.1, 300.0,  1},
-    230  => {0.040, 0.370, 3.3, 450.0,  1},
-    345  => {0.020, 0.335, 3.6, 900.0,  1},
-    500  => {0.010, 0.300, 4.0, 1800.0, 2},
-    765  => {0.006, 0.280, 4.5, 3200.0, 2}
+    69 => {0.170, 0.450, 2.7, 130.0, 1},
+    115 => {0.100, 0.420, 2.9, 200.0, 1},
+    138 => {0.075, 0.400, 3.0, 250.0, 1},
+    161 => {0.060, 0.390, 3.1, 300.0, 1},
+    230 => {0.040, 0.370, 3.3, 450.0, 1},
+    345 => {0.020, 0.335, 3.6, 900.0, 1},
+    500 => {0.010, 0.300, 4.0, 1800.0, 2},
+    765 => {0.006, 0.280, 4.5, 3200.0, 2}
   }
 
   @base_mva 100.0
@@ -44,10 +44,12 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   def estimate_line_parameters(opts \\ []) do
     ambient_temp = Keyword.get(opts, :ambient_temp_c, @default_ambient_temp_c)
 
-    lines = from(tl in TransmissionLine,
-      where: is_nil(tl.r_pu) or is_nil(tl.x_pu),
-      preload: [:from_bus, :to_bus]
-    ) |> Repo.all()
+    lines =
+      from(tl in TransmissionLine,
+        where: is_nil(tl.r_pu) or is_nil(tl.x_pu),
+        preload: [:from_bus, :to_bus]
+      )
+      |> Repo.all()
 
     Enum.each(lines, fn line ->
       voltage_kv = line.voltage_kv || 0.0
@@ -56,9 +58,10 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
         {r_per_km, x_per_km, b_per_km, rating, typical_circuits} =
           lookup_line_params(voltage_kv)
 
-        length_km = line.length_km ||
-                    estimate_length(line.geometry) ||
-                    estimate_length_from_buses(line.from_bus, line.to_bus)
+        length_km =
+          line.length_km ||
+            estimate_length(line.geometry) ||
+            estimate_length_from_buses(line.from_bus, line.to_bus)
 
         z_base = voltage_kv * voltage_kv / @base_mva
 
@@ -87,9 +90,11 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
 
   @doc "Estimate reactive power limits for generators"
   def estimate_generator_q_limits do
-    generators = from(g in Generator,
-      where: is_nil(g.q_max_mvar)
-    ) |> Repo.all()
+    generators =
+      from(g in Generator,
+        where: is_nil(g.q_max_mvar)
+      )
+      |> Repo.all()
 
     Enum.each(generators, fn gen ->
       {q_max, q_min} = estimate_q_limits(gen)
@@ -102,16 +107,25 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
 
   @doc "Look up standard parameters for a voltage level"
   def lookup_line_params(voltage_kv) do
-    closest = @line_params
-    |> Map.keys()
-    |> Enum.min_by(&abs(&1 - voltage_kv))
+    closest =
+      @line_params
+      |> Map.keys()
+      |> Enum.min_by(&abs(&1 - voltage_kv))
 
     Map.fetch!(@line_params, closest)
   end
 
   @doc "Convert physical parameters to per-unit"
-  def to_per_unit(r_ohm_per_km, x_ohm_per_km, b_us_per_km, length_km, base_kv, base_mva \\ @base_mva) do
+  def to_per_unit(
+        r_ohm_per_km,
+        x_ohm_per_km,
+        b_us_per_km,
+        length_km,
+        base_kv,
+        base_mva \\ @base_mva
+      ) do
     z_base = base_kv * base_kv / base_mva
+
     %{
       r_pu: r_ohm_per_km * length_km / z_base,
       x_pu: x_ohm_per_km * length_km / z_base,
@@ -141,8 +155,10 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   end
 
   defp categorize_prime_mover(nil), do: :synchronous
+
   defp categorize_prime_mover(pm) do
     pm_upper = String.upcase(pm)
+
     cond do
       pm_upper in ~w(PV BA) -> :inverter
       pm_upper in ~w(WT WS) -> :inverter
@@ -154,6 +170,7 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   end
 
   defp estimate_length(nil), do: nil
+
   defp estimate_length(%Geo.LineString{coordinates: coords}) when length(coords) >= 2 do
     coords
     |> Enum.chunk_every(2, 1, :discard)
@@ -164,18 +181,25 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
     |> Enum.sum()
     |> max(0.1)
   end
+
   defp estimate_length(_), do: nil
 
-  defp estimate_length_from_buses(%Bus{coordinates: %Geo.Point{coordinates: {lon1, lat1}}},
-                                   %Bus{coordinates: %Geo.Point{coordinates: {lon2, lat2}}}) do
+  defp estimate_length_from_buses(
+         %Bus{coordinates: %Geo.Point{coordinates: {lon1, lat1}}},
+         %Bus{coordinates: %Geo.Point{coordinates: {lon2, lat2}}}
+       ) do
     dist = haversine_km(lat1, lon1, lat2, lon2)
     max(dist, 0.1)
   end
-  defp estimate_length_from_buses(%{coordinates: %Geo.Point{coordinates: {lon1, lat1}}},
-                                   %{coordinates: %Geo.Point{coordinates: {lon2, lat2}}}) do
+
+  defp estimate_length_from_buses(
+         %{coordinates: %Geo.Point{coordinates: {lon1, lat1}}},
+         %{coordinates: %Geo.Point{coordinates: {lon2, lat2}}}
+       ) do
     dist = haversine_km(lat1, lon1, lat2, lon2)
     max(dist, 0.1)
   end
+
   defp estimate_length_from_buses(_, _), do: 10.0
 
   defp haversine_km(lat1, lon1, lat2, lon2) do
@@ -185,9 +209,11 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
     lat1_r = lat1 * :math.pi() / 180.0
     lat2_r = lat2 * :math.pi() / 180.0
 
-    a = :math.sin(dlat / 2) * :math.sin(dlat / 2) +
+    a =
+      :math.sin(dlat / 2) * :math.sin(dlat / 2) +
         :math.cos(lat1_r) * :math.cos(lat2_r) *
-        :math.sin(dlon / 2) * :math.sin(dlon / 2)
+          :math.sin(dlon / 2) * :math.sin(dlon / 2)
+
     c = 2 * :math.atan2(:math.sqrt(a), :math.sqrt(1 - a))
     r * c
   end

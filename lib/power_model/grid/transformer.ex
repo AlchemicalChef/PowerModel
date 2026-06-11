@@ -26,8 +26,16 @@ defmodule PowerModel.Grid.Transformer do
 
   def changeset(transformer, attrs) do
     transformer
-    |> cast(attrs, [:rated_mva, :r_pu, :x_pu, :tap_ratio, :phase_shift_deg, :status,
-                     :from_bus_id, :to_bus_id])
+    |> cast(attrs, [
+      :rated_mva,
+      :r_pu,
+      :x_pu,
+      :tap_ratio,
+      :phase_shift_deg,
+      :status,
+      :from_bus_id,
+      :to_bus_id
+    ])
     |> validate_required([:rated_mva, :x_pu, :from_bus_id, :to_bus_id])
     |> foreign_key_constraint(:from_bus_id)
     |> foreign_key_constraint(:to_bus_id)

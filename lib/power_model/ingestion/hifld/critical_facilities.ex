@@ -13,19 +13,23 @@ defmodule PowerModel.Ingestion.HIFLD.CriticalFacilities do
 
   @services %{
     hospital: %{
-      url: "https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/Hospitals/FeatureServer/0",
+      url:
+        "https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/Hospitals/FeatureServer/0",
       parser: :hospital
     },
     fire_station: %{
-      url: "https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/Structures_Medical_Emergency_Response_v1/FeatureServer/2",
+      url:
+        "https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/Structures_Medical_Emergency_Response_v1/FeatureServer/2",
       parser: :structures
     },
     police_station: %{
-      url: "https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/Structures_Law_Enforcement_v1/FeatureServer/0",
+      url:
+        "https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/Structures_Law_Enforcement_v1/FeatureServer/0",
       parser: :structures
     },
     ems_station: %{
-      url: "https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/Structures_Medical_Emergency_Response_v1/FeatureServer/1",
+      url:
+        "https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/Structures_Medical_Emergency_Response_v1/FeatureServer/1",
       parser: :structures
     }
   }
@@ -55,12 +59,15 @@ defmodule PowerModel.Ingestion.HIFLD.CriticalFacilities do
     |> Stream.reject(&is_nil/1)
     |> Stream.chunk_every(@batch_size)
     |> Stream.each(fn batch ->
-      {inserted, _} = Repo.insert_all(CriticalFacility, batch,
-        on_conflict: :nothing,
-        conflict_target: [:source, :source_id]
-      )
+      {inserted, _} =
+        Repo.insert_all(CriticalFacility, batch,
+          on_conflict: :nothing,
+          conflict_target: [:source, :source_id]
+        )
+
       :counters.add(counter, 1, inserted)
       total = :counters.get(counter, 1)
+
       if rem(total, 2000) < @batch_size do
         IO.puts("  #{category}: #{total} records inserted...")
       end
@@ -77,7 +84,8 @@ defmodule PowerModel.Ingestion.HIFLD.CriticalFacilities do
   defp get_count(base_url) do
     case Req.get("#{base_url}/query",
            params: [where: "1=1", returnCountOnly: "true", f: "json"],
-           receive_timeout: 60_000) do
+           receive_timeout: 60_000
+         ) do
       {:ok, %{status: 200, body: %{"count" => count}}} -> {:ok, count}
       {:ok, resp} -> {:error, resp.body}
       {:error, err} -> {:error, err}
@@ -121,7 +129,8 @@ defmodule PowerModel.Ingestion.HIFLD.CriticalFacilities do
            params: params,
            receive_timeout: 60_000,
            retry: :transient,
-           max_retries: 3) do
+           max_retries: 3
+         ) do
       {:ok, %{status: 200, body: body}} when is_map(body) ->
         if body["error"] do
           {:error, body["error"]}
@@ -224,20 +233,26 @@ defmodule PowerModel.Ingestion.HIFLD.CriticalFacilities do
   defp fcode_to_type(_, _), do: nil
 
   defp parse_name(nil), do: "Unknown"
+
   defp parse_name(name) when is_binary(name) do
     case String.trim(name) do
       "" -> "Unknown"
       n -> n
     end
   end
+
   defp parse_name(_), do: "Unknown"
 
   defp parse_zip(nil), do: nil
   defp parse_zip(zip) when is_binary(zip), do: String.trim(zip)
-  defp parse_zip(zip) when is_number(zip), do: zip |> round() |> Integer.to_string() |> String.pad_leading(5, "0")
+
+  defp parse_zip(zip) when is_number(zip),
+    do: zip |> round() |> Integer.to_string() |> String.pad_leading(5, "0")
+
   defp parse_zip(_), do: nil
 
   defp parse_status(nil), do: "active"
+
   defp parse_status(status) when is_binary(status) do
     case String.upcase(String.trim(status)) do
       s when s in ["OPEN", "ACTIVE", "IN SERVICE"] -> "active"
@@ -245,6 +260,7 @@ defmodule PowerModel.Ingestion.HIFLD.CriticalFacilities do
       _ -> "active"
     end
   end
+
   defp parse_status(_), do: "active"
 
   defp parse_trauma(nil), do: nil
@@ -255,18 +271,21 @@ defmodule PowerModel.Ingestion.HIFLD.CriticalFacilities do
   defp parse_int(nil), do: nil
   defp parse_int(v) when is_integer(v) and v >= 0, do: v
   defp parse_int(v) when is_float(v) and v >= 0, do: round(v)
+
   defp parse_int(v) when is_binary(v) do
     case Integer.parse(v) do
       {n, _} when n >= 0 -> n
       _ -> nil
     end
   end
+
   defp parse_int(_), do: nil
 
   defp estimate_power(:hospital, attrs) do
     beds = parse_int(attrs["BEDS"]) || 100
     beds * 0.008
   end
+
   defp estimate_power(:fire_station, _attrs), do: 0.05
   defp estimate_power(:police_station, _attrs), do: 0.08
   defp estimate_power(:ems_station, _attrs), do: 0.04

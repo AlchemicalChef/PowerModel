@@ -138,6 +138,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
   defp pwm_device(id, bus_id, p_mw, opts \\ []) do
     params = Keyword.get(opts, :params, %{})
+
     %HarmonicDevice{
       id: id,
       bus_id: bus_id,
@@ -180,7 +181,8 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
       dev = hd(arc_devices)
       assert dev.bus_id == 3
-      assert dev.active == false  # inactive by default
+      # inactive by default
+      assert dev.active == false
       assert dev.p_mw == 80.0
     end
 
@@ -200,12 +202,14 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
     end
 
     test "skips retired generators" do
-      snapshot = %{snapshot_3bus() |
-        generators: [
-          generator(1, 1, p_max_mw: 200.0, fuel_type: "NG"),
-          generator(2, 2, p_max_mw: 50.0, fuel_type: "SUN", status: "retired")
-        ]
+      snapshot = %{
+        snapshot_3bus()
+        | generators: [
+            generator(1, 1, p_max_mw: 200.0, fuel_type: "NG"),
+            generator(2, 2, p_max_mw: 50.0, fuel_type: "SUN", status: "retired")
+          ]
       }
+
       scenario = Scenario.create_scenario(snapshot)
 
       ibr_devices = Enum.filter(scenario.devices, &(&1.device_type == :pwm_inverter))
@@ -240,7 +244,8 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
       device1 = six_pulse_device(:conv1, 2, 50.0)
       device2 = %{device1 | p_mw: 100.0}
 
-      updated = scenario
+      updated =
+        scenario
         |> Scenario.add_device(device1)
         |> Scenario.add_device(device2)
 
@@ -250,12 +255,14 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "accepts a plain map and converts to struct" do
       scenario = %HarmonicScenario{}
-      updated = Scenario.add_device(scenario, %{
-        id: :test,
-        bus_id: 1,
-        device_type: :pwm_inverter,
-        p_mw: 30.0
-      })
+
+      updated =
+        Scenario.add_device(scenario, %{
+          id: :test,
+          bus_id: 1,
+          device_type: :pwm_inverter,
+          p_mw: 30.0
+        })
 
       assert length(updated.devices) == 1
       assert %HarmonicDevice{} = hd(updated.devices)
@@ -266,7 +273,8 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
       d1 = six_pulse_device(:a, 1, 10.0)
       d2 = six_pulse_device(:b, 2, 20.0)
 
-      updated = scenario
+      updated =
+        scenario
         |> Scenario.add_device(d1)
         |> Scenario.add_device(d2)
 
@@ -279,10 +287,12 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
   describe "remove_device/2" do
     test "removes a device by ID" do
-      scenario = %HarmonicScenario{devices: [
-        six_pulse_device(:a, 1, 10.0),
-        six_pulse_device(:b, 2, 20.0)
-      ]}
+      scenario = %HarmonicScenario{
+        devices: [
+          six_pulse_device(:a, 1, 10.0),
+          six_pulse_device(:b, 2, 20.0)
+        ]
+      }
 
       updated = Scenario.remove_device(scenario, :a)
       assert length(updated.devices) == 1
@@ -303,7 +313,8 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
       {:ok, updated} = Scenario.modify_device(scenario, :conv1, %{device_type: :twelve_pulse})
       dev = hd(updated.devices)
       assert dev.device_type == :twelve_pulse
-      assert dev.p_mw == 50.0  # unchanged
+      # unchanged
+      assert dev.p_mw == 50.0
     end
 
     test "modifies power rating" do
@@ -328,11 +339,13 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
         p_mw: 50.0,
         params: %{switching_freq_hz: 5000, spectrum: %{5 => 4.0, 7 => 3.0}}
       }
+
       scenario = %HarmonicScenario{devices: [device]}
 
-      {:ok, updated} = Scenario.modify_device(scenario, :inv1, %{
-        params: %{spectrum: %{5 => 8.0}}
-      })
+      {:ok, updated} =
+        Scenario.modify_device(scenario, :inv1, %{
+          params: %{spectrum: %{5 => 8.0}}
+        })
 
       dev = hd(updated.devices)
       # The spectrum should be merged (new value for key 5, key 7 dropped due to merge)
@@ -349,7 +362,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
     test "accepts keyword list changes" do
       scenario = %HarmonicScenario{devices: [six_pulse_device(:conv1, 2, 50.0)]}
 
-      {:ok, updated} = Scenario.modify_device(scenario, :conv1, [p_mw: 75.0])
+      {:ok, updated} = Scenario.modify_device(scenario, :conv1, p_mw: 75.0)
       assert hd(updated.devices).p_mw == 75.0
     end
   end
@@ -384,7 +397,8 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
     test "replaces existing filter at same bus" do
       scenario = %HarmonicScenario{}
 
-      updated = scenario
+      updated =
+        scenario
         |> Scenario.add_filter(2, :single_tuned, 5, 30.0)
         |> Scenario.add_filter(2, :single_tuned, 7, 25.0)
 
@@ -395,7 +409,8 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
   describe "remove_filter/2" do
     test "removes filter at specified bus" do
-      scenario = %HarmonicScenario{}
+      scenario =
+        %HarmonicScenario{}
         |> Scenario.add_filter(2, :single_tuned, 5, 30.0)
 
       updated = Scenario.remove_filter(scenario, 2)
@@ -418,9 +433,9 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
       devices = [
         six_pulse_device(:a, 1, 10.0),
         pwm_device(:b, 2, 20.0),
-        %HarmonicDevice{id: :c, bus_id: 2, device_type: :arc_furnace,
-                         p_mw: 30.0, active: false}
+        %HarmonicDevice{id: :c, bus_id: 2, device_type: :arc_furnace, p_mw: 30.0, active: false}
       ]
+
       scenario = %HarmonicScenario{devices: devices}
       {:ok, scenario: scenario}
     end
@@ -461,8 +476,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
           six_pulse_device(:a, 1, 50.0),
           six_pulse_device(:b, 2, 30.0),
           pwm_device(:c, 3, 100.0),
-          %HarmonicDevice{id: :d, bus_id: 4, device_type: :arc_furnace,
-                           p_mw: 80.0, active: false}
+          %HarmonicDevice{id: :d, bus_id: 4, device_type: :arc_furnace, p_mw: 80.0, active: false}
         ],
         filters: %{2 => %{filter_type: :single_tuned}}
       }
@@ -487,6 +501,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
   describe "run/3" do
     test "produces THD map for all buses" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [six_pulse_device(:conv1, 2, 50.0)],
         max_harmonic: 13,
@@ -506,6 +521,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "includes individual harmonic distortion" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [six_pulse_device(:conv1, 2, 50.0)],
         max_harmonic: 13,
@@ -524,6 +540,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "includes IEEE 519 compliance check" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [six_pulse_device(:conv1, 2, 50.0)],
         max_harmonic: 13,
@@ -533,7 +550,8 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
       {:ok, result} = Scenario.run(scenario, snapshot)
 
       assert is_list(result.ieee_519)
-      assert length(result.ieee_519) == 3  # one per bus
+      # one per bus
+      assert length(result.ieee_519) == 3
 
       bus2_compliance = Enum.find(result.ieee_519, &(&1.bus_id == 2))
       assert is_boolean(bus2_compliance.compliant)
@@ -542,6 +560,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "includes impedance scan at source buses" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [six_pulse_device(:conv1, 2, 50.0)],
         max_harmonic: 13,
@@ -563,6 +582,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "reports worst bus and total violations" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [six_pulse_device(:conv1, 2, 50.0)],
         max_harmonic: 13,
@@ -588,6 +608,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
       # Same device but inactive
       inactive_dev = %{six_pulse_device(:conv1, 2, 50.0) | active: false}
+
       scenario_inactive = %HarmonicScenario{
         devices: [inactive_dev],
         max_harmonic: 13
@@ -604,6 +625,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "respects custom fundamental solution" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [six_pulse_device(:conv1, 2, 50.0)],
         max_harmonic: 7
@@ -645,6 +667,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
         p_mw: 50.0,
         active: true
       }
+
       scenario_12p = %HarmonicScenario{
         devices: [device_12p],
         max_harmonic: 13
@@ -660,7 +683,8 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
       # Check that 5th harmonic is much smaller with 12-pulse
       hd_5_6p = get_in(result_6p, [:individual_hd, 2, 5]) || 0.0
       hd_5_12p = get_in(result_12p, [:individual_hd, 2, 5]) || 0.0
-      assert hd_5_12p < hd_5_6p * 0.1  # should be essentially zero for ideal 12-pulse
+      # should be essentially zero for ideal 12-pulse
+      assert hd_5_12p < hd_5_6p * 0.1
     end
 
     test "modify_device can switch topology in place" do
@@ -668,7 +692,8 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
       {:ok, updated} = Scenario.modify_device(scenario, :conv1, %{device_type: :twelve_pulse})
       assert hd(updated.devices).device_type == :twelve_pulse
-      assert hd(updated.devices).p_mw == 50.0  # power preserved
+      # power preserved
+      assert hd(updated.devices).p_mw == 50.0
     end
   end
 
@@ -688,8 +713,11 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
       # Degraded inverter with elevated 5th harmonic
       scenario_bad = %HarmonicScenario{
-        devices: [pwm_device(:solar1, 2, 100.0,
-          params: %{spectrum: %{5 => 8.0, 7 => 5.0, 11 => 2.0, 13 => 1.5}})],
+        devices: [
+          pwm_device(:solar1, 2, 100.0,
+            params: %{spectrum: %{5 => 8.0, 7 => 5.0, 11 => 2.0, 13 => 1.5}}
+          )
+        ],
         max_harmonic: 13
       }
 
@@ -702,6 +730,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "what_if can model inverter degradation" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [pwm_device(:solar1, 2, 100.0)],
         max_harmonic: 13
@@ -709,10 +738,20 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
       # Inject elevated 5th harmonic at 12% (default is 4%) — clearly worse
       changes = [
-        {:modify_device, :solar1, %{params: %{spectrum: %{
-          2 => 0.5, 3 => 2.0, 5 => 12.0, 7 => 8.0, 9 => 1.0,
-          11 => 2.0, 13 => 1.5
-        }}}}
+        {:modify_device, :solar1,
+         %{
+           params: %{
+             spectrum: %{
+               2 => 0.5,
+               3 => 2.0,
+               5 => 12.0,
+               7 => 8.0,
+               9 => 1.0,
+               11 => 2.0,
+               13 => 1.5
+             }
+           }
+         }}
       ]
 
       {:ok, result} = Scenario.what_if(scenario, snapshot, changes)
@@ -737,7 +776,8 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
         max_harmonic: 13
       }
 
-      scenario_with_filter = scenario_no_filter
+      scenario_with_filter =
+        scenario_no_filter
         |> Scenario.add_filter(2, :single_tuned, 5, 30.0, bus_kv: 138.0)
 
       {:ok, result_before} = Scenario.run(scenario_no_filter, snapshot)
@@ -751,6 +791,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "what_if with filter addition" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [six_pulse_device(:conv1, 2, 80.0)],
         max_harmonic: 13
@@ -780,10 +821,15 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
       }
 
       scenario_after = %HarmonicScenario{
-        devices: [%HarmonicDevice{
-          id: :conv1, bus_id: 2, device_type: :twelve_pulse,
-          p_mw: 80.0, active: true
-        }],
+        devices: [
+          %HarmonicDevice{
+            id: :conv1,
+            bus_id: 2,
+            device_type: :twelve_pulse,
+            p_mw: 80.0,
+            active: true
+          }
+        ],
         max_harmonic: 13
       }
 
@@ -804,7 +850,8 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
     test "tracks compliance changes" do
       # Create a synthetic result pair where compliance changes
       result_before = %{
-        thd: %{1 => 0.5, 2 => 6.0},  # bus 2 exceeds 5% THD limit
+        # bus 2 exceeds 5% THD limit
+        thd: %{1 => 0.5, 2 => 6.0},
         worst_bus: {2, 6.0},
         total_violations: 1,
         ieee_519: [
@@ -814,7 +861,8 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
       }
 
       result_after = %{
-        thd: %{1 => 0.4, 2 => 3.0},  # bus 2 now below 5% THD limit
+        # bus 2 now below 5% THD limit
+        thd: %{1 => 0.4, 2 => 3.0},
         worst_bus: {2, 3.0},
         total_violations: 0,
         ieee_519: [
@@ -839,6 +887,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
   describe "what_if/4" do
     test "applies multiple changes in sequence" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [
           six_pulse_device(:conv1, 2, 50.0),
@@ -868,14 +917,16 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "does not mutate original scenario" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [six_pulse_device(:conv1, 2, 50.0)],
         max_harmonic: 13
       }
 
-      _result = Scenario.what_if(scenario, snapshot, [
-        {:modify_device, :conv1, %{device_type: :twelve_pulse}}
-      ])
+      _result =
+        Scenario.what_if(scenario, snapshot, [
+          {:modify_device, :conv1, %{device_type: :twelve_pulse}}
+        ])
 
       # Original scenario should be unchanged
       assert hd(scenario.devices).device_type == :six_pulse
@@ -883,6 +934,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "skips baseline when run_baseline: false" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [six_pulse_device(:conv1, 2, 50.0)],
         max_harmonic: 7
@@ -897,6 +949,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "handles add and remove device changes" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [six_pulse_device(:conv1, 2, 50.0)],
         max_harmonic: 7
@@ -924,6 +977,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
   describe "arc furnace modeling" do
     test "arc furnace produces broadband harmonics" do
       snapshot = snapshot_3bus()
+
       device = %HarmonicDevice{
         id: :eaf1,
         bus_id: 3,
@@ -948,18 +1002,30 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
       snapshot = snapshot_3bus()
 
       scenario_melting = %HarmonicScenario{
-        devices: [%HarmonicDevice{
-          id: :eaf1, bus_id: 3, device_type: :arc_furnace,
-          p_mw: 80.0, params: %{phase: :melting}, active: true
-        }],
+        devices: [
+          %HarmonicDevice{
+            id: :eaf1,
+            bus_id: 3,
+            device_type: :arc_furnace,
+            p_mw: 80.0,
+            params: %{phase: :melting},
+            active: true
+          }
+        ],
         max_harmonic: 13
       }
 
       scenario_refining = %HarmonicScenario{
-        devices: [%HarmonicDevice{
-          id: :eaf1, bus_id: 3, device_type: :arc_furnace,
-          p_mw: 80.0, params: %{phase: :refining}, active: true
-        }],
+        devices: [
+          %HarmonicDevice{
+            id: :eaf1,
+            bus_id: 3,
+            device_type: :arc_furnace,
+            p_mw: 80.0,
+            params: %{phase: :refining},
+            active: true
+          }
+        ],
         max_harmonic: 13
       }
 
@@ -978,6 +1044,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
   describe "saturated transformer modeling" do
     test "GIC saturation produces even harmonics" do
       snapshot = snapshot_3bus()
+
       device = %HarmonicDevice{
         id: :sat_xfmr1,
         bus_id: 2,
@@ -1095,7 +1162,9 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "scenario with only filters and no sources produces zero THD" do
       snapshot = snapshot_3bus()
-      scenario = %HarmonicScenario{devices: []}
+
+      scenario =
+        %HarmonicScenario{devices: []}
         |> Scenario.add_filter(2, :single_tuned, 5, 30.0)
 
       {:ok, result} = Scenario.run(scenario, snapshot)
@@ -1105,6 +1174,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "very small power device produces negligible THD" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [six_pulse_device(:tiny, 2, 0.001)],
         max_harmonic: 7
@@ -1117,6 +1187,7 @@ defmodule PowerModel.Solver.Harmonics.ScenarioTest do
 
     test "what_if with empty changes returns same result as baseline" do
       snapshot = snapshot_3bus()
+
       scenario = %HarmonicScenario{
         devices: [six_pulse_device(:conv1, 2, 50.0)],
         max_harmonic: 7

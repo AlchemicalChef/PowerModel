@@ -9,30 +9,50 @@ defmodule PowerModel.Failure.ScenariosTest do
 
   defp bus(id, opts \\ []) do
     coords = Keyword.get(opts, :coordinates, nil)
-    %{id: id, bus_type: Keyword.get(opts, :bus_type, 1), base_kv: 138.0,
-      vm_pu: 1.0, va_rad: 0.0, b_shunt_mvar: 0.0, coordinates: coords}
+
+    %{
+      id: id,
+      bus_type: Keyword.get(opts, :bus_type, 1),
+      base_kv: 138.0,
+      vm_pu: 1.0,
+      va_rad: 0.0,
+      b_shunt_mvar: 0.0,
+      coordinates: coords
+    }
   end
 
   defp line(id, from, to, opts \\ []) do
-    %{id: id, from_bus_id: from, to_bus_id: to,
-      voltage_kv: 138.0, r_pu: 0.01,
+    %{
+      id: id,
+      from_bus_id: from,
+      to_bus_id: to,
+      voltage_kv: 138.0,
+      r_pu: 0.01,
       x_pu: Keyword.get(opts, :x_pu, 0.1),
       b_pu: 0.02,
-      rating_a_mva: Keyword.get(opts, :rating_a_mva, 100.0)}
+      rating_a_mva: Keyword.get(opts, :rating_a_mva, 100.0)
+    }
   end
 
   defp generator(id, bus_id, opts \\ []) do
-    %{id: id, bus_id: bus_id,
+    %{
+      id: id,
+      bus_id: bus_id,
       p_max_mw: Keyword.get(opts, :p_max_mw, 100.0),
       capacity_factor: 1.0,
-      fuel_type: "NG", status: "in_service",
-      marginal_cost_per_mwh: 35.0}
+      fuel_type: "NG",
+      status: "in_service",
+      marginal_cost_per_mwh: 35.0
+    }
   end
 
   defp load(id, bus_id, opts \\ []) do
-    %{id: id, bus_id: bus_id,
+    %{
+      id: id,
+      bus_id: bus_id,
       p_mw: Keyword.get(opts, :p_mw, 50.0),
-      q_mvar: Keyword.get(opts, :q_mvar, 15.0)}
+      q_mvar: Keyword.get(opts, :q_mvar, 15.0)
+    }
   end
 
   defp geo_point(lat, lon) do
@@ -47,6 +67,7 @@ defmodule PowerModel.Failure.ScenariosTest do
       bus(4, coordinates: geo_point(34.5, -118.5)),
       bus(5, coordinates: geo_point(35.5, -117.5))
     ]
+
     lines = [
       line(1, 1, 2, x_pu: 0.1),
       line(2, 1, 3, x_pu: 0.15),
@@ -55,11 +76,11 @@ defmodule PowerModel.Failure.ScenariosTest do
       line(5, 3, 5, x_pu: 0.15),
       line(6, 4, 5, x_pu: 0.2)
     ]
+
     gens = [generator(1, 1, p_max_mw: 200.0)]
     loads = [load(1, 5, p_mw: 100.0)]
 
-    %{buses: buses, lines: lines, transformers: [],
-      generators: gens, loads: loads}
+    %{buses: buses, lines: lines, transformers: [], generators: gens, loads: loads}
   end
 
   # Fake cascade state struct (plain map) for apply_scenario tests
@@ -110,14 +131,15 @@ defmodule PowerModel.Failure.ScenariosTest do
 
       # Bounding box that covers bus 1 (34.0, -118.0) and bus 4 (34.5, -118.5)
       # but NOT bus 5 (35.5, -117.5) or bus 3 (35.0, -118.0, on border)
-      scenario = Scenarios.heat_wave(snapshot,
-        north: 34.6, south: 33.5, east: -117.0, west: -119.0)
+      scenario =
+        Scenarios.heat_wave(snapshot, north: 34.6, south: 33.5, east: -117.0, west: -119.0)
 
       # Loads at bus 5 should be included because at least some lines
       # connect to in-region buses; but load multipliers are per-load
       # and load 1 is at bus 5 which is outside the box
       load_1_mult = Map.get(scenario.load_multipliers, 1)
-      assert load_1_mult == nil  # bus 5 is at 35.5N, outside [33.5, 34.6]
+      # bus 5 is at 35.5N, outside [33.5, 34.6]
+      assert load_1_mult == nil
     end
 
     test "heat wave deratings are deterministic (same result on re-run)" do
@@ -143,7 +165,8 @@ defmodule PowerModel.Failure.ScenariosTest do
       # (deterministic, so exact count depends on hash values)
       assert is_list(scenario.forced_trips)
       total_affected = length(scenario.forced_trips) + map_size(scenario.line_deratings)
-      assert total_affected == 6  # all lines are either tripped or derated
+      # all lines are either tripped or derated
+      assert total_affected == 6
 
       # Tripped lines should not also appear in deratings
       for tripped_id <- scenario.forced_trips do
@@ -169,8 +192,11 @@ defmodule PowerModel.Failure.ScenariosTest do
       scenario = Scenarios.ice_storm(snapshot, severity: 3)
 
       for {_id, mult} <- scenario.load_multipliers do
-        assert mult > 1.0, "Ice storm should increase loads (heating demand), got multiplier #{mult}"
-        assert mult <= 1.20, "Ice storm load increase should be reasonable, got multiplier #{mult}"
+        assert mult > 1.0,
+               "Ice storm should increase loads (heating demand), got multiplier #{mult}"
+
+        assert mult <= 1.20,
+               "Ice storm load increase should be reasonable, got multiplier #{mult}"
       end
     end
   end
@@ -184,8 +210,8 @@ defmodule PowerModel.Failure.ScenariosTest do
       snapshot = diamond_snapshot()
 
       # Center fire near bus 1 (34.0, -118.0) with small radius
-      scenario = Scenarios.wildfire(snapshot,
-        center_lat: 34.0, center_lon: -118.0, radius_km: 10.0)
+      scenario =
+        Scenarios.wildfire(snapshot, center_lat: 34.0, center_lon: -118.0, radius_km: 10.0)
 
       # Lines connected to bus 1 (ids 1, 2, 3) should be tripped or at least
       # some lines near the fire center should be affected
@@ -201,8 +227,7 @@ defmodule PowerModel.Failure.ScenariosTest do
       snapshot = diamond_snapshot()
 
       # Fire in the middle of the ocean
-      scenario = Scenarios.wildfire(snapshot,
-        center_lat: 0.0, center_lon: 0.0, radius_km: 10.0)
+      scenario = Scenarios.wildfire(snapshot, center_lat: 0.0, center_lon: 0.0, radius_km: 10.0)
 
       assert scenario.forced_trips == []
     end
@@ -217,8 +242,8 @@ defmodule PowerModel.Failure.ScenariosTest do
       snapshot = diamond_snapshot()
 
       # Epicenter right at bus 1 (34.0, -118.0), magnitude 6
-      scenario = Scenarios.earthquake(snapshot,
-        epicenter_lat: 34.0, epicenter_lon: -118.0, magnitude: 6.0)
+      scenario =
+        Scenarios.earthquake(snapshot, epicenter_lat: 34.0, epicenter_lon: -118.0, magnitude: 6.0)
 
       # Damage radius at M6 = 10^(0.5*6 - 1.5) = 10^1.5 ~ 31.6 km
       # Bus 1 is at the epicenter (0 km), so it's damaged
@@ -231,10 +256,11 @@ defmodule PowerModel.Failure.ScenariosTest do
     test "larger magnitude damages wider area" do
       snapshot = diamond_snapshot()
 
-      s6 = Scenarios.earthquake(snapshot,
-        epicenter_lat: 34.0, epicenter_lon: -118.0, magnitude: 6.0)
-      s8 = Scenarios.earthquake(snapshot,
-        epicenter_lat: 34.0, epicenter_lon: -118.0, magnitude: 8.0)
+      s6 =
+        Scenarios.earthquake(snapshot, epicenter_lat: 34.0, epicenter_lon: -118.0, magnitude: 6.0)
+
+      s8 =
+        Scenarios.earthquake(snapshot, epicenter_lat: 34.0, epicenter_lon: -118.0, magnitude: 8.0)
 
       assert length(s8.forced_trips) >= length(s6.forced_trips)
     end
@@ -259,13 +285,14 @@ defmodule PowerModel.Failure.ScenariosTest do
 
       result = Scenarios.apply_scenario(cascade, scenario)
 
-      line_1 = Enum.find(result.lines, & &1.id == 1)
-      line_3 = Enum.find(result.lines, & &1.id == 3)
-      line_2 = Enum.find(result.lines, & &1.id == 2)
+      line_1 = Enum.find(result.lines, &(&1.id == 1))
+      line_3 = Enum.find(result.lines, &(&1.id == 3))
+      line_2 = Enum.find(result.lines, &(&1.id == 2))
 
       assert line_1.rating_a_mva == 100.0 * 0.5
       assert line_3.rating_a_mva == 100.0 * 0.8
-      assert line_2.rating_a_mva == 100.0  # unchanged
+      # unchanged
+      assert line_2.rating_a_mva == 100.0
     end
 
     test "apply_scenario scales loads" do
@@ -282,7 +309,7 @@ defmodule PowerModel.Failure.ScenariosTest do
 
       result = Scenarios.apply_scenario(cascade, scenario)
 
-      load_1 = Enum.find(result.loads, & &1.id == 1)
+      load_1 = Enum.find(result.loads, &(&1.id == 1))
       assert_in_delta load_1.p_mw, 100.0 * 1.15, 0.01
       assert_in_delta load_1.q_mvar, 15.0 * 1.15, 0.01
     end
@@ -320,7 +347,7 @@ defmodule PowerModel.Failure.ScenariosTest do
 
       result = Scenarios.apply_scenario(cascade, scenario)
 
-      gen_1 = Enum.find(result.generators, & &1.id == 1)
+      gen_1 = Enum.find(result.generators, &(&1.id == 1))
       assert_in_delta gen_1.p_max_mw, 200.0 * 0.7, 0.01
     end
   end
