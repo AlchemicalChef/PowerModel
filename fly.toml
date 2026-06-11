@@ -11,6 +11,8 @@ primary_region = "ord"
 [env]
   PHX_HOST = "powermodel-grid.fly.dev"
   PORT = "8080"
+  # Fly's internal Postgres hostnames resolve via IPv6 AAAA only
+  ECTO_IPV6 = "true"
 
 [http_service]
   internal_port = 8080

@@ -15,7 +15,10 @@ defmodule PowerModel.Application do
         {Phoenix.PubSub, name: PowerModel.PubSub},
         {Registry, keys: :unique, name: PowerModel.SimulationRegistry},
         {DynamicSupervisor, name: PowerModel.SimulationSupervisor, strategy: :one_for_one},
-        PowerModelWeb.Endpoint
+        PowerModelWeb.Endpoint,
+        # Rebuild DB-derived map exports when the (ephemeral) filesystem lacks
+        # them — e.g. every Fly machine cold start. No-op when files exist.
+        {Task, &PowerModel.GridExport.ensure_exported/0}
       ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

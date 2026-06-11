@@ -7,6 +7,30 @@ defmodule PowerModel.GridExport do
   Mix APIs in here.
   """
 
+  require Logger
+
+  @doc """
+  Regenerate the map data files at application boot when they are missing.
+
+  Fly machines get a fresh image filesystem on every cold start, so the
+  DB-derived exports must be rebuilt; locally and on warm restarts the files
+  exist and this is a no-op. Never crashes the supervision tree.
+  """
+  def ensure_exported do
+    dir = Application.app_dir(:power_model, "priv/static/grid_data")
+
+    if File.exists?(Path.join(dir, "transmission.bin")) do
+      :ok
+    else
+      Logger.info("grid_data exports missing; regenerating from database")
+      run(dir)
+    end
+  rescue
+    e -> Logger.warning("grid_data export at boot failed: #{Exception.message(e)}")
+  catch
+    kind, reason -> Logger.warning("grid_data export at boot failed: #{kind} #{inspect(reason)}")
+  end
+
   @doc "Export all map data files into `output_dir`."
   def run(output_dir) do
     File.mkdir_p!(output_dir)
