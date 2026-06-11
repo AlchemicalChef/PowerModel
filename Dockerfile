@@ -20,9 +20,10 @@ ARG RUNNER_IMAGE="docker.io/debian:${DEBIAN_VERSION}"
 
 FROM ${BUILDER_IMAGE} AS builder
 
-# install build dependencies (curl for rustup; Rust compiles the sparse_solver NIF)
+# install build dependencies (curl for rustup; Rust compiles the sparse_solver
+# NIF; node/npm install the map's JS dependencies — deck.gl, maplibre)
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends build-essential git curl ca-certificates \
+  && apt-get install -y --no-install-recommends build-essential git curl ca-certificates nodejs npm \
   && rm -rf /var/lib/apt/lists/*
 
 # Rust toolchain for the rustler NIF (native/sparse_solver)
@@ -64,7 +65,8 @@ RUN mix compile
 
 COPY assets assets
 
-# compile assets
+# install JS dependencies, then compile assets
+RUN npm ci --prefix assets
 RUN mix assets.deploy
 
 # Changes to config/runtime.exs don't require recompiling the code
