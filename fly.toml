@@ -25,6 +25,17 @@ primary_region = "ord"
   min_machines_running = 0
   processes = ["app"]
 
+  # Don't route to a machine until the app actually answers. The header is
+  # required because force_ssl would 301 a plain-HTTP probe.
+  [[http_service.checks]]
+    grace_period = "20s"
+    interval = "15s"
+    timeout = "5s"
+    method = "GET"
+    path = "/"
+    [http_service.checks.headers]
+      X-Forwarded-Proto = "https"
+
 [[vm]]
   # Power-flow solves on the 20k-bus network need real headroom
   memory = "2gb"
