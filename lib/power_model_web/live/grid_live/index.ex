@@ -76,6 +76,7 @@ defmodule PowerModelWeb.GridLive.Index do
         case type do
           "transmission_line" -> SimulationServer.trip_branch(sim_id, component_id)
           "generator" -> SimulationServer.trip_generator(sim_id, component_id)
+          "transformer" -> SimulationServer.trip_transformer(sim_id, component_id)
           _ -> :ok
         end
 
@@ -88,7 +89,7 @@ defmodule PowerModelWeb.GridLive.Index do
       end
     end
 
-    if type in ["transmission_line", "generator"], do: Task.start(trip)
+    if type in ["transmission_line", "generator", "transformer"], do: Task.start(trip)
 
     {:noreply, socket}
   end
@@ -203,7 +204,8 @@ defmodule PowerModelWeb.GridLive.Index do
       voltage: hidden |> Map.get("voltage", MapSet.new()) |> MapSet.to_list(),
       fuel: hidden |> Map.get("fuel", MapSet.new()) |> MapSet.to_list(),
       water: hidden |> Map.get("water", MapSet.new()) |> MapSet.to_list(),
-      datacenter: hidden |> Map.get("datacenter", MapSet.new()) |> MapSet.to_list()
+      datacenter: hidden |> Map.get("datacenter", MapSet.new()) |> MapSet.to_list(),
+      equipment: hidden |> Map.get("equipment", MapSet.new()) |> MapSet.to_list()
     })
 
     {:noreply, socket}
@@ -385,6 +387,16 @@ defmodule PowerModelWeb.GridLive.Index do
       from g in PowerModel.Grid.Generator,
         join: b in PowerModel.Grid.Bus, on: g.bus_id == b.id,
         where: g.id == ^gen_id,
+        select: b.interconnection_id
+    )
+  end
+
+  defp resolve_interconnection({"transformer", xfmr_id}) do
+    import Ecto.Query
+    PowerModel.Repo.one(
+      from t in PowerModel.Grid.Transformer,
+        join: b in PowerModel.Grid.Bus, on: t.from_bus_id == b.id,
+        where: t.id == ^xfmr_id,
         select: b.interconnection_id
     )
   end

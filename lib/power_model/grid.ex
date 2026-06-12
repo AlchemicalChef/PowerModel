@@ -379,6 +379,24 @@ defmodule PowerModel.Grid do
     |> Repo.all()
   end
 
+  def export_transformers do
+    # Positioned at their from-bus (transformers join two voltage levels at
+    # the same physical substation).
+    from(t in Transformer,
+      join: fb in Bus,
+      on: t.from_bus_id == fb.id,
+      where: t.status == "in_service" and not is_nil(fb.coordinates),
+      select: %{
+        id: t.id,
+        coordinates: fb.coordinates,
+        rated_mva: t.rated_mva,
+        from_bus_id: t.from_bus_id,
+        to_bus_id: t.to_bus_id
+      }
+    )
+    |> Repo.all()
+  end
+
   def export_datacenters do
     from(d in Datacenter,
       where: d.status == "active",

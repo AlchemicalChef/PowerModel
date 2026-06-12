@@ -47,6 +47,10 @@ defmodule PowerModel.Engine.SimulationServer do
     GenServer.call(via(sim_id), {:trip_generator, gen_id}, @trip_timeout)
   end
 
+  def trip_transformer(sim_id, xfmr_id) do
+    GenServer.call(via(sim_id), {:trip_transformer, xfmr_id}, @trip_timeout)
+  end
+
   def get_state(sim_id) do
     GenServer.call(via(sim_id), :get_state, 30_000)
   end
@@ -152,6 +156,25 @@ defmodule PowerModel.Engine.SimulationServer do
     end
   end
 
+  def handle_call({:trip_transformer, xfmr_id}, _from, state) do
+    cascade = state.cascade_state
+
+    cond do
+      MapSet.member?(cascade.tripped_transformers, xfmr_id) ->
+        {:reply, {:error, :already_tripped}, state}
+
+      Enum.any?(cascade.transformers, &(&1.id == xfmr_id)) ->
+        state = %{state | epoch: state.epoch + 1}
+        broadcast_manual_trip(state, "transformer", xfmr_id)
+        {final_cascade, step_results} = Cascade.trip_transformer(cascade, xfmr_id)
+        run_and_broadcast_cascade(state, final_cascade, step_results)
+
+      true ->
+        Logger.warning("[sim #{state.sim_id}] trip rejected: transformer #{xfmr_id} not in simulated network")
+        {:reply, {:error, :not_in_network}, state}
+    end
+  end
+
   def handle_call({:trip_generator, gen_id}, _from, state) do
     cascade = state.cascade_state
 
@@ -170,6 +193,40 @@ defmodule PowerModel.Engine.SimulationServer do
         {:reply, {:error, :not_in_network}, state}
     end
   end
+
+  def handle_call(:get_state, _from, state) do
+    reply = %{
+      sim_id: state.sim_id,
+      cascade_step: state.cascade_state.step,
+      stable: state.cascade_state.stable,
+      tripped_lines: MapSet.to_list(state.cascade_state.tripped_lines),
+      tripped_generators: MapSet.to_list(state.cascade_state.tripped_generators),
+      events: state.cascade_state.events,
+      has_dc_solution: state.dc_solution != nil,
+      has_ac_solution: state.ac_solution != nil,
+      hour: state.hour
+    }
+    {:reply, reply, state}
+  end
+
+  def handle_call(:reset, _from, state) do
+    cascade = Cascade.init(state.snapshot, state.base_mva)
+    state = %{state |
+      cascade_state: cascade,
+      dc_solution: nil,
+      ac_solution: nil,
+      base_overloaded: cascade.base_overloaded,
+      base_line_categories: cascade.base_line_categories,
+      base_line_loading: cascade.base_line_loading,
+      # Invalidate any in-flight AC refinement from the pre-reset topology
+      epoch: state.epoch + 1
+    }
+    send(self(), :initial_solve)
+    broadcast(state.sim_id, "reset", %{})
+    {:reply, :ok, state}
+  end
+
+  # Private
 
   # The user-injected failure itself must reach the map immediately: cascade
   # step payloads only carry trips DISCOVERED during the cascade, so without
@@ -234,40 +291,6 @@ defmodule PowerModel.Engine.SimulationServer do
         {:reply, {:ok, step_results}, state}
     end
   end
-
-  def handle_call(:get_state, _from, state) do
-    reply = %{
-      sim_id: state.sim_id,
-      cascade_step: state.cascade_state.step,
-      stable: state.cascade_state.stable,
-      tripped_lines: MapSet.to_list(state.cascade_state.tripped_lines),
-      tripped_generators: MapSet.to_list(state.cascade_state.tripped_generators),
-      events: state.cascade_state.events,
-      has_dc_solution: state.dc_solution != nil,
-      has_ac_solution: state.ac_solution != nil,
-      hour: state.hour
-    }
-    {:reply, reply, state}
-  end
-
-  def handle_call(:reset, _from, state) do
-    cascade = Cascade.init(state.snapshot, state.base_mva)
-    state = %{state |
-      cascade_state: cascade,
-      dc_solution: nil,
-      ac_solution: nil,
-      base_overloaded: cascade.base_overloaded,
-      base_line_categories: cascade.base_line_categories,
-      base_line_loading: cascade.base_line_loading,
-      # Invalidate any in-flight AC refinement from the pre-reset topology
-      epoch: state.epoch + 1
-    }
-    send(self(), :initial_solve)
-    broadcast(state.sim_id, "reset", %{})
-    {:reply, :ok, state}
-  end
-
-  # Private
 
   defp solve_dc(state) do
     try do
@@ -401,13 +424,26 @@ defmodule PowerModel.Engine.SimulationServer do
   is what makes flow redistribution ("load shifting") visible even when a
   branch stays within its base category.
 
-  Returns `{overloaded_ids, stressed_ids, rerouted_ids}`.
+  Lines and transformers are reported in SEPARATE id lists: they come from
+  different tables with independently colliding numeric ids.
+
+  Returns a map with `overloaded/stressed/rerouted_line_ids` and
+  `overloaded/stressed/rerouted_transformer_ids`.
   """
-  def categorize_line_flows(line_flows, base_categories, base_loading) do
+  def classify_flows(flows, base_categories, base_loading) do
     base_cats = base_categories || %{}
     base_load = base_loading || %{}
 
-    Enum.reduce(line_flows, {[], [], []}, fn {key, flow}, {ol, st, rt} ->
+    empty = %{
+      overloaded_line_ids: [],
+      stressed_line_ids: [],
+      rerouted_line_ids: [],
+      overloaded_transformer_ids: [],
+      stressed_transformer_ids: [],
+      rerouted_transformer_ids: []
+    }
+
+    Enum.reduce(flows, empty, fn {{type, id} = key, flow}, acc ->
       base_cat = Map.get(base_cats, key, 0)
       base_pct = Map.get(base_load, key, 0.0)
       delta = flow.loading_pct - base_pct
@@ -422,37 +458,44 @@ defmodule PowerModel.Engine.SimulationServer do
       worsened = new_cat > base_cat
       shifted = delta >= 10.0 and flow.loading_pct >= 20.0
 
-      case key do
-        # Only transmission LINES feed the map's line-coloring id lists --
-        # transformer ids live in a separate table and would collide with
-        # unrelated line ids (the map has no transformer layer to paint).
-        {:line, id} ->
-          cond do
-            new_cat == 3 and (worsened or shifted) -> {[id | ol], st, rt}
-            new_cat == 2 and (worsened or shifted) -> {ol, [id | st], rt}
-            (new_cat == 1 and worsened) or (new_cat <= 1 and shifted) -> {ol, st, [id | rt]}
-            true -> {ol, st, rt}
-          end
+      bucket = cond do
+        new_cat == 3 and (worsened or shifted) -> :overloaded
+        new_cat == 2 and (worsened or shifted) -> :stressed
+        (new_cat == 1 and worsened) or (new_cat <= 1 and shifted) -> :rerouted
+        true -> nil
+      end
 
-        _ ->
-          {ol, st, rt}
+      case {bucket, type} do
+        {nil, _} -> acc
+        {b, :line} -> Map.update!(acc, :"#{b}_line_ids", &[id | &1])
+        {b, :transformer} -> Map.update!(acc, :"#{b}_transformer_ids", &[id | &1])
+        _ -> acc
       end
     end)
   end
 
+  @doc "Line-only view of `classify_flows/3`: `{overloaded, stressed, rerouted}` ids."
+  def categorize_line_flows(line_flows, base_categories, base_loading) do
+    c = classify_flows(line_flows, base_categories, base_loading)
+    {c.overloaded_line_ids, c.stressed_line_ids, c.rerouted_line_ids}
+  end
+
   defp solution_payload(nil, _state), do: %{}
   defp solution_payload(solution, state) do
-    {overloaded, stressed_lines, rerouted_lines} =
-      categorize_line_flows(solution.line_flows, state.base_line_categories, state.base_line_loading)
+    classified =
+      classify_flows(solution.line_flows, state.base_line_categories, state.base_line_loading)
 
     %{
       converged: solution.converged,
       iterations: solution.iterations,
       max_mismatch: solution.max_mismatch,
-      overloaded_line_ids: overloaded,
-      stressed_line_ids: stressed_lines,
-      rerouted_line_ids: rerouted_lines,
-      overloaded_count: length(overloaded),
+      overloaded_line_ids: classified.overloaded_line_ids,
+      stressed_line_ids: classified.stressed_line_ids,
+      rerouted_line_ids: classified.rerouted_line_ids,
+      overloaded_transformer_ids: classified.overloaded_transformer_ids,
+      stressed_transformer_ids: classified.stressed_transformer_ids,
+      rerouted_transformer_ids: classified.rerouted_transformer_ids,
+      overloaded_count: length(classified.overloaded_line_ids),
       total_gen_mw: solution.total_gen_mw,
       total_load_mw: solution.total_load_mw,
       total_loss_mw: solution.total_loss_mw,
@@ -492,6 +535,10 @@ defmodule PowerModel.Engine.SimulationServer do
     |> Enum.filter(&(&1.component_type == "transmission_line"))
     |> Enum.map(& &1.component_id)
 
+    tripped_transformer_ids = trips
+    |> Enum.filter(&(&1.component_type == "transformer"))
+    |> Enum.map(& &1.component_id)
+
     tripped_generator_ids = trips
     |> Enum.filter(&(&1.component_type == "generator"))
     |> Enum.map(& &1.component_id)
@@ -508,17 +555,23 @@ defmodule PowerModel.Engine.SimulationServer do
     datacenter_trips = Enum.filter(trips, &(&1.component_type == "datacenter"))
     datacenter_ids = Map.get(step, :datacenter_ids, [])
 
-    # Extract overloaded/stressed/rerouted from step solutions (these are LINE IDs only)
-    # Filter out base-case overloads (model artifacts)
+    # Extract overloaded/stressed/rerouted from step solutions, lines and
+    # transformers in separate channels. Base-case artifacts filtered out.
     solutions = if is_list(step.solution), do: step.solution, else: []
 
-    {overloaded_line_ids, stressed_line_ids, rerouted_line_ids} =
-      Enum.reduce(solutions, {[], [], []}, fn sol, {ol, st, rt} ->
-        {sol_ol, sol_st, sol_rt} =
-          categorize_line_flows(sol.line_flows, state.base_line_categories, state.base_line_loading)
-
-        {ol ++ sol_ol, st ++ sol_st, rt ++ sol_rt}
-      end)
+    merged =
+      Enum.reduce(
+        solutions,
+        %{
+          overloaded_line_ids: [], stressed_line_ids: [], rerouted_line_ids: [],
+          overloaded_transformer_ids: [], stressed_transformer_ids: [],
+          rerouted_transformer_ids: []
+        },
+        fn sol, acc ->
+          c = classify_flows(sol.line_flows, state.base_line_categories, state.base_line_loading)
+          Map.new(acc, fn {k, v} -> {k, v ++ Map.fetch!(c, k)} end)
+        end
+      )
 
     %{
       step: step.step,
@@ -526,11 +579,15 @@ defmodule PowerModel.Engine.SimulationServer do
       islands: step.islands,
       trips: trips,
       tripped_line_ids: tripped_line_ids,
+      tripped_transformer_ids: tripped_transformer_ids,
       tripped_generator_ids: tripped_generator_ids,
       trip_count: length(trips),
-      overloaded_line_ids: overloaded_line_ids,
-      stressed_line_ids: stressed_line_ids,
-      rerouted_line_ids: rerouted_line_ids,
+      overloaded_line_ids: merged.overloaded_line_ids,
+      stressed_line_ids: merged.stressed_line_ids,
+      rerouted_line_ids: merged.rerouted_line_ids,
+      overloaded_transformer_ids: merged.overloaded_transformer_ids,
+      stressed_transformer_ids: merged.stressed_transformer_ids,
+      rerouted_transformer_ids: merged.rerouted_transformer_ids,
       shed_ids: shed_ids,
       water_facility_ids: water_facility_ids,
       water_facility_trips: Enum.map(water_facility_trips, fn t ->

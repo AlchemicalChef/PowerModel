@@ -38,6 +38,7 @@ defmodule PowerModel.GridExport do
     export_generators(output_dir)
     export_transmission_lines(output_dir)
     export_substations(output_dir)
+    export_transformers(output_dir)
     export_water_facilities(output_dir)
     export_datacenters(output_dir)
 
@@ -115,6 +116,27 @@ defmodule PowerModel.GridExport do
 
     File.write!(Path.join(dir, "substations.bin"), binary)
     IO.puts("  substations.bin: #{count} records, #{byte_size(binary)} bytes")
+  end
+
+  defp export_transformers(dir) do
+    transformers = PowerModel.Grid.export_transformers()
+    count = length(transformers)
+
+    binary = <<count::unsigned-little-32>> <>
+      Enum.reduce(transformers, <<>>, fn t, acc ->
+        {lon, lat} = extract_coords(t.coordinates)
+
+        acc <> <<
+          t.id::unsigned-little-32,
+          lon::float-little-32,
+          lat::float-little-32,
+          (t.rated_mva || 0.0)::float-little-32,
+          0::unsigned-8
+        >>
+      end)
+
+    File.write!(Path.join(dir, "transformers.bin"), binary)
+    IO.puts("  transformers.bin: #{count} records, #{byte_size(binary)} bytes")
   end
 
   defp export_water_facilities(dir) do

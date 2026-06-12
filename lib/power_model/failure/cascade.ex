@@ -224,6 +224,19 @@ defmodule PowerModel.Failure.Cascade do
   end
 
   @doc """
+  Trip a transformer and run cascade.
+  Returns {final_state, all_step_results} for streaming.
+  """
+  def trip_transformer(%__MODULE__{} = state, xfmr_id) do
+    state = %{state |
+      tripped_transformers: MapSet.put(state.tripped_transformers, xfmr_id),
+      events: [%{step: 0, component_type: "transformer", component_id: xfmr_id,
+                  failure_cause: "manual_trip", details: %{}} | state.events]
+    }
+    run_cascade(state)
+  end
+
+  @doc """
   Trip a generator and run cascade.
   Performs redispatch to cover the lost generation before running the cascade loop.
   """

@@ -63,4 +63,51 @@ defmodule PowerModel.Engine.CategorizeLineFlowsTest do
     assert st == [2]
     assert rt == [1]
   end
+
+  defp xfmr_flow(id, loading_pct) do
+    {{:transformer, id}, %{from_bus_id: 1, to_bus_id: 2, p_flow_mw: 0.0, loading_pct: loading_pct}}
+  end
+
+  describe "classify_flows/3 transformer channels" do
+    test "transformers land in transformer id lists, never line lists" do
+      flows = Map.new([xfmr_flow(7, 110.0), xfmr_flow(8, 85.0), xfmr_flow(9, 50.0)])
+      c = SimulationServer.classify_flows(flows, nil, nil)
+
+      assert c.overloaded_transformer_ids == [7]
+      assert c.stressed_transformer_ids == [8]
+      assert c.rerouted_transformer_ids == [9]
+      assert c.overloaded_line_ids == []
+      assert c.stressed_line_ids == []
+      assert c.rerouted_line_ids == []
+    end
+
+    test "colliding numeric ids across tables stay separated" do
+      # Line 5 and transformer 5: line overloads, transformer is quiet.
+      flows = Map.new([flow(5, 120.0), xfmr_flow(5, 10.0)])
+      c = SimulationServer.classify_flows(flows, nil, nil)
+
+      assert c.overloaded_line_ids == [5]
+      assert c.overloaded_transformer_ids == []
+      assert c.stressed_transformer_ids == []
+      assert c.rerouted_transformer_ids == []
+    end
+
+    test "transformer worsened-category and delta rules match line rules" do
+      # Same category (2), +14 pts shift -> stressed
+      c = SimulationServer.classify_flows(
+        Map.new([xfmr_flow(1, 92.0)]),
+        %{{:transformer, 1} => 2},
+        %{{:transformer, 1} => 78.0}
+      )
+      assert c.stressed_transformer_ids == [1]
+
+      # Barely-moved base overload is suppressed
+      c2 = SimulationServer.classify_flows(
+        Map.new([xfmr_flow(2, 106.0)]),
+        %{{:transformer, 2} => 3},
+        %{{:transformer, 2} => 105.0}
+      )
+      assert c2.overloaded_transformer_ids == []
+    end
+  end
 end

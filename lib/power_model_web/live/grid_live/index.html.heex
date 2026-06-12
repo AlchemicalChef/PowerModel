@@ -196,6 +196,14 @@
         <% end %>
       </div>
     <% end %>
+    <div class="legend-divider"></div>
+    <div class="legend-section">
+      <div class="legend-title">Equipment</div>
+      <.legend_item category="equipment" key="transformer" label="Transformers"
+        hidden={legend_hidden?(@hidden_legend, "equipment", "transformer")}>
+        <svg class="legend-icon" viewBox="0 0 20 20"><circle cx="7.5" cy="10" r="5" stroke="rgb(186,154,90)" stroke-width="2" fill="none"/><circle cx="12.5" cy="10" r="5" stroke="rgb(186,154,90)" stroke-width="2" fill="none"/></svg>
+      </.legend_item>
+    </div>
     <%= if @show_water do %>
     <div class="legend-divider"></div>
     <div class="legend-section">

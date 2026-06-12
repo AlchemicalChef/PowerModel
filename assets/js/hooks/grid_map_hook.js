@@ -22,6 +22,9 @@ const GridMapHook = {
       this.mapManager = blackhole;
     }
 
+    // Debug/automation handle (read access to the manager for tooling)
+    window.__gridMapManager = this.mapManager;
+
     // Load initial grid data; a failed fetch must not become an unhandled
     // rejection that silently leaves the map empty with no trace.
     Promise.resolve(this.mapManager.loadInitialData()).catch((err) =>

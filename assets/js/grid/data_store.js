@@ -14,6 +14,7 @@ export class DataStore {
     this.substations = { count: 0, ids: null, positions: null, voltages: null, states: null };
     this.waterFacilities = { count: 0, facilities: [] };
     this.datacenters = { count: 0, datacenters: [] };
+    this.transformers = { count: 0, ids: null, positions: null, ratings: null, states: null };
   }
 
   loadGenerators(buffer) {
@@ -85,6 +86,59 @@ export class DataStore {
     }
 
     this.substations = { count, ids, positions, voltages, states };
+  }
+
+  loadTransformers(buffer) {
+    const view = new DataView(buffer);
+    const count = view.getUint32(0, true);
+    let offset = 4;
+
+    const ids = new Uint32Array(count);
+    const positions = new Float32Array(count * 2);
+    const ratings = new Float32Array(count);
+    const states = new Uint8Array(count);
+
+    for (let i = 0; i < count; i++) {
+      ids[i] = view.getUint32(offset, true); offset += 4;
+      positions[i * 2] = view.getFloat32(offset, true); offset += 4;
+      positions[i * 2 + 1] = view.getFloat32(offset, true); offset += 4;
+      ratings[i] = view.getFloat32(offset, true); offset += 4;
+      states[i] = view.getUint8(offset); offset += 1;
+    }
+
+    this.transformers = { count, ids, positions, ratings, states };
+  }
+
+  getTransformerData() {
+    const data = [];
+    for (let i = 0; i < this.transformers.count; i++) {
+      data.push({
+        id: this.transformers.ids[i],
+        position: [this.transformers.positions[i * 2], this.transformers.positions[i * 2 + 1]],
+        ratedMva: this.transformers.ratings[i],
+        state: this.transformers.states[i],
+      });
+    }
+    return data;
+  }
+
+  applyTransformerStateMap(stateMap) {
+    if (!stateMap || Object.keys(stateMap).length === 0) return;
+    if (!this.transformers.ids) return;
+    for (let i = 0; i < this.transformers.count; i++) {
+      const s = stateMap[this.transformers.ids[i]];
+      if (s !== undefined) this.transformers.states[i] = s;
+    }
+  }
+
+  // Clear flow-derived transformer states, preserving tripped marks
+  resetTransformerFlowStates() {
+    if (!this.transformers.states) return;
+    for (let i = 0; i < this.transformers.count; i++) {
+      if (this.transformers.states[i] !== STATE_TRIPPED) {
+        this.transformers.states[i] = STATE_NORMAL;
+      }
+    }
   }
 
   loadWaterFacilities(json) {
@@ -185,6 +239,7 @@ export class DataStore {
     if (this.generators.states) this.generators.states.fill(STATE_NORMAL);
     for (const line of this.transmissionLines.lines) line.state = STATE_NORMAL;
     if (this.substations.states) this.substations.states.fill(STATE_NORMAL);
+    if (this.transformers.states) this.transformers.states.fill(STATE_NORMAL);
     for (const f of this.waterFacilities.facilities) f.state = STATE_NORMAL;
     for (const d of this.datacenters.datacenters) d.state = STATE_NORMAL;
   }

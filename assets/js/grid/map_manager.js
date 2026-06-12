@@ -6,6 +6,7 @@ import { createTransmissionLayer } from "./layers/transmission_layer";
 import { createSubstationsLayer } from "./layers/substations_layer";
 import { createWaterFacilitiesLayer } from "./layers/water_facilities_layer";
 import { createDatacentersLayer } from "./layers/datacenters_layer";
+import { createTransformersLayer } from "./layers/transformers_layer";
 import { COLOR_SCALES } from "./color_scales";
 
 const MAPLIBRE_STYLE =
@@ -39,6 +40,7 @@ export class MapManager {
       fuel: new Set(),
       water: new Set(),
       datacenter: new Set(),
+      equipment: new Set(),
     };
     this.onComponentClick = null;
     this.onViewportChange = null;
@@ -84,7 +86,7 @@ export class MapManager {
   }
 
   async loadInitialData() {
-    const [genData, transData, subData, waterData, dcData] = await Promise.all([
+    const [genData, transData, subData, waterData, dcData, xfmrData] = await Promise.all([
       fetch("/grid_data/generators.bin").then((r) =>
         r.ok ? r.arrayBuffer() : null
       ),
@@ -100,6 +102,9 @@ export class MapManager {
       fetch("/grid_data/datacenters.json").then((r) =>
         r.ok ? r.json() : null
       ),
+      fetch("/grid_data/transformers.bin").then((r) =>
+        r.ok ? r.arrayBuffer() : null
+      ),
     ]);
 
     if (genData) this.dataStore.loadGenerators(genData);
@@ -107,6 +112,7 @@ export class MapManager {
     if (subData) this.dataStore.loadSubstations(subData);
     if (waterData) this.dataStore.loadWaterFacilities(waterData);
     if (dcData) this.dataStore.loadDatacenters(dcData);
+    if (xfmrData) this.dataStore.loadTransformers(xfmrData);
 
     this._updateLayers();
   }
@@ -175,6 +181,22 @@ export class MapManager {
       );
     }
 
+    // Transformers (visible at zoom >= 7; affected units at any zoom)
+    if (this.dataStore.transformers.count > 0) {
+      layers.push(
+        createTransformersLayer(this.dataStore, this.viewMode, zoom, (info) => {
+          if (info.object && this.onComponentClick) {
+            const obj = info.object;
+            this.onComponentClick("transformer", obj.id, {
+              ratingMva: obj.ratedMva,
+              state: obj.state,
+            });
+          }
+        }, selectedType === "transformer" ? selectedId : null, ca,
+        this.categoryFilters.equipment.has("transformer"), this.stateVersion)
+      );
+    }
+
     // Water facilities / critical infrastructure: hidden unless toggled on.
     // During a cascade, facilities that lose power are still shown — that is
     // failure impact, not baseline clutter.
@@ -231,6 +253,7 @@ export class MapManager {
     // cannot see — tripped lines carry no flow) so recovered lines stop
     // showing stale alarms.
     this.dataStore.resetLineFlowStates();
+    this.dataStore.resetTransformerFlowStates();
 
     // Apply least-severe first so a line in multiple lists keeps the most
     // severe color (rerouted < stressed < overloaded).
@@ -246,6 +269,19 @@ export class MapManager {
     }
 
     this.dataStore.applyLineStateMap(lineStateMap);
+
+    const xfmrStateMap = {};
+    if (data.rerouted_transformer_ids) {
+      for (const id of data.rerouted_transformer_ids) xfmrStateMap[id] = 4;
+    }
+    if (data.stressed_transformer_ids) {
+      for (const id of data.stressed_transformer_ids) xfmrStateMap[id] = 1;
+    }
+    if (data.overloaded_transformer_ids) {
+      for (const id of data.overloaded_transformer_ids) xfmrStateMap[id] = 2;
+    }
+    this.dataStore.applyTransformerStateMap(xfmrStateMap);
+
     this._updateLayers();
   }
 
@@ -291,6 +327,22 @@ export class MapManager {
       for (const id of data.tripped_line_ids) lineMap[id] = 3;
     }
     this.dataStore.applyLineStateMap(lineMap);
+
+    // Transformer-specific state changes (separate id space from lines)
+    const xfmrMap = {};
+    if (data.rerouted_transformer_ids) {
+      for (const id of data.rerouted_transformer_ids) xfmrMap[id] = 4;
+    }
+    if (data.stressed_transformer_ids) {
+      for (const id of data.stressed_transformer_ids) xfmrMap[id] = 1;
+    }
+    if (data.overloaded_transformer_ids) {
+      for (const id of data.overloaded_transformer_ids) xfmrMap[id] = 2;
+    }
+    if (data.tripped_transformer_ids) {
+      for (const id of data.tripped_transformer_ids) xfmrMap[id] = 3;
+    }
+    this.dataStore.applyTransformerStateMap(xfmrMap);
 
     // Generator-specific state changes
     const genMap = {};
@@ -344,6 +396,7 @@ export class MapManager {
       fuel: new Set(data.fuel || []),
       water: new Set(data.water || []),
       datacenter: new Set(data.datacenter || []),
+      equipment: new Set(data.equipment || []),
     };
     this._updateLayers();
   }

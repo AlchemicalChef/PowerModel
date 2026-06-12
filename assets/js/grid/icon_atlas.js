@@ -41,6 +41,10 @@ export function datacenterIconName() {
   return "datacenter";
 }
 
+export function transformerIconName() {
+  return "transformer";
+}
+
 function buildAtlas() {
   const canvas = document.createElement("canvas");
   canvas.width = COLS * ICON_SIZE;
@@ -50,7 +54,7 @@ function buildAtlas() {
   // Grid layout:
   // Row 0: gen_gas, gen_coal, gen_nuclear, gen_hydro, gen_wind
   // Row 1: gen_solar, gen_other, substation, water_desal, water_waste
-  // Row 2: water_treat, water_pump, water_reservoir, datacenter, (empty)
+  // Row 2: water_treat, water_pump, water_reservoir, datacenter, transformer
 
   const s = ICON_SIZE * 0.38; // drawing radius
 
@@ -68,12 +72,13 @@ function buildAtlas() {
   drawChevrons(ctx, cell(1, 2), s);
   drawWaves(ctx, cell(2, 2), s);
   drawServerRack(ctx, cell(3, 2), s);
+  drawTransformerCoils(ctx, cell(4, 2), s);
 
   const mapping = {};
   const names = [
     ["gen_gas", "gen_coal", "gen_nuclear", "gen_hydro", "gen_wind"],
     ["gen_solar", "gen_other", "substation", "water_desal", "water_waste"],
-    ["water_treat", "water_pump", "water_reservoir", "datacenter"],
+    ["water_treat", "water_pump", "water_reservoir", "datacenter", "transformer"],
   ];
   for (let r = 0; r < names.length; r++) {
     for (let c = 0; c < names[r].length; c++) {
@@ -346,6 +351,20 @@ function drawServerRack(ctx, { cx, cy }, s) {
     ctx.arc(cx - w * 0.22, y, s * 0.07, 0, Math.PI * 2);
     ctx.fill();
   }
+}
+
+function drawTransformerCoils(ctx, { cx, cy }, s) {
+  // Classic transformer symbol: two overlapping circles
+  ctx.strokeStyle = "white";
+  ctx.lineWidth = 5;
+  const r = s * 0.52;
+  const d = s * 0.34;
+  ctx.beginPath();
+  ctx.arc(cx, cy - d, r, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx, cy + d, r, 0, Math.PI * 2);
+  ctx.stroke();
 }
 
 function drawWaves(ctx, { cx, cy }, s) {
