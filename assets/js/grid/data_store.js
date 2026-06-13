@@ -15,6 +15,8 @@ export class DataStore {
     this.waterFacilities = { count: 0, facilities: [] };
     this.datacenters = { count: 0, datacenters: [] };
     this.transformers = { count: 0, ids: null, positions: null, ratings: null, states: null };
+    this.busLoads = { count: 0, positions: null, demands: null };
+    this._demandHexCache = {}; // resolution -> [{ hex, mw }]
   }
 
   loadGenerators(buffer) {
@@ -139,6 +141,49 @@ export class DataStore {
         this.transformers.states[i] = STATE_NORMAL;
       }
     }
+  }
+
+  // Per-bus demand points for the H3 demand-density overlay.
+  // Layout: count u32, then per record lon f32, lat f32, demand_mw f32.
+  loadBusLoads(buffer) {
+    const view = new DataView(buffer);
+    const count = view.getUint32(0, true);
+    let offset = 4;
+
+    const positions = new Float32Array(count * 2);
+    const demands = new Float32Array(count);
+
+    for (let i = 0; i < count; i++) {
+      positions[i * 2] = view.getFloat32(offset, true); offset += 4;
+      positions[i * 2 + 1] = view.getFloat32(offset, true); offset += 4;
+      demands[i] = view.getFloat32(offset, true); offset += 4;
+    }
+
+    this.busLoads = { count, positions, demands };
+    this._demandHexCache = {};
+  }
+
+  // Aggregate per-bus demand into H3 cells at the given resolution. Memoized
+  // per resolution so panning at one zoom doesn't re-bin 77k points.
+  getDemandHexagons(res, h3) {
+    if (this._demandHexCache[res]) return this._demandHexCache[res];
+    if (!this.busLoads.count) return [];
+
+    const sums = new Map();
+    const { positions, demands, count } = this.busLoads;
+    for (let i = 0; i < count; i++) {
+      const lon = positions[i * 2];
+      const lat = positions[i * 2 + 1];
+      const mw = demands[i];
+      if (!(mw > 0)) continue;
+      const hex = h3.latLngToCell(lat, lon, res);
+      sums.set(hex, (sums.get(hex) || 0) + mw);
+    }
+
+    const out = [];
+    for (const [hex, mw] of sums) out.push({ hex, mw });
+    this._demandHexCache[res] = out;
+    return out;
   }
 
   loadWaterFacilities(json) {

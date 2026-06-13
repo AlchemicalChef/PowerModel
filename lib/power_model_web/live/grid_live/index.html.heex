@@ -25,6 +25,12 @@
         <input type="checkbox" name="datacenters" value="true" checked={@show_datacenters} />
         <span>Datacenters</span>
       </label>
+
+      <label class="layer-toggle" title="Demand density hexbin overlay (H3)">
+        <input type="hidden" name="demand_density" value="false" />
+        <input type="checkbox" name="demand_density" value="true" checked={@show_demand_density} />
+        <span>Demand</span>
+      </label>
     </form>
 
     <%= if @demand_range do %>
@@ -240,6 +246,19 @@
           <span class="legend-dot" style={"background: #{color};"}></span>
         </.legend_item>
       <% end %>
+    </div>
+    <% end %>
+    <%= if @show_demand_density do %>
+    <div class="legend-divider"></div>
+    <div class="legend-section">
+      <div class="legend-title">Demand Density</div>
+      <div class="legend-item">
+        <span class="legend-swatch" style="background: linear-gradient(to right, rgb(12,8,38), rgb(90,20,110), rgb(182,54,121), rgb(240,110,70), rgb(252,200,120)); width: 80px;"></span>
+      </div>
+      <div class="legend-item legend-scale-labels">
+        <span>Low</span>
+        <span>High MW</span>
+      </div>
     </div>
     <% end %>
     <%= if @view_mode == "failure_state" or @cascade_active or length(@cascade_steps) > 0 do %>

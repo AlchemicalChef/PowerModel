@@ -39,6 +39,7 @@ defmodule PowerModel.GridExport do
     export_transmission_lines(output_dir)
     export_substations(output_dir)
     export_transformers(output_dir)
+    export_bus_loads(output_dir)
     export_water_facilities(output_dir)
     export_datacenters(output_dir)
 
@@ -116,6 +117,27 @@ defmodule PowerModel.GridExport do
 
     File.write!(Path.join(dir, "substations.bin"), binary)
     IO.puts("  substations.bin: #{count} records, #{byte_size(binary)} bytes")
+  end
+
+  # Per-bus demand points for the H3 hexbin overlay. Aggregation into H3
+  # cells happens client-side (h3-js) so resolution can follow zoom.
+  defp export_bus_loads(dir) do
+    loads = PowerModel.Grid.export_bus_loads()
+    count = length(loads)
+
+    binary = <<count::unsigned-little-32>> <>
+      Enum.reduce(loads, <<>>, fn l, acc ->
+        {lon, lat} = extract_coords(l.coordinates)
+
+        acc <> <<
+          lon::float-little-32,
+          lat::float-little-32,
+          (l.demand_mw || 0.0)::float-little-32
+        >>
+      end)
+
+    File.write!(Path.join(dir, "bus_loads.bin"), binary)
+    IO.puts("  bus_loads.bin: #{count} records, #{byte_size(binary)} bytes")
   end
 
   defp export_transformers(dir) do

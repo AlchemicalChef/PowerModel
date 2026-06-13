@@ -60,6 +60,10 @@ const GridMapHook = {
       this.mapManager.setDatacentersVisible(data.visible);
     });
 
+    this.handleEvent("set_demand_density_visibility", (data) => {
+      this.mapManager.setDemandDensityVisible(data.visible);
+    });
+
     this.handleEvent("set_category_filters", (data) => {
       this.mapManager.setCategoryFilters(data);
     });

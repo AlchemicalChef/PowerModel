@@ -7,6 +7,7 @@ import { createSubstationsLayer } from "./layers/substations_layer";
 import { createWaterFacilitiesLayer } from "./layers/water_facilities_layer";
 import { createDatacentersLayer } from "./layers/datacenters_layer";
 import { createTransformersLayer } from "./layers/transformers_layer";
+import { createDemandDensityLayer } from "./layers/demand_density_layer";
 import { COLOR_SCALES } from "./color_scales";
 
 const MAPLIBRE_STYLE =
@@ -29,6 +30,7 @@ export class MapManager {
     this.cascadeActive = false;
     this.showWaterFacilities = false;
     this.showDatacenters = false;
+    this.showDemandDensity = false;
     // Monotonic counter bumped on every state mutation; used as the deck.gl
     // updateTrigger so color accessors re-evaluate exactly when needed
     // (Date.now() both defeated caching on idle pans and could collide
@@ -86,7 +88,7 @@ export class MapManager {
   }
 
   async loadInitialData() {
-    const [genData, transData, subData, waterData, dcData, xfmrData] = await Promise.all([
+    const [genData, transData, subData, waterData, dcData, xfmrData, loadData] = await Promise.all([
       fetch("/grid_data/generators.bin").then((r) =>
         r.ok ? r.arrayBuffer() : null
       ),
@@ -105,6 +107,9 @@ export class MapManager {
       fetch("/grid_data/transformers.bin").then((r) =>
         r.ok ? r.arrayBuffer() : null
       ),
+      fetch("/grid_data/bus_loads.bin").then((r) =>
+        r.ok ? r.arrayBuffer() : null
+      ),
     ]);
 
     if (genData) this.dataStore.loadGenerators(genData);
@@ -113,6 +118,7 @@ export class MapManager {
     if (waterData) this.dataStore.loadWaterFacilities(waterData);
     if (dcData) this.dataStore.loadDatacenters(dcData);
     if (xfmrData) this.dataStore.loadTransformers(xfmrData);
+    if (loadData) this.dataStore.loadBusLoads(loadData);
 
     this._updateLayers();
   }
@@ -131,6 +137,17 @@ export class MapManager {
     const layers = [];
 
     const ca = this.cascadeActive;
+
+    // Demand-density hexbin overlay (drawn first = beneath the network) so
+    // the line/generator geometry stays legible on top of it.
+    layers.push(
+      ...createDemandDensityLayer(
+        this.dataStore,
+        zoom,
+        !this.showDemandDensity,
+        this.stateVersion
+      )
+    );
 
     // Transmission lines (always visible, filtered by zoom)
     if (this.dataStore.transmissionLines.count > 0) {
@@ -387,6 +404,11 @@ export class MapManager {
 
   setDatacentersVisible(visible) {
     this.showDatacenters = !!visible;
+    this._updateLayers();
+  }
+
+  setDemandDensityVisible(visible) {
+    this.showDemandDensity = !!visible;
     this._updateLayers();
   }
 

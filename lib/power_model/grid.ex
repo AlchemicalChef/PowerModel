@@ -379,6 +379,26 @@ defmodule PowerModel.Grid do
     |> Repo.all()
   end
 
+  @doc """
+  Per-bus total demand (MW) at geolocated buses, for the H3 demand-density
+  overlay. Sums every in-service load on a bus — population/water
+  `constant_power` rows and flat `datacenter` rows alike, since both are real
+  consumption. Buses with no load or no coordinates are omitted.
+
+  This is the baseline (unscaled) spatial distribution; the EIA-930 per-BA
+  hour scaling rescales magnitudes per snapshot but not the relative shape.
+  """
+  def export_bus_loads do
+    from(l in Load,
+      join: b in Bus,
+      on: l.bus_id == b.id,
+      where: l.status == "in_service" and not is_nil(b.coordinates),
+      group_by: [b.id, b.coordinates],
+      select: %{coordinates: b.coordinates, demand_mw: sum(l.p_mw)}
+    )
+    |> Repo.all()
+  end
+
   def export_transformers do
     # Positioned at their from-bus (transformers join two voltage levels at
     # the same physical substation).

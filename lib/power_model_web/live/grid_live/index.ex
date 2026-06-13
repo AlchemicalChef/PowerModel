@@ -24,6 +24,7 @@ defmodule PowerModelWeb.GridLive.Index do
     |> assign(:selected_hour, nil)
     |> assign(:show_water, false)
     |> assign(:show_datacenters, false)
+    |> assign(:show_demand_density, false)
     |> assign(:hidden_legend, %{})
     |> assign(:show_utilization, false)
     |> assign(:utilization, nil)
@@ -216,12 +217,15 @@ defmodule PowerModelWeb.GridLive.Index do
     # pattern), so server, checkbox, and map can never drift out of sync.
     show_water = params["water"] == "true"
     show_datacenters = params["datacenters"] == "true"
+    show_demand_density = params["demand_density"] == "true"
 
     socket = socket
     |> assign(:show_water, show_water)
     |> assign(:show_datacenters, show_datacenters)
+    |> assign(:show_demand_density, show_demand_density)
     |> push_event("set_water_visibility", %{visible: show_water})
     |> push_event("set_datacenter_visibility", %{visible: show_datacenters})
+    |> push_event("set_demand_density_visibility", %{visible: show_demand_density})
 
     {:noreply, socket}
   end
