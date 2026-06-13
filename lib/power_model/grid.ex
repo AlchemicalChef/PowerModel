@@ -610,6 +610,58 @@ defmodule PowerModel.Grid do
   end
 
   @doc """
+  Re-merge mapped water facility MW into the `constant_power` bus loads.
+
+  `map_water_facilities_to_grid/1` adds each facility's MW into its bus's
+  baseline load exactly once (guarded by `is_nil(bus_id)`), so when the load
+  estimator rebuilds those rows the water MW is lost. This re-applies it for
+  every already-mapped facility. NOT idempotent on its own — call it exactly
+  once after each load re-estimation (LoadEstimator.run/0 does).
+
+  Returns `{updated_count, inserted_count}`.
+  """
+  def reapply_water_facility_loads do
+    q_ratio = 0.3287
+
+    # Add water MW into existing constant_power rows
+    %{num_rows: updated} =
+      Repo.query!(
+        """
+        UPDATE loads l
+        SET p_mw = l.p_mw + w.total_mw,
+            q_mvar = COALESCE(l.q_mvar, 0) + w.total_mw * $1
+        FROM (
+          SELECT bus_id, SUM(power_consumption_mw) AS total_mw
+          FROM water_facilities
+          WHERE status = 'active' AND bus_id IS NOT NULL AND power_consumption_mw > 0
+          GROUP BY bus_id
+        ) w
+        WHERE l.bus_id = w.bus_id AND l.load_type = 'constant_power'
+        """,
+        [q_ratio]
+      )
+
+    # Facilities mapped to buses with no constant_power row (e.g. non-PQ
+    # buses) get a fresh row, as the original mapping did
+    %{num_rows: inserted} =
+      Repo.query!(
+        """
+        INSERT INTO loads (bus_id, p_mw, q_mvar, load_type, status, inserted_at, updated_at)
+        SELECT w.bus_id, SUM(w.power_consumption_mw), SUM(w.power_consumption_mw) * $1,
+               'constant_power', 'in_service', NOW(), NOW()
+        FROM water_facilities w
+        LEFT JOIN loads l ON l.bus_id = w.bus_id AND l.load_type = 'constant_power'
+        WHERE w.status = 'active' AND w.bus_id IS NOT NULL
+          AND w.power_consumption_mw > 0 AND l.id IS NULL
+        GROUP BY w.bus_id
+        """,
+        [q_ratio]
+      )
+
+    {updated, inserted}
+  end
+
+  @doc """
   Get water facilities connected to a set of bus IDs.
   Used during cascade to determine which facilities lose power.
   """

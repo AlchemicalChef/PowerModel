@@ -16,11 +16,14 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       mix power_model.ingest estimate_loads
       mix power_model.ingest map_bas [/path/to/egrid/]   # balancing authorities + bus assignment
       mix power_model.ingest demand [/path/to/eia930/]   # EIA-930 hourly demand profiles
+      mix power_model.ingest population [/path/to/census/]  # county population (load weights)
       mix power_model.ingest full_pipeline    # runs all API-based steps in order
 
   Demand data pipeline (after the grid is built): `egrid` -> `map_bas` ->
-  `demand` -> `estimate_loads`. Download EIA930_BALANCE_*.csv bulk files from
-  https://www.eia.gov/electricity/gridmonitor into data/ first.
+  `demand` -> `population` -> `estimate_loads`. Download EIA930_BALANCE_*.csv
+  bulk files from https://www.eia.gov/electricity/gridmonitor, plus
+  co-est*-alldata.csv (Census PEP county totals) and
+  *_Gaz_counties_national.txt (Census Gazetteer) into data/ first.
   """
 
   use Mix.Task
@@ -135,6 +138,16 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       ["demand", path] ->
         Mix.shell().info("Ingesting EIA-930 demand from #{path}...")
         PowerModel.Ingestion.ingest_demand(path)
+        Mix.shell().info("Done.")
+
+      ["population"] ->
+        Mix.shell().info("Ingesting Census county population from data/...")
+        PowerModel.Ingestion.ingest_population("data")
+        Mix.shell().info("Done.")
+
+      ["population", path] ->
+        Mix.shell().info("Ingesting Census county population from #{path}...")
+        PowerModel.Ingestion.ingest_population(path)
         Mix.shell().info("Done.")
 
       ["backfill_hifld_fields"] ->

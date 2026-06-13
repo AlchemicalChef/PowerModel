@@ -6,6 +6,7 @@ defmodule PowerModel.Ingestion do
   alias PowerModel.Ingestion.{BAMapper, BusMapper, ParameterEstimator, LoadEstimator, InternationalConnections}
   alias PowerModel.Ingestion.HIFLD
   alias PowerModel.Ingestion.EIA
+  alias PowerModel.Ingestion.Census
 
   def ingest_substations(path) do
     HIFLD.Substations.ingest(path)
@@ -51,6 +52,11 @@ defmodule PowerModel.Ingestion do
   @doc "Ingest EIA-930 hourly demand per balancing authority from bulk CSVs."
   def ingest_demand(path \\ "data") do
     EIA.Form930.ingest(path)
+  end
+
+  @doc "Ingest Census county population + centroids (load distribution weights)."
+  def ingest_population(path \\ "data") do
+    Census.Population.ingest(path)
   end
 
   @doc "Upsert the curated datacenter campus dataset."
