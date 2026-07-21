@@ -6,7 +6,7 @@ defmodule PowerModel.Failure.Protection do
 
   @doc """
   Check thermal overloads and return components to trip.
-  Uses inverse-time characteristic: t_trip = k / (I/I_rated - 1)
+  Uses the IEC 60255-151 standard-inverse characteristic for trip timing.
   For simulation, we trip immediately if loading > 100%.
 
   Loading is computed from apparent power S = sqrt(P^2 + Q^2) when reactive
@@ -46,6 +46,7 @@ defmodule PowerModel.Failure.Protection do
       flow
     end
   end
+
   defp recompute_loading(flow), do: flow
 
   # Extract the line/transformer rating from the flow map or fall back to
@@ -53,9 +54,11 @@ defmodule PowerModel.Failure.Protection do
   defp rating_from_flow(%{rating_mva: r}) when is_number(r) and r > 0, do: r
   defp rating_from_flow(%{rating_a_mva: r}) when is_number(r) and r > 0, do: r
   defp rating_from_flow(%{rated_mva: r}) when is_number(r) and r > 0, do: r
+
   defp rating_from_flow(%{loading_pct: pct, p_flow_mw: p}) when pct > 0 do
     abs(p) / (pct / 100.0)
   end
+
   defp rating_from_flow(_), do: 0
 
   @doc """
@@ -73,42 +76,28 @@ defmodule PowerModel.Failure.Protection do
 
   Parameters
     - `line_flows` — the `solution.line_flows` map
-    - `lines`      — list of line/transformer maps (need `from_bus_id`, `to_bus_id`)
+    - `lines`      — retained for API compatibility; endpoint IDs come from each flow
     - `buses`      — list of bus maps (need `id`, `base_kv`)
     - `vm_pu`      — list of per-unit voltage magnitudes (same order as `bus_ids`)
     - `va_rad`     — list of voltage angles in radians (same order as `bus_ids`)
     - `bus_index`  — map of bus_id => positional index into vm_pu / va_rad lists
   """
-  def check_zone3_encroachment(line_flows, lines, _buses, vm_pu, _va_rad, bus_index) do
-    # Build a quick lookup: line/xfmr id => struct
-    line_map = Map.new(lines, fn l -> {l.id, l} end)
-
+  def check_zone3_encroachment(line_flows, _lines, _buses, vm_pu, _va_rad, bus_index) do
     line_flows
     |> Enum.filter(fn {{_type, _id}, flow} -> flow.loading_pct > 80.0 end)
-    |> Enum.filter(fn {{type, id}, _flow} ->
-      component = case type do
-        :line -> Map.get(line_map, id)
-        :transformer -> Map.get(line_map, id)
-        _ -> nil
-      end
+    |> Enum.filter(fn {_key, flow} ->
+      from_idx = Map.get(bus_index, flow.from_bus_id)
+      to_idx = Map.get(bus_index, flow.to_bus_id)
 
-      if component do
-        from_idx = Map.get(bus_index, component.from_bus_id)
-        to_idx = Map.get(bus_index, component.to_bus_id)
+      v_from = if from_idx, do: Enum.at(vm_pu, from_idx, 1.0), else: 1.0
+      v_to = if to_idx, do: Enum.at(vm_pu, to_idx, 1.0), else: 1.0
 
-        v_from = if from_idx, do: Enum.at(vm_pu, from_idx, 1.0), else: 1.0
-        v_to = if to_idx, do: Enum.at(vm_pu, to_idx, 1.0), else: 1.0
-
-        # Zone 3 encroachment when either end voltage is depressed
-        v_from < 0.9 or v_to < 0.9
-      else
-        false
-      end
+      # Zone 3 encroachment when either end voltage is depressed
+      v_from < 0.9 or v_to < 0.9
     end)
     |> Enum.map(fn {{type, id}, flow} ->
-      component = Map.get(line_map, id)
-      from_idx = if component, do: Map.get(bus_index, component.from_bus_id), else: nil
-      to_idx = if component, do: Map.get(bus_index, component.to_bus_id), else: nil
+      from_idx = Map.get(bus_index, flow.from_bus_id)
+      to_idx = Map.get(bus_index, flow.to_bus_id)
       v_from = if from_idx, do: Enum.at(vm_pu, from_idx, 1.0), else: 1.0
       v_to = if to_idx, do: Enum.at(vm_pu, to_idx, 1.0), else: 1.0
 
@@ -139,15 +128,18 @@ defmodule PowerModel.Failure.Protection do
 
   The probability rises with loading percentage (above 80%) and with voltage
   depression (below 0.9 pu).  At 100% loading and 0.8 pu voltage the
-  probability is ~0.80; at 120% loading and 0.75 pu it saturates near 1.0.
+  probability is ~0.833; at 120% loading and 0.75 pu it saturates at 1.0.
+  If either factor is zero, the probability equals the other factor alone.
+  Depressed voltage can therefore produce a probability above 0.5 at 80%
+  loading, but `check_zone3_encroachment/6` only evaluates flows above 80%.
   """
   def zone3_trip_probability(loading_pct, v_min_pu) do
     # Loading factor: 0 at 80%, 1.0 at 120%
     loading_factor = min(max((loading_pct - 80.0) / 40.0, 0.0), 1.0)
     # Voltage factor: 0 at 0.9 pu, 1.0 at 0.75 pu
     voltage_factor = min(max((0.9 - v_min_pu) / 0.15, 0.0), 1.0)
-    # Combined probability (both conditions must be present)
-    loading_factor * voltage_factor
+    # Union of the independent loading and voltage contributions
+    loading_factor + voltage_factor - loading_factor * voltage_factor
   end
 
   @doc """
@@ -163,6 +155,7 @@ defmodule PowerModel.Failure.Protection do
     |> Enum.filter(fn {_id, v} -> v < uv_threshold or v > ov_threshold end)
     |> Enum.map(fn {bus_id, v} ->
       cause = if v < uv_threshold, do: "undervoltage", else: "overvoltage"
+
       %{
         component_type: "bus",
         component_id: bus_id,
@@ -174,16 +167,26 @@ defmodule PowerModel.Failure.Protection do
 
   @doc """
   Under-Frequency Load Shedding (UFLS) scheme.
-  Sheds load in stages based on frequency deviation.
-  Returns list of {bus_id, shed_fraction} tuples.
+
+  Static nadir-based view of the canonical staged program defined in
+  `PowerModel.Solver.Frequency.ufls_stages/0`: every stage whose threshold the
+  frequency fell below has tripped, and the returned `shed_fraction` is their
+  CUMULATIVE total (~30% of load with all stages in).
+
+  Returns `[]` above the first stage, else `[stage: n, shed_fraction: cum]`.
   """
   def ufls_schedule(frequency_hz) do
-    cond do
-      frequency_hz >= 59.5 -> []
-      frequency_hz >= 59.0 -> [stage: 1, shed_fraction: 0.05]
-      frequency_hz >= 58.5 -> [stage: 2, shed_fraction: 0.10]
-      frequency_hz >= 58.0 -> [stage: 3, shed_fraction: 0.15]
-      true -> [stage: 4, shed_fraction: 0.25]
+    tripped =
+      PowerModel.Solver.Frequency.ufls_stages()
+      |> Enum.filter(fn {threshold_hz, _frac, _delay} -> frequency_hz < threshold_hz end)
+
+    case tripped do
+      [] ->
+        []
+
+      stages ->
+        cumulative = stages |> Enum.map(fn {_t, frac, _d} -> frac end) |> Enum.sum()
+        [stage: length(stages), shed_fraction: cumulative]
     end
   end
 
@@ -221,15 +224,15 @@ defmodule PowerModel.Failure.Protection do
   defp component_type_string(other), do: Atom.to_string(other)
 
   @doc """
-  Inverse-time overcurrent trip time.
-  Returns time in seconds for a given loading percentage.
+  IEC 60255-151 standard-inverse overcurrent trip time with TMS = 1 by default.
+  Returns the trip time in seconds for a given loading percentage.
   """
   def overcurrent_trip_time(loading_pct, k \\ 0.14) do
     if loading_pct <= 100.0 do
       :infinity
     else
       ratio = loading_pct / 100.0
-      k / (ratio - 1.0)
+      k / (:math.pow(ratio, 0.02) - 1.0)
     end
   end
 end

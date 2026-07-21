@@ -105,6 +105,7 @@ defmodule PowerModel.Failure.CascadeTest do
       assert state.step == 0
       assert state.stable == false
       assert state.solution == nil
+      assert state.relay_elapsed == %{}
     end
 
     test "creates state with custom base_mva" do
@@ -230,14 +231,25 @@ defmodule PowerModel.Failure.CascadeTest do
       state = Cascade.init(snapshot)
 
       # Trip both lines, isolating bus 2
-      state = %{state |
-        tripped_lines: MapSet.new([1, 2]),
-        events: [
-          %{step: 0, component_type: "transmission_line", component_id: 1,
-            failure_cause: "manual_trip", details: %{}},
-          %{step: 0, component_type: "transmission_line", component_id: 2,
-            failure_cause: "manual_trip", details: %{}}
-        ]
+      state = %{
+        state
+        | tripped_lines: MapSet.new([1, 2]),
+          events: [
+            %{
+              step: 0,
+              component_type: "transmission_line",
+              component_id: 1,
+              failure_cause: "manual_trip",
+              details: %{}
+            },
+            %{
+              step: 0,
+              component_type: "transmission_line",
+              component_id: 2,
+              failure_cause: "manual_trip",
+              details: %{}
+            }
+          ]
       }
 
       {final_state, _step_results} = Cascade.run_cascade(state)
@@ -264,11 +276,13 @@ defmodule PowerModel.Failure.CascadeTest do
       # Line3 is overloaded (100 > 60) => trips.
       # After line3 trips, bus3 isolated => blackout.
       buses = [bus(1, bus_type: 3), bus(2), bus(3)]
+
       lines = [
         line(1, 1, 2, rating_a_mva: 60.0, x_pu: 0.1),
         line(2, 1, 2, rating_a_mva: 60.0, x_pu: 0.1),
         line(3, 2, 3, rating_a_mva: 60.0, x_pu: 0.1)
       ]
+
       gens = [generator(1, 1, p_max_mw: 200.0)]
       loads = [load(1, 3, p_mw: 100.0)]
 
@@ -319,6 +333,38 @@ defmodule PowerModel.Failure.CascadeTest do
       assert thermal_events == []
       assert final_state.stable == true
       assert length(step_results) == 1
+    end
+
+    test "equal concurrent overloads accrue relay time in parallel" do
+      buses = [bus(1, bus_type: 3), bus(2), bus(3, bus_type: 3), bus(4)]
+
+      lines = [
+        line(1, 1, 2, rating_a_mva: 50.0),
+        line(2, 3, 4, rating_a_mva: 50.0)
+      ]
+
+      gens = [generator(1, 1, p_max_mw: 100.0), generator(2, 3, p_max_mw: 100.0)]
+      loads = [load(1, 2, p_mw: 80.0), load(2, 4, p_mw: 80.0)]
+
+      state =
+        Cascade.init(make_snapshot(buses, lines, [], gens, loads))
+        |> Map.put(:base_overloaded, MapSet.new())
+
+      {final_state, step_results} = Cascade.run_cascade(state)
+
+      thermal_steps =
+        Enum.filter(step_results, fn step ->
+          Enum.any?(step.trips, &(&1.failure_cause == "thermal_overload"))
+        end)
+
+      assert [first_trip_step, second_trip_step] = thermal_steps
+      assert first_trip_step.simulated_time > 0.0
+
+      # Both lines started with the same loading and timed concurrently, so the
+      # second trip consumes no additional wall-clock time.
+      assert_in_delta second_trip_step.simulated_time, first_trip_step.simulated_time, 1.0e-9
+      assert_in_delta final_state.simulated_time, first_trip_step.simulated_time, 1.0e-9
+      assert final_state.relay_elapsed == %{}
     end
   end
 
@@ -583,10 +629,12 @@ defmodule PowerModel.Failure.CascadeTest do
     test "island-A deficit beyond headroom sheds only island-A load" do
       # Island A: single 90 MW gen serving 100 MW (deficit); island B healthy
       buses = [bus(1, bus_type: 3), bus(2), bus(3, bus_type: 3), bus(4)]
+
       lines = [
         line(1, 1, 2, rating_a_mva: 500.0, x_pu: 0.1),
         line(2, 3, 4, rating_a_mva: 500.0, x_pu: 0.1)
       ]
+
       gens = [generator(1, 1, p_max_mw: 90.0), generator(3, 3, p_max_mw: 200.0)]
       loads = [load(1, 2, p_mw: 120.0), load(2, 4, p_mw: 100.0)]
 
@@ -598,6 +646,41 @@ defmodule PowerModel.Failure.CascadeTest do
 
       assert load_a.p_mw < 120.0
       assert load_b.p_mw == 100.0
+    end
+
+    test "manual island split raises local reserves before UFLS and writes dispatch back" do
+      buses = [bus(1, bus_type: 3), bus(2), bus(3, bus_type: 3), bus(4)]
+
+      lines = [
+        line(1, 1, 2, rating_a_mva: 500.0),
+        line(2, 3, 4, rating_a_mva: 500.0),
+        line(3, 2, 3, rating_a_mva: 500.0)
+      ]
+
+      gens = [generator(1, 1, p_max_mw: 200.0), generator(2, 3, p_max_mw: 200.0)]
+      loads = [load(1, 2, p_mw: 150.0), load(2, 4, p_mw: 50.0)]
+
+      state = Cascade.init(make_snapshot(buses, lines, [], gens, loads))
+      assert_in_delta Map.fetch!(state.dispatch, 1), 100.0, 1.0e-6
+
+      {final_state, step_results} = Cascade.trip_line(state, 3)
+
+      assert_in_delta Map.fetch!(final_state.dispatch, 1), 150.0, 1.0e-6
+      refute Enum.any?(final_state.events, &(&1.failure_cause == "ufls_shed"))
+
+      reserve_island_solution =
+        step_results
+        |> Enum.flat_map(& &1.solution)
+        |> Enum.find(&(MapSet.new(&1.bus_ids) == MapSet.new([1, 2])))
+
+      assert_in_delta reserve_island_solution.scheduled_gen_mw, 150.0, 1.0e-6
+      assert_in_delta reserve_island_solution.total_load_mw, 150.0, 1.0e-6
+
+      balance = Cascade.balance(final_state)
+
+      assert_in_delta balance.served_load_mw + balance.shed_load_mw + balance.blackout_load_mw,
+                      balance.original_load_mw,
+                      0.01
     end
   end
 
@@ -613,7 +696,8 @@ defmodule PowerModel.Failure.CascadeTest do
       snapshot = %{
         buses: state.buses,
         lines: Enum.reject(state.lines, &MapSet.member?(state.tripped_lines, &1.id)),
-        transformers: Enum.reject(state.transformers, &MapSet.member?(state.tripped_transformers, &1.id)),
+        transformers:
+          Enum.reject(state.transformers, &MapSet.member?(state.tripped_transformers, &1.id)),
         generators: Cascade.dispatched_generators(state),
         loads: state.loads
       }
@@ -621,7 +705,9 @@ defmodule PowerModel.Failure.CascadeTest do
       solution = DCPowerFlow.solve_islands(snapshot, base_mva: state.base_mva)
 
       SimulationServer.categorize_line_flows(
-        solution.line_flows, state.base_line_categories, state.base_line_loading
+        solution.line_flows,
+        state.base_line_categories,
+        state.base_line_loading
       )
     end
 
@@ -718,6 +804,80 @@ defmodule PowerModel.Failure.CascadeTest do
   end
 
   # ===========================================================================
+  # Water-facility power-loss tracking
+  # ===========================================================================
+
+  describe "water facility impacts" do
+    test "facility on a single-bus generator island loses power with its load" do
+      buses = [bus(1, bus_type: 3), bus(2)]
+      lines = [line(1, 1, 2, rating_a_mva: 500.0)]
+      gens = [generator(1, 1, p_max_mw: 100.0)]
+      loads = [load(1, 1, p_mw: 40.0)]
+
+      snapshot =
+        make_snapshot(buses, lines, [], gens, loads)
+        |> Map.put(:water_facilities, [
+          %{
+            id: 8,
+            name: "Island Water",
+            facility_type: "treatment_plant",
+            power_consumption_mw: 5.0,
+            bus_id: 1
+          }
+        ])
+
+      {final_state, step_results} = snapshot |> Cascade.init() |> Cascade.trip_line(1)
+
+      assert MapSet.member?(final_state.affected_water_facilities, 8)
+      assert Enum.any?(final_state.events, &(&1.failure_cause == "island_blackout"))
+
+      streamed_power_losses =
+        step_results
+        |> Enum.flat_map(& &1.trips)
+        |> Enum.filter(&(&1.component_type == "water_facility"))
+
+      persisted_power_losses =
+        Enum.filter(final_state.events, &(&1.component_type == "water_facility"))
+
+      assert [streamed_event] = streamed_power_losses
+      assert [persisted_event] = persisted_power_losses
+      assert streamed_event.failure_cause == "power_loss"
+      assert persisted_event.failure_cause == "power_loss"
+      assert persisted_event.step == streamed_event.step
+    end
+
+    test "facility power loss persists when it is the only stable-step trip" do
+      snapshot =
+        three_bus_snapshot()
+        |> Map.put(:water_facilities, [
+          %{
+            id: 9,
+            name: "Remote Pump",
+            facility_type: "pump_station",
+            power_consumption_mw: 2.0,
+            bus_id: 3
+          }
+        ])
+        |> Map.update!(:loads, &Enum.reject(&1, fn grid_load -> grid_load.bus_id == 3 end))
+
+      {final_state, step_results} = snapshot |> Cascade.init() |> Cascade.trip_line(2)
+
+      assert [step_result] = step_results
+
+      assert [streamed_event] =
+               Enum.filter(step_result.trips, &(&1.component_type == "water_facility"))
+
+      assert [persisted_event] =
+               Enum.filter(final_state.events, &(&1.component_type == "water_facility"))
+
+      assert final_state.stable
+      assert persisted_event.failure_cause == "power_loss"
+      assert persisted_event.step == step_result.step
+      assert persisted_event == streamed_event
+    end
+  end
+
+  # ===========================================================================
   # Datacenter power-loss tracking
   # ===========================================================================
 
@@ -727,8 +887,14 @@ defmodule PowerModel.Failure.CascadeTest do
       snapshot =
         three_bus_snapshot()
         |> Map.put(:datacenters, [
-          %{id: 7, name: "Test DC", operator: "TestCo", facility_type: "hyperscale",
-            power_mw: 50.0, bus_id: 2}
+          %{
+            id: 7,
+            name: "Test DC",
+            operator: "TestCo",
+            facility_type: "hyperscale",
+            power_mw: 50.0,
+            bus_id: 2
+          }
         ])
 
       state = Cascade.init(snapshot)
@@ -736,8 +902,7 @@ defmodule PowerModel.Failure.CascadeTest do
 
       assert MapSet.member?(final_state.affected_datacenters, 7)
 
-      # power_loss trip emitted exactly once across all steps (same delivery
-      # path as water facilities: step trips, not state.events)
+      # power_loss trip emitted exactly once across all steps
       dc_trips =
         step_results
         |> Enum.flat_map(& &1.trips)
@@ -756,8 +921,14 @@ defmodule PowerModel.Failure.CascadeTest do
       snapshot =
         three_bus_snapshot()
         |> Map.put(:datacenters, [
-          %{id: 7, name: "Test DC", operator: "TestCo", facility_type: "hyperscale",
-            power_mw: 50.0, bus_id: 2}
+          %{
+            id: 7,
+            name: "Test DC",
+            operator: "TestCo",
+            facility_type: "hyperscale",
+            power_mw: 50.0,
+            bus_id: 2
+          }
         ])
 
       state = Cascade.init(snapshot)
