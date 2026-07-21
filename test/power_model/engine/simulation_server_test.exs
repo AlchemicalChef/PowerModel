@@ -12,12 +12,20 @@ defmodule PowerModel.Engine.SimulationServerTest do
     ic = Repo.insert!(%PowerModel.Grid.Interconnection{name: "TestIC"})
 
     bus1 =
-      Repo.insert!(%Bus{bus_type: 3, base_kv: 138.0, interconnection_id: ic.id,
-        coordinates: point(-112.0, 33.4)})
+      Repo.insert!(%Bus{
+        bus_type: 3,
+        base_kv: 138.0,
+        interconnection_id: ic.id,
+        coordinates: point(-112.0, 33.4)
+      })
 
     bus2 =
-      Repo.insert!(%Bus{bus_type: 1, base_kv: 138.0, interconnection_id: ic.id,
-        coordinates: point(-111.9, 33.5)})
+      Repo.insert!(%Bus{
+        bus_type: 1,
+        base_kv: 138.0,
+        interconnection_id: ic.id,
+        coordinates: point(-111.9, 33.5)
+      })
 
     line =
       Repo.insert!(%TransmissionLine{

@@ -29,7 +29,9 @@ defmodule PowerModelWeb.GridLive.FailureControls do
       </div>
 
       <%= if @mode == :single do %>
-        <p class="control-hint">Click any line or generator on the map, then use the Info Panel to inject a failure.</p>
+        <p class="control-hint">
+          Click any line or generator on the map, then use the Info Panel to inject a failure.
+        </p>
       <% else %>
         <div class="control-group">
           <label class="control-label">Contingency Screening</label>
@@ -39,13 +41,13 @@ defmodule PowerModelWeb.GridLive.FailureControls do
             class="action-btn"
             disabled={@screening}
           >
-            <%= if @screening, do: "Scanning...", else: "Run N-1 Screen" %>
+            {if @screening, do: "Scanning...", else: "Run N-1 Screen"}
           </button>
         </div>
 
         <%= if @violations > 0 do %>
           <div class="violation-summary">
-            <span class="violation-count"><%= @violations %></span>
+            <span class="violation-count">{@violations}</span>
             <span class="violation-text">contingencies with violations</span>
           </div>
         <% end %>

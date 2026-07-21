@@ -6,27 +6,27 @@ defmodule PowerModelWeb.GridLive.AffectedList do
     <div class="affected-panel">
       <div class="affected-header">
         <h4>Affected Components</h4>
-        <span class="affected-count"><%= length(@events) %></span>
+        <span class="affected-count">{length(@events)}</span>
       </div>
 
       <div class="affected-scroll">
         <%= for event <- Enum.take(@events, 50) do %>
           <div class={"affected-item " <> cause_class(event.failure_cause)}>
-            <div class="affected-icon"><%= type_icon(event.component_type) %></div>
+            <div class="affected-icon">{type_icon(event.component_type)}</div>
             <div class="affected-info">
-              <span class="affected-type"><%= humanize(event.component_type) %></span>
-              <span class="affected-id">#<%= event.component_id %></span>
+              <span class="affected-type">{humanize(event.component_type)}</span>
+              <span class="affected-id">#{event.component_id}</span>
             </div>
             <div class="affected-cause">
-              <span class="cause-badge"><%= humanize(event.failure_cause) %></span>
-              <span class="affected-step">Step <%= event[:step] || "?" %></span>
+              <span class="cause-badge">{humanize(event.failure_cause)}</span>
+              <span class="affected-step">Step {event[:step] || "?"}</span>
             </div>
           </div>
         <% end %>
 
         <%= if length(@events) > 50 do %>
           <div class="affected-overflow">
-            + <%= length(@events) - 50 %> more
+            + {length(@events) - 50} more
           </div>
         <% end %>
       </div>
@@ -55,5 +55,6 @@ defmodule PowerModelWeb.GridLive.AffectedList do
   defp humanize(str) when is_binary(str) do
     str |> String.replace("_", " ") |> String.capitalize()
   end
+
   defp humanize(_), do: ""
 end

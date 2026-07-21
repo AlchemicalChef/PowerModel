@@ -5,84 +5,84 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
     ~H"""
     <div class="info-panel">
       <div class="info-header">
-        <h3><%= component_title(@component.type) %> #<%= @component.id %></h3>
+        <h3>{component_title(@component.type)} #{@component.id}</h3>
         <button phx-click="deselect" class="close-btn">&times;</button>
       </div>
 
       <div class="info-body">
         <div class="info-row">
           <span class="info-label">Type</span>
-          <span class="info-value"><%= humanize_type(@component.type) %></span>
+          <span class="info-value">{humanize_type(@component.type)}</span>
         </div>
         <div class="info-row">
           <span class="info-label">ID</span>
-          <span class="info-value"><%= @component.id %></span>
+          <span class="info-value">{@component.id}</span>
         </div>
         <%= if @component[:capacity] do %>
           <div class="info-row">
             <span class="info-label">Capacity</span>
-            <span class="info-value"><%= format_number(@component.capacity) %> MW</span>
+            <span class="info-value">{format_number(@component.capacity)} MW</span>
           </div>
         <% end %>
         <%= if @component[:capacity_mgd] do %>
           <div class="info-row">
             <span class="info-label">Capacity</span>
-            <span class="info-value"><%= format_number(@component.capacity_mgd) %> MGD</span>
+            <span class="info-value">{format_number(@component.capacity_mgd)} MGD</span>
           </div>
         <% end %>
         <%= if @component[:fuel_type] do %>
           <div class="info-row">
             <span class="info-label">Fuel Type</span>
-            <span class="info-value"><%= @component.fuel_type %></span>
+            <span class="info-value">{@component.fuel_type}</span>
           </div>
         <% end %>
         <%= if @component[:voltage_kv] do %>
           <div class="info-row">
             <span class="info-label">Voltage</span>
-            <span class="info-value"><%= @component.voltage_kv %> kV</span>
+            <span class="info-value">{@component.voltage_kv} kV</span>
           </div>
         <% end %>
         <%= if @component[:rating_mva] do %>
           <div class="info-row">
             <span class="info-label">Rating</span>
-            <span class="info-value"><%= @component.rating_mva %> MVA</span>
+            <span class="info-value">{@component.rating_mva} MVA</span>
           </div>
         <% end %>
         <%= if @component[:voltage] do %>
           <div class="info-row">
             <span class="info-label">Max Voltage</span>
-            <span class="info-value"><%= @component.voltage %> kV</span>
+            <span class="info-value">{@component.voltage} kV</span>
           </div>
         <% end %>
         <%!-- Water facility / datacenter fields --%>
         <%= if @component[:facility_type] do %>
           <div class="info-row">
             <span class="info-label">Facility</span>
-            <span class="info-value"><%= @component.facility_type %></span>
+            <span class="info-value">{@component.facility_type}</span>
           </div>
         <% end %>
         <%= if @component[:operator] do %>
           <div class="info-row">
             <span class="info-label">Operator</span>
-            <span class="info-value"><%= @component.operator %></span>
+            <span class="info-value">{@component.operator}</span>
           </div>
         <% end %>
         <%= if @component[:power_mw] do %>
           <div class="info-row">
             <span class="info-label">Power Draw</span>
-            <span class="info-value"><%= format_number(@component.power_mw) %> MW</span>
+            <span class="info-value">{format_number(@component.power_mw)} MW</span>
           </div>
         <% end %>
         <%= if @component[:bus_id] do %>
           <div class="info-row">
             <span class="info-label">Grid Bus</span>
-            <span class="info-value">Bus #<%= @component.bus_id %></span>
+            <span class="info-value">Bus #{@component.bus_id}</span>
           </div>
         <% end %>
         <%= if @component[:state] do %>
           <div class="info-row">
             <span class="info-label">State</span>
-            <span class="info-value"><%= state_name(@component.state) %></span>
+            <span class="info-value">{state_name(@component.state)}</span>
           </div>
         <% end %>
       </div>
@@ -101,8 +101,7 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
 
         <%= if @cascade_active do %>
           <div class="cascade-indicator">
-            <span class="cascade-dot"></span>
-            Cascade in progress...
+            <span class="cascade-dot"></span> Cascade in progress...
           </div>
         <% end %>
       </div>

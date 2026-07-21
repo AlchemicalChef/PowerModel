@@ -6,7 +6,7 @@ defmodule PowerModelWeb.GridLive.CascadeTimeline do
     <div class="timeline-panel" id="cascade-timeline" phx-hook="CascadeTimeline">
       <div class="timeline-header">
         <h4>Cascade Timeline</h4>
-        <span class="step-count"><%= length(@steps) %> steps</span>
+        <span class="step-count">{length(@steps)} steps</span>
       </div>
 
       <div class="timeline-track">
@@ -17,8 +17,8 @@ defmodule PowerModelWeb.GridLive.CascadeTimeline do
             phx-value-step={step.step}
             title={"Step #{step.step}: #{step.trip_count} trips, #{step.islands} islands"}
           >
-            <span class="step-num"><%= step.step %></span>
-            <span class="step-trips"><%= step.trip_count %></span>
+            <span class="step-num">{step.step}</span>
+            <span class="step-trips">{step.trip_count}</span>
           </button>
         <% end %>
 

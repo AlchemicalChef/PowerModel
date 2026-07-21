@@ -21,9 +21,19 @@ defmodule PowerModel.Grid.Generator do
 
   def changeset(generator, attrs) do
     generator
-    |> cast(attrs, [:eia_plant_id, :fuel_type, :prime_mover, :p_max_mw, :p_min_mw,
-                     :q_max_mvar, :q_min_mvar, :capacity_factor, :coordinates,
-                     :status, :bus_id])
+    |> cast(attrs, [
+      :eia_plant_id,
+      :fuel_type,
+      :prime_mover,
+      :p_max_mw,
+      :p_min_mw,
+      :q_max_mvar,
+      :q_min_mvar,
+      :capacity_factor,
+      :coordinates,
+      :status,
+      :bus_id
+    ])
     |> validate_required([:p_max_mw])
     |> foreign_key_constraint(:bus_id)
   end

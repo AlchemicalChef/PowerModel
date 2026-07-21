@@ -11,8 +11,7 @@ config :power_model,
   ecto_repos: [PowerModel.Repo],
   generators: [timestamp_type: :utc_datetime]
 
-config :power_model, PowerModel.Repo,
-  types: PowerModel.PostgresTypes
+config :power_model, PowerModel.Repo, types: PowerModel.PostgresTypes
 
 # Configure the endpoint
 config :power_model, PowerModelWeb.Endpoint,

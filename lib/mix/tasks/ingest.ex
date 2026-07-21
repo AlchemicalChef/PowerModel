@@ -114,10 +114,12 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       ["map_datacenters"] ->
         Mix.shell().info("Mapping datacenters to nearest grid buses...")
         {mapped, loads, unmapped} = PowerModel.Grid.map_datacenters_to_grid()
+
         Mix.shell().info(
           "Mapped #{mapped} datacenters (#{unmapped} unmapped), " <>
-          "#{loads} flat load rows created."
+            "#{loads} flat load rows created."
         )
+
         Mix.shell().info("Done.")
 
       ["map_bas"] ->

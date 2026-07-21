@@ -51,20 +51,22 @@ defmodule PowerModel.GridExport do
     generators = PowerModel.Grid.export_generators()
     count = length(generators)
 
-    binary = <<count::unsigned-little-32>> <>
-      Enum.reduce(generators, <<>>, fn gen, acc ->
-        {lon, lat} = extract_coords(gen.coordinates)
-        fuel_code = fuel_type_code(gen.fuel_type)
+    binary =
+      <<count::unsigned-little-32>> <>
+        Enum.reduce(generators, <<>>, fn gen, acc ->
+          {lon, lat} = extract_coords(gen.coordinates)
+          fuel_code = fuel_type_code(gen.fuel_type)
 
-        acc <> <<
-          gen.id::unsigned-little-32,
-          lon::float-little-32,
-          lat::float-little-32,
-          (gen.p_max_mw || 0.0)::float-little-32,
-          fuel_code::unsigned-8,
-          0::unsigned-8
-        >>
-      end)
+          acc <>
+            <<
+              gen.id::unsigned-little-32,
+              lon::float-little-32,
+              lat::float-little-32,
+              gen.p_max_mw || 0.0::float-little-32,
+              fuel_code::unsigned-8,
+              0::unsigned-8
+            >>
+        end)
 
     File.write!(Path.join(dir, "generators.bin"), binary)
     IO.puts("  generators.bin: #{count} records, #{byte_size(binary)} bytes")
@@ -74,25 +76,27 @@ defmodule PowerModel.GridExport do
     lines = PowerModel.Grid.export_transmission_lines()
     count = length(lines)
 
-    binary = <<count::unsigned-little-32>> <>
-      Enum.reduce(lines, <<>>, fn line, acc ->
-        coords = extract_line_coords(line.geometry)
-        num_points = length(coords)
+    binary =
+      <<count::unsigned-little-32>> <>
+        Enum.reduce(lines, <<>>, fn line, acc ->
+          coords = extract_line_coords(line.geometry)
+          num_points = length(coords)
 
-        line_header = <<
-          line.id::unsigned-little-32,
-          (line.voltage_kv || 0.0)::float-little-32,
-          (line.rating_a_mva || 0.0)::float-little-32,
-          num_points::unsigned-little-16,
-          0::unsigned-8
-        >>
+          line_header = <<
+            line.id::unsigned-little-32,
+            line.voltage_kv || 0.0::float-little-32,
+            line.rating_a_mva || 0.0::float-little-32,
+            num_points::unsigned-little-16,
+            0::unsigned-8
+          >>
 
-        point_data = Enum.reduce(coords, <<>>, fn {lon, lat}, pa ->
-          pa <> <<lon::float-little-32, lat::float-little-32>>
+          point_data =
+            Enum.reduce(coords, <<>>, fn {lon, lat}, pa ->
+              pa <> <<lon::float-little-32, lat::float-little-32>>
+            end)
+
+          acc <> line_header <> point_data
         end)
-
-        acc <> line_header <> point_data
-      end)
 
     File.write!(Path.join(dir, "transmission.bin"), binary)
     IO.puts("  transmission.bin: #{count} records, #{byte_size(binary)} bytes")
@@ -102,18 +106,20 @@ defmodule PowerModel.GridExport do
     substations = PowerModel.Grid.export_substations()
     count = length(substations)
 
-    binary = <<count::unsigned-little-32>> <>
-      Enum.reduce(substations, <<>>, fn sub, acc ->
-        {lon, lat} = extract_coords(sub.coordinates)
+    binary =
+      <<count::unsigned-little-32>> <>
+        Enum.reduce(substations, <<>>, fn sub, acc ->
+          {lon, lat} = extract_coords(sub.coordinates)
 
-        acc <> <<
-          sub.id::unsigned-little-32,
-          lon::float-little-32,
-          lat::float-little-32,
-          (sub.max_voltage_kv || 0.0)::float-little-32,
-          0::unsigned-8
-        >>
-      end)
+          acc <>
+            <<
+              sub.id::unsigned-little-32,
+              lon::float-little-32,
+              lat::float-little-32,
+              sub.max_voltage_kv || 0.0::float-little-32,
+              0::unsigned-8
+            >>
+        end)
 
     File.write!(Path.join(dir, "substations.bin"), binary)
     IO.puts("  substations.bin: #{count} records, #{byte_size(binary)} bytes")
@@ -125,16 +131,18 @@ defmodule PowerModel.GridExport do
     loads = PowerModel.Grid.export_bus_loads()
     count = length(loads)
 
-    binary = <<count::unsigned-little-32>> <>
-      Enum.reduce(loads, <<>>, fn l, acc ->
-        {lon, lat} = extract_coords(l.coordinates)
+    binary =
+      <<count::unsigned-little-32>> <>
+        Enum.reduce(loads, <<>>, fn l, acc ->
+          {lon, lat} = extract_coords(l.coordinates)
 
-        acc <> <<
-          lon::float-little-32,
-          lat::float-little-32,
-          (l.demand_mw || 0.0)::float-little-32
-        >>
-      end)
+          acc <>
+            <<
+              lon::float-little-32,
+              lat::float-little-32,
+              l.demand_mw || 0.0::float-little-32
+            >>
+        end)
 
     File.write!(Path.join(dir, "bus_loads.bin"), binary)
     IO.puts("  bus_loads.bin: #{count} records, #{byte_size(binary)} bytes")
@@ -144,18 +152,20 @@ defmodule PowerModel.GridExport do
     transformers = PowerModel.Grid.export_transformers()
     count = length(transformers)
 
-    binary = <<count::unsigned-little-32>> <>
-      Enum.reduce(transformers, <<>>, fn t, acc ->
-        {lon, lat} = extract_coords(t.coordinates)
+    binary =
+      <<count::unsigned-little-32>> <>
+        Enum.reduce(transformers, <<>>, fn t, acc ->
+          {lon, lat} = extract_coords(t.coordinates)
 
-        acc <> <<
-          t.id::unsigned-little-32,
-          lon::float-little-32,
-          lat::float-little-32,
-          (t.rated_mva || 0.0)::float-little-32,
-          0::unsigned-8
-        >>
-      end)
+          acc <>
+            <<
+              t.id::unsigned-little-32,
+              lon::float-little-32,
+              lat::float-little-32,
+              t.rated_mva || 0.0::float-little-32,
+              0::unsigned-8
+            >>
+        end)
 
     File.write!(Path.join(dir, "transformers.bin"), binary)
     IO.puts("  transformers.bin: #{count} records, #{byte_size(binary)} bytes")
@@ -165,24 +175,27 @@ defmodule PowerModel.GridExport do
     facilities = PowerModel.Grid.export_water_facilities()
     count = length(facilities)
 
-    json = Jason.encode!(%{
-      count: count,
-      facilities: Enum.map(facilities, fn f ->
-        {lon, lat} = extract_coords(f.coordinates)
-        %{
-          id: f.id,
-          lon: lon,
-          lat: lat,
-          name: f.name,
-          facilityType: water_facility_type_code(f.facility_type),
-          capacityMgd: f.capacity_mgd || 0.0,
-          powerMw: f.power_consumption_mw || 0.0,
-          storageAcreFeet: f.storage_acre_feet || 0.0,
-          busId: f.bus_id,
-          state: 0
-        }
-      end)
-    })
+    json =
+      Jason.encode!(%{
+        count: count,
+        facilities:
+          Enum.map(facilities, fn f ->
+            {lon, lat} = extract_coords(f.coordinates)
+
+            %{
+              id: f.id,
+              lon: lon,
+              lat: lat,
+              name: f.name,
+              facilityType: water_facility_type_code(f.facility_type),
+              capacityMgd: f.capacity_mgd || 0.0,
+              powerMw: f.power_consumption_mw || 0.0,
+              storageAcreFeet: f.storage_acre_feet || 0.0,
+              busId: f.bus_id,
+              state: 0
+            }
+          end)
+      })
 
     File.write!(Path.join(dir, "water_facilities.json"), json)
     IO.puts("  water_facilities.json: #{count} records, #{byte_size(json)} bytes")
@@ -192,23 +205,26 @@ defmodule PowerModel.GridExport do
     datacenters = PowerModel.Grid.export_datacenters()
     count = length(datacenters)
 
-    json = Jason.encode!(%{
-      count: count,
-      datacenters: Enum.map(datacenters, fn d ->
-        {lon, lat} = extract_coords(d.coordinates)
-        %{
-          id: d.id,
-          lon: lon,
-          lat: lat,
-          name: d.name,
-          operator: d.operator,
-          facilityType: datacenter_type_code(d.facility_type),
-          powerMw: d.power_mw || 0.0,
-          busId: d.bus_id,
-          state: 0
-        }
-      end)
-    })
+    json =
+      Jason.encode!(%{
+        count: count,
+        datacenters:
+          Enum.map(datacenters, fn d ->
+            {lon, lat} = extract_coords(d.coordinates)
+
+            %{
+              id: d.id,
+              lon: lon,
+              lat: lat,
+              name: d.name,
+              operator: d.operator,
+              facilityType: datacenter_type_code(d.facility_type),
+              powerMw: d.power_mw || 0.0,
+              busId: d.bus_id,
+              state: 0
+            }
+          end)
+      })
 
     File.write!(Path.join(dir, "datacenters.json"), json)
     IO.puts("  datacenters.json: #{count} records, #{byte_size(json)} bytes")
@@ -219,15 +235,18 @@ defmodule PowerModel.GridExport do
   defp extract_coords(_), do: {0.0, 0.0}
 
   defp extract_line_coords(nil), do: []
+
   defp extract_line_coords(%Geo.LineString{coordinates: coords}) do
     Enum.map(coords, fn
       {lon, lat} -> {lon, lat}
       {lon, lat, _} -> {lon, lat}
     end)
   end
+
   defp extract_line_coords(_), do: []
 
   defp fuel_type_code(nil), do: 0
+
   defp fuel_type_code(ft) do
     case String.upcase(ft) do
       "NG" -> 1

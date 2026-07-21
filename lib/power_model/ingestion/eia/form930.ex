@@ -142,8 +142,8 @@ defmodule PowerModel.Ingestion.EIA.Form930 do
          interchange: find.(@interchange_columns)
        }}
     else
-      {:error, %{missing: missing_columns(ba_idx, utc_idx, demand_adj_idx || demand_idx),
-                 header: header}}
+      {:error,
+       %{missing: missing_columns(ba_idx, utc_idx, demand_adj_idx || demand_idx), header: header}}
     end
   end
 
@@ -177,7 +177,7 @@ defmodule PowerModel.Ingestion.EIA.Form930 do
 
     ba_id = Map.get(ba_codes, code)
 
-    if code != "" and ba_id && demand && timestamp do
+    if (code != "" and ba_id) && demand && timestamp do
       now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
 
       %{

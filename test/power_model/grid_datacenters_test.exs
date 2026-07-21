@@ -21,13 +21,19 @@ defmodule PowerModel.GridDatacentersTest do
   test "maps datacenters to nearest bus and creates one flat load row per bus",
        %{bus: bus} do
     Repo.insert!(%Datacenter{
-      name: "DC One", facility_type: "hyperscale", power_mw: 100.0,
-      coordinates: point(-77.461, 39.021), status: "active"
+      name: "DC One",
+      facility_type: "hyperscale",
+      power_mw: 100.0,
+      coordinates: point(-77.461, 39.021),
+      status: "active"
     })
 
     Repo.insert!(%Datacenter{
-      name: "DC Two", facility_type: "colocation", power_mw: 50.0,
-      coordinates: point(-77.459, 39.019), status: "active"
+      name: "DC Two",
+      facility_type: "colocation",
+      power_mw: 50.0,
+      coordinates: point(-77.459, 39.019),
+      status: "active"
     })
 
     {mapped, load_rows, unmapped} = Grid.map_datacenters_to_grid(max_km: 10)
@@ -46,8 +52,11 @@ defmodule PowerModel.GridDatacentersTest do
 
   test "datacenter beyond max_km stays unmapped and creates no load" do
     Repo.insert!(%Datacenter{
-      name: "Remote DC", facility_type: "hyperscale", power_mw: 100.0,
-      coordinates: point(-150.0, 60.0), status: "active"
+      name: "Remote DC",
+      facility_type: "hyperscale",
+      power_mw: 100.0,
+      coordinates: point(-150.0, 60.0),
+      status: "active"
     })
 
     {mapped, load_rows, unmapped} = Grid.map_datacenters_to_grid(max_km: 10)
@@ -60,8 +69,11 @@ defmodule PowerModel.GridDatacentersTest do
 
   test "re-running the mapping is idempotent", %{bus: bus} do
     Repo.insert!(%Datacenter{
-      name: "DC One", facility_type: "hyperscale", power_mw: 100.0,
-      coordinates: point(-77.461, 39.021), status: "active"
+      name: "DC One",
+      facility_type: "hyperscale",
+      power_mw: 100.0,
+      coordinates: point(-77.461, 39.021),
+      status: "active"
     })
 
     {1, 1, 0} = Grid.map_datacenters_to_grid(max_km: 10)
@@ -75,13 +87,19 @@ defmodule PowerModel.GridDatacentersTest do
 
   test "datacenter loads can coexist with a baseline load on the same bus", %{bus: bus} do
     Repo.insert!(%Load{
-      bus_id: bus.id, p_mw: 25.0, q_mvar: 8.0,
-      load_type: "constant_power", status: "in_service"
+      bus_id: bus.id,
+      p_mw: 25.0,
+      q_mvar: 8.0,
+      load_type: "constant_power",
+      status: "in_service"
     })
 
     Repo.insert!(%Datacenter{
-      name: "DC One", facility_type: "hyperscale", power_mw: 100.0,
-      coordinates: point(-77.461, 39.021), status: "active"
+      name: "DC One",
+      facility_type: "hyperscale",
+      power_mw: 100.0,
+      coordinates: point(-77.461, 39.021),
+      status: "active"
     })
 
     {1, 1, 0} = Grid.map_datacenters_to_grid(max_km: 10)

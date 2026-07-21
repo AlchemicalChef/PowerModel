@@ -65,7 +65,8 @@ defmodule PowerModel.Engine.CategorizeLineFlowsTest do
   end
 
   defp xfmr_flow(id, loading_pct) do
-    {{:transformer, id}, %{from_bus_id: 1, to_bus_id: 2, p_flow_mw: 0.0, loading_pct: loading_pct}}
+    {{:transformer, id},
+     %{from_bus_id: 1, to_bus_id: 2, p_flow_mw: 0.0, loading_pct: loading_pct}}
   end
 
   describe "classify_flows/3 transformer channels" do
@@ -94,19 +95,23 @@ defmodule PowerModel.Engine.CategorizeLineFlowsTest do
 
     test "transformer worsened-category and delta rules match line rules" do
       # Same category (2), +14 pts shift -> stressed
-      c = SimulationServer.classify_flows(
-        Map.new([xfmr_flow(1, 92.0)]),
-        %{{:transformer, 1} => 2},
-        %{{:transformer, 1} => 78.0}
-      )
+      c =
+        SimulationServer.classify_flows(
+          Map.new([xfmr_flow(1, 92.0)]),
+          %{{:transformer, 1} => 2},
+          %{{:transformer, 1} => 78.0}
+        )
+
       assert c.stressed_transformer_ids == [1]
 
       # Barely-moved base overload is suppressed
-      c2 = SimulationServer.classify_flows(
-        Map.new([xfmr_flow(2, 106.0)]),
-        %{{:transformer, 2} => 3},
-        %{{:transformer, 2} => 105.0}
-      )
+      c2 =
+        SimulationServer.classify_flows(
+          Map.new([xfmr_flow(2, 106.0)]),
+          %{{:transformer, 2} => 3},
+          %{{:transformer, 2} => 105.0}
+        )
+
       assert c2.overloaded_transformer_ids == []
     end
   end

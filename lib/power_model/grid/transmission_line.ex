@@ -27,9 +27,24 @@ defmodule PowerModel.Grid.TransmissionLine do
   end
 
   @cast_fields [
-    :voltage_kv, :r_pu, :x_pu, :b_pu, :rating_a_mva, :length_km,
-    :geometry, :status, :source, :source_id, :from_bus_id, :to_bus_id,
-    :line_type, :owner, :sub_1, :sub_2, :naics_code, :naics_desc
+    :voltage_kv,
+    :r_pu,
+    :x_pu,
+    :b_pu,
+    :rating_a_mva,
+    :length_km,
+    :geometry,
+    :status,
+    :source,
+    :source_id,
+    :from_bus_id,
+    :to_bus_id,
+    :line_type,
+    :owner,
+    :sub_1,
+    :sub_2,
+    :naics_code,
+    :naics_desc
   ]
 
   def changeset(line, attrs) do

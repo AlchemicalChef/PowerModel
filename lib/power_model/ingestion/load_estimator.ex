@@ -27,7 +27,8 @@ defmodule PowerModel.Ingestion.LoadEstimator do
   alias PowerModel.Grid.{Bus, Generator, Load}
 
   @power_factor 0.95
-  @q_ratio :math.tan(:math.acos(@power_factor))  # ~0.3287
+  # ~0.3287
+  @q_ratio :math.tan(:math.acos(@power_factor))
   @population_weight 0.8
 
   @doc """
@@ -43,11 +44,12 @@ defmodule PowerModel.Ingestion.LoadEstimator do
     if deleted > 0, do: IO.puts("  Cleared #{deleted} existing estimated loads.")
 
     # Get total in-service generation capacity
-    total_gen = Repo.one(
-      from g in Generator,
-        where: g.status == "in_service" and not is_nil(g.bus_id),
-        select: sum(g.p_max_mw)
-    ) || 0.0
+    total_gen =
+      Repo.one(
+        from g in Generator,
+          where: g.status == "in_service" and not is_nil(g.bus_id),
+          select: sum(g.p_max_mw)
+      ) || 0.0
 
     # Target load = 85% of capacity (15% reserve margin)
     target_load = total_gen * 0.85
@@ -66,7 +68,10 @@ defmodule PowerModel.Ingestion.LoadEstimator do
 
       weight_fn =
         if total_pop > 0 do
-          IO.puts("  Population weighting: #{map_size(pop_by_bus)} buses carry #{total_pop} people.")
+          IO.puts(
+            "  Population weighting: #{map_size(pop_by_bus)} buses carry #{total_pop} people."
+          )
+
           population_weights(pq_buses, pop_by_bus, total_pop)
         else
           IO.puts("  No county population data; falling back to gen-proximity weighting.")
@@ -76,20 +81,21 @@ defmodule PowerModel.Ingestion.LoadEstimator do
 
       now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
 
-      loads = Enum.map(pq_buses, fn bus ->
-        p_mw = max(weight_fn.(bus) * target_load, 1.0)
-        q_mvar = p_mw * @q_ratio
+      loads =
+        Enum.map(pq_buses, fn bus ->
+          p_mw = max(weight_fn.(bus) * target_load, 1.0)
+          q_mvar = p_mw * @q_ratio
 
-        %{
-          bus_id: bus.id,
-          p_mw: Float.round(p_mw, 2),
-          q_mvar: Float.round(q_mvar, 2),
-          load_type: "constant_power",
-          status: "in_service",
-          inserted_at: now,
-          updated_at: now
-        }
-      end)
+          %{
+            bus_id: bus.id,
+            p_mw: Float.round(p_mw, 2),
+            q_mvar: Float.round(q_mvar, 2),
+            load_type: "constant_power",
+            status: "in_service",
+            inserted_at: now,
+            updated_at: now
+          }
+        end)
 
       # Batch insert (replace on conflict with bus_id)
       loads
@@ -107,6 +113,7 @@ defmodule PowerModel.Ingestion.LoadEstimator do
       # Re-estimation rebuilt the constant_power rows, dropping the water
       # facility MW that map_water_facilities_to_grid had merged in.
       {updated, inserted} = PowerModel.Grid.reapply_water_facility_loads()
+
       if updated + inserted > 0 do
         IO.puts("  Re-applied water facility MW (#{updated} loads updated, #{inserted} created).")
       end
@@ -127,12 +134,14 @@ defmodule PowerModel.Ingestion.LoadEstimator do
 
   # Legacy heuristic: 50% uniform + 50% proportional to bus-attached generation.
   defp gen_proximity_weights(pq_buses, total_gen) do
-    gen_per_bus = Repo.all(
-      from g in Generator,
-        where: g.status == "in_service" and not is_nil(g.bus_id),
-        group_by: g.bus_id,
-        select: {g.bus_id, sum(g.p_max_mw)}
-    ) |> Map.new()
+    gen_per_bus =
+      Repo.all(
+        from g in Generator,
+          where: g.status == "in_service" and not is_nil(g.bus_id),
+          group_by: g.bus_id,
+          select: {g.bus_id, sum(g.p_max_mw)}
+      )
+      |> Map.new()
 
     uniform = 0.5 / length(pq_buses)
 

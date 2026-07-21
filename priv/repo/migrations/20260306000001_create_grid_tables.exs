@@ -10,6 +10,7 @@ defmodule PowerModel.Repo.Migrations.CreateGridTables do
       add :geometry, :geometry
       timestamps()
     end
+
     create unique_index(:interconnections, [:name])
 
     # Balancing Authorities
@@ -20,6 +21,7 @@ defmodule PowerModel.Repo.Migrations.CreateGridTables do
       add :interconnection_id, references(:interconnections, on_delete: :restrict)
       timestamps()
     end
+
     create unique_index(:balancing_authorities, [:code])
     create index(:balancing_authorities, [:interconnection_id])
 
@@ -35,6 +37,7 @@ defmodule PowerModel.Repo.Migrations.CreateGridTables do
       add :interconnection_id, references(:interconnections, on_delete: :restrict)
       timestamps()
     end
+
     create unique_index(:buses, [:source, :source_id])
     create index(:buses, [:interconnection_id])
     create index(:buses, [:bus_type])
@@ -56,6 +59,7 @@ defmodule PowerModel.Repo.Migrations.CreateGridTables do
       add :bus_id, references(:buses, on_delete: :restrict), null: false
       timestamps()
     end
+
     create index(:generators, [:bus_id])
     create index(:generators, [:fuel_type])
     execute "CREATE INDEX generators_coordinates_gist ON generators USING GIST (coordinates)"
@@ -76,10 +80,12 @@ defmodule PowerModel.Repo.Migrations.CreateGridTables do
       add :to_bus_id, references(:buses, on_delete: :restrict), null: false
       timestamps()
     end
+
     create unique_index(:transmission_lines, [:source, :source_id])
     create index(:transmission_lines, [:from_bus_id])
     create index(:transmission_lines, [:to_bus_id])
     create index(:transmission_lines, [:voltage_kv])
+
     execute "CREATE INDEX transmission_lines_geometry_gist ON transmission_lines USING GIST (geometry)"
 
     # Loads
@@ -91,6 +97,7 @@ defmodule PowerModel.Repo.Migrations.CreateGridTables do
       add :bus_id, references(:buses, on_delete: :restrict), null: false
       timestamps()
     end
+
     create index(:loads, [:bus_id])
 
     # Substations
@@ -103,6 +110,7 @@ defmodule PowerModel.Repo.Migrations.CreateGridTables do
       add :status, :string, default: "in_service"
       timestamps()
     end
+
     create unique_index(:substations, [:hifld_id])
     execute "CREATE INDEX substations_coordinates_gist ON substations USING GIST (coordinates)"
 
@@ -117,6 +125,7 @@ defmodule PowerModel.Repo.Migrations.CreateGridTables do
       add :to_bus_id, references(:buses, on_delete: :restrict), null: false
       timestamps()
     end
+
     create index(:transformers, [:from_bus_id])
     create index(:transformers, [:to_bus_id])
 
@@ -142,6 +151,7 @@ defmodule PowerModel.Repo.Migrations.CreateGridTables do
       add :bus_id, references(:buses, on_delete: :restrict), null: false
       timestamps()
     end
+
     create index(:simulation_results, [:scenario_id])
     create index(:simulation_results, [:bus_id])
     create unique_index(:simulation_results, [:scenario_id, :bus_id])
@@ -156,6 +166,7 @@ defmodule PowerModel.Repo.Migrations.CreateGridTables do
       add :scenario_id, references(:simulation_scenarios, on_delete: :delete_all), null: false
       timestamps()
     end
+
     create index(:failure_events, [:scenario_id])
     create index(:failure_events, [:scenario_id, :step])
   end

@@ -6,10 +6,14 @@
   <div class="top-bar">
     <div class="view-controls">
       <select phx-change="change_view_mode" name="mode" class="view-select">
-        <option value="voltage_level" selected={@view_mode == "voltage_level"}>Voltage Level</option>
+        <option value="voltage_level" selected={@view_mode == "voltage_level"}>
+          Voltage Level
+        </option>
         <option value="loading" selected={@view_mode == "loading"}>Loading %</option>
         <option value="fuel_type" selected={@view_mode == "fuel_type"}>Fuel Type</option>
-        <option value="failure_state" selected={@view_mode == "failure_state"}>Failure State</option>
+        <option value="failure_state" selected={@view_mode == "failure_state"}>
+          Failure State
+        </option>
       </select>
     </div>
 
@@ -45,7 +49,11 @@
 
     <%!-- Demand hour picker (only when EIA-930 data is loaded) --%>
     <%= if @demand_range do %>
-      <form phx-change="select_hour" class="hour-controls" title="Scale loads to actual EIA-930 demand for an hour (UTC)">
+      <form
+        phx-change="select_hour"
+        class="hour-controls"
+        title="Scale loads to actual EIA-930 demand for an hour (UTC)"
+      >
         <input
           type="date"
           name="date"
@@ -58,7 +66,7 @@
           <option value="" selected={is_nil(@selected_hour)}>Hour (UTC)</option>
           <%= for h <- 0..23 do %>
             <option value={h} selected={@selected_hour && @selected_hour.hour == h}>
-              <%= String.pad_leading("#{h}", 2, "0") %>:00
+              {String.pad_leading("#{h}", 2, "0")}:00
             </option>
           <% end %>
         </select>
@@ -70,7 +78,7 @@
 
     <div class="solver-badge">
       <span class={"status-dot " <> solver_status_class(@solver_status)}></span>
-      <span><%= solver_status_text(@solver_status) %></span>
+      <span>{solver_status_text(@solver_status)}</span>
     </div>
   </div>
 
@@ -135,166 +143,296 @@
       <span class="legend-toggle-icon"></span>
     </button>
     <div class="legend-body">
-    <%= if @view_mode == "voltage_level" do %>
-      <div class="legend-section">
-        <div class="legend-title">Lines &amp; Substations</div>
-        <%= for {key, label, color} <- voltage_legend() do %>
-          <.legend_item category="voltage" key={key} label={label}
-            hidden={legend_hidden?(@hidden_legend, "voltage", key)}>
-            <span class="legend-swatch" style={"background: #{color};"}></span>
-          </.legend_item>
-        <% end %>
-      </div>
-      <div class="legend-divider"></div>
-      <div class="legend-section">
-        <div class="legend-title">Generators</div>
-        <%= for {key, label, color} <- fuel_legend() do %>
-          <.legend_item category="fuel" key={key} label={label}
-            hidden={legend_hidden?(@hidden_legend, "fuel", key)}>
-            <span class="legend-dot" style={"background: #{color};"}></span>
-          </.legend_item>
-        <% end %>
-      </div>
-    <% end %>
-    <%= if @view_mode == "fuel_type" do %>
-      <div class="legend-section">
-        <div class="legend-title">Generators</div>
-        <%= for {key, label, color} <- fuel_legend() do %>
-          <.legend_item category="fuel" key={key} label={label}
-            hidden={legend_hidden?(@hidden_legend, "fuel", key)}>
-            <span class="legend-dot" style={"background: #{color};"}></span>
-          </.legend_item>
-        <% end %>
-      </div>
-    <% end %>
-    <%= if @view_mode == "loading" do %>
-      <div class="legend-section">
-        <div class="legend-title">Line Loading</div>
-        <div class="legend-item">
-          <span class="legend-swatch" style="background: rgb(46, 204, 113);"></span>
-          <span>&lt; 50%</span>
+      <%= if @view_mode == "voltage_level" do %>
+        <div class="legend-section">
+          <div class="legend-title">Lines &amp; Substations</div>
+          <%= for {key, label, color} <- voltage_legend() do %>
+            <.legend_item
+              category="voltage"
+              key={key}
+              label={label}
+              hidden={legend_hidden?(@hidden_legend, "voltage", key)}
+            >
+              <span class="legend-swatch" style={"background: #{color};"}></span>
+            </.legend_item>
+          <% end %>
         </div>
-        <div class="legend-item">
-          <span class="legend-swatch" style="background: rgb(241, 196, 15);"></span>
-          <span>50–75%</span>
+        <div class="legend-divider"></div>
+        <div class="legend-section">
+          <div class="legend-title">Generators</div>
+          <%= for {key, label, color} <- fuel_legend() do %>
+            <.legend_item
+              category="fuel"
+              key={key}
+              label={label}
+              hidden={legend_hidden?(@hidden_legend, "fuel", key)}
+            >
+              <span class="legend-dot" style={"background: #{color};"}></span>
+            </.legend_item>
+          <% end %>
         </div>
-        <div class="legend-item">
-          <span class="legend-swatch" style="background: rgb(230, 126, 34);"></span>
-          <span>75–90%</span>
-        </div>
-        <div class="legend-item">
-          <span class="legend-swatch" style="background: rgb(231, 76, 60);"></span>
-          <span>90–100%</span>
-        </div>
-        <div class="legend-item">
-          <span class="legend-swatch" style="background: rgb(192, 57, 43);"></span>
-          <span>&gt; 100%</span>
-        </div>
-      </div>
-      <div class="legend-divider"></div>
-      <div class="legend-section">
-        <div class="legend-title">Generators</div>
-        <%= for {key, label, color} <- fuel_legend() do %>
-          <.legend_item category="fuel" key={key} label={label}
-            hidden={legend_hidden?(@hidden_legend, "fuel", key)}>
-            <span class="legend-dot" style={"background: #{color};"}></span>
-          </.legend_item>
-        <% end %>
-      </div>
-    <% end %>
-    <div class="legend-divider"></div>
-    <div class="legend-section">
-      <div class="legend-title">Equipment</div>
-      <.legend_item category="equipment" key="transformer" label="Transformers"
-        hidden={legend_hidden?(@hidden_legend, "equipment", "transformer")}>
-        <svg class="legend-icon" viewBox="0 0 20 20"><circle cx="7.5" cy="10" r="5" stroke="rgb(186,154,90)" stroke-width="2" fill="none"/><circle cx="12.5" cy="10" r="5" stroke="rgb(186,154,90)" stroke-width="2" fill="none"/></svg>
-      </.legend_item>
-    </div>
-    <%= if @show_water do %>
-    <div class="legend-divider"></div>
-    <div class="legend-section">
-      <div class="legend-title">Water Facilities</div>
-      <.legend_item category="water" key="desalination" label="Desalination"
-        hidden={legend_hidden?(@hidden_legend, "water", "desalination")}>
-        <svg class="legend-icon" viewBox="0 0 20 20"><path d="M10 3 Q12 7 13.5 11 Q14.5 15 12 17 Q10.5 18 10 18 Q9.5 18 8 17 Q5.5 15 6.5 11 Q8 7 10 3Z" fill="rgb(0,191,255)"/></svg>
-      </.legend_item>
-      <.legend_item category="water" key="wastewater" label="Wastewater"
-        hidden={legend_hidden?(@hidden_legend, "water", "wastewater")}>
-        <svg class="legend-icon" viewBox="0 0 20 20"><path d="M6 6 Q10 3 14 6" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M14 6 L13 9" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round" marker-end="none"/><path d="M14 10 Q10 13 6 10" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M6 10 L7 13" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M6 14 Q10 17 14 14" stroke="rgb(139,90,43)" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
-      </.legend_item>
-      <.legend_item category="water" key="treatment" label="Treatment"
-        hidden={legend_hidden?(@hidden_legend, "water", "treatment")}>
-        <svg class="legend-icon" viewBox="0 0 20 20"><rect x="8" y="2" width="4" height="7" fill="rgb(0,200,150)"/><path d="M8 9 L5 18 L15 18 L12 9Z" fill="rgb(0,200,150)"/><rect x="7" y="1.5" width="6" height="1.5" fill="rgb(0,200,150)"/></svg>
-      </.legend_item>
-      <.legend_item category="water" key="pump_station" label="Pump Station"
-        hidden={legend_hidden?(@hidden_legend, "water", "pump_station")}>
-        <svg class="legend-icon" viewBox="0 0 20 20"><path d="M4 14 L10 8 L16 14" stroke="rgb(147,51,234)" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 10 L10 4 L16 10" stroke="rgb(147,51,234)" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      </.legend_item>
-      <.legend_item category="water" key="reservoir" label="Reservoir"
-        hidden={legend_hidden?(@hidden_legend, "water", "reservoir")}>
-        <svg class="legend-icon" viewBox="0 0 20 20"><path d="M2 7 Q6 4 10 7 Q14 10 18 7" stroke="rgb(0,100,180)" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M2 12 Q6 9 10 12 Q14 15 18 12" stroke="rgb(0,100,180)" stroke-width="2.5" fill="none" stroke-linecap="round"/></svg>
-      </.legend_item>
-    </div>
-    <% end %>
-    <%= if @show_datacenters do %>
-    <div class="legend-divider"></div>
-    <div class="legend-section">
-      <div class="legend-title">Datacenters</div>
-      <%= for {key, label, color} <- datacenter_legend() do %>
-        <.legend_item category="datacenter" key={key} label={label}
-          hidden={legend_hidden?(@hidden_legend, "datacenter", key)}>
-          <span class="legend-dot" style={"background: #{color};"}></span>
-        </.legend_item>
       <% end %>
-    </div>
-    <% end %>
-    <%= if @show_demand_density do %>
-    <div class="legend-divider"></div>
-    <div class="legend-section">
-      <div class="legend-title">Demand Density</div>
-      <div class="legend-item">
-        <span class="legend-swatch" style="background: linear-gradient(to right, rgb(12,8,38), rgb(90,20,110), rgb(182,54,121), rgb(240,110,70), rgb(252,200,120)); width: 80px;"></span>
-      </div>
-      <div class="legend-item legend-scale-labels">
-        <span>Low</span>
-        <span>High MW</span>
-      </div>
-    </div>
-    <% end %>
-    <%= if @view_mode == "failure_state" or @cascade_active or length(@cascade_steps) > 0 do %>
+      <%= if @view_mode == "fuel_type" do %>
+        <div class="legend-section">
+          <div class="legend-title">Generators</div>
+          <%= for {key, label, color} <- fuel_legend() do %>
+            <.legend_item
+              category="fuel"
+              key={key}
+              label={label}
+              hidden={legend_hidden?(@hidden_legend, "fuel", key)}
+            >
+              <span class="legend-dot" style={"background: #{color};"}></span>
+            </.legend_item>
+          <% end %>
+        </div>
+      <% end %>
+      <%= if @view_mode == "loading" do %>
+        <div class="legend-section">
+          <div class="legend-title">Line Loading</div>
+          <div class="legend-item">
+            <span class="legend-swatch" style="background: rgb(46, 204, 113);"></span>
+            <span>&lt; 50%</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch" style="background: rgb(241, 196, 15);"></span>
+            <span>50–75%</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch" style="background: rgb(230, 126, 34);"></span>
+            <span>75–90%</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch" style="background: rgb(231, 76, 60);"></span>
+            <span>90–100%</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch" style="background: rgb(192, 57, 43);"></span>
+            <span>&gt; 100%</span>
+          </div>
+        </div>
+        <div class="legend-divider"></div>
+        <div class="legend-section">
+          <div class="legend-title">Generators</div>
+          <%= for {key, label, color} <- fuel_legend() do %>
+            <.legend_item
+              category="fuel"
+              key={key}
+              label={label}
+              hidden={legend_hidden?(@hidden_legend, "fuel", key)}
+            >
+              <span class="legend-dot" style={"background: #{color};"}></span>
+            </.legend_item>
+          <% end %>
+        </div>
+      <% end %>
       <div class="legend-divider"></div>
       <div class="legend-section">
-        <div class="legend-title">Failure Impact</div>
-        <div class="legend-item">
-          <span class="legend-dot" style="background: rgb(46, 204, 113);"></span>
-          <span>Normal</span>
-        </div>
-        <div class="legend-item">
-          <span class="legend-dot" style="background: rgb(255, 140, 0);"></span>
-          <span>Rerouted Flow</span>
-        </div>
-        <div class="legend-item">
-          <span class="legend-dot" style="background: rgb(245, 166, 35);"></span>
-          <span>Stressed (75-100%)</span>
-        </div>
-        <div class="legend-item">
-          <span class="legend-dot" style="background: rgb(231, 76, 60);"></span>
-          <span>Overloaded (>100%)</span>
-        </div>
-        <div class="legend-item">
-          <span class="legend-dot" style="background: rgb(155, 89, 182);"></span>
-          <span>Load Shed</span>
-        </div>
-        <div class="legend-item">
-          <span class="legend-dot" style="background: rgb(52, 73, 94);"></span>
-          <span>Islanded</span>
-        </div>
-        <div class="legend-item">
-          <span class="legend-dot" style="background: rgb(255, 50, 30);"></span>
-          <span>Tripped / Dead</span>
-        </div>
+        <div class="legend-title">Equipment</div>
+        <.legend_item
+          category="equipment"
+          key="transformer"
+          label="Transformers"
+          hidden={legend_hidden?(@hidden_legend, "equipment", "transformer")}
+        >
+          <svg class="legend-icon" viewBox="0 0 20 20">
+            <circle cx="7.5" cy="10" r="5" stroke="rgb(186,154,90)" stroke-width="2" fill="none" /><circle
+              cx="12.5"
+              cy="10"
+              r="5"
+              stroke="rgb(186,154,90)"
+              stroke-width="2"
+              fill="none"
+            />
+          </svg>
+        </.legend_item>
       </div>
-    <% end %>
+      <%= if @show_water do %>
+        <div class="legend-divider"></div>
+        <div class="legend-section">
+          <div class="legend-title">Water Facilities</div>
+          <.legend_item
+            category="water"
+            key="desalination"
+            label="Desalination"
+            hidden={legend_hidden?(@hidden_legend, "water", "desalination")}
+          >
+            <svg class="legend-icon" viewBox="0 0 20 20">
+              <path
+                d="M10 3 Q12 7 13.5 11 Q14.5 15 12 17 Q10.5 18 10 18 Q9.5 18 8 17 Q5.5 15 6.5 11 Q8 7 10 3Z"
+                fill="rgb(0,191,255)"
+              />
+            </svg>
+          </.legend_item>
+          <.legend_item
+            category="water"
+            key="wastewater"
+            label="Wastewater"
+            hidden={legend_hidden?(@hidden_legend, "water", "wastewater")}
+          >
+            <svg class="legend-icon" viewBox="0 0 20 20">
+              <path
+                d="M6 6 Q10 3 14 6"
+                stroke="rgb(139,90,43)"
+                stroke-width="2"
+                fill="none"
+                stroke-linecap="round"
+              /><path
+                d="M14 6 L13 9"
+                stroke="rgb(139,90,43)"
+                stroke-width="2"
+                fill="none"
+                stroke-linecap="round"
+                marker-end="none"
+              /><path
+                d="M14 10 Q10 13 6 10"
+                stroke="rgb(139,90,43)"
+                stroke-width="2"
+                fill="none"
+                stroke-linecap="round"
+              /><path
+                d="M6 10 L7 13"
+                stroke="rgb(139,90,43)"
+                stroke-width="2"
+                fill="none"
+                stroke-linecap="round"
+              /><path
+                d="M6 14 Q10 17 14 14"
+                stroke="rgb(139,90,43)"
+                stroke-width="2"
+                fill="none"
+                stroke-linecap="round"
+              />
+            </svg>
+          </.legend_item>
+          <.legend_item
+            category="water"
+            key="treatment"
+            label="Treatment"
+            hidden={legend_hidden?(@hidden_legend, "water", "treatment")}
+          >
+            <svg class="legend-icon" viewBox="0 0 20 20">
+              <rect x="8" y="2" width="4" height="7" fill="rgb(0,200,150)" /><path
+                d="M8 9 L5 18 L15 18 L12 9Z"
+                fill="rgb(0,200,150)"
+              /><rect x="7" y="1.5" width="6" height="1.5" fill="rgb(0,200,150)" />
+            </svg>
+          </.legend_item>
+          <.legend_item
+            category="water"
+            key="pump_station"
+            label="Pump Station"
+            hidden={legend_hidden?(@hidden_legend, "water", "pump_station")}
+          >
+            <svg class="legend-icon" viewBox="0 0 20 20">
+              <path
+                d="M4 14 L10 8 L16 14"
+                stroke="rgb(147,51,234)"
+                stroke-width="2.5"
+                fill="none"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              /><path
+                d="M4 10 L10 4 L16 10"
+                stroke="rgb(147,51,234)"
+                stroke-width="2.5"
+                fill="none"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </.legend_item>
+          <.legend_item
+            category="water"
+            key="reservoir"
+            label="Reservoir"
+            hidden={legend_hidden?(@hidden_legend, "water", "reservoir")}
+          >
+            <svg class="legend-icon" viewBox="0 0 20 20">
+              <path
+                d="M2 7 Q6 4 10 7 Q14 10 18 7"
+                stroke="rgb(0,100,180)"
+                stroke-width="2.5"
+                fill="none"
+                stroke-linecap="round"
+              /><path
+                d="M2 12 Q6 9 10 12 Q14 15 18 12"
+                stroke="rgb(0,100,180)"
+                stroke-width="2.5"
+                fill="none"
+                stroke-linecap="round"
+              />
+            </svg>
+          </.legend_item>
+        </div>
+      <% end %>
+      <%= if @show_datacenters do %>
+        <div class="legend-divider"></div>
+        <div class="legend-section">
+          <div class="legend-title">Datacenters</div>
+          <%= for {key, label, color} <- datacenter_legend() do %>
+            <.legend_item
+              category="datacenter"
+              key={key}
+              label={label}
+              hidden={legend_hidden?(@hidden_legend, "datacenter", key)}
+            >
+              <span class="legend-dot" style={"background: #{color};"}></span>
+            </.legend_item>
+          <% end %>
+        </div>
+      <% end %>
+      <%= if @show_demand_density do %>
+        <div class="legend-divider"></div>
+        <div class="legend-section">
+          <div class="legend-title">Demand Density</div>
+          <div class="legend-item">
+            <span
+              class="legend-swatch"
+              style="background: linear-gradient(to right, rgb(12,8,38), rgb(90,20,110), rgb(182,54,121), rgb(240,110,70), rgb(252,200,120)); width: 80px;"
+            >
+            </span>
+          </div>
+          <div class="legend-item legend-scale-labels">
+            <span>Low</span>
+            <span>High MW</span>
+          </div>
+        </div>
+      <% end %>
+      <%= if @view_mode == "failure_state" or @cascade_active or length(@cascade_steps) > 0 do %>
+        <div class="legend-divider"></div>
+        <div class="legend-section">
+          <div class="legend-title">Failure Impact</div>
+          <div class="legend-item">
+            <span class="legend-dot" style="background: rgb(46, 204, 113);"></span>
+            <span>Normal</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot" style="background: rgb(255, 140, 0);"></span>
+            <span>Rerouted Flow</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot" style="background: rgb(245, 166, 35);"></span>
+            <span>Stressed (75-100%)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot" style="background: rgb(231, 76, 60);"></span>
+            <span>Overloaded (>100%)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot" style="background: rgb(155, 89, 182);"></span>
+            <span>Load Shed</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot" style="background: rgb(52, 73, 94);"></span>
+            <span>Islanded</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot" style="background: rgb(255, 50, 30);"></span>
+            <span>Tripped / Dead</span>
+          </div>
+        </div>
+      <% end %>
     </div>
   </div>
 </div>

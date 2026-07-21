@@ -38,9 +38,11 @@ defmodule PowerModel.Ingestion.EIA.Form923 do
       plant_id_str = to_string(plant_id)
       hours_in_year = 8760.0
 
-      generators = from(g in Generator,
-        where: g.eia_plant_id == ^plant_id_str and g.p_max_mw > 0
-      ) |> Repo.all()
+      generators =
+        from(g in Generator,
+          where: g.eia_plant_id == ^plant_id_str and g.p_max_mw > 0
+        )
+        |> Repo.all()
 
       total_capacity = Enum.sum(Enum.map(generators, & &1.p_max_mw))
 
@@ -67,6 +69,7 @@ defmodule PowerModel.Ingestion.EIA.Form923 do
 
   defp parse_float(nil), do: nil
   defp parse_float(val) when is_number(val), do: val * 1.0
+
   defp parse_float(val) when is_binary(val) do
     case Float.parse(String.trim(val)) do
       {f, _} -> f

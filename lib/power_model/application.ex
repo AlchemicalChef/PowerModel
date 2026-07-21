@@ -34,5 +34,4 @@ defmodule PowerModel.Application do
     PowerModelWeb.Endpoint.config_change(changed, removed)
     :ok
   end
-
 end

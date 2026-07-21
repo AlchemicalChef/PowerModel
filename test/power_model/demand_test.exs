@@ -107,12 +107,31 @@ defmodule PowerModel.DemandTest do
       pt = fn lon, lat -> %Geo.Point{coordinates: {lon, lat}, srid: 4326} end
 
       # CISO buses in Western; ERCO bus in ERCOT
-      b1 = Repo.insert!(%Bus{bus_type: 1, base_kv: 138.0, coordinates: pt.(-120.0, 37.0),
-        interconnection_id: western.id, balancing_authority_id: ciso.id})
-      Repo.insert!(%Bus{bus_type: 1, base_kv: 138.0, coordinates: pt.(-119.0, 36.0),
-        interconnection_id: western.id, balancing_authority_id: ciso.id})
-      b3 = Repo.insert!(%Bus{bus_type: 1, base_kv: 138.0, coordinates: pt.(-97.0, 31.0),
-        interconnection_id: ercot.id, balancing_authority_id: erco.id})
+      b1 =
+        Repo.insert!(%Bus{
+          bus_type: 1,
+          base_kv: 138.0,
+          coordinates: pt.(-120.0, 37.0),
+          interconnection_id: western.id,
+          balancing_authority_id: ciso.id
+        })
+
+      Repo.insert!(%Bus{
+        bus_type: 1,
+        base_kv: 138.0,
+        coordinates: pt.(-119.0, 36.0),
+        interconnection_id: western.id,
+        balancing_authority_id: ciso.id
+      })
+
+      b3 =
+        Repo.insert!(%Bus{
+          bus_type: 1,
+          base_kv: 138.0,
+          coordinates: pt.(-97.0, 31.0),
+          interconnection_id: ercot.id,
+          balancing_authority_id: erco.id
+        })
 
       Repo.insert!(%Generator{p_max_mw: 500.0, bus_id: b1.id, status: "in_service"})
       Repo.insert!(%Generator{p_max_mw: 300.0, bus_id: b3.id, status: "in_service"})

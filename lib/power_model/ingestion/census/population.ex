@@ -35,7 +35,9 @@ defmodule PowerModel.Ingestion.Census.Population do
   end
 
   def ingest(popest: popest, gazetteer: gazetteer) do
-    IO.puts("Ingesting county population from #{Path.basename(popest)} + #{Path.basename(gazetteer)}...")
+    IO.puts(
+      "Ingesting county population from #{Path.basename(popest)} + #{Path.basename(gazetteer)}..."
+    )
 
     centroids = parse_gazetteer(gazetteer)
     counties = parse_popest(popest)
@@ -76,7 +78,9 @@ defmodule PowerModel.Ingestion.Census.Population do
     IO.puts("  #{length(rows)} counties upserted, total population #{total_pop}.")
 
     if missing != [] do
-      IO.puts("  #{length(missing)} counties without a Gazetteer centroid (skipped): #{Enum.join(Enum.take(missing, 10), ", ")}")
+      IO.puts(
+        "  #{length(missing)} counties without a Gazetteer centroid (skipped): #{Enum.join(Enum.take(missing, 10), ", ")}"
+      )
     end
 
     {:ok, length(rows)}

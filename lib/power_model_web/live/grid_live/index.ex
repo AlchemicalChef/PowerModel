@@ -11,23 +11,24 @@ defmodule PowerModelWeb.GridLive.Index do
       Phoenix.PubSub.subscribe(PowerModel.PubSub, "simulation:#{sim_id}")
     end
 
-    socket = socket
-    |> assign(:sim_id, sim_id)
-    |> assign(:selected_component, nil)
-    |> assign(:cascade_steps, [])
-    |> assign(:cascade_active, false)
-    |> assign(:system_metrics, initial_metrics())
-    |> assign(:solver_status, :idle)
-    |> assign(:view_mode, "voltage_level")
-    |> assign(:interconnection, "all")
-    |> assign(:demand_range, PowerModel.Demand.available_range())
-    |> assign(:selected_hour, nil)
-    |> assign(:show_water, false)
-    |> assign(:show_datacenters, false)
-    |> assign(:show_demand_density, false)
-    |> assign(:hidden_legend, %{})
-    |> assign(:show_utilization, false)
-    |> assign(:utilization, nil)
+    socket =
+      socket
+      |> assign(:sim_id, sim_id)
+      |> assign(:selected_component, nil)
+      |> assign(:cascade_steps, [])
+      |> assign(:cascade_active, false)
+      |> assign(:system_metrics, initial_metrics())
+      |> assign(:solver_status, :idle)
+      |> assign(:view_mode, "voltage_level")
+      |> assign(:interconnection, "all")
+      |> assign(:demand_range, PowerModel.Demand.available_range())
+      |> assign(:selected_hour, nil)
+      |> assign(:show_water, false)
+      |> assign(:show_datacenters, false)
+      |> assign(:show_demand_density, false)
+      |> assign(:hidden_legend, %{})
+      |> assign(:show_utilization, false)
+      |> assign(:utilization, nil)
 
     {:ok, socket, layout: {PowerModelWeb.Layouts, :grid}}
   end
@@ -67,8 +68,12 @@ defmodule PowerModelWeb.GridLive.Index do
     socket = assign(socket, :solver_status, :solving)
 
     # Ensure simulation server is running with the right interconnection
-    ensure_sim_server(sim_id, socket.assigns.interconnection,
-      socket.assigns.selected_hour, {type, component_id})
+    ensure_sim_server(
+      sim_id,
+      socket.assigns.interconnection,
+      socket.assigns.selected_hour,
+      {type, component_id}
+    )
 
     lv = self()
 
@@ -99,21 +104,23 @@ defmodule PowerModelWeb.GridLive.Index do
     sim_id = socket.assigns.sim_id
     SimulationServer.reset(sim_id)
 
-    socket = socket
-    |> assign(:cascade_steps, [])
-    |> assign(:cascade_active, false)
-    |> assign(:selected_component, nil)
-    |> assign(:solver_status, :idle)
-    |> push_event("reset_grid", %{})
-    |> push_event("deselect_highlight", %{})
+    socket =
+      socket
+      |> assign(:cascade_steps, [])
+      |> assign(:cascade_active, false)
+      |> assign(:selected_component, nil)
+      |> assign(:solver_status, :idle)
+      |> push_event("reset_grid", %{})
+      |> push_event("deselect_highlight", %{})
 
     {:noreply, socket}
   end
 
   def handle_event("change_view_mode", %{"mode" => mode}, socket) do
-    socket = socket
-    |> assign(:view_mode, mode)
-    |> push_event("view_mode_changed", %{mode: mode})
+    socket =
+      socket
+      |> assign(:view_mode, mode)
+      |> push_event("view_mode_changed", %{mode: mode})
 
     {:noreply, socket}
   end
@@ -132,9 +139,10 @@ defmodule PowerModelWeb.GridLive.Index do
   end
 
   def handle_event("deselect", _params, socket) do
-    socket = socket
-    |> assign(:selected_component, nil)
-    |> push_event("deselect_highlight", %{})
+    socket =
+      socket
+      |> assign(:selected_component, nil)
+      |> push_event("deselect_highlight", %{})
 
     {:noreply, socket}
   end
@@ -166,9 +174,10 @@ defmodule PowerModelWeb.GridLive.Index do
           _ -> default_utilization_date(socket.assigns)
         end
 
-      socket = socket
-      |> assign(:show_utilization, true)
-      |> assign(:utilization, date && build_utilization(date))
+      socket =
+        socket
+        |> assign(:show_utilization, true)
+        |> assign(:utilization, date && build_utilization(date))
 
       {:noreply, socket}
     end
@@ -199,15 +208,16 @@ defmodule PowerModelWeb.GridLive.Index do
 
     hidden = Map.put(hidden, category, set)
 
-    socket = socket
-    |> assign(:hidden_legend, hidden)
-    |> push_event("set_category_filters", %{
-      voltage: hidden |> Map.get("voltage", MapSet.new()) |> MapSet.to_list(),
-      fuel: hidden |> Map.get("fuel", MapSet.new()) |> MapSet.to_list(),
-      water: hidden |> Map.get("water", MapSet.new()) |> MapSet.to_list(),
-      datacenter: hidden |> Map.get("datacenter", MapSet.new()) |> MapSet.to_list(),
-      equipment: hidden |> Map.get("equipment", MapSet.new()) |> MapSet.to_list()
-    })
+    socket =
+      socket
+      |> assign(:hidden_legend, hidden)
+      |> push_event("set_category_filters", %{
+        voltage: hidden |> Map.get("voltage", MapSet.new()) |> MapSet.to_list(),
+        fuel: hidden |> Map.get("fuel", MapSet.new()) |> MapSet.to_list(),
+        water: hidden |> Map.get("water", MapSet.new()) |> MapSet.to_list(),
+        datacenter: hidden |> Map.get("datacenter", MapSet.new()) |> MapSet.to_list(),
+        equipment: hidden |> Map.get("equipment", MapSet.new()) |> MapSet.to_list()
+      })
 
     {:noreply, socket}
   end
@@ -219,13 +229,14 @@ defmodule PowerModelWeb.GridLive.Index do
     show_datacenters = params["datacenters"] == "true"
     show_demand_density = params["demand_density"] == "true"
 
-    socket = socket
-    |> assign(:show_water, show_water)
-    |> assign(:show_datacenters, show_datacenters)
-    |> assign(:show_demand_density, show_demand_density)
-    |> push_event("set_water_visibility", %{visible: show_water})
-    |> push_event("set_datacenter_visibility", %{visible: show_datacenters})
-    |> push_event("set_demand_density_visibility", %{visible: show_demand_density})
+    socket =
+      socket
+      |> assign(:show_water, show_water)
+      |> assign(:show_datacenters, show_datacenters)
+      |> assign(:show_demand_density, show_demand_density)
+      |> push_event("set_water_visibility", %{visible: show_water})
+      |> push_event("set_datacenter_visibility", %{visible: show_datacenters})
+      |> push_event("set_demand_density_visibility", %{visible: show_demand_density})
 
     {:noreply, socket}
   end
@@ -234,19 +245,21 @@ defmodule PowerModelWeb.GridLive.Index do
 
   @impl true
   def handle_info({:simulation_dc_update, payload}, socket) do
-    socket = socket
-    |> assign(:solver_status, :dc_solved)
-    |> update_metrics(payload)
-    |> push_event("dc_results", payload)
+    socket =
+      socket
+      |> assign(:solver_status, :dc_solved)
+      |> update_metrics(payload)
+      |> push_event("dc_results", payload)
 
     {:noreply, socket}
   end
 
   def handle_info({:simulation_ac_update, payload}, socket) do
-    socket = socket
-    |> assign(:solver_status, :ac_solved)
-    |> update_metrics(payload)
-    |> push_event("ac_results", payload)
+    socket =
+      socket
+      |> assign(:solver_status, :ac_solved)
+      |> update_metrics(payload)
+      |> push_event("ac_results", payload)
 
     {:noreply, socket}
   end
@@ -254,37 +267,40 @@ defmodule PowerModelWeb.GridLive.Index do
   def handle_info({:simulation_cascade_step, payload}, socket) do
     steps = socket.assigns.cascade_steps ++ [payload]
 
-    socket = socket
-    |> assign(:cascade_steps, steps)
-    |> update(:system_metrics, fn m ->
-      m
-      |> merge_balance(payload[:balance])
-      |> Map.put(:islands, payload[:islands] || m.islands)
-    end)
-    |> push_event("cascade_step", payload)
+    socket =
+      socket
+      |> assign(:cascade_steps, steps)
+      |> update(:system_metrics, fn m ->
+        m
+        |> merge_balance(payload[:balance])
+        |> Map.put(:islands, payload[:islands] || m.islands)
+      end)
+      |> push_event("cascade_step", payload)
 
     {:noreply, socket}
   end
 
   def handle_info({:simulation_cascade_done, payload}, socket) do
-    socket = socket
-    |> assign(:cascade_active, false)
-    |> assign(:solver_status, :stable)
-    |> update(:system_metrics, fn m ->
-      m
-      |> merge_balance(payload[:balance])
-      |> Map.put(:tripped_count, payload.total_events)
-    end)
+    socket =
+      socket
+      |> assign(:cascade_active, false)
+      |> assign(:solver_status, :stable)
+      |> update(:system_metrics, fn m ->
+        m
+        |> merge_balance(payload[:balance])
+        |> Map.put(:tripped_count, payload.total_events)
+      end)
 
     {:noreply, socket}
   end
 
   def handle_info({:simulation_reset, _payload}, socket) do
-    socket = socket
-    |> assign(:cascade_steps, [])
-    |> assign(:cascade_active, false)
-    |> assign(:solver_status, :idle)
-    |> assign(:system_metrics, initial_metrics())
+    socket =
+      socket
+      |> assign(:cascade_steps, [])
+      |> assign(:cascade_active, false)
+      |> assign(:solver_status, :idle)
+      |> assign(:system_metrics, initial_metrics())
 
     {:noreply, socket}
   end
@@ -305,6 +321,7 @@ defmodule PowerModelWeb.GridLive.Index do
           # For now, broadcast the result count back
           violations = length(state.tripped_lines) + length(state.tripped_generators)
           send(lv, {:n1_screening_done, violations})
+
         _ ->
           send(lv, {:n1_screening_done, 0})
       end
@@ -314,9 +331,10 @@ defmodule PowerModelWeb.GridLive.Index do
   end
 
   def handle_info({:trip_rejected, reason, _type, _id}, socket) do
-    socket = socket
-    |> assign(:cascade_active, false)
-    |> assign(:solver_status, reason)
+    socket =
+      socket
+      |> assign(:cascade_active, false)
+      |> assign(:solver_status, reason)
 
     {:noreply, socket}
   end
@@ -327,6 +345,7 @@ defmodule PowerModelWeb.GridLive.Index do
       screening: false,
       violations: violations
     )
+
     {:noreply, socket}
   end
 
@@ -336,12 +355,15 @@ defmodule PowerModelWeb.GridLive.Index do
 
   defp ensure_sim_server(sim_id, interconnection, hour, component \\ nil) do
     case Registry.lookup(PowerModel.SimulationRegistry, sim_id) do
-      [{_pid, _}] -> :ok
+      [{_pid, _}] ->
+        :ok
+
       [] ->
-        interconnection_id = case interconnection do
-          "all" -> resolve_interconnection(component)
-          id -> String.to_integer(id)
-        end
+        interconnection_id =
+          case interconnection do
+            "all" -> resolve_interconnection(component)
+            id -> String.to_integer(id)
+          end
 
         opts = [sim_id: sim_id, interconnection_id: interconnection_id, hour: hour]
 
@@ -377,9 +399,11 @@ defmodule PowerModelWeb.GridLive.Index do
 
   defp resolve_interconnection({"transmission_line", line_id}) do
     import Ecto.Query
+
     PowerModel.Repo.one(
       from tl in PowerModel.Grid.TransmissionLine,
-        join: b in PowerModel.Grid.Bus, on: tl.from_bus_id == b.id,
+        join: b in PowerModel.Grid.Bus,
+        on: tl.from_bus_id == b.id,
         where: tl.id == ^line_id,
         select: b.interconnection_id
     )
@@ -387,9 +411,11 @@ defmodule PowerModelWeb.GridLive.Index do
 
   defp resolve_interconnection({"generator", gen_id}) do
     import Ecto.Query
+
     PowerModel.Repo.one(
       from g in PowerModel.Grid.Generator,
-        join: b in PowerModel.Grid.Bus, on: g.bus_id == b.id,
+        join: b in PowerModel.Grid.Bus,
+        on: g.bus_id == b.id,
         where: g.id == ^gen_id,
         select: b.interconnection_id
     )
@@ -397,9 +423,11 @@ defmodule PowerModelWeb.GridLive.Index do
 
   defp resolve_interconnection({"transformer", xfmr_id}) do
     import Ecto.Query
+
     PowerModel.Repo.one(
       from t in PowerModel.Grid.Transformer,
-        join: b in PowerModel.Grid.Bus, on: t.from_bus_id == b.id,
+        join: b in PowerModel.Grid.Bus,
+        on: t.from_bus_id == b.id,
         where: t.id == ^xfmr_id,
         select: b.interconnection_id
     )
@@ -432,12 +460,13 @@ defmodule PowerModelWeb.GridLive.Index do
 
   defp update_metrics(socket, payload) do
     update(socket, :system_metrics, fn m ->
-      %{m |
-        total_gen_mw: payload[:total_gen_mw] || m.total_gen_mw,
-        total_load_mw: payload[:total_load_mw] || m.total_load_mw,
-        total_loss_mw: payload[:total_loss_mw] || m.total_loss_mw,
-        mismatch_mw: payload[:mismatch_mw] || m.mismatch_mw,
-        overload: payload[:overload_summary] || m.overload
+      %{
+        m
+        | total_gen_mw: payload[:total_gen_mw] || m.total_gen_mw,
+          total_load_mw: payload[:total_load_mw] || m.total_load_mw,
+          total_loss_mw: payload[:total_loss_mw] || m.total_loss_mw,
+          mismatch_mw: payload[:mismatch_mw] || m.mismatch_mw,
+          overload: payload[:overload_summary] || m.overload
       }
     end)
   end
@@ -445,11 +474,12 @@ defmodule PowerModelWeb.GridLive.Index do
   defp merge_balance(metrics, nil), do: metrics
 
   defp merge_balance(metrics, balance) do
-    %{metrics |
-      demand_mw: balance[:original_load_mw] || metrics.demand_mw,
-      served_mw: balance[:served_load_mw] || metrics.served_mw,
-      shed_mw: balance[:shed_load_mw] || metrics.shed_mw,
-      blackout_mw: balance[:blackout_load_mw] || metrics.blackout_mw
+    %{
+      metrics
+      | demand_mw: balance[:original_load_mw] || metrics.demand_mw,
+        served_mw: balance[:served_load_mw] || metrics.served_mw,
+        shed_mw: balance[:shed_load_mw] || metrics.shed_mw,
+        blackout_mw: balance[:blackout_load_mw] || metrics.blackout_mw
     }
   end
 
@@ -506,22 +536,26 @@ defmodule PowerModelWeb.GridLive.Index do
   defp parse_int(nil), do: nil
   defp parse_int(v) when is_integer(v), do: v
   defp parse_int(v) when is_float(v), do: round(v)
+
   defp parse_int(v) when is_binary(v) do
     case Integer.parse(v) do
       {n, _} -> n
       :error -> nil
     end
   end
+
   defp parse_int(_), do: nil
 
   defp parse_number(nil), do: nil
   defp parse_number(v) when is_number(v), do: v * 1.0
+
   defp parse_number(v) when is_binary(v) do
     case Float.parse(v) do
       {f, _} -> f
       :error -> nil
     end
   end
+
   defp parse_number(_), do: nil
 
   # ---------------------------------------------------------------------------
@@ -597,7 +631,9 @@ defmodule PowerModelWeb.GridLive.Index do
 
   defp demand_points(hours, y_max) do
     hours
-    |> Enum.map(fn {h, mw} -> "#{Float.round(chart_x(h), 1)},#{Float.round(chart_y(mw, y_max), 1)}" end)
+    |> Enum.map(fn {h, mw} ->
+      "#{Float.round(chart_x(h), 1)},#{Float.round(chart_y(mw, y_max), 1)}"
+    end)
     |> Enum.join(" ")
   end
 
@@ -609,7 +645,7 @@ defmodule PowerModelWeb.GridLive.Index do
     ~H"""
     <div class="util-panel">
       <div class="util-header">
-        <h3>Grid Utilization — <%= Calendar.strftime(@utilization.date, "%a, %b %d %Y") %> (UTC)</h3>
+        <h3>Grid Utilization — {Calendar.strftime(@utilization.date, "%a, %b %d %Y")} (UTC)</h3>
         <button phx-click="toggle_utilization" class="close-btn">&times;</button>
       </div>
 
@@ -620,26 +656,40 @@ defmodule PowerModelWeb.GridLive.Index do
         <button phx-click="util_peak_day" class="util-peak-btn">Peak day</button>
       </div>
 
-      <svg viewBox={"0 0 #{chart_w()} #{chart_h()}"} class="util-chart" preserveAspectRatio="xMidYMid meet">
+      <svg
+        viewBox={"0 0 #{chart_w()} #{chart_h()}"}
+        class="util-chart"
+        preserveAspectRatio="xMidYMid meet"
+      >
         <%!-- horizontal gridlines at quarter intervals --%>
         <%= for frac <- [0.25, 0.5, 0.75, 1.0] do %>
           <line
-            x1={pad_l()} x2={chart_w() - pad_r()}
+            x1={pad_l()}
+            x2={chart_w() - pad_r()}
             y1={Float.round(chart_y(@utilization.y_max * frac, @utilization.y_max), 1)}
             y2={Float.round(chart_y(@utilization.y_max * frac, @utilization.y_max), 1)}
-            stroke="rgba(120,120,140,0.18)" stroke-width="1"
+            stroke="rgba(120,120,140,0.18)"
+            stroke-width="1"
           />
           <text
             x={pad_l() - 6}
             y={Float.round(chart_y(@utilization.y_max * frac, @utilization.y_max) + 3, 1)}
-            class="util-axis-label" text-anchor="end"
-          ><%= format_gw(@utilization.y_max * frac) %></text>
+            class="util-axis-label"
+            text-anchor="end"
+          >
+            {format_gw(@utilization.y_max * frac)}
+          </text>
         <% end %>
 
         <%!-- x axis labels --%>
         <%= for h <- [0, 6, 12, 18, 23] do %>
-          <text x={Float.round(chart_x(h), 1)} y={chart_h() - 8} class="util-axis-label" text-anchor="middle">
-            <%= String.pad_leading("#{h}", 2, "0") %>:00
+          <text
+            x={Float.round(chart_x(h), 1)}
+            y={chart_h() - 8}
+            class="util-axis-label"
+            text-anchor="middle"
+          >
+            {String.pad_leading("#{h}", 2, "0")}:00
           </text>
         <% end %>
 
@@ -647,16 +697,23 @@ defmodule PowerModelWeb.GridLive.Index do
         <%= for s <- @utilization.series do %>
           <%= if s.capacity_mw > 0 do %>
             <line
-              x1={pad_l()} x2={chart_w() - pad_r()}
+              x1={pad_l()}
+              x2={chart_w() - pad_r()}
               y1={Float.round(chart_y(s.capacity_mw, @utilization.y_max), 1)}
               y2={Float.round(chart_y(s.capacity_mw, @utilization.y_max), 1)}
-              stroke={s.color} stroke-width="1" stroke-dasharray="5,4" opacity="0.55"
+              stroke={s.color}
+              stroke-width="1"
+              stroke-dasharray="5,4"
+              opacity="0.55"
             />
           <% end %>
           <polyline
             points={demand_points(s.hours, @utilization.y_max)}
-            fill="none" stroke={s.color} stroke-width="2"
-            stroke-linejoin="round" stroke-linecap="round"
+            fill="none"
+            stroke={s.color}
+            stroke-width="2"
+            stroke-linejoin="round"
+            stroke-linecap="round"
           />
         <% end %>
       </svg>
@@ -664,21 +721,21 @@ defmodule PowerModelWeb.GridLive.Index do
       <div class="util-stats">
         <%= for s <- @utilization.series do %>
           <div class="util-stat" style={"border-left: 3px solid #{s.color};"}>
-            <div class="util-stat-name"><%= s.name %></div>
+            <div class="util-stat-name">{s.name}</div>
             <div class="util-stat-row">
               <span>Capacity</span><span><%= format_gw(s.capacity_mw) %></span>
             </div>
             <div class="util-stat-row">
               <span>Peak</span>
-              <span><%= format_gw(s.peak_mw) %> @ <%= String.pad_leading("#{s.peak_hour}", 2, "0") %>:00</span>
+              <span>{format_gw(s.peak_mw)} @ {String.pad_leading("#{s.peak_hour}", 2, "0")}:00</span>
             </div>
             <div class="util-stat-row">
               <span>Trough</span>
-              <span><%= format_gw(s.min_mw) %> @ <%= String.pad_leading("#{s.min_hour}", 2, "0") %>:00</span>
+              <span>{format_gw(s.min_mw)} @ {String.pad_leading("#{s.min_hour}", 2, "0")}:00</span>
             </div>
             <div class="util-stat-row util-stat-em">
               <span>Peak utilization</span>
-              <span><%= Float.round(s.peak_util_pct, 1) %>%</span>
+              <span>{Float.round(s.peak_util_pct, 1)}%</span>
             </div>
           </div>
         <% end %>
@@ -747,8 +804,8 @@ defmodule PowerModelWeb.GridLive.Index do
       phx-value-key={@key}
       title={if(@hidden, do: "Click to show", else: "Click to hide")}
     >
-      <%= render_slot(@inner_block) %>
-      <span><%= @label %></span>
+      {render_slot(@inner_block)}
+      <span>{@label}</span>
     </div>
     """
   end
@@ -758,6 +815,7 @@ defmodule PowerModelWeb.GridLive.Index do
     |> Enum.flat_map(fn step ->
       trips = step[:trips]
       trips = if is_list(trips), do: trips, else: []
+
       Enum.map(trips, fn trip ->
         Map.put(trip, :step, step[:step])
       end)
