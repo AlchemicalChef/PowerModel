@@ -74,9 +74,23 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
     # Newton-Raphson iteration with PV-to-PQ switching and ZIP load model
     {vm, va, converged, iter, max_mis, p_calc} =
-      iterate(vm, va, y_data, p_gen, q_gen, v_sched, q_limits,
-              pq_indices, pv_indices, slack_idx, n, max_iter, tol,
-              bus_loads, base_mva)
+      iterate(
+        vm,
+        va,
+        y_data,
+        p_gen,
+        q_gen,
+        v_sched,
+        q_limits,
+        pq_indices,
+        pv_indices,
+        slack_idx,
+        n,
+        max_iter,
+        tol,
+        bus_loads,
+        base_mva
+      )
 
     # Convert arrays back to lists for Solution struct
     vm_list = :array.to_list(vm)
@@ -341,7 +355,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
          bus_loads,
          base_mva
        ) do
-    do_iterate(
+    outer_solve(
       vm,
       va,
       y_data,
@@ -351,14 +365,101 @@ defmodule PowerModel.Solver.NewtonRaphson do
       q_limits,
       pq_indices,
       pv_indices,
+      %{},
       slack_idx,
       n,
-      0,
       max_iter,
       tol,
       bus_loads,
-      base_mva
+      base_mva,
+      0,
+      0
     )
+  end
+
+  @max_qlim_rounds 6
+
+  # Outer-loop Q-limit enforcement (MATPOWER-style): converge with FIXED bus
+  # types, then check generator Q limits at the converged operating point and
+  # re-solve warm-started if the PV/PQ split changed. Switching inside the NR
+  # iterations reacts to transient Q excursions of the half-converged state —
+  # it either locks buses at limits spuriously or oscillates and diverges.
+  defp outer_solve(
+         vm,
+         va,
+         y_data,
+         p_gen,
+         q_gen,
+         v_sched,
+         q_limits,
+         orig_pq,
+         orig_pv,
+         switched,
+         slack_idx,
+         n,
+         max_iter,
+         tol,
+         bus_loads,
+         base_mva,
+         round,
+         iters_so_far
+       ) do
+    pv_eff = orig_pv |> Enum.reject(&Map.has_key?(switched, &1)) |> Enum.sort()
+    pq_eff = Enum.sort(orig_pq ++ Map.keys(switched))
+
+    {vm, va, converged, iter, max_mis, p_calc, q_calc} =
+      do_iterate(
+        vm,
+        va,
+        y_data,
+        p_gen,
+        q_gen,
+        v_sched,
+        q_limits,
+        pq_eff,
+        pv_eff,
+        switched,
+        slack_idx,
+        n,
+        0,
+        max_iter,
+        tol,
+        bus_loads,
+        base_mva
+      )
+
+    total_iters = iters_so_far + iter
+
+    if converged and round < @max_qlim_rounds do
+      new_switched = update_pv_pq_switching(pv_eff, switched, q_calc, q_limits, vm, v_sched)
+
+      if new_switched == switched do
+        {vm, va, converged, total_iters, max_mis, p_calc}
+      else
+        outer_solve(
+          vm,
+          va,
+          y_data,
+          p_gen,
+          q_gen,
+          v_sched,
+          q_limits,
+          orig_pq,
+          orig_pv,
+          new_switched,
+          slack_idx,
+          n,
+          max_iter,
+          tol,
+          bus_loads,
+          base_mva,
+          round + 1,
+          total_iters
+        )
+      end
+    else
+      {vm, va, converged, total_iters, max_mis, p_calc}
+    end
   end
 
   defp do_iterate(
@@ -371,6 +472,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
          _q_limits,
          _pq,
          _pv,
+         _switched,
          _slack,
          _n,
          iter,
@@ -380,7 +482,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
          _base_mva
        )
        when iter >= max_iter do
-    {vm, va, false, iter, :infinity, nil}
+    {vm, va, false, iter, :infinity, nil, nil}
   end
 
   defp do_iterate(
@@ -393,6 +495,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
          q_limits,
          pq_indices,
          pv_indices,
+         switched,
          slack_idx,
          n,
          iter,
@@ -410,12 +513,14 @@ defmodule PowerModel.Solver.NewtonRaphson do
     # Recompute scheduled power with ZIP load model using current bus voltages
     {p_sched, q_sched} = combine_gen_load(p_gen, q_gen, bus_loads, n, base_mva, vm)
 
+    # Buses switched to PQ by the outer Q-limit loop hold Q at the violated limit
+    q_sched =
+      Enum.reduce(switched, q_sched, fn {idx, {_side, q_lim}}, acc ->
+        :array.set(idx, q_lim, acc)
+      end)
+
     # Compute power injections from current voltages
     {p_calc, q_calc} = compute_power(vm, va, y_data, n)
-
-    # PV-to-PQ switching: check Q limits on PV buses
-    {pq_indices, pv_indices, q_sched} =
-      check_pv_pq_switching(pv_indices, pq_indices, q_calc, q_limits, q_sched)
 
     # Active power mismatch for PQ and PV buses (all non-slack)
     non_slack = (pq_indices ++ pv_indices) |> Enum.sort()
@@ -436,16 +541,21 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
     cond do
       max_mis < tol ->
-        {vm, va, true, iter + 1, max_mis, p_calc}
+        {vm, va, true, iter + 1, max_mis, p_calc, q_calc}
 
       not is_number(max_mis) or max_mis > 1.0e10 ->
-        {vm, va, false, iter + 1, max_mis, nil}
+        {vm, va, false, iter + 1, max_mis, nil, nil}
 
       true ->
         j_size = length(non_slack) + length(pq_indices)
 
         non_slack_arr = :array.from_list(non_slack)
         pq_arr = :array.from_list(pq_indices)
+
+        # ZIP load voltage sensitivity: the scheduled injection itself depends
+        # on V, so d(load)/dV joins the J2/J4 diagonals. Omitting it leaves
+        # the residual exact but degrades convergence from quadratic to linear.
+        {dpload_dv, dqload_dv} = load_voltage_sensitivity(bus_loads, vm, n, base_mva)
 
         jacobian =
           build_jacobian(
@@ -458,7 +568,9 @@ defmodule PowerModel.Solver.NewtonRaphson do
             pq_arr,
             length(non_slack),
             length(pq_indices),
-            n
+            n,
+            dpload_dv,
+            dqload_dv
           )
 
         correction = solve_jacobian(jacobian, mismatch, j_size)
@@ -494,6 +606,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
           q_limits,
           pq_indices,
           pv_indices,
+          switched,
           slack_idx,
           n,
           iter + 1,
@@ -505,32 +618,43 @@ defmodule PowerModel.Solver.NewtonRaphson do
     end
   end
 
-  defp check_pv_pq_switching(pv_indices, pq_indices, q_calc, q_limits, q_sched) do
-    {remaining_pv, switched_to_pq, updated_q_sched} =
-      Enum.reduce(pv_indices, {[], [], q_sched}, fn idx, {pv_acc, pq_acc, qs_acc} ->
-        q_injected = :array.get(idx, q_calc)
-
+  # PV/PQ switching with back-switching (standard criterion):
+  #   - a PV bus whose computed network Q injection violates a limit becomes
+  #     PQ with Q held at that limit;
+  #   - a switched bus returns to PV when its voltage crosses back over the
+  #     setpoint in the direction that relaxes the binding limit (held at
+  #     q_max while V rose above setpoint, or at q_min while V fell below).
+  # Without the second rule a transient Q excursion during early iterations
+  # locks the bus at its limit and the solution converges to sagged voltages.
+  # Returns the updated switched map: bus_idx => {:max | :min, q_limit_pu}.
+  defp update_pv_pq_switching(pv_indices, switched, q_calc, q_limits, vm, v_sched) do
+    switched =
+      Enum.reduce(pv_indices, switched, fn idx, acc ->
         case Map.get(q_limits, idx) do
           nil ->
-            {[idx | pv_acc], pq_acc, qs_acc}
+            acc
 
           {q_min, q_max} ->
+            q_injected = :array.get(idx, q_calc)
+
             cond do
-              q_injected > q_max ->
-                {pv_acc, [idx | pq_acc], :array.set(idx, q_max, qs_acc)}
-
-              q_injected < q_min ->
-                {pv_acc, [idx | pq_acc], :array.set(idx, q_min, qs_acc)}
-
-              true ->
-                {[idx | pv_acc], pq_acc, qs_acc}
+              q_injected > q_max -> Map.put(acc, idx, {:max, q_max})
+              q_injected < q_min -> Map.put(acc, idx, {:min, q_min})
+              true -> acc
             end
         end
       end)
 
-    new_pq = (pq_indices ++ Enum.reverse(switched_to_pq)) |> Enum.sort()
-    new_pv = Enum.reverse(remaining_pv) |> Enum.sort()
-    {new_pq, new_pv, updated_q_sched}
+    Enum.reduce(Map.keys(switched), switched, fn idx, acc ->
+      v = :array.get(idx, vm)
+      v_set = :array.get(idx, v_sched)
+
+      case Map.fetch!(acc, idx) do
+        {:max, _} when v > v_set -> Map.delete(acc, idx)
+        {:min, _} when v < v_set -> Map.delete(acc, idx)
+        _ -> acc
+      end
+    end)
   end
 
   defp limit_step_size(correction, n_ns, n_pq) do
@@ -589,7 +713,20 @@ defmodule PowerModel.Solver.NewtonRaphson do
     {:array.from_list(p), :array.from_list(q)}
   end
 
-  defp build_jacobian(vm, va, %{g: g, b: b, n: n}, p_calc, q_calc, non_slack_arr, pq_arr, n_ns, n_pq, _n_total) do
+  defp build_jacobian(
+         vm,
+         va,
+         %{g: g, b: b, n: n},
+         p_calc,
+         q_calc,
+         non_slack_arr,
+         pq_arr,
+         n_ns,
+         n_pq,
+         _n_total,
+         dpload_dv,
+         dqload_dv
+       ) do
     j_size = n_ns + n_pq
 
     for row <- 0..(j_size - 1) do
@@ -603,7 +740,8 @@ defmodule PowerModel.Solver.NewtonRaphson do
           row < n_ns and col >= n_ns ->
             i = :array.get(row, non_slack_arr)
             j = :array.get(col - n_ns, pq_arr)
-            jacobian_j2(i, j, vm, va, g, b, n, p_calc)
+            j2 = jacobian_j2(i, j, vm, va, g, b, n, p_calc)
+            if i == j, do: j2 + :array.get(i, dpload_dv), else: j2
 
           row >= n_ns and col < n_ns ->
             i = :array.get(row - n_ns, pq_arr)
@@ -613,10 +751,35 @@ defmodule PowerModel.Solver.NewtonRaphson do
           true ->
             i = :array.get(row - n_ns, pq_arr)
             j = :array.get(col - n_ns, pq_arr)
-            jacobian_j4(i, j, vm, va, g, b, n, q_calc)
+            j4 = jacobian_j4(i, j, vm, va, g, b, n, q_calc)
+            if i == j, do: j4 + :array.get(i, dqload_dv), else: j4
         end
       end
     end
+  end
+
+  # Per-bus d(P_load)/dV and d(Q_load)/dV of the ZIP model at the current
+  # voltage, in per-unit. Zero for constant-power loads (dfactor_dv == 0).
+  defp load_voltage_sensitivity(bus_loads, vm, n, base_mva) do
+    dp = :array.new(n, default: 0.0)
+    dq = :array.new(n, default: 0.0)
+
+    Enum.reduce(bus_loads, {dp, dq}, fn {bus_idx, loads_at_bus}, {dpa, dqa} ->
+      v = :array.get(bus_idx, vm)
+
+      Enum.reduce(loads_at_bus, {dpa, dqa}, fn load, {dpa2, dqa2} ->
+        df = LoadModel.dfactor_dv(Map.get(load, :load_type), v)
+
+        if df == 0.0 do
+          {dpa2, dqa2}
+        else
+          q0 = Map.get(load, :q_mvar) || 0.0
+
+          {array_add(dpa2, bus_idx, load.p_mw * df / base_mva),
+           array_add(dqa2, bus_idx, q0 * df / base_mva)}
+        end
+      end)
+    end)
   end
 
   defp jacobian_j1(i, j, vm, _va, _g, b, n, _p_calc, q_calc) when i == j do

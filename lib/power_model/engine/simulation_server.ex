@@ -69,11 +69,12 @@ defmodule PowerModel.Engine.SimulationServer do
     base_mva = Keyword.get(opts, :base_mva, 100.0)
     hour = Keyword.get(opts, :hour)
 
-    snapshot = if interconnection_id do
-      Grid.get_grid_snapshot(interconnection_id, hour: hour)
-    else
-      Grid.get_full_grid_snapshot(hour: hour)
-    end
+    snapshot =
+      if interconnection_id do
+        Grid.get_grid_snapshot(interconnection_id, hour: hour)
+      else
+        Grid.get_full_grid_snapshot(hour: hour)
+      end
 
     cascade_state = Cascade.init(snapshot, base_mva)
 
@@ -105,6 +106,7 @@ defmodule PowerModel.Engine.SimulationServer do
       {:ok, solution} ->
         broadcast(state.sim_id, "dc_update", solution_payload(solution, state))
         {:noreply, %{state | dc_solution: solution}}
+
       _ ->
         {:noreply, state}
     end
@@ -116,7 +118,10 @@ defmodule PowerModel.Engine.SimulationServer do
         # Computed against a topology that no longer exists (the grid was
         # reset or re-tripped while the AC task ran). Stale -- discard, or it
         # would repaint pre-reset overloads onto a clean grid.
-        Logger.info("[sim #{state.sim_id}] discarding stale AC result (epoch #{epoch} != #{state.epoch})")
+        Logger.info(
+          "[sim #{state.sim_id}] discarding stale AC result (epoch #{epoch} != #{state.epoch})"
+        )
+
         {:noreply, state}
 
       not solution.converged ->
@@ -151,7 +156,10 @@ defmodule PowerModel.Engine.SimulationServer do
       true ->
         # The clicked line is not part of the simulated component (e.g. a small
         # disconnected fragment). Tripping it would silently change nothing.
-        Logger.warning("[sim #{state.sim_id}] trip rejected: line #{line_id} not in simulated network")
+        Logger.warning(
+          "[sim #{state.sim_id}] trip rejected: line #{line_id} not in simulated network"
+        )
+
         {:reply, {:error, :not_in_network}, state}
     end
   end
@@ -170,7 +178,10 @@ defmodule PowerModel.Engine.SimulationServer do
         run_and_broadcast_cascade(state, final_cascade, step_results)
 
       true ->
-        Logger.warning("[sim #{state.sim_id}] trip rejected: transformer #{xfmr_id} not in simulated network")
+        Logger.warning(
+          "[sim #{state.sim_id}] trip rejected: transformer #{xfmr_id} not in simulated network"
+        )
+
         {:reply, {:error, :not_in_network}, state}
     end
   end
@@ -189,7 +200,10 @@ defmodule PowerModel.Engine.SimulationServer do
         run_and_broadcast_cascade(state, final_cascade, step_results)
 
       true ->
-        Logger.warning("[sim #{state.sim_id}] trip rejected: generator #{gen_id} not in simulated network")
+        Logger.warning(
+          "[sim #{state.sim_id}] trip rejected: generator #{gen_id} not in simulated network"
+        )
+
         {:reply, {:error, :not_in_network}, state}
     end
   end
@@ -206,21 +220,25 @@ defmodule PowerModel.Engine.SimulationServer do
       has_ac_solution: state.ac_solution != nil,
       hour: state.hour
     }
+
     {:reply, reply, state}
   end
 
   def handle_call(:reset, _from, state) do
     cascade = Cascade.init(state.snapshot, state.base_mva)
-    state = %{state |
-      cascade_state: cascade,
-      dc_solution: nil,
-      ac_solution: nil,
-      base_overloaded: cascade.base_overloaded,
-      base_line_categories: cascade.base_line_categories,
-      base_line_loading: cascade.base_line_loading,
-      # Invalidate any in-flight AC refinement from the pre-reset topology
-      epoch: state.epoch + 1
+
+    state = %{
+      state
+      | cascade_state: cascade,
+        dc_solution: nil,
+        ac_solution: nil,
+        base_overloaded: cascade.base_overloaded,
+        base_line_categories: cascade.base_line_categories,
+        base_line_loading: cascade.base_line_loading,
+        # Invalidate any in-flight AC refinement from the pre-reset topology
+        epoch: state.epoch + 1
     }
+
     send(self(), :initial_solve)
     broadcast(state.sim_id, "reset", %{})
     {:reply, :ok, state}
@@ -316,7 +334,10 @@ defmodule PowerModel.Engine.SimulationServer do
       {:ok, solution}
     rescue
       e ->
-        Logger.warning("[sim #{state.sim_id}] post-cascade DC solve raised: #{Exception.message(e)}")
+        Logger.warning(
+          "[sim #{state.sim_id}] post-cascade DC solve raised: #{Exception.message(e)}"
+        )
+
         :error
     catch
       thrown ->
@@ -338,10 +359,10 @@ defmodule PowerModel.Engine.SimulationServer do
       )
     end
 
-    mismatch = solution.mismatch_mw
+    mismatch = solution.mismatch_abs_mw || abs(solution.mismatch_mw || 0.0)
 
     if is_number(mismatch) and
-         abs(mismatch) > 0.05 * max(solution.total_load_mw || 0.0, 1.0) do
+         mismatch > 0.05 * max(solution.total_load_mw || 0.0, 1.0) do
       Logger.warning(
         "[sim #{sim_id}] slack bus #{inspect(solution.slack_bus_id)} is covering " <>
           "#{Float.round(mismatch * 1.0, 1)} MW of unscheduled generation " <>
@@ -406,10 +427,12 @@ defmodule PowerModel.Engine.SimulationServer do
   # "impact" onto regions the failure never touched.
   defp active_snapshot(state) do
     cascade = state.cascade_state
+
     %{
       buses: cascade.buses,
       lines: Enum.reject(cascade.lines, &MapSet.member?(cascade.tripped_lines, &1.id)),
-      transformers: Enum.reject(cascade.transformers, &MapSet.member?(cascade.tripped_transformers, &1.id)),
+      transformers:
+        Enum.reject(cascade.transformers, &MapSet.member?(cascade.tripped_transformers, &1.id)),
       generators: Cascade.dispatched_generators(cascade),
       loads: cascade.loads
     }
@@ -448,22 +471,24 @@ defmodule PowerModel.Engine.SimulationServer do
       base_pct = Map.get(base_load, key, 0.0)
       delta = flow.loading_pct - base_pct
 
-      new_cat = cond do
-        flow.loading_pct > 100.0 -> 3
-        flow.loading_pct >= 75.0 -> 2
-        flow.loading_pct >= 30.0 -> 1
-        true -> 0
-      end
+      new_cat =
+        cond do
+          flow.loading_pct > 100.0 -> 3
+          flow.loading_pct >= 75.0 -> 2
+          flow.loading_pct >= 30.0 -> 1
+          true -> 0
+        end
 
       worsened = new_cat > base_cat
       shifted = delta >= 10.0 and flow.loading_pct >= 20.0
 
-      bucket = cond do
-        new_cat == 3 and (worsened or shifted) -> :overloaded
-        new_cat == 2 and (worsened or shifted) -> :stressed
-        (new_cat == 1 and worsened) or (new_cat <= 1 and shifted) -> :rerouted
-        true -> nil
-      end
+      bucket =
+        cond do
+          new_cat == 3 and (worsened or shifted) -> :overloaded
+          new_cat == 2 and (worsened or shifted) -> :stressed
+          (new_cat == 1 and worsened) or (new_cat <= 1 and shifted) -> :rerouted
+          true -> nil
+        end
 
       case {bucket, type} do
         {nil, _} -> acc
@@ -481,6 +506,7 @@ defmodule PowerModel.Engine.SimulationServer do
   end
 
   defp solution_payload(nil, _state), do: %{}
+
   defp solution_payload(solution, state) do
     classified =
       classify_flows(solution.line_flows, state.base_line_categories, state.base_line_loading)
@@ -531,23 +557,27 @@ defmodule PowerModel.Engine.SimulationServer do
 
     # Separate trips by component type. Transformer ids must NOT enter the
     # line id list -- separate tables, colliding numeric ids.
-    tripped_line_ids = trips
-    |> Enum.filter(&(&1.component_type == "transmission_line"))
-    |> Enum.map(& &1.component_id)
+    tripped_line_ids =
+      trips
+      |> Enum.filter(&(&1.component_type == "transmission_line"))
+      |> Enum.map(& &1.component_id)
 
-    tripped_transformer_ids = trips
-    |> Enum.filter(&(&1.component_type == "transformer"))
-    |> Enum.map(& &1.component_id)
+    tripped_transformer_ids =
+      trips
+      |> Enum.filter(&(&1.component_type == "transformer"))
+      |> Enum.map(& &1.component_id)
 
-    tripped_generator_ids = trips
-    |> Enum.filter(&(&1.component_type == "generator"))
-    |> Enum.map(& &1.component_id)
+    tripped_generator_ids =
+      trips
+      |> Enum.filter(&(&1.component_type == "generator"))
+      |> Enum.map(& &1.component_id)
 
     # Categorize trips by failure cause (load shedding affects buses).
     # LoadShedding emits "ufls_shed"; "ufls" kept for safety.
-    shed_ids = trips
-    |> Enum.filter(&(&1.failure_cause in ["ufls_shed", "ufls", "island_blackout"]))
-    |> Enum.map(& &1.component_id)
+    shed_ids =
+      trips
+      |> Enum.filter(&(&1.failure_cause in ["ufls_shed", "ufls", "island_blackout"]))
+      |> Enum.map(& &1.component_id)
 
     # Critical-infrastructure impacts (water facilities, datacenters)
     water_facility_trips = Enum.filter(trips, &(&1.component_type == "water_facility"))
@@ -563,8 +593,11 @@ defmodule PowerModel.Engine.SimulationServer do
       Enum.reduce(
         solutions,
         %{
-          overloaded_line_ids: [], stressed_line_ids: [], rerouted_line_ids: [],
-          overloaded_transformer_ids: [], stressed_transformer_ids: [],
+          overloaded_line_ids: [],
+          stressed_line_ids: [],
+          rerouted_line_ids: [],
+          overloaded_transformer_ids: [],
+          stressed_transformer_ids: [],
           rerouted_transformer_ids: []
         },
         fn sol, acc ->
@@ -590,18 +623,26 @@ defmodule PowerModel.Engine.SimulationServer do
       rerouted_transformer_ids: merged.rerouted_transformer_ids,
       shed_ids: shed_ids,
       water_facility_ids: water_facility_ids,
-      water_facility_trips: Enum.map(water_facility_trips, fn t ->
-        %{id: t.component_id, name: get_in(t, [:details, :name]),
-          facility_type: get_in(t, [:details, :facility_type]),
-          cause: t.failure_cause}
-      end),
+      water_facility_trips:
+        Enum.map(water_facility_trips, fn t ->
+          %{
+            id: t.component_id,
+            name: get_in(t, [:details, :name]),
+            facility_type: get_in(t, [:details, :facility_type]),
+            cause: t.failure_cause
+          }
+        end),
       datacenter_ids: datacenter_ids,
-      datacenter_trips: Enum.map(datacenter_trips, fn t ->
-        %{id: t.component_id, name: get_in(t, [:details, :name]),
-          operator: get_in(t, [:details, :operator]),
-          power_mw: get_in(t, [:details, :power_mw]),
-          cause: t.failure_cause}
-      end),
+      datacenter_trips:
+        Enum.map(datacenter_trips, fn t ->
+          %{
+            id: t.component_id,
+            name: get_in(t, [:details, :name]),
+            operator: get_in(t, [:details, :operator]),
+            power_mw: get_in(t, [:details, :power_mw]),
+            cause: t.failure_cause
+          }
+        end),
       balance: Map.get(step, :balance)
     }
   end

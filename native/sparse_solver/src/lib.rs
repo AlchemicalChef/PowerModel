@@ -1,10 +1,11 @@
-use rustler::{Atom, NifResult};
+use rustler::{Atom, Encoder, Env, NifResult, Term};
 use sprs::TriMat;
 
 mod atoms {
     rustler::atoms! {
         ok,
-        error
+        error,
+        singular_matrix
     }
 }
 
@@ -43,10 +44,7 @@ fn csr_from_triplets(
 
 /// LU factorization with partial pivoting (dense, for moderate sizes)
 #[rustler::nif(schedule = "DirtyCpu")]
-fn lu_factorize(
-    matrix: Vec<Vec<f64>>,
-    n: usize,
-) -> NifResult<(Atom, Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<usize>)> {
+fn lu_factorize<'a>(env: Env<'a>, matrix: Vec<Vec<f64>>, n: usize) -> NifResult<Term<'a>> {
     let mut a: Vec<Vec<f64>> = matrix;
     let mut l = vec![vec![0.0; n]; n];
     let mut u = vec![vec![0.0; n]; n];
@@ -63,8 +61,13 @@ fn lu_factorize(
             }
         }
 
+        if max_val <= 1e-15 {
+            return Ok((atoms::error(), atoms::singular_matrix()).encode(env));
+        }
+
         if max_row != k {
             a.swap(k, max_row);
+            l.swap(k, max_row);
             perm.swap(k, max_row);
         }
 
@@ -73,27 +76,26 @@ fn lu_factorize(
             u[k][j] = a[k][j];
         }
 
-        if u[k][k].abs() > 1e-15 {
-            for i in (k + 1)..n {
-                l[i][k] = a[i][k] / u[k][k];
-                for j in (k + 1)..n {
-                    a[i][j] -= l[i][k] * u[k][j];
-                }
+        for i in (k + 1)..n {
+            l[i][k] = a[i][k] / u[k][k];
+            for j in (k + 1)..n {
+                a[i][j] -= l[i][k] * u[k][j];
             }
         }
     }
 
-    Ok((atoms::ok(), l, u, perm))
+    Ok((atoms::ok(), l, u, perm).encode(env))
 }
 
 /// Solve using LU factors: L*U*x = P*b
 #[rustler::nif(schedule = "DirtyCpu")]
-fn lu_solve(
+fn lu_solve<'a>(
+    env: Env<'a>,
     l: Vec<Vec<f64>>,
     u: Vec<Vec<f64>>,
     perm: Vec<usize>,
     rhs: Vec<f64>,
-) -> NifResult<(Atom, Vec<f64>)> {
+) -> NifResult<Term<'a>> {
     let n = rhs.len();
 
     // Apply permutation
@@ -118,12 +120,13 @@ fn lu_solve(
         for j in (i + 1)..n {
             x[i] -= u[i][j] * x[j];
         }
-        if u[i][i].abs() > 1e-15 {
-            x[i] /= u[i][i];
+        if u[i][i].abs() <= 1e-15 {
+            return Ok((atoms::error(), atoms::singular_matrix()).encode(env));
         }
+        x[i] /= u[i][i];
     }
 
-    Ok((atoms::ok(), x))
+    Ok((atoms::ok(), x).encode(env))
 }
 
 /// Add branch contributions to Y-bus triplet arrays
@@ -295,9 +298,7 @@ fn sparse_solve(
     // where P is a fill-reducing permutation.
     // The matrix must be symmetric positive definite.
     let ldlt = sprs_ldl::LdlNumeric::new(csc.view()).map_err(|e| {
-        rustler::Error::Term(Box::new(format!(
-            "sparse LDL factorization failed: {e}"
-        )))
+        rustler::Error::Term(Box::new(format!("sparse LDL factorization failed: {e}")))
     })?;
 
     let solution = ldlt.solve(&rhs);

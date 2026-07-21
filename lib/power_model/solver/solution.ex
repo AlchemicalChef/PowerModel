@@ -18,7 +18,8 @@ defmodule PowerModel.Solver.Solution do
     :scheduled_gen_mw,
     :slack_bus_id,
     :slack_injection_mw,
-    :mismatch_mw
+    :mismatch_mw,
+    :mismatch_abs_mw
   ]
 
   def new(bus_ids, vm_pu, va_rad, line_flows, base_mva, extra \\ []) do
@@ -38,7 +39,8 @@ defmodule PowerModel.Solver.Solution do
         scheduled_gen_mw: 0.0,
         slack_bus_id: nil,
         slack_injection_mw: 0.0,
-        mismatch_mw: nil
+        mismatch_mw: nil,
+        mismatch_abs_mw: nil
       },
       extra
     )

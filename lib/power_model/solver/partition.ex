@@ -63,6 +63,14 @@ defmodule PowerModel.Solver.Partition do
 
   def merge_solutions(solutions, base_mva) do
     largest = Enum.max_by(solutions, &length(&1.bus_ids))
+    mismatch_values = Enum.map(solutions, & &1.mismatch_mw)
+
+    {mismatch_mw, mismatch_abs_mw} =
+      if Enum.any?(mismatch_values, &is_nil/1) do
+        {nil, nil}
+      else
+        {Enum.sum(mismatch_values), Enum.sum(Enum.map(mismatch_values, &abs/1))}
+      end
 
     %Solution{
       bus_ids: Enum.flat_map(solutions, & &1.bus_ids),
@@ -79,23 +87,13 @@ defmodule PowerModel.Solver.Partition do
       scheduled_gen_mw: sum_field(solutions, :scheduled_gen_mw),
       slack_bus_id: largest.slack_bus_id,
       slack_injection_mw: sum_field(solutions, :slack_injection_mw),
-      mismatch_mw: sum_mismatch(solutions)
+      mismatch_mw: mismatch_mw,
+      mismatch_abs_mw: mismatch_abs_mw
     }
   end
 
   defp sum_field(solutions, field) do
     Enum.reduce(solutions, 0.0, fn s, acc -> acc + (Map.get(s, field) || 0.0) end)
-  end
-
-  # Unknown (nil) mismatch in any island makes the total unknown.
-  defp sum_mismatch(solutions) do
-    values = Enum.map(solutions, & &1.mismatch_mw)
-
-    if Enum.any?(values, &is_nil/1) do
-      nil
-    else
-      Enum.sum(values)
-    end
   end
 
   defp numeric(:infinity), do: 1.0e30

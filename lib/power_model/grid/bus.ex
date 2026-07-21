@@ -9,6 +9,10 @@ defmodule PowerModel.Grid.Bus do
     field :base_kv, :float
     field :vm_pu, :float, default: 1.0
     field :va_rad, :float, default: 0.0
+    # Fixed shunt devices (MATPOWER convention): MW/MVAr injected at V = 1.0 pu.
+    # Capacitor bank: bs_mvar > 0; reactor: bs_mvar < 0.
+    field :gs_mw, :float, default: 0.0
+    field :bs_mvar, :float, default: 0.0
     field :coordinates, Geo.PostGIS.Geometry
     field :source, :string
     field :source_id, :string
@@ -26,8 +30,19 @@ defmodule PowerModel.Grid.Bus do
 
   def changeset(bus, attrs) do
     bus
-    |> cast(attrs, [:bus_type, :base_kv, :vm_pu, :va_rad, :coordinates,
-                     :source, :source_id, :interconnection_id, :balancing_authority_id])
+    |> cast(attrs, [
+      :bus_type,
+      :base_kv,
+      :vm_pu,
+      :va_rad,
+      :gs_mw,
+      :bs_mvar,
+      :coordinates,
+      :source,
+      :source_id,
+      :interconnection_id,
+      :balancing_authority_id
+    ])
     |> validate_required([:bus_type, :base_kv])
     |> validate_inclusion(:bus_type, Map.values(@bus_types))
     |> unique_constraint([:source, :source_id])
