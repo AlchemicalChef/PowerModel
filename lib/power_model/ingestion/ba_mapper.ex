@@ -20,6 +20,7 @@ defmodule PowerModel.Ingestion.BAMapper do
   import Ecto.Query
   alias PowerModel.Repo
   alias PowerModel.Grid.{BalancingAuthority, Bus, Generator}
+  alias PowerModel.Ingestion.BusMapper
   alias PowerModel.Ingestion.EPA.EGrid
 
   @doc """
@@ -31,6 +32,8 @@ defmodule PowerModel.Ingestion.BAMapper do
       {:ok, plant_bas} ->
         code_to_id = upsert_balancing_authorities(plant_bas)
         assign_buses(plant_bas, code_to_id)
+        reconciled = BusMapper.reconcile_interconnections_from_ba()
+        IO.puts("  Buses reassigned to interconnection from BA: #{reconciled}")
         report()
         :ok
 

@@ -5,7 +5,18 @@ defmodule PowerModel.Grid do
 
   import Ecto.Query
   alias PowerModel.Repo
-  alias PowerModel.Grid.{Bus, Generator, TransmissionLine, Load, Substation, Transformer, Interconnection, WaterFacility, Datacenter}
+
+  alias PowerModel.Grid.{
+    Bus,
+    Generator,
+    TransmissionLine,
+    Load,
+    Substation,
+    Transformer,
+    Interconnection,
+    WaterFacility,
+    Datacenter
+  }
 
   # Interconnections
 
@@ -48,10 +59,12 @@ defmodule PowerModel.Grid do
   def get_generator!(id), do: Repo.get!(Generator, id)
 
   def total_generation_capacity(interconnection_id \\ nil) do
-    query = from g in Generator,
-      join: b in Bus, on: g.bus_id == b.id,
-      where: g.status == "in_service",
-      select: sum(g.p_max_mw)
+    query =
+      from g in Generator,
+        join: b in Bus,
+        on: g.bus_id == b.id,
+        where: g.status == "in_service",
+        select: sum(g.p_max_mw)
 
     query
     |> maybe_filter_bus_interconnection(interconnection_id)
@@ -81,12 +94,16 @@ defmodule PowerModel.Grid do
   # in Arizona ripples into Indiana.
   def in_service_lines(interconnection_id) do
     from(tl in TransmissionLine,
-      join: fb in Bus, on: tl.from_bus_id == fb.id,
-      join: tb in Bus, on: tl.to_bus_id == tb.id,
-      where: tl.status == "in_service" and fb.interconnection_id == ^interconnection_id
-        and not is_nil(fb.coordinates) and not is_nil(tb.coordinates)
-        and not is_nil(fb.interconnection_id)
-        and fb.interconnection_id == tb.interconnection_id,
+      join: fb in Bus,
+      on: tl.from_bus_id == fb.id,
+      join: tb in Bus,
+      on: tl.to_bus_id == tb.id,
+      where:
+        tl.status == "in_service" and fb.interconnection_id == ^interconnection_id and
+          tl.from_bus_id != tl.to_bus_id and
+          not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
+          not is_nil(fb.interconnection_id) and
+          fb.interconnection_id == tb.interconnection_id,
       select: tl
     )
     |> Repo.all()
@@ -101,10 +118,12 @@ defmodule PowerModel.Grid do
   end
 
   def total_load(interconnection_id \\ nil) do
-    query = from l in Load,
-      join: b in Bus, on: l.bus_id == b.id,
-      where: l.status == "in_service",
-      select: %{p_mw: sum(l.p_mw), q_mvar: sum(l.q_mvar)}
+    query =
+      from l in Load,
+        join: b in Bus,
+        on: l.bus_id == b.id,
+        where: l.status == "in_service",
+        select: %{p_mw: sum(l.p_mw), q_mvar: sum(l.q_mvar)}
 
     query
     |> maybe_filter_bus_interconnection(interconnection_id)
@@ -123,12 +142,15 @@ defmodule PowerModel.Grid do
 
   def in_service_transformers(interconnection_id) do
     from(t in Transformer,
-      join: fb in Bus, on: t.from_bus_id == fb.id,
-      join: tb in Bus, on: t.to_bus_id == tb.id,
-      where: t.status == "in_service" and fb.interconnection_id == ^interconnection_id
-        and not is_nil(fb.coordinates) and not is_nil(tb.coordinates)
-        and not is_nil(fb.interconnection_id)
-        and fb.interconnection_id == tb.interconnection_id,
+      join: fb in Bus,
+      on: t.from_bus_id == fb.id,
+      join: tb in Bus,
+      on: t.to_bus_id == tb.id,
+      where:
+        t.status == "in_service" and fb.interconnection_id == ^interconnection_id and
+          not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
+          not is_nil(fb.interconnection_id) and
+          fb.interconnection_id == tb.interconnection_id,
       select: t
     )
     |> Repo.all()
@@ -137,13 +159,18 @@ defmodule PowerModel.Grid do
   # Topology helpers
 
   def get_bus_branches(bus_id) do
-    lines = from(tl in TransmissionLine,
-      where: (tl.from_bus_id == ^bus_id or tl.to_bus_id == ^bus_id) and tl.status == "in_service"
-    ) |> Repo.all()
+    lines =
+      from(tl in TransmissionLine,
+        where:
+          (tl.from_bus_id == ^bus_id or tl.to_bus_id == ^bus_id) and tl.status == "in_service"
+      )
+      |> Repo.all()
 
-    transformers = from(t in Transformer,
-      where: (t.from_bus_id == ^bus_id or t.to_bus_id == ^bus_id) and t.status == "in_service"
-    ) |> Repo.all()
+    transformers =
+      from(t in Transformer,
+        where: (t.from_bus_id == ^bus_id or t.to_bus_id == ^bus_id) and t.status == "in_service"
+      )
+      |> Repo.all()
 
     %{lines: lines, transformers: transformers}
   end
@@ -167,50 +194,62 @@ defmodule PowerModel.Grid do
     main_list = MapSet.to_list(main_bus_ids)
 
     # Filter lines/transformers to only those within the main component
-    lines = Enum.filter(lines, fn l ->
-      MapSet.member?(main_bus_ids, l.from_bus_id) and MapSet.member?(main_bus_ids, l.to_bus_id)
-    end)
-    transformers = Enum.filter(transformers, fn t ->
-      MapSet.member?(main_bus_ids, t.from_bus_id) and MapSet.member?(main_bus_ids, t.to_bus_id)
-    end)
+    lines =
+      Enum.filter(lines, fn l ->
+        MapSet.member?(main_bus_ids, l.from_bus_id) and MapSet.member?(main_bus_ids, l.to_bus_id)
+      end)
 
-    buses = if main_list != [] do
-      from(b in Bus, where: b.id in ^main_list) |> Repo.all()
-    else
-      []
-    end
+    transformers =
+      Enum.filter(transformers, fn t ->
+        MapSet.member?(main_bus_ids, t.from_bus_id) and MapSet.member?(main_bus_ids, t.to_bus_id)
+      end)
 
-    generators = if main_list != [] do
-      from(g in Generator,
-        where: g.status == "in_service" and g.bus_id in ^main_list
-      ) |> Repo.all()
-    else
-      []
-    end
+    buses =
+      if main_list != [] do
+        from(b in Bus, where: b.id in ^main_list) |> Repo.all()
+      else
+        []
+      end
 
-    loads = if main_list != [] do
-      from(l in Load,
-        where: l.status == "in_service" and l.bus_id in ^main_list
-      ) |> Repo.all()
-    else
-      []
-    end
+    generators =
+      if main_list != [] do
+        from(g in Generator,
+          where: g.status == "in_service" and g.bus_id in ^main_list
+        )
+        |> Repo.all()
+      else
+        []
+      end
 
-    water_facilities = if main_list != [] do
-      from(w in WaterFacility,
-        where: w.status == "active" and w.bus_id in ^main_list
-      ) |> Repo.all()
-    else
-      []
-    end
+    loads =
+      if main_list != [] do
+        from(l in Load,
+          where: l.status == "in_service" and l.bus_id in ^main_list
+        )
+        |> Repo.all()
+      else
+        []
+      end
 
-    datacenters = if main_list != [] do
-      from(d in Datacenter,
-        where: d.status == "active" and d.bus_id in ^main_list
-      ) |> Repo.all()
-    else
-      []
-    end
+    water_facilities =
+      if main_list != [] do
+        from(w in WaterFacility,
+          where: w.status == "active" and w.bus_id in ^main_list
+        )
+        |> Repo.all()
+      else
+        []
+      end
+
+    datacenters =
+      if main_list != [] do
+        from(d in Datacenter,
+          where: d.status == "active" and d.bus_id in ^main_list
+        )
+        |> Repo.all()
+      else
+        []
+      end
 
     %{
       buses: buses,
@@ -230,67 +269,90 @@ defmodule PowerModel.Grid do
   def get_full_grid_snapshot(opts \\ []) do
     # Geo-located endpoints only, no cross-interconnection branches --
     # see in_service_lines/1 for rationale.
-    lines = from(tl in TransmissionLine,
-      join: fb in Bus, on: tl.from_bus_id == fb.id,
-      join: tb in Bus, on: tl.to_bus_id == tb.id,
-      where: tl.status == "in_service"
-        and not is_nil(fb.coordinates) and not is_nil(tb.coordinates)
-        and not is_nil(fb.interconnection_id)
-        and fb.interconnection_id == tb.interconnection_id,
-      select: tl
-    ) |> Repo.all()
-    transformers = from(t in Transformer,
-      join: fb in Bus, on: t.from_bus_id == fb.id,
-      join: tb in Bus, on: t.to_bus_id == tb.id,
-      where: t.status == "in_service"
-        and not is_nil(fb.coordinates) and not is_nil(tb.coordinates)
-        and not is_nil(fb.interconnection_id)
-        and fb.interconnection_id == tb.interconnection_id,
-      select: t
-    ) |> Repo.all()
+    lines =
+      from(tl in TransmissionLine,
+        join: fb in Bus,
+        on: tl.from_bus_id == fb.id,
+        join: tb in Bus,
+        on: tl.to_bus_id == tb.id,
+        where:
+          tl.status == "in_service" and
+            tl.from_bus_id != tl.to_bus_id and
+            not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
+            not is_nil(fb.interconnection_id) and
+            fb.interconnection_id == tb.interconnection_id,
+        select: tl
+      )
+      |> Repo.all()
+
+    transformers =
+      from(t in Transformer,
+        join: fb in Bus,
+        on: t.from_bus_id == fb.id,
+        join: tb in Bus,
+        on: t.to_bus_id == tb.id,
+        where:
+          t.status == "in_service" and
+            not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
+            not is_nil(fb.interconnection_id) and
+            fb.interconnection_id == tb.interconnection_id,
+        select: t
+      )
+      |> Repo.all()
 
     # Find the largest connected component to exclude data fragments
     main_bus_ids = largest_connected_component(lines, transformers)
     main_list = MapSet.to_list(main_bus_ids)
 
-    lines = Enum.filter(lines, fn l ->
-      MapSet.member?(main_bus_ids, l.from_bus_id) and MapSet.member?(main_bus_ids, l.to_bus_id)
-    end)
-    transformers = Enum.filter(transformers, fn t ->
-      MapSet.member?(main_bus_ids, t.from_bus_id) and MapSet.member?(main_bus_ids, t.to_bus_id)
-    end)
+    lines =
+      Enum.filter(lines, fn l ->
+        MapSet.member?(main_bus_ids, l.from_bus_id) and MapSet.member?(main_bus_ids, l.to_bus_id)
+      end)
 
-    buses = if main_list != [] do
-      from(b in Bus, where: b.id in ^main_list) |> Repo.all()
-    else
-      []
-    end
+    transformers =
+      Enum.filter(transformers, fn t ->
+        MapSet.member?(main_bus_ids, t.from_bus_id) and MapSet.member?(main_bus_ids, t.to_bus_id)
+      end)
 
-    generators = if main_list != [] do
-      from(g in Generator,
-        where: g.status == "in_service" and g.bus_id in ^main_list
-      ) |> Repo.all()
-    else
-      []
-    end
+    buses =
+      if main_list != [] do
+        from(b in Bus, where: b.id in ^main_list) |> Repo.all()
+      else
+        []
+      end
 
-    loads = if main_list != [] do
-      from(l in Load, where: l.status == "in_service" and l.bus_id in ^main_list) |> Repo.all()
-    else
-      []
-    end
+    generators =
+      if main_list != [] do
+        from(g in Generator,
+          where: g.status == "in_service" and g.bus_id in ^main_list
+        )
+        |> Repo.all()
+      else
+        []
+      end
 
-    water_facilities = if main_list != [] do
-      from(w in WaterFacility, where: w.status == "active" and w.bus_id in ^main_list) |> Repo.all()
-    else
-      []
-    end
+    loads =
+      if main_list != [] do
+        from(l in Load, where: l.status == "in_service" and l.bus_id in ^main_list) |> Repo.all()
+      else
+        []
+      end
 
-    datacenters = if main_list != [] do
-      from(d in Datacenter, where: d.status == "active" and d.bus_id in ^main_list) |> Repo.all()
-    else
-      []
-    end
+    water_facilities =
+      if main_list != [] do
+        from(w in WaterFacility, where: w.status == "active" and w.bus_id in ^main_list)
+        |> Repo.all()
+      else
+        []
+      end
+
+    datacenters =
+      if main_list != [] do
+        from(d in Datacenter, where: d.status == "active" and d.bus_id in ^main_list)
+        |> Repo.all()
+      else
+        []
+      end
 
     %{
       buses: buses,
@@ -475,11 +537,12 @@ defmodule PowerModel.Grid do
   defp build_adjacency(lines, transformers) do
     adj = %{}
 
-    adj = Enum.reduce(lines, adj, fn l, acc ->
-      acc
-      |> Map.update(l.from_bus_id, [l.to_bus_id], &[l.to_bus_id | &1])
-      |> Map.update(l.to_bus_id, [l.from_bus_id], &[l.from_bus_id | &1])
-    end)
+    adj =
+      Enum.reduce(lines, adj, fn l, acc ->
+        acc
+        |> Map.update(l.from_bus_id, [l.to_bus_id], &[l.to_bus_id | &1])
+        |> Map.update(l.to_bus_id, [l.from_bus_id], &[l.from_bus_id | &1])
+      end)
 
     Enum.reduce(transformers, adj, fn t, acc ->
       acc
@@ -489,6 +552,7 @@ defmodule PowerModel.Grid do
   end
 
   defp bfs_component([], comp, visited, _adj), do: {comp, visited}
+
   defp bfs_component([node | rest], comp, visited, adj) do
     neighbors = Map.get(adj, node, [])
 
@@ -501,11 +565,13 @@ defmodule PowerModel.Grid do
   end
 
   defp maybe_filter_interconnection(query, nil), do: query
+
   defp maybe_filter_interconnection(query, id) do
     from b in query, where: b.interconnection_id == ^id
   end
 
   defp maybe_filter_bus_type(query, nil), do: query
+
   defp maybe_filter_bus_type(query, type) do
     from b in query, where: b.bus_type == ^type
   end
@@ -513,7 +579,8 @@ defmodule PowerModel.Grid do
   defp maybe_join_bus(query, opts) do
     if opts[:interconnection_id] do
       from g in query,
-        join: b in Bus, on: g.bus_id == b.id,
+        join: b in Bus,
+        on: g.bus_id == b.id,
         where: b.interconnection_id == ^opts[:interconnection_id]
     else
       query
@@ -521,31 +588,37 @@ defmodule PowerModel.Grid do
   end
 
   defp maybe_filter_fuel_type(query, nil), do: query
+
   defp maybe_filter_fuel_type(query, type) do
     from g in query, where: g.fuel_type == ^type
   end
 
   defp maybe_filter_voltage(query, nil), do: query
+
   defp maybe_filter_voltage(query, min_kv) do
     from tl in query, where: tl.voltage_kv >= ^min_kv
   end
 
   defp maybe_filter_status(query, nil), do: query
+
   defp maybe_filter_status(query, status) do
     from q in query, where: q.status == ^status
   end
 
   defp maybe_filter_bus_interconnection(query, nil), do: query
+
   defp maybe_filter_bus_interconnection(query, id) do
     from [_, b] in query, where: b.interconnection_id == ^id
   end
 
   defp maybe_filter_county(query, nil), do: query
+
   defp maybe_filter_county(query, county) do
     from w in query, where: w.county == ^county
   end
 
   defp maybe_filter_facility_type(query, nil), do: query
+
   defp maybe_filter_facility_type(query, type) do
     from w in query, where: w.facility_type == ^type
   end
@@ -563,68 +636,90 @@ defmodule PowerModel.Grid do
 
     # Only facilities not yet mapped: re-running must not re-ADD their MW to
     # the shared bus loads (the merge below is additive, not idempotent).
-    facilities = from(w in WaterFacility,
-      where: w.status == "active" and not is_nil(w.coordinates) and is_nil(w.bus_id)
-    ) |> Repo.all()
+    facilities =
+      from(w in WaterFacility,
+        where: w.status == "active" and not is_nil(w.coordinates) and is_nil(w.bus_id)
+      )
+      |> Repo.all()
 
-    mapped = Enum.reduce(facilities, {0, 0}, fn facility, {map_count, load_count} ->
-      # Find nearest bus within range
-      nearest = from(b in Bus,
-        where: not is_nil(b.coordinates),
-        where: fragment("ST_DWithin(?::geography, ?::geography, ?)",
-          b.coordinates, ^facility.coordinates, ^max_meters),
-        order_by: fragment("ST_Distance(?::geography, ?::geography)",
-          b.coordinates, ^facility.coordinates),
-        limit: 1
-      ) |> Repo.one()
+    mapped =
+      Enum.reduce(facilities, {0, 0}, fn facility, {map_count, load_count} ->
+        # Find nearest bus within range
+        nearest =
+          from(b in Bus,
+            where: not is_nil(b.coordinates),
+            where:
+              fragment(
+                "ST_DWithin(?::geography, ?::geography, ?)",
+                b.coordinates,
+                ^facility.coordinates,
+                ^max_meters
+              ),
+            order_by:
+              fragment(
+                "ST_Distance(?::geography, ?::geography)",
+                b.coordinates,
+                ^facility.coordinates
+              ),
+            limit: 1
+          )
+          |> Repo.one()
 
-      case nearest do
-        nil ->
-          {map_count, load_count}
-        bus ->
-          # Update water facility with bus_id
-          facility
-          |> Ecto.Changeset.change(%{bus_id: bus.id})
-          |> Repo.update!()
+        case nearest do
+          nil ->
+            {map_count, load_count}
 
-          # Add water facility power consumption to the bus's baseline load
-          # (never the datacenter load row, which is held flat)
-          lc = if facility.power_consumption_mw && facility.power_consumption_mw > 0 do
-            existing_load =
-              from(l in Load,
-                where: l.bus_id == ^bus.id and l.load_type == "constant_power"
-              ) |> Repo.one()
+          bus ->
+            # Update water facility with bus_id
+            facility
+            |> Ecto.Changeset.change(%{bus_id: bus.id})
+            |> Repo.update!()
 
-            case existing_load do
-              nil ->
-                # No load on this bus yet — create one
-                q_mvar = facility.power_consumption_mw * 0.3287
-                %Load{}
-                |> Load.changeset(%{
-                  bus_id: bus.id,
-                  p_mw: facility.power_consumption_mw,
-                  q_mvar: q_mvar,
-                  load_type: "constant_power",
-                  status: "in_service"
-                })
-                |> Repo.insert!()
-                1
-              load ->
-                # Add to existing load
-                new_p = load.p_mw + facility.power_consumption_mw
-                new_q = (load.q_mvar || 0.0) + facility.power_consumption_mw * 0.3287
-                load
-                |> Ecto.Changeset.change(%{p_mw: new_p, q_mvar: new_q})
-                |> Repo.update!()
-                1
-            end
-          else
-            0
-          end
+            # Add water facility power consumption to the bus's baseline load
+            # (never the datacenter load row, which is held flat)
+            lc =
+              if facility.power_consumption_mw && facility.power_consumption_mw > 0 do
+                existing_load =
+                  from(l in Load,
+                    where: l.bus_id == ^bus.id and l.load_type == "constant_power"
+                  )
+                  |> Repo.one()
 
-          {map_count + 1, load_count + lc}
-      end
-    end)
+                case existing_load do
+                  nil ->
+                    # No load on this bus yet — create one
+                    q_mvar = facility.power_consumption_mw * 0.3287
+
+                    %Load{}
+                    |> Load.changeset(%{
+                      bus_id: bus.id,
+                      p_mw: facility.power_consumption_mw,
+                      q_mvar: q_mvar,
+                      load_type: "constant_power",
+                      status: "in_service"
+                    })
+                    |> Repo.insert!()
+
+                    1
+
+                  load ->
+                    # Add to existing load
+                    new_p = load.p_mw + facility.power_consumption_mw
+                    new_q = (load.q_mvar || 0.0) + facility.power_consumption_mw * 0.3287
+
+                    load
+                    |> Ecto.Changeset.change(%{p_mw: new_p, q_mvar: new_q})
+                    |> Repo.update!()
+
+                    1
+                end
+              else
+                0
+              end
+
+            {map_count + 1, load_count + lc}
+        end
+      end)
 
     mapped
   end
@@ -688,7 +783,8 @@ defmodule PowerModel.Grid do
   def get_water_facilities_for_buses(bus_ids) when is_list(bus_ids) do
     from(w in WaterFacility,
       where: w.bus_id in ^bus_ids and w.status == "active"
-    ) |> Repo.all()
+    )
+    |> Repo.all()
   end
 
   @doc """
@@ -704,20 +800,29 @@ defmodule PowerModel.Grid do
     max_km = Keyword.get(opts, :max_km, 30)
     max_meters = max_km * 1000
 
-    datacenters = from(d in Datacenter,
-      where: d.status == "active" and not is_nil(d.coordinates)
-    ) |> Repo.all()
+    datacenters =
+      from(d in Datacenter,
+        where: d.status == "active" and not is_nil(d.coordinates)
+      )
+      |> Repo.all()
 
     {mapped, unmapped} =
       Enum.reduce(datacenters, {0, 0}, fn dc, {mapped, unmapped} ->
-        nearest = from(b in Bus,
-          where: not is_nil(b.coordinates),
-          where: fragment("ST_DWithin(?::geography, ?::geography, ?)",
-            b.coordinates, ^dc.coordinates, ^max_meters),
-          order_by: fragment("ST_Distance(?::geography, ?::geography)",
-            b.coordinates, ^dc.coordinates),
-          limit: 1
-        ) |> Repo.one()
+        nearest =
+          from(b in Bus,
+            where: not is_nil(b.coordinates),
+            where:
+              fragment(
+                "ST_DWithin(?::geography, ?::geography, ?)",
+                b.coordinates,
+                ^dc.coordinates,
+                ^max_meters
+              ),
+            order_by:
+              fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^dc.coordinates),
+            limit: 1
+          )
+          |> Repo.one()
 
         case nearest do
           nil ->
@@ -772,7 +877,8 @@ defmodule PowerModel.Grid do
   def get_datacenters_for_buses(bus_ids) when is_list(bus_ids) do
     from(d in Datacenter,
       where: d.bus_id in ^bus_ids and d.status == "active"
-    ) |> Repo.all()
+    )
+    |> Repo.all()
   end
 
   @doc """
@@ -781,51 +887,82 @@ defmodule PowerModel.Grid do
   def get_regional_grid_snapshot(bounds) do
     {west, south, east, north} = bounds
 
-    buses = from(b in Bus,
-      where: not is_nil(b.coordinates),
-      where: fragment("ST_Within(?, ST_MakeEnvelope(?, ?, ?, ?, 4326))",
-        b.coordinates, ^west, ^south, ^east, ^north)
-    ) |> Repo.all()
+    buses =
+      from(b in Bus,
+        where: not is_nil(b.coordinates),
+        where:
+          fragment(
+            "ST_Within(?, ST_MakeEnvelope(?, ?, ?, ?, 4326))",
+            b.coordinates,
+            ^west,
+            ^south,
+            ^east,
+            ^north
+          )
+      )
+      |> Repo.all()
 
     bus_ids = MapSet.new(buses, & &1.id)
 
-    lines = from(tl in TransmissionLine,
-      where: tl.status == "in_service" and not is_nil(tl.from_bus_id) and not is_nil(tl.to_bus_id),
-      where: fragment("ST_Intersects(?, ST_MakeEnvelope(?, ?, ?, ?, 4326))",
-        tl.geometry, ^west, ^south, ^east, ^north)
-    ) |> Repo.all()
+    lines =
+      from(tl in TransmissionLine,
+        where:
+          tl.status == "in_service" and not is_nil(tl.from_bus_id) and not is_nil(tl.to_bus_id),
+        where:
+          fragment(
+            "ST_Intersects(?, ST_MakeEnvelope(?, ?, ?, ?, 4326))",
+            tl.geometry,
+            ^west,
+            ^south,
+            ^east,
+            ^north
+          )
+      )
+      |> Repo.all()
 
     # Include buses referenced by lines but outside the bbox
-    extra_bus_ids = lines
-    |> Enum.flat_map(fn l -> [l.from_bus_id, l.to_bus_id] end)
-    |> Enum.reject(&MapSet.member?(bus_ids, &1))
-    |> Enum.uniq()
+    extra_bus_ids =
+      lines
+      |> Enum.flat_map(fn l -> [l.from_bus_id, l.to_bus_id] end)
+      |> Enum.reject(&MapSet.member?(bus_ids, &1))
+      |> Enum.uniq()
 
-    extra_buses = if extra_bus_ids != [] do
-      from(b in Bus, where: b.id in ^extra_bus_ids) |> Repo.all()
-    else
-      []
-    end
+    extra_buses =
+      if extra_bus_ids != [] do
+        from(b in Bus, where: b.id in ^extra_bus_ids) |> Repo.all()
+      else
+        []
+      end
 
     all_buses = buses ++ extra_buses
     all_bus_ids = MapSet.new(all_buses, & &1.id)
 
-    transformers = from(t in Transformer,
-      where: t.status == "in_service",
-      where: t.from_bus_id in ^MapSet.to_list(all_bus_ids) or t.to_bus_id in ^MapSet.to_list(all_bus_ids)
-    ) |> Repo.all()
+    transformers =
+      from(t in Transformer,
+        where: t.status == "in_service",
+        where:
+          t.from_bus_id in ^MapSet.to_list(all_bus_ids) or
+            t.to_bus_id in ^MapSet.to_list(all_bus_ids)
+      )
+      |> Repo.all()
 
-    generators = from(g in Generator,
-      where: g.status == "in_service" and g.bus_id in ^MapSet.to_list(all_bus_ids)
-    ) |> Repo.all()
+    generators =
+      from(g in Generator,
+        where: g.status == "in_service" and g.bus_id in ^MapSet.to_list(all_bus_ids)
+      )
+      |> Repo.all()
 
-    loads = from(l in Load,
-      where: l.status == "in_service" and l.bus_id in ^MapSet.to_list(all_bus_ids)
-    ) |> Repo.all()
+    loads =
+      from(l in Load,
+        where: l.status == "in_service" and l.bus_id in ^MapSet.to_list(all_bus_ids)
+      )
+      |> Repo.all()
 
-    water_facilities = from(w in WaterFacility,
-      where: w.status == "active" and w.bus_id in ^MapSet.to_list(all_bus_ids)
-    ) |> Repo.all()
+    water_facilities =
+      from(w in WaterFacility,
+        where: w.status == "active" and w.bus_id in ^MapSet.to_list(all_bus_ids)
+      )
+      |> Repo.all()
 
     %{
       buses: all_buses,

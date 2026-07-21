@@ -10,11 +10,31 @@ defmodule PowerModel.Ingestion.BusMapper do
   """
 
   import Ecto.Query
+  require Logger
   alias PowerModel.Repo
-  alias PowerModel.Grid.{Bus, Generator, TransmissionLine, Substation, Transformer}
+
+  alias PowerModel.Grid.{
+    Bus,
+    BalancingAuthority,
+    Generator,
+    TransmissionLine,
+    Substation,
+    Transformer
+  }
 
   @gen_match_radius_m 10_000
   @line_match_radius_m 5_000
+
+  # Balancing authorities in the Western Interconnection. A bus whose BA is in
+  # this set belongs to Western no matter where its geographic fallback box
+  # placed it. ERCO is the sole ERCOT balancing authority; every other BA is
+  # Eastern (SPP, MISO, PJM, SERC, ...). Consumed by
+  # reconcile_interconnections_from_ba/0.
+  @wecc_ba_codes ~w(
+    AVA AZPS BANC BPAT CHPD CISO DEAA DOPD EPE GCPD GRID GRIF GWA HGMA IID
+    IPCO LDWP NEVP NWMT PACE PACW PGE PNM PSCO PSEI SCL SRP TEPC TIDC TPWR
+    WACM WALC WAUW WWA
+  )
 
   def run do
     create_substation_buses()
@@ -51,11 +71,13 @@ defmodule PowerModel.Ingestion.BusMapper do
   defp determine_voltage_levels(sub) do
     levels = []
     levels = if sub.max_voltage_kv, do: [sub.max_voltage_kv | levels], else: levels
-    levels = if sub.min_voltage_kv && sub.min_voltage_kv != sub.max_voltage_kv do
-      [sub.min_voltage_kv | levels]
-    else
-      levels
-    end
+
+    levels =
+      if sub.min_voltage_kv && sub.min_voltage_kv != sub.max_voltage_kv do
+        [sub.min_voltage_kv | levels]
+      else
+        levels
+      end
 
     case levels do
       [] -> [138.0]
@@ -64,8 +86,9 @@ defmodule PowerModel.Ingestion.BusMapper do
   end
 
   defp map_generators_to_buses do
-    generators = from(g in Generator, where: is_nil(g.bus_id) and not is_nil(g.coordinates))
-                 |> Repo.all()
+    generators =
+      from(g in Generator, where: is_nil(g.bus_id) and not is_nil(g.coordinates))
+      |> Repo.all()
 
     Enum.each(generators, fn gen ->
       nearest_bus = find_nearest_bus(gen.coordinates, @gen_match_radius_m)
@@ -76,15 +99,16 @@ defmodule PowerModel.Ingestion.BusMapper do
         |> Repo.update()
       else
         # Create synthetic bus at generator location
-        {:ok, bus} = %Bus{}
-        |> Bus.changeset(%{
-          bus_type: 2,
-          base_kv: 13.8,
-          coordinates: gen.coordinates,
-          source: "synthetic",
-          source_id: "gen_#{gen.id}"
-        })
-        |> Repo.insert()
+        {:ok, bus} =
+          %Bus{}
+          |> Bus.changeset(%{
+            bus_type: 2,
+            base_kv: 13.8,
+            coordinates: gen.coordinates,
+            source: "synthetic",
+            source_id: "gen_#{gen.id}"
+          })
+          |> Repo.insert()
 
         gen
         |> Ecto.Changeset.change(%{bus_id: bus.id})
@@ -94,9 +118,11 @@ defmodule PowerModel.Ingestion.BusMapper do
   end
 
   defp map_transmission_line_buses do
-    lines = from(tl in TransmissionLine,
-      where: is_nil(tl.from_bus_id) or is_nil(tl.to_bus_id)
-    ) |> Repo.all()
+    lines =
+      from(tl in TransmissionLine,
+        where: is_nil(tl.from_bus_id) or is_nil(tl.to_bus_id)
+      )
+      |> Repo.all()
 
     Enum.each(lines, fn line ->
       from_point = get_line_endpoint(line.geometry, :from)
@@ -105,27 +131,43 @@ defmodule PowerModel.Ingestion.BusMapper do
       from_bus = find_nearest_bus_at_voltage(from_point, line.voltage_kv, @line_match_radius_m)
       to_bus = find_nearest_bus_at_voltage(to_point, line.voltage_kv, @line_match_radius_m)
 
-      changes = %{}
-      changes = if from_bus, do: Map.put(changes, :from_bus_id, from_bus.id), else: changes
-      changes = if to_bus, do: Map.put(changes, :to_bus_id, to_bus.id), else: changes
+      resolved_from = if from_bus, do: from_bus.id, else: line.from_bus_id
+      resolved_to = if to_bus, do: to_bus.id, else: line.to_bus_id
 
-      if map_size(changes) > 0 do
-        line
-        |> Ecto.Changeset.change(changes)
-        |> Repo.update()
+      if not is_nil(resolved_from) and resolved_from == resolved_to do
+        # Both endpoints snapped to the same bus: mapping this would create a
+        # self-loop, which is electrically meaningless. Leave the line
+        # unmapped/flagged so the cleanup pass can retry with a wider radius.
+        Logger.warning(
+          "BusMapper: skipping self-loop on transmission line #{line.id} " <>
+            "(both endpoints snapped to bus #{resolved_from})"
+        )
+      else
+        changes = %{}
+        changes = if from_bus, do: Map.put(changes, :from_bus_id, from_bus.id), else: changes
+        changes = if to_bus, do: Map.put(changes, :to_bus_id, to_bus.id), else: changes
+
+        if map_size(changes) > 0 do
+          line
+          |> Ecto.Changeset.change(changes)
+          |> Repo.update()
+        end
       end
     end)
   end
 
   defp create_substation_transformers do
     # Find substations with multiple voltage-level buses
-    buses_by_source = from(b in Bus,
-      where: b.source == "substation",
-      select: b
-    ) |> Repo.all() |> Enum.group_by(fn b ->
-      # Group by substation (extract sub id from source_id)
-      b.source_id |> String.split("_") |> List.first()
-    end)
+    buses_by_source =
+      from(b in Bus,
+        where: b.source == "substation",
+        select: b
+      )
+      |> Repo.all()
+      |> Enum.group_by(fn b ->
+        # Group by substation (extract sub id from source_id)
+        b.source_id |> String.split("_") |> List.first()
+      end)
 
     Enum.each(buses_by_source, fn {_sub_id, buses} ->
       if length(buses) >= 2 do
@@ -153,26 +195,25 @@ defmodule PowerModel.Ingestion.BusMapper do
 
   defp find_nearest_bus(point, radius_m) do
     from(b in Bus,
-      where: fragment("ST_DWithin(?::geography, ?::geography, ?)",
-                       b.coordinates, ^point, ^radius_m),
-      order_by: fragment("ST_Distance(?::geography, ?::geography)",
-                          b.coordinates, ^point),
+      where:
+        fragment("ST_DWithin(?::geography, ?::geography, ?)", b.coordinates, ^point, ^radius_m),
+      order_by: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
       limit: 1
     )
     |> Repo.one()
   end
 
   defp find_nearest_bus_at_voltage(nil, _kv, _radius), do: nil
+
   defp find_nearest_bus_at_voltage(point, voltage_kv, radius_m) do
     tolerance = voltage_kv * 0.1
 
     from(b in Bus,
-      where: fragment("ST_DWithin(?::geography, ?::geography, ?)",
-                       b.coordinates, ^point, ^radius_m)
-             and b.base_kv >= ^(voltage_kv - tolerance)
-             and b.base_kv <= ^(voltage_kv + tolerance),
-      order_by: fragment("ST_Distance(?::geography, ?::geography)",
-                          b.coordinates, ^point),
+      where:
+        fragment("ST_DWithin(?::geography, ?::geography, ?)", b.coordinates, ^point, ^radius_m) and
+          b.base_kv >= ^(voltage_kv - tolerance) and
+          b.base_kv <= ^(voltage_kv + tolerance),
+      order_by: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
       limit: 1
     )
     |> Repo.one()
@@ -185,6 +226,7 @@ defmodule PowerModel.Ingestion.BusMapper do
       _ -> nil
     end
   end
+
   defp get_line_endpoint(%Geo.LineString{coordinates: coords}, :to) do
     case List.last(coords) do
       {lon, lat} -> %Geo.Point{coordinates: {lon, lat}, srid: 4326}
@@ -192,35 +234,112 @@ defmodule PowerModel.Ingestion.BusMapper do
       _ -> nil
     end
   end
+
   defp get_line_endpoint(_, _), do: nil
 
   defp determine_interconnection(nil), do: nil
+
   defp determine_interconnection(%Geo.Point{coordinates: {lon, lat}}) do
+    get_or_create_interconnection(interconnection_from_box(lon, lat))
+  end
+
+  defp determine_interconnection(_), do: nil
+
+  @doc """
+  Coarse geographic interconnection guess from a coordinate. This is only a
+  FALLBACK for buses that never receive a balancing-authority assignment;
+  `reconcile_interconnections_from_ba/0` overrides it wherever a BA is known.
+
+  The ERCOT box is deliberately conservative so it does not swallow
+  Eastern-interconnection territory that sits inside the geographic footprint
+  of Texas: deep East Texas (Entergy/MISO, lon > -94.0), the Texas Panhandle
+  (SPP, lat > 35.0 west of -100.5), and El Paso (Western, lon < -104.0).
+  """
+  def interconnection_from_box(lon, lat) do
     cond do
-      # ERCOT: roughly Texas grid (excluding El Paso which is Western)
-      lat >= 25.8 and lat <= 36.5 and lon >= -104.0 and lon <= -93.5 ->
-        get_or_create_interconnection("ERCOT")
-
-      # Western Interconnection: west of approximately -104° longitude
+      # El Paso and everything west of the Texas grid is Western.
       lon < -104.0 ->
-        get_or_create_interconnection("Western")
+        "Western"
 
-      # Eastern Interconnection: everything else in CONUS
+      # ERCOT: the Texas grid, minus the Eastern/Western pockets noted above.
+      lat >= 25.8 and lat <= 36.5 and lon >= -104.0 and lon <= -94.0 and
+          not (lat > 35.0 and lon < -100.5) ->
+        "ERCOT"
+
+      # Everything else in CONUS is Eastern.
       true ->
-        get_or_create_interconnection("Eastern")
+        "Eastern"
     end
   end
-  defp determine_interconnection(_), do: nil
+
+  @doc """
+  Map a balancing-authority code to its interconnection name: ERCO -> ERCOT,
+  the WECC balancing authorities -> Western, every other BA -> Eastern (SPP,
+  MISO, PJM, SERC, ...).
+  """
+  def interconnection_for_ba_code(code) do
+    normalized = code |> to_string() |> String.trim() |> String.upcase()
+
+    cond do
+      normalized == "ERCO" -> "ERCOT"
+      normalized in @wecc_ba_codes -> "Western"
+      true -> "Eastern"
+    end
+  end
+
+  @doc """
+  Reassign each bus's interconnection from its balancing authority.
+
+  Interconnection is first set from a coarse geographic box when the bus is
+  created (before any BA is known). A bus's BA is a far more reliable signal of
+  which asynchronous system the bus belongs to, so once BA assignment has run
+  this pass overrides the box result for every bus that has a BA. Buses without
+  a BA keep their box-derived interconnection.
+
+  Returns the number of buses whose interconnection actually changed.
+  """
+  def reconcile_interconnections_from_ba do
+    ic_ids = %{
+      "ERCOT" => get_or_create_interconnection("ERCOT"),
+      "Western" => get_or_create_interconnection("Western"),
+      "Eastern" => get_or_create_interconnection("Eastern")
+    }
+
+    ba_ids_by_interconnection =
+      from(ba in BalancingAuthority, select: {ba.id, ba.code})
+      |> Repo.all()
+      |> Enum.group_by(
+        fn {_id, code} -> interconnection_for_ba_code(code) end,
+        fn {id, _code} -> id end
+      )
+
+    Enum.reduce(ba_ids_by_interconnection, 0, fn {ic_name, ba_ids}, changed ->
+      ic_id = Map.fetch!(ic_ids, ic_name)
+
+      {n, _} =
+        from(b in Bus,
+          where:
+            b.balancing_authority_id in ^ba_ids and
+              fragment("? IS DISTINCT FROM ?", b.interconnection_id, ^ic_id)
+        )
+        |> Repo.update_all(set: [interconnection_id: ic_id])
+
+      changed + n
+    end)
+  end
 
   defp get_or_create_interconnection(name) do
     alias PowerModel.Grid.Interconnection
 
     case Repo.get_by(Interconnection, name: name) do
-      %{id: id} -> id
+      %{id: id} ->
+        id
+
       nil ->
-        {:ok, ic} = %Interconnection{}
-        |> Interconnection.changeset(%{name: name})
-        |> Repo.insert(on_conflict: :nothing, conflict_target: [:name])
+        {:ok, ic} =
+          %Interconnection{}
+          |> Interconnection.changeset(%{name: name})
+          |> Repo.insert(on_conflict: :nothing, conflict_target: [:name])
 
         # on_conflict: :nothing may return nil id, so re-fetch
         case ic.id do
