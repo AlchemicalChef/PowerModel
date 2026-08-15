@@ -54,3 +54,6 @@ data/vendored/*
 # Byte-compiled helper scripts (scripts/*.py)
 __pycache__/
 *.pyc
+
+# Compiled NIF (Rustler copies it into priv/native during mix compile)
+/priv/native/

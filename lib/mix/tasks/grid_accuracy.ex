@@ -50,9 +50,9 @@ defmodule Mix.Tasks.Grid.Accuracy do
       --format text|json         default text; json keys are stable for CI diffs
       --base-mva F               solver base, default 100.0
       --max-solve-buses N        skip the base case above this island size
-                                 (default 8000; 0 disables the guard). Dense
-                                 B' assembly is O(n^2), so Eastern does not
-                                 merely run slowly above it — see ROADMAP 18.
+                                 (default 0 = no guard). Obsolete since sparse
+                                 triplet assembly landed (ROADMAP 18): Eastern
+                                 solves in ~1 s. Kept for CI time budgets.
       --solve-timeout MS         wall-clock cap per base-case solve
   """
 
@@ -105,7 +105,7 @@ defmodule Mix.Tasks.Grid.Accuracy do
         interconnections: Keyword.get_values(opts, :interconnection),
         hour: parse_hour(opts[:hour]),
         base_mva: Keyword.get(opts, :base_mva, 100.0),
-        max_solve_buses: Keyword.get(opts, :max_solve_buses, 8_000),
+        max_solve_buses: Keyword.get(opts, :max_solve_buses, 0),
         solve_timeout_ms: Keyword.get(opts, :solve_timeout, 120_000),
         overrides: Enum.map(Keyword.get_values(opts, :ab), &parse_override/1)
       )

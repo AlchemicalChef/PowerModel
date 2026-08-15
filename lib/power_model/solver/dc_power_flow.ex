@@ -4,6 +4,21 @@ defmodule PowerModel.Solver.DCPowerFlow do
   Assumes V=1.0 pu, lossless lines. Solves P = B' * theta.
   Target: <50ms per interconnection.
 
+  ## Scale
+
+  B' is assembled directly as COO triplets and factorized by sparse LDL^T in
+  the Rust NIF; it is never built as a dense matrix. That is what makes the
+  Eastern interconnection solvable at all — a dense (n-1)x(n-1) B' there is
+  2.7e9 entries, hundreds of gigabytes as an Elixir term, where the triplet
+  form is ~259k entries.
+
+  Dense LU survives only as a fallback for systems small enough to materialize,
+  and it exists because LDL^T assumes B' is positive definite. A
+  series-compensated branch keeps its negative reactance through
+  `YBus.effective_reactance/1` and can cost B' that property, so every sparse
+  solve is residual-verified natively and an unverified result is never
+  returned as a `Solution`.
+
   ## DC ties
 
   A snapshot may carry `:dc_ties` (`PowerModel.Grid.DcTie`). These are NOT
@@ -92,21 +107,6 @@ defmodule PowerModel.Solver.DCPowerFlow do
     # Find slack bus (type 3, or largest generator)
     slack_idx = find_slack_index(buses, generators, bus_index)
 
-    # Build B' matrix (n-1 x n-1, excluding slack)
-    {b_prime_dense, p_inject} =
-      build_b_prime_and_injection(
-        buses,
-        lines,
-        transformers,
-        generators,
-        loads,
-        dc_ties,
-        bus_index,
-        slack_idx,
-        n,
-        base_mva
-      )
-
     totals = compute_totals(generators, loads, dc_ties, bus_index, slack_idx, bus_ids)
 
     # Solve: theta = B'^-1 * P (excluding slack row/col)
@@ -115,7 +115,21 @@ defmodule PowerModel.Solver.DCPowerFlow do
     if non_slack_size == 0 do
       Solution.new(bus_ids, List.duplicate(1.0, n), List.duplicate(0.0, n), %{}, base_mva, totals)
     else
-      theta = solve_system(b_prime_dense, p_inject, non_slack_size)
+      # Build B' in triplet form (n-1 x n-1, slack row/col dropped at emission)
+      system =
+        assemble_system(
+          lines,
+          transformers,
+          generators,
+          loads,
+          dc_ties,
+          bus_index,
+          slack_idx,
+          n,
+          base_mva
+        )
+
+      theta = solve_system(system)
 
       # Insert slack angle (0.0) back
       theta_full = insert_at(theta, slack_idx, 0.0)
@@ -246,8 +260,27 @@ defmodule PowerModel.Solver.DCPowerFlow do
     end
   end
 
-  defp build_b_prime_and_injection(
-         _buses,
+  # ---------------------------------------------------------------------------
+  # B' assembly
+  #
+  # B' is built as COO triplets and is never materialized densely. Each branch
+  # contributes exactly four entries, so assembly is O(branches) rather than the
+  # O(buses^2) a dense (n-1)x(n-1) array costs. On the Eastern interconnection
+  # (51.7k buses, 64.7k branches) that is ~259k triplets against 2.7e9 dense
+  # entries, which is why Eastern could not previously be solved at all.
+  #
+  # Duplicate (row, col) pairs are summed when the solver builds its CSC matrix,
+  # so parallel branches need no consolidation pass here. They do mean the two
+  # off-diagonal positions of a bus pair accumulate independently and can end up
+  # a bit apart, which is why the native side does not demand bit-exact symmetry
+  # — see `Sparse.sparse_solve_checked/5`.
+  #
+  # The slack row and column are dropped at emission time: a bus index past the
+  # slack shifts down by one, and any entry touching the slack is simply not
+  # emitted. That is the same B' the dense path produced by slicing.
+  # ---------------------------------------------------------------------------
+
+  defp assemble_system(
          lines,
          transformers,
          generators,
@@ -258,38 +291,74 @@ defmodule PowerModel.Solver.DCPowerFlow do
          n,
          base_mva
        ) do
-    # Build full B matrix
-    b_full = :array.new(n * n, default: 0.0)
+    {rows, cols, vals, negative_branches} =
+      b_prime_triplets(lines, transformers, bus_index, slack_idx)
 
-    b_full =
-      Enum.reduce(lines, b_full, fn line, b ->
+    %{
+      rows: rows,
+      cols: cols,
+      vals: vals,
+      p: injection_vector(generators, loads, dc_ties, bus_index, slack_idx, n, base_mva),
+      size: n - 1,
+      negative_branches: negative_branches
+    }
+  end
+
+  defp b_prime_triplets(lines, transformers, bus_index, slack_idx) do
+    acc =
+      Enum.reduce(lines, {[], [], [], 0}, fn line, acc ->
         i = Map.fetch!(bus_index, line.from_bus_id)
         j = Map.fetch!(bus_index, line.to_bus_id)
-        x = YBus.effective_reactance(line.x_pu)
-        b_ij = 1.0 / x
-
-        b
-        |> array_add(i * n + i, b_ij)
-        |> array_add(j * n + j, b_ij)
-        |> array_add(i * n + j, -b_ij)
-        |> array_add(j * n + i, -b_ij)
+        b_ij = 1.0 / YBus.effective_reactance(line.x_pu)
+        add_branch_triplets(acc, i, j, b_ij, slack_idx)
       end)
 
-    b_full =
-      Enum.reduce(transformers, b_full, fn xfmr, b ->
-        i = Map.fetch!(bus_index, xfmr.from_bus_id)
-        j = Map.fetch!(bus_index, xfmr.to_bus_id)
-        x = YBus.effective_reactance(xfmr.x_pu)
-        t = effective_tap_ratio(Map.get(xfmr, :tap_ratio))
-        b_ij = 1.0 / (t * x)
+    Enum.reduce(transformers, acc, fn xfmr, acc ->
+      i = Map.fetch!(bus_index, xfmr.from_bus_id)
+      j = Map.fetch!(bus_index, xfmr.to_bus_id)
+      t = effective_tap_ratio(Map.get(xfmr, :tap_ratio))
+      b_ij = 1.0 / (t * YBus.effective_reactance(xfmr.x_pu))
+      add_branch_triplets(acc, i, j, b_ij, slack_idx)
+    end)
+  end
 
-        b
-        |> array_add(i * n + i, b_ij)
-        |> array_add(j * n + j, b_ij)
-        |> array_add(i * n + j, -b_ij)
-        |> array_add(j * n + i, -b_ij)
-      end)
+  # The four entries a branch of susceptance b between buses i and j puts into
+  # B': +b on both diagonals, -b on both off-diagonals. Anything in the slack
+  # row or column is dropped rather than emitted, which is how the slack is
+  # eliminated without ever slicing a matrix.
+  #
+  # A self-loop at a non-slack bus lands all four entries on one diagonal
+  # position, where +b, +b, -b, -b cancel — a branch from a bus to itself
+  # carries no flow and must not stiffen the diagonal. The dense accumulation
+  # did the same thing.
+  defp add_branch_triplets({rows, cols, vals, negative}, i, j, b_ij, slack_idx) do
+    negative = if b_ij < 0.0, do: negative + 1, else: negative
 
+    case {i == slack_idx, j == slack_idx} do
+      {true, true} ->
+        {rows, cols, vals, negative}
+
+      {true, false} ->
+        rj = shift_past_slack(j, slack_idx)
+        {[rj | rows], [rj | cols], [b_ij | vals], negative}
+
+      {false, true} ->
+        ri = shift_past_slack(i, slack_idx)
+        {[ri | rows], [ri | cols], [b_ij | vals], negative}
+
+      {false, false} ->
+        ri = shift_past_slack(i, slack_idx)
+        rj = shift_past_slack(j, slack_idx)
+
+        {[ri, rj, ri, rj | rows], [ri, rj, rj, ri | cols], [b_ij, b_ij, -b_ij, -b_ij | vals],
+         negative}
+    end
+  end
+
+  defp shift_past_slack(i, slack_idx) when i < slack_idx, do: i
+  defp shift_past_slack(i, _slack_idx), do: i - 1
+
+  defp injection_vector(generators, loads, dc_ties, bus_index, slack_idx, n, base_mva) do
     # Power injection vector (P_gen - P_load) in per unit
     p_full = :array.new(n, default: 0.0)
 
@@ -320,59 +389,108 @@ defmodule PowerModel.Solver.DCPowerFlow do
         |> add_at_bus(bus_index, Map.get(tie, :to_bus_id), -schedule_pu)
       end)
 
-    # Remove slack row/col to form B' and P'
-    non_slack_indices = Enum.reject(0..(n - 1), &(&1 == slack_idx))
-
-    b_prime =
-      for i <- non_slack_indices, j <- non_slack_indices do
-        :array.get(i * n + j, b_full)
-      end
-
-    p_inject =
-      for i <- non_slack_indices do
-        :array.get(i, p_full)
-      end
-
-    {b_prime, p_inject}
+    # Drop the slack entry to form P'
+    for i <- 0..(n - 1), i != slack_idx, do: :array.get(i, p_full)
   end
 
-  @sparse_threshold 500
+  # ---------------------------------------------------------------------------
+  # Solving
+  #
+  # Sparse LDL^T is the only assembly-fed path. Dense LU survives strictly as a
+  # fallback for systems small enough to materialize, because B' is only
+  # symmetric *positive definite* when every branch susceptance is positive.
+  # A series-compensated branch keeps its negative reactance through
+  # `YBus.effective_reactance/1`, and `sprs-ldl` does not pivot: an indefinite
+  # B' factorizes without complaint and can return numerical garbage. Every
+  # sparse solve is therefore residual-verified natively (see
+  # `Sparse.sparse_solve_checked/5`) and an unverified result is never returned.
+  # ---------------------------------------------------------------------------
 
-  defp solve_system(b_prime_flat, p_inject, size) do
-    if size > @sparse_threshold do
-      solve_sparse(b_prime_flat, p_inject, size)
-    else
-      solve_dense_system(b_prime_flat, p_inject, size)
+  # Above this the dense fallback is itself an O(size^2) blowup and refusing is
+  # the honest answer. 500x500 is ~2 MB and solves in milliseconds.
+  @dense_fallback_max 500
+
+  # A healthy DC solve lands near 1.0e-12 relative; 1.0e-6 leaves room for
+  # badly-scaled but genuinely-solved systems without admitting garbage.
+  @residual_tolerance 1.0e-6
+
+  defp solve_system(%{negative_branches: negative, size: size} = system)
+       when negative > 0 and size <= @dense_fallback_max do
+    # Known-indefinite and small enough to solve properly: skip LDL^T entirely
+    # and use dense LU with partial pivoting, which is the right factorization
+    # for an indefinite system.
+    Logger.warning(
+      "DC solve: #{negative} branch(es) with negative susceptance make B' " <>
+        "non-SPD; using dense LU fallback for #{size}x#{size} system"
+    )
+
+    solve_dense_system(system)
+  end
+
+  defp solve_system(system) do
+    case verified_sparse_solve(system) do
+      {:ok, theta} -> theta
+      {:error, reason} -> sparse_fallback(system, reason)
     end
   end
 
-  defp solve_sparse(b_prime_flat, p_inject, size) do
-    # Build COO triplets from the dense flat array (only non-zero entries)
-    {rows, cols, vals} =
-      b_prime_flat
-      |> Enum.with_index()
-      |> Enum.reduce({[], [], []}, fn {val, idx}, {rs, cs, vs} ->
-        if abs(val) > 1.0e-15 do
-          r = div(idx, size)
-          c = rem(idx, size)
-          {[r | rs], [c | cs], [val | vs]}
-        else
-          {rs, cs, vs}
-        end
+  defp verified_sparse_solve(%{rows: rows, cols: cols, vals: vals, p: p, size: size}) do
+    case Sparse.sparse_solve_checked(rows, cols, vals, p, size) do
+      {:ok, theta, residual} when residual <= @residual_tolerance -> {:ok, theta}
+      {:ok, _theta, residual} -> {:error, {:residual_too_large, residual}}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    # NIF unavailable, or the native input validation raised.
+    error -> {:error, {:nif_unavailable, Exception.message(error)}}
+  end
+
+  # One summary line, never one per branch: the OTP logger drops most of a
+  # warning burst under load, so the count has to be carried in a single
+  # message (DAT-20).
+  defp sparse_fallback(%{size: size, negative_branches: negative} = system, reason)
+       when size <= @dense_fallback_max do
+    Logger.warning(
+      "DC solve: sparse LDL^T rejected (#{inspect(reason)}) on #{size}x#{size} " <>
+        "system with #{negative} negative-susceptance branch(es); " <>
+        "falling back to dense LU"
+    )
+
+    solve_dense_system(system)
+  end
+
+  defp sparse_fallback(%{size: size, negative_branches: negative}, reason) do
+    Logger.warning(
+      "DC solve FAILED: sparse LDL^T rejected (#{inspect(reason)}) on " <>
+        "#{size}x#{size} system with #{negative} negative-susceptance " <>
+        "branch(es), which is too large for the dense fallback " <>
+        "(max #{@dense_fallback_max}). No angles produced."
+    )
+
+    if negative > 0 do
+      throw({:error, :not_spd})
+    else
+      throw({:error, :singular_matrix})
+    end
+  end
+
+  # The only place a dense B' is ever materialized, and only at sizes where
+  # size^2 is harmless.
+  defp densify(%{rows: rows, cols: cols, vals: vals, size: size}) do
+    flat =
+      [rows, cols, vals]
+      |> Enum.zip()
+      |> Enum.reduce(:array.new(size * size, default: 0.0), fn {r, c, v}, acc ->
+        array_add(acc, r * size + c, v)
       end)
 
-    try do
-      case Sparse.sparse_solve(rows, cols, vals, p_inject, size) do
-        {:ok, x} -> x
-        _ -> solve_dense_system(b_prime_flat, p_inject, size)
-      end
-    rescue
-      _ -> solve_dense_system(b_prime_flat, p_inject, size)
+    for r <- 0..(size - 1) do
+      for c <- 0..(size - 1), do: :array.get(r * size + c, flat)
     end
   end
 
-  defp solve_dense_system(b_prime_flat, p_inject, size) do
-    b_matrix = Enum.chunk_every(b_prime_flat, size)
+  defp solve_dense_system(%{p: p_inject, size: size} = system) do
+    b_matrix = densify(system)
 
     try do
       case Sparse.lu_factorize(b_matrix, size) do
