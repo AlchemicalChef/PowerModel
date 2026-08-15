@@ -8,6 +8,7 @@ defmodule PowerModel.Grid do
 
   alias PowerModel.Grid.{
     Bus,
+    BtmSolar,
     DcTie,
     Generator,
     TransmissionLine,
@@ -220,6 +221,24 @@ defmodule PowerModel.Grid do
     }
   end
 
+  # Behind-the-meter solar on the snapshot's buses (ROADMAP 2.5 item 30).
+  #
+  # THE REPRESENTATION RULE: this key is INERT for steady state. EIA-930 demand
+  # is metered net of behind-the-meter output, so the gross-up and the
+  # generation cancel at the bus and every solve is identical with the key
+  # present or absent. Solvers and `PowerModel.Demand` load scaling therefore
+  # must not read it — see `PowerModel.Grid.BtmSolar`. It is carried so the
+  # cascade (IEEE 1547 inverter tripping) and scenarios have a quantity to
+  # perturb, at which point the cancellation stops holding and the difference
+  # is the physics.
+  defp btm_solar_for_buses([], _hour), do: []
+
+  defp btm_solar_for_buses(bus_ids, hour) do
+    from(s in BtmSolar, where: s.bus_id in ^bus_ids)
+    |> Repo.all()
+    |> BtmSolar.output_at(hour)
+  end
+
   # Topology helpers
 
   def get_bus_branches(bus_id) do
@@ -323,7 +342,8 @@ defmodule PowerModel.Grid do
       loads: maybe_scale_loads(loads, buses, opts[:hour]),
       water_facilities: water_facilities,
       datacenters: datacenters,
-      dc_ties: dc_ties_for_buses(main_list)
+      dc_ties: dc_ties_for_buses(main_list),
+      btm_solar: btm_solar_for_buses(main_list, opts[:hour])
     }
   end
 
@@ -429,7 +449,8 @@ defmodule PowerModel.Grid do
       loads: maybe_scale_loads(loads, buses, opts[:hour]),
       water_facilities: water_facilities,
       datacenters: datacenters,
-      dc_ties: dc_ties_for_buses(main_list)
+      dc_ties: dc_ties_for_buses(main_list),
+      btm_solar: btm_solar_for_buses(main_list, opts[:hour])
     }
   end
 
@@ -1127,7 +1148,8 @@ defmodule PowerModel.Grid do
       loads: maybe_scale_loads(loads, all_buses, opts[:hour]),
       water_facilities: water_facilities,
       datacenters: datacenters,
-      dc_ties: dc_ties_for_buses(all_bus_id_list)
+      dc_ties: dc_ties_for_buses(all_bus_id_list),
+      btm_solar: btm_solar_for_buses(all_bus_id_list, opts[:hour])
     }
   end
 end

@@ -21,6 +21,7 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       mix power_model.ingest map_bas [/path/to/egrid/]   # balancing authorities + bus assignment
       mix power_model.ingest demand [/path/to/eia930/]   # EIA-930 hourly demand profiles
       mix power_model.ingest population [/path/to/census/]  # county population (load weights)
+      mix power_model.ingest btm_solar [/path/to/eia861/]   # EIA-861 rooftop PV on buses
       mix power_model.ingest validate [--update-baseline] # ingest-time validation gates
       mix power_model.ingest full_pipeline    # runs EVERY documented step in order
 
@@ -43,10 +44,16 @@ defmodule Mix.Tasks.PowerModel.Ingest do
   nothing authoritative is served live any more.
 
   Demand data pipeline (after the grid is built): `egrid` -> `map_bas` ->
-  `demand` -> `population` -> `estimate_loads`. Download EIA930_BALANCE_*.csv
-  bulk files from https://www.eia.gov/electricity/gridmonitor, plus
-  co-est*-alldata.csv (Census PEP county totals) and
-  *_Gaz_counties_national.txt (Census Gazetteer) into data/ first.
+  `demand` -> `population` -> `estimate_loads` -> `btm_solar`. Download
+  EIA930_BALANCE_*.csv bulk files from
+  https://www.eia.gov/electricity/gridmonitor, plus co-est*-alldata.csv
+  (Census PEP county totals), *_Gaz_counties_national.txt (Census Gazetteer),
+  and f861*.zip (https://www.eia.gov/electricity/data/eia861/zip/f8612024.zip)
+  into data/ first.
+
+  `btm_solar` (ROADMAP 2.5 item 30) needs county population, mapped BAs, and
+  the estimated loads that define its bus universe, so it runs after all three.
+  It is idempotent — the table is rebuilt from scratch on every run.
 
   `prepare_eia860` runs `scripts/prepare_eia860.py`, which extracts the two
   sheets `generators` needs out of `data/eia860_<year>.zip` (EIA ships XLSX
@@ -220,6 +227,16 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       ["population", path] ->
         Mix.shell().info("Ingesting Census county population from #{path}...")
         PowerModel.Ingestion.ingest_population(path)
+        Mix.shell().info("Done.")
+
+      ["btm_solar"] ->
+        Mix.shell().info("Ingesting EIA-861 behind-the-meter solar from data/...")
+        PowerModel.Ingestion.EIA.Form861.run("data")
+        Mix.shell().info("Done.")
+
+      ["btm_solar", path] ->
+        Mix.shell().info("Ingesting EIA-861 behind-the-meter solar from #{path}...")
+        PowerModel.Ingestion.EIA.Form861.run(path)
         Mix.shell().info("Done.")
 
       ["backfill_hifld_fields"] ->
@@ -414,6 +431,11 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       # 50 km last-resort search recovered and joins only what is still apart.
       {"Repairing network connectivity",
        fn -> PowerModel.Ingestion.BusMapper.repair_connectivity() end},
+      # ROADMAP 2.5 item 30. Last of the data stages: it allocates onto the
+      # PQ-buses-with-loads universe, so it must see the bus set that cleanup
+      # and connectivity repair leave behind, not the one estimate_loads saw.
+      {"Ingesting EIA-861 behind-the-meter solar (data/)",
+       fn -> PowerModel.Ingestion.EIA.Form861.run("data") end},
       # ROADMAP Phase 0 item 3: the gates run LAST, on the data every earlier
       # stage just wrote, and fail the pipeline on a topology regression.
       {"Validating ingested data", fn -> run_validation([]) end}
