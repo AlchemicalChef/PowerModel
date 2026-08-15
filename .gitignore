@@ -35,6 +35,9 @@ power_model-*.tar
 npm-debug.log
 /assets/node_modules/
 
+# Rust NIF build artifacts (rebuilt by mix compile via Rustler)
+/native/sparse_solver/target/
+
 # macOS metadata
 .DS_Store
 
