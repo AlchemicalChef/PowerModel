@@ -1,0 +1,47 @@
+{
+  "generated_at": "2026-08-15T14:09:24Z",
+  "metrics": {
+    "bus_count": 160164,
+    "buses_without_ba": 82200,
+    "generator_count": 31664,
+    "generators_without_bus": 1,
+    "geolocated_bus_count": 77964,
+    "geolocated_buses_without_ba": 0,
+    "geolocated_buses_without_interconnection": 0,
+    "interconnections": {
+      "ERCOT": {
+        "component_count": 929,
+        "connected_bus_count": 5268,
+        "connected_fraction": 0.5669,
+        "geolocated_bus_count": 9293,
+        "largest_component_bus_count": 2847,
+        "largest_component_fraction": 0.3064
+      },
+      "Eastern": {
+        "component_count": 4819,
+        "connected_bus_count": 29007,
+        "connected_fraction": 0.5266,
+        "geolocated_bus_count": 55085,
+        "largest_component_bus_count": 14996,
+        "largest_component_fraction": 0.2722
+      },
+      "Western": {
+        "component_count": 974,
+        "connected_bus_count": 4445,
+        "connected_fraction": 0.3272,
+        "geolocated_bus_count": 13586,
+        "largest_component_bus_count": 2249,
+        "largest_component_fraction": 0.1655
+      }
+    },
+    "line_count": 135876,
+    "lines_in_service": 124869,
+    "lines_unmapped_endpoints": 1751,
+    "self_loop_lines": 1805,
+    "self_loop_transformers": 0,
+    "transformer_count": 29940,
+    "transformers_unmapped_endpoints": 0
+  },
+  "note": "Topology census baseline written by PowerModel.Ingestion.Validation. Regenerate with `mix power_model.ingest validate --update-baseline` and commit the change together with the ingest change that caused it.",
+  "version": 1
+}

@@ -17,6 +17,7 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       mix power_model.ingest map_bas [/path/to/egrid/]   # balancing authorities + bus assignment
       mix power_model.ingest demand [/path/to/eia930/]   # EIA-930 hourly demand profiles
       mix power_model.ingest population [/path/to/census/]  # county population (load weights)
+      mix power_model.ingest validate [--update-baseline] # ingest-time validation gates
       mix power_model.ingest full_pipeline    # runs EVERY documented step in order
 
   Demand data pipeline (after the grid is built): `egrid` -> `map_bas` ->
@@ -32,6 +33,17 @@ defmodule Mix.Tasks.PowerModel.Ingest do
   result. File-based stages raise when their `data/` inputs are missing:
   a network-only "pipeline" that silently skips the fleet and demand data
   produces a degenerate 1 MW/bus grid while reporting success.
+
+  The last pipeline stage is `validate` (ROADMAP Phase 0 item 3,
+  `PowerModel.Ingestion.Validation`): EIA-930 hour completeness, eGRID vs
+  EIA-860 vintage, and a topology census diffed against
+  `priv/topology_baseline.json`. It prints a summary table; warnings are loud
+  but let the pipeline finish, while a topology regression fails the task with
+  a non-zero exit. Run it alone with `mix power_model.ingest validate`; flags:
+
+    * `--update-baseline` — rewrite the topology golden file from this run
+    * `--baseline PATH` — compare against (or write) a different golden file
+    * `--data-dir PATH` — where the source files live (default `data`)
   """
 
   use Mix.Task
@@ -165,6 +177,9 @@ defmodule Mix.Tasks.PowerModel.Ingest do
         PowerModel.Ingestion.HIFLD.TransmissionLines.backfill_hifld_fields()
         Mix.shell().info("Done.")
 
+      ["validate" | flags] ->
+        run_validation(flags)
+
       ["full_pipeline"] ->
         run_full_pipeline()
 
@@ -186,6 +201,7 @@ defmodule Mix.Tasks.PowerModel.Ingest do
           mix power_model.ingest water san_diego
           mix power_model.ingest datacenters
           mix power_model.ingest map_datacenters
+          mix power_model.ingest validate [--update-baseline] [--baseline <path>] [--data-dir <path>]
           mix power_model.ingest full_pipeline
         """)
     end
@@ -222,9 +238,51 @@ defmodule Mix.Tasks.PowerModel.Ingest do
        fn -> PowerModel.Grid.map_water_facilities_to_grid() end},
       {"Ingesting curated datacenters", fn -> PowerModel.Ingestion.ingest_datacenters() end},
       {"Mapping datacenters to grid buses", fn -> PowerModel.Grid.map_datacenters_to_grid() end},
-      {"Cleanup: re-mapping synthetic components", fn -> PowerModel.Ingestion.Cleanup.run() end}
+      {"Cleanup: re-mapping synthetic components", fn -> PowerModel.Ingestion.Cleanup.run() end},
+      # ROADMAP Phase 0 item 3: the gates run LAST, on the data every earlier
+      # stage just wrote, and fail the pipeline on a topology regression.
+      {"Validating ingested data", fn -> run_validation([]) end}
     ]
   end
+
+  # Shared by `mix power_model.ingest validate` and the final pipeline stage.
+  # Prints the summary table either way; `Mix.raise` on failure gives the
+  # non-zero exit a CI gate needs.
+  defp run_validation(flags) do
+    {parsed, _rest, invalid} =
+      OptionParser.parse(flags,
+        strict: [update_baseline: :boolean, baseline: :string, data_dir: :string]
+      )
+
+    if invalid != [] do
+      Mix.raise(
+        "Unknown validate option(s): #{Enum.map_join(invalid, ", ", fn {flag, _} -> flag end)}"
+      )
+    end
+
+    opts =
+      [update_baseline: Keyword.get(parsed, :update_baseline, false)]
+      |> put_if(:baseline_path, parsed[:baseline])
+      |> put_if(:data_dir, parsed[:data_dir])
+
+    case PowerModel.Ingestion.Validation.run(opts) do
+      {:ok, summary} ->
+        Mix.shell().info("\n" <> PowerModel.Ingestion.Validation.summary_table(summary))
+        summary.status
+
+      {:error, summary} ->
+        Mix.shell().error("\n" <> PowerModel.Ingestion.Validation.summary_table(summary))
+
+        Mix.raise(
+          "Ingest validation failed (#{length(summary.failures)} gate(s)). " <>
+            "If the change is intended, re-run with --update-baseline and commit the new " <>
+            "priv/topology_baseline.json alongside it."
+        )
+    end
+  end
+
+  defp put_if(opts, _key, nil), do: opts
+  defp put_if(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp run_full_pipeline do
     Mix.shell().info("=== Full Ingestion Pipeline ===\n")
