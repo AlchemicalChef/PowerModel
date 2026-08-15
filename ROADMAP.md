@@ -39,6 +39,19 @@ reproduced here so the document stands alone.
 Ordering favors accuracy-per-effort and measured dependency; S ≈ days, M ≈ 1–2 wk,
 L ≈ multi-week.
 
+> **STATUS 2026-08-15 (later): Phase 2 LANDED** (items 8–13 + ENE-17) with a fresh
+> re-ingest from the vendored snapshots. Measured: buses carrying a branch 49.7% →
+> **91.7%**; largest components Eastern 27.2% → 80.5%, Western 16.6% → 89.7%, ERCOT
+> 30.6% → 87.7%; >5:1 welds 2,989 → 0; kV-mismatch 12.3% → 0.3%; buses without BA → 0;
+> unplaced nuclear 24.2 → 1.7 GW; fuel-mix TV 0.096 → **0.0068**; interchange MAE
+> −71%; generation coverage 98.5%; all 8 HVDC ties placed; 1,599 branches freed from
+> trip immunity. Key data discovery: HIFLD's `UNKNOWN<id>`/`TAP<id>` endpoint names are
+> per-yard KEYS (81.5% of endpoints match by name). Consequences: item 18 (sparse DC
+> assembly) is now load-bearing for MEASUREMENT — Eastern (51,713 buses) and Western
+> (17,265) exceed the dense-solve cap, so their base cases are currently unmeasurable;
+> 13,520 no-voltage substations carry placeholder 138 kV levels (REVIEW DAT-21, OSM
+> polygons in item 24 are the fix).
+>
 > **STATUS 2026-08-15: Phases 0 and 1 LANDED** (items 1–7). Measured result via the new
 > `mix power_model.validate --legacy`: fuel-mix TV distance 0.293 (legacy proportional)
 > → 0.107 (fuel-anchored), a 64% reduction; interchange MAE −42%. The residual 0.107 is

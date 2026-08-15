@@ -494,7 +494,12 @@ needs work (e.g. no back-switching for genuinely-violating buses within a round,
 simultaneous-violation resolution). Guarded bus-for-bus at IEEE-118 scale where it
 works; the skipped ACTIVSg2000 AC tests are the acceptance gate. Found by the Phase 0
 validation ladder, 2026-08-15.
-**ENE-17 (HIGH) [OPEN]** Regional snapshots inflate straddling BAs: `Demand.scale_loads/3`
+**DAT-21 (DATA QUALITY, MED) [OPEN→Phase 5]** 13,520 substations (17%) in the native
+layer report no voltage and receive the default 138 kV bus; 70% of connectivity-repair
+joints connect two such yards (mean 0.78 km apart — the joins are right, the level and
+250 MVA tie rating are placeholders). OSM substation polygons (ROADMAP item 24, 67%
+voltage-tagged) are the enrichment path.
+**ENE-17 (FIXED 2026-08-15)** Regional snapshots inflate straddling BAs: `Demand.scale_loads/3`
 lands a BA's ENTIRE demand on whatever slice of its buses the snapshot contains. Nine BAs
 straddle interconnection boundaries — MISO's 69 GW lands on stray ERCOT-labelled buses at
 17.2×, AECI 191×, TEPC 28.8× — so hour-scaled ERCOT simulations carry ~151 GW against a
