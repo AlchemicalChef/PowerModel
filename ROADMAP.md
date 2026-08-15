@@ -190,3 +190,21 @@ L ≈ multi-week.
 - **Standalone reserve-margin model / LODES / CBP / NARIS nodal / breaker topology**:
   superseded, proxy-blind, non-public, or substrate-free respectively (see domain
   reports in session log for full arguments).
+
+## Appendix: ISO market-data licensing (for when LMP validation is revisited)
+
+Verified 2026-08-14. When Phase 1 makes congestion comparison meaningful, the access
+pattern is constrained by licensing, not tooling:
+- **Hosted gridstatus.io API: redistribution blocker.** ToS (2026-04-02) licenses data
+  for internal use only, prohibits publishing anything that "substantially reproduces"
+  it, and claims compilation copyright + trade secret. Raw or near-raw hosted data can
+  never be committed to this repo. Free tier 500k rows/month; fine for private analysis.
+- **OSS `gridstatus` lib (BSD-3, actively maintained)** pulling DIRECT from ISOs is the
+  right pattern. Credential-free: CAISO, NYISO, SPP, IESO. Keys required: PJM (free),
+  ERCOT API (geo-restricted), MISO, ISO-NE. The credential-free ERCOT/MISO/ISONE
+  scraper paths are being deprecated.
+- **Per-ISO redistribution**: ERCOT explicitly permissive (raw data may be redistributed
+  in compilations/analyses); EIA public domain (already our scaling source); CAISO
+  attribution + murky; **PJM prohibits non-member republishing** — validate against PJM
+  privately, publish only derived metrics. History is shallow per-dataset (some 5-30
+  days) — archive pulls promptly once validation starts.
