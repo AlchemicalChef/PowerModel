@@ -26,6 +26,35 @@ defmodule PowerModel.Ingestion.BusMapperTest do
 
   defp insert_ba(code), do: Repo.insert!(%BalancingAuthority{code: code, name: code})
 
+  defp substation_buses(sub) do
+    prefix = "#{sub.id}_"
+
+    Repo.all(
+      from b in Bus,
+        where: b.source == "substation" and like(b.source_id, ^(prefix <> "%"))
+    )
+  end
+
+  defp substation_bus_kvs(sub), do: sub |> substation_buses() |> Enum.map(& &1.base_kv)
+
+  # {high kV, low kV} of every transformer, ordered down the level chain.
+  defp transformer_level_pairs(status \\ nil) do
+    query =
+      from t in Transformer,
+        join: fb in Bus,
+        on: t.from_bus_id == fb.id,
+        join: tb in Bus,
+        on: t.to_bus_id == tb.id,
+        select: {fb.base_kv, tb.base_kv}
+
+    query
+    |> then(fn q -> if status, do: from(t in q, where: t.status == ^status), else: q end)
+    |> Repo.all()
+    |> Enum.sort_by(fn {high, _low} -> -high end)
+  end
+
+  defp in_service_transformer_level_pairs, do: transformer_level_pairs("in_service")
+
   describe "interconnection_from_box/2 (geographic fallback)" do
     test "keeps Eastern-interconnection Texas pockets out of the ERCOT box" do
       # Deep East Texas (Entergy/MISO) sits east of -94.0.
@@ -188,6 +217,49 @@ defmodule PowerModel.Ingestion.BusMapperTest do
       assert Repo.aggregate(Transformer, :count) == 1
     end
 
+    test "MATPOWER transformers are left alone by the re-map (foreign parameters)" do
+      # Imported case-file impedances are real data; the generic 10%/0.3%
+      # recipe must never overwrite them.
+      hv =
+        Repo.insert!(%Bus{
+          bus_type: 1,
+          base_kv: 345.0,
+          source: "matpower",
+          source_id: "mp_1",
+          coordinates: point(-90.0, 35.0)
+        })
+
+      lv =
+        Repo.insert!(%Bus{
+          bus_type: 1,
+          base_kv: 138.0,
+          source: "matpower",
+          source_id: "mp_2",
+          coordinates: point(-90.0, 35.0)
+        })
+
+      # Reversed terminals and a case-file impedance, both of which the re-map
+      # would "correct" if it claimed authority over this row.
+      xfmr =
+        Repo.insert!(%Transformer{
+          from_bus_id: lv.id,
+          to_bus_id: hv.id,
+          rated_mva: 250.0,
+          r_pu: 0.0012,
+          x_pu: 0.0457,
+          tap_ratio: 0.98,
+          params_version: 0
+        })
+
+      assert %{recomputed: 0, retired: 0} = BusMapper.remap_stale_transformers()
+
+      reloaded = Repo.get!(Transformer, xfmr.id)
+      assert reloaded.from_bus_id == lv.id
+      assert reloaded.x_pu == 0.0457
+      assert reloaded.tap_ratio == 0.98
+      assert reloaded.params_version == 0
+    end
+
     test "near-integer voltage levels get distinct buses (LIN-10)" do
       # round/1 collapsed 138.0 and 138.4 into the same source_id, silently
       # dropping one voltage level's bus.
@@ -205,6 +277,337 @@ defmodule PowerModel.Ingestion.BusMapperTest do
         Repo.all(from b in Bus, where: b.source == "substation", select: b.source_id)
 
       assert Enum.sort(source_ids) == Enum.sort(["#{sub.id}_138.4kV", "#{sub.id}_138.0kV"])
+    end
+  end
+
+  describe "voltage_levels/1" do
+    test "prefers the stored list, descending" do
+      sub = %Substation{voltage_levels: [138.0, 500.0, 345.0], max_voltage_kv: 500.0}
+      assert BusMapper.voltage_levels(sub) == [500.0, 345.0, 138.0]
+    end
+
+    test "falls back to max/min for rows ingested before the column existed" do
+      sub = %Substation{voltage_levels: nil, max_voltage_kv: 345.0, min_voltage_kv: 115.0}
+      assert BusMapper.voltage_levels(sub) == [345.0, 115.0]
+    end
+
+    test "falls back to 138 kV when nothing usable is stored" do
+      assert BusMapper.voltage_levels(%Substation{voltage_levels: []}) == [138.0]
+      assert BusMapper.voltage_levels(%Substation{voltage_levels: [0.0, nil]}) == [138.0]
+    end
+
+    test "levels that would share a one-decimal bus source_id collapse" do
+      sub = %Substation{voltage_levels: [138.44, 138.41, 115.0]}
+      assert BusMapper.voltage_levels(sub) == [138.44, 115.0]
+    end
+  end
+
+  describe "one bus per voltage level (LIN-5)" do
+    test "every stored level gets its own bus" do
+      sub =
+        Repo.insert!(%Substation{
+          name: "KEYSTONE",
+          voltage_levels: [500.0, 345.0, 138.0, 115.0],
+          max_voltage_kv: 500.0,
+          min_voltage_kv: 115.0,
+          coordinates: point(-90.0, 35.0)
+        })
+
+      BusMapper.run()
+
+      assert Enum.sort(substation_bus_kvs(sub)) == [115.0, 138.0, 345.0, 500.0]
+
+      source_ids =
+        Repo.all(from b in Bus, where: b.source == "substation", select: b.source_id)
+
+      assert Enum.sort(source_ids) ==
+               Enum.sort([
+                 "#{sub.id}_500.0kV",
+                 "#{sub.id}_345.0kV",
+                 "#{sub.id}_138.0kV",
+                 "#{sub.id}_115.0kV"
+               ])
+    end
+
+    test "transformers chain adjacent levels only, never the extremes" do
+      Repo.insert!(%Substation{
+        name: "KEYSTONE",
+        voltage_levels: [500.0, 345.0, 138.0, 115.0],
+        coordinates: point(-90.0, 35.0)
+      })
+
+      BusMapper.run()
+
+      # The old max/min-only scheme could only produce the 500/115 weld.
+      assert transformer_level_pairs() == [{500.0, 345.0}, {345.0, 138.0}, {138.0, 115.0}]
+    end
+
+    test "rating comes from the genuine high side whatever order the pair arrives in" do
+      sub =
+        Repo.insert!(%Substation{
+          name: "TEST 500/230",
+          voltage_levels: [500.0, 230.0],
+          coordinates: point(-90.0, 35.0)
+        })
+
+      BusMapper.run()
+
+      [high, low] = Enum.sort_by(substation_buses(sub), & &1.base_kv, :desc)
+
+      forward = BusMapper.transformer_attrs(high, low)
+      reversed = BusMapper.transformer_attrs(low, high)
+
+      assert forward == reversed
+      # 500 kV high side -> 1000 MVA, NOT the 400 MVA a 230 kV terminal implies.
+      assert forward.rated_mva == 1000.0
+      assert forward.from_bus_id == high.id
+      assert forward.to_bus_id == low.id
+      assert_in_delta forward.x_pu, 0.1 * (100.0 / 1000.0), 1.0e-9
+      assert forward.params_version == BusMapper.params_version()
+    end
+
+    test "creation stamps the current params version" do
+      Repo.insert!(%Substation{
+        name: "TEST 345/138",
+        voltage_levels: [345.0, 138.0],
+        coordinates: point(-90.0, 35.0)
+      })
+
+      BusMapper.run()
+
+      assert Repo.one!(Transformer).params_version == BusMapper.params_version()
+    end
+  end
+
+  describe "endpoint snapping across levels" do
+    test "a 345 kV line at a KEYSTONE-class yard snaps to the 345 kV bus" do
+      keystone =
+        Repo.insert!(%Substation{
+          name: "KEYSTONE",
+          voltage_levels: [500.0, 345.0, 138.0, 115.0],
+          coordinates: point(-90.0, 35.0)
+        })
+
+      far =
+        Repo.insert!(%Substation{
+          name: "CONEMAUGH",
+          voltage_levels: [500.0, 345.0],
+          coordinates: point(-89.0, 35.0)
+        })
+
+      line =
+        Repo.insert!(%TransmissionLine{
+          voltage_kv: 345.0,
+          status: "in_service",
+          geometry: line_string({-90.0, 35.0}, {-89.0, 35.0})
+        })
+
+      BusMapper.run()
+
+      reloaded = Repo.get!(TransmissionLine, line.id)
+      assert Repo.get!(Bus, reloaded.from_bus_id).base_kv == 345.0
+      assert Repo.get!(Bus, reloaded.to_bus_id).base_kv == 345.0
+      assert Repo.get!(Bus, reloaded.from_bus_id).source_id == "#{keystone.id}_345.0kV"
+      assert Repo.get!(Bus, reloaded.to_bus_id).source_id == "#{far.id}_345.0kV"
+    end
+
+    test "the closest level wins when several sit inside the +/-10% window" do
+      # 320 and 345 are more than 5% apart, so both survive clustering and both
+      # fall inside a 345 kV line's window — at the SAME coordinate, where
+      # distance cannot separate them.
+      sub =
+        Repo.insert!(%Substation{
+          name: "TWO NEAR LEVELS",
+          voltage_levels: [345.0, 320.0],
+          coordinates: point(-90.0, 35.0)
+        })
+
+      Repo.insert!(%Substation{
+        name: "REMOTE",
+        voltage_levels: [345.0],
+        coordinates: point(-89.0, 35.0)
+      })
+
+      line =
+        Repo.insert!(%TransmissionLine{
+          voltage_kv: 345.0,
+          status: "in_service",
+          geometry: line_string({-90.0, 35.0}, {-89.0, 35.0})
+        })
+
+      BusMapper.run()
+
+      from_bus = Repo.get!(Bus, Repo.get!(TransmissionLine, line.id).from_bus_id)
+      assert from_bus.base_kv == 345.0
+      assert from_bus.source_id == "#{sub.id}_345.0kV"
+    end
+  end
+
+  describe "re-map mode (ROADMAP item 8)" do
+    test "a substation that gains a level gains a bus and keeps the old ones (DAT-9)" do
+      sub =
+        Repo.insert!(%Substation{
+          name: "GROWING",
+          voltage_levels: [500.0, 115.0],
+          coordinates: point(-90.0, 35.0)
+        })
+
+      BusMapper.run()
+
+      [bus_500, bus_115] = Enum.sort_by(substation_buses(sub), & &1.base_kv, :desc)
+
+      # Something already points at the low-side bus; a re-ingest must not
+      # orphan it.
+      line =
+        Repo.insert!(%TransmissionLine{
+          voltage_kv: 115.0,
+          status: "in_service",
+          from_bus_id: bus_115.id,
+          to_bus_id: bus_500.id
+        })
+
+      sub
+      |> Ecto.Changeset.change(%{voltage_levels: [500.0, 345.0, 138.0, 115.0]})
+      |> Repo.update!()
+
+      BusMapper.remap()
+
+      assert Enum.sort(substation_bus_kvs(sub)) == [115.0, 138.0, 345.0, 500.0]
+      # The original buses survive with their ids, so the line still resolves.
+      assert Repo.get(Bus, bus_500.id)
+      assert Repo.get(Bus, bus_115.id)
+      reloaded = Repo.get!(TransmissionLine, line.id)
+      assert reloaded.from_bus_id == bus_115.id
+      assert reloaded.to_bus_id == bus_500.id
+    end
+
+    test "the weld across the gained levels is retired in favour of the chain" do
+      sub =
+        Repo.insert!(%Substation{
+          name: "GROWING",
+          voltage_levels: [500.0, 138.0],
+          coordinates: point(-90.0, 35.0)
+        })
+
+      BusMapper.run()
+
+      weld = Repo.one!(Transformer)
+      # Pretend it was written by the previous recipe.
+      weld |> Ecto.Changeset.change(%{params_version: 0}) |> Repo.update!()
+
+      sub
+      |> Ecto.Changeset.change(%{voltage_levels: [500.0, 345.0, 138.0]})
+      |> Repo.update!()
+
+      assert %{transformers_retired: 1} = BusMapper.remap()
+
+      assert Repo.get!(Transformer, weld.id).status == "out_of_service"
+
+      assert in_service_transformer_level_pairs() == [{500.0, 345.0}, {345.0, 138.0}]
+    end
+
+    test "a stale bank is reoriented high side first and re-rated" do
+      sub =
+        Repo.insert!(%Substation{
+          name: "REVERSED",
+          voltage_levels: [345.0, 138.0],
+          coordinates: point(-90.0, 35.0)
+        })
+
+      BusMapper.create_substation_buses()
+      [high, low] = Enum.sort_by(substation_buses(sub), & &1.base_kv, :desc)
+
+      # The defect: the writer trusted row order and rated the bank off the
+      # 138 kV terminal it happened to list first.
+      stale =
+        Repo.insert!(%Transformer{
+          from_bus_id: low.id,
+          to_bus_id: high.id,
+          rated_mva: 200.0,
+          r_pu: 0.003,
+          x_pu: 0.1,
+          params_version: 0
+        })
+
+      assert %{recomputed: 1, retired: 0} = BusMapper.remap_stale_transformers()
+
+      reloaded = Repo.get!(Transformer, stale.id)
+      assert reloaded.from_bus_id == high.id
+      assert reloaded.to_bus_id == low.id
+      assert reloaded.rated_mva == 600.0
+      assert_in_delta reloaded.x_pu, 0.1 * (100.0 / 600.0), 1.0e-9
+      assert reloaded.params_version == BusMapper.params_version()
+    end
+
+    test "rows already at the current version are not churned" do
+      Repo.insert!(%Substation{
+        name: "CURRENT",
+        voltage_levels: [345.0, 138.0],
+        coordinates: point(-90.0, 35.0)
+      })
+
+      BusMapper.run()
+
+      assert %{
+               transformers_created: 0,
+               transformers_recomputed: 0,
+               transformers_retired: 0,
+               buses_created: 0
+             } = BusMapper.remap()
+    end
+  end
+
+  describe "unordered transformer pair key" do
+    test "a reversed duplicate cannot be created" do
+      sub =
+        Repo.insert!(%Substation{
+          name: "PAIR",
+          voltage_levels: [345.0, 138.0],
+          coordinates: point(-90.0, 35.0)
+        })
+
+      BusMapper.create_substation_buses()
+      [high, low] = Enum.sort_by(substation_buses(sub), & &1.base_kv, :desc)
+
+      # A bank recorded low side first — the ordered (from, to) index let this
+      # through as a second row between the same two buses.
+      Repo.insert!(%Transformer{
+        from_bus_id: low.id,
+        to_bus_id: high.id,
+        rated_mva: 600.0,
+        x_pu: 0.02
+      })
+
+      assert BusMapper.create_substation_transformers() == 0
+      assert Repo.aggregate(Transformer, :count) == 1
+    end
+
+    test "the unique index itself rejects the reversed twin" do
+      sub =
+        Repo.insert!(%Substation{
+          name: "PAIR",
+          voltage_levels: [345.0, 138.0],
+          coordinates: point(-90.0, 35.0)
+        })
+
+      BusMapper.create_substation_buses()
+      [high, low] = Enum.sort_by(substation_buses(sub), & &1.base_kv, :desc)
+
+      Repo.insert!(%Transformer{
+        from_bus_id: high.id,
+        to_bus_id: low.id,
+        rated_mva: 600.0,
+        x_pu: 0.02
+      })
+
+      assert_raise Ecto.ConstraintError, ~r/transformers_bus_pair_index/, fn ->
+        Repo.insert!(%Transformer{
+          from_bus_id: low.id,
+          to_bus_id: high.id,
+          rated_mva: 600.0,
+          x_pu: 0.02
+        })
+      end
     end
   end
 

@@ -1,12 +1,25 @@
 defmodule PowerModel.Ingestion.HIFLD.TransmissionLines do
   @moduledoc """
   Ingest transmission lines from HIFLD Electric Power Transmission Lines.
-  Supports both ArcGIS REST API and local shapefile sources.
+
+  Three sources, in order of preference:
+
+    1. **The vendored HIFLD Next snapshot** (`ingest/1` on a `.geojsonl` or
+       `.geojson` file) — 94,619 features, public domain, checksummed in
+       `data/vendored/PROVENANCE.md`. This is the default the ingest task
+       picks when the file is present. Produce it with
+       `scripts/convert_vendored_hifld.py`.
+    2. A local shapefile directory (`ingest/1` on a directory).
+    3. The ArcGIS REST API (`ingest_from_api/0`) — documented fallback only.
+       It serves an unofficial 52,244-feature mirror uploaded in Sept 2023,
+       roughly half the vendored snapshot, from an org that is not HIFLD
+       (REVIEW DAT-19; HIFLD Open was shut down 2025-08-26).
   """
 
   alias PowerModel.Repo
   alias PowerModel.Grid.TransmissionLine
   alias PowerModel.Ingestion.HIFLD.API
+  alias PowerModel.Ingestion.HIFLD.GeoJSON
 
   @service "Electric_Power_Transmission_Lines"
 
@@ -38,9 +51,107 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLines do
   end
 
   @doc """
-  Ingest from local shapefile directory.
+  Ingest from a local file or directory.
+
+  A `.geojsonl`/`.geojson`/`.json` FILE is the vendored HIFLD Next snapshot
+  (see `ingest_geojson/1`); a DIRECTORY is a HIFLD shapefile export.
   """
   def ingest(path) do
+    cond do
+      File.dir?(path) -> ingest_shapefile(path)
+      File.regular?(path) -> ingest_geojson(path)
+      true -> raise "HIFLD transmission line source not found at #{path}"
+    end
+  end
+
+  @doc """
+  Ingest the vendored HIFLD Next snapshot from GeoJSON.
+
+  Reads newline-delimited features or a single FeatureCollection (see
+  `PowerModel.Ingestion.HIFLD.GeoJSON`) and upserts on `{source, source_id}`,
+  so re-running is idempotent. Returns `{:ok, inserted}`.
+
+  Features without a usable voltage (VOLTAGE sentinel `-999999` AND an
+  unparseable VOLT_CLASS) or with fewer than two coordinates are skipped and
+  counted in the printed summary rather than inserted at a guessed voltage.
+  """
+  def ingest_geojson(path) do
+    IO.puts("Ingesting transmission lines from #{path}...")
+
+    # 1 = features seen, 2 = inserted, 3 = skipped (no voltage / no geometry)
+    counter = :counters.new(3, [:atomics])
+
+    path
+    |> GeoJSON.stream_features!()
+    |> Stream.map(fn feature ->
+      :counters.add(counter, 1, 1)
+      parse_geojson_feature(feature)
+    end)
+    |> Stream.filter(fn
+      nil ->
+        :counters.add(counter, 3, 1)
+        false
+
+      _ ->
+        true
+    end)
+    |> Stream.chunk_every(1000)
+    |> Stream.each(fn batch ->
+      insert_batch(batch)
+      :counters.add(counter, 2, length(batch))
+      count = :counters.get(counter, 2)
+      if rem(count, 10_000) < 1000, do: IO.puts("  #{count} lines inserted...")
+    end)
+    |> Stream.run()
+
+    seen = :counters.get(counter, 1)
+    inserted = :counters.get(counter, 2)
+    skipped = :counters.get(counter, 3)
+
+    IO.puts(
+      "Read #{seen} features: #{inserted} lines inserted, #{skipped} skipped (no usable voltage or geometry)."
+    )
+
+    {:ok, inserted}
+  end
+
+  @doc """
+  Parse one vendored GeoJSON feature into an insertable attrs map, or nil.
+
+  Field names follow the HIFLD Next schema: `source_ID` is the stable line id
+  (the ArcGIS mirror calls it `ID`), and geometry arrives as LineString or
+  MultiLineString rather than ArcGIS `paths`. Everything downstream —
+  per-part length, HVDC marking, status mapping — is shared with the API path.
+  """
+  def parse_geojson_feature(%{"properties" => props} = feature) do
+    parts = GeoJSON.line_parts(feature)
+    coords = Enum.concat(parts)
+    voltage = parse_voltage(props["VOLTAGE"], props["VOLT_CLASS"])
+    source_id = to_string(props["source_ID"] || props["ID"] || props["OBJECTID"])
+
+    if voltage && voltage > 0 && length(coords) >= 2 && source_id != "" do
+      %{
+        voltage_kv: voltage,
+        geometry: %Geo.LineString{coordinates: coords, srid: 4326},
+        length_km: parts_length_km(parts),
+        source: "hifld",
+        source_id: source_id,
+        status: parse_status(props["STATUS"]),
+        line_type: line_type_from(props["VOLT_CLASS"], props["TYPE"]),
+        owner: props["OWNER"],
+        sub_1: props["SUB_1"],
+        sub_2: props["SUB_2"],
+        naics_code: props["NAICS_CODE"],
+        naics_desc: props["NAICS_DESC"],
+        from_bus_id: nil,
+        to_bus_id: nil
+      }
+    end
+  end
+
+  def parse_geojson_feature(_), do: nil
+
+  defp ingest_shapefile(path) do
     path
     |> read_shapefile()
     |> Flow.from_enumerable(max_demand: 100)

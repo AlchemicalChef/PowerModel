@@ -4,14 +4,18 @@ defmodule Mix.Tasks.PowerModel.Ingest do
 
   ## Usage
 
+      mix power_model.ingest substations              # vendored snapshot (preferred)
       mix power_model.ingest substations /path/to/hifld/
       mix power_model.ingest substations --api
+      mix power_model.ingest transmission_lines       # vendored snapshot (preferred)
       mix power_model.ingest transmission_lines /path/to/hifld/
       mix power_model.ingest transmission_lines --api
+      mix power_model.ingest prepare_eia860           # xlsx zip -> the CSVs generators reads
       mix power_model.ingest generators /path/to/eia860/
       mix power_model.ingest capacity_factors /path/to/eia923/
       mix power_model.ingest egrid /path/to/egrid/
       mix power_model.ingest map_buses
+      mix power_model.ingest connectivity_repair      # ROADMAP item 12 post-mapping pass
       mix power_model.ingest estimate_parameters
       mix power_model.ingest estimate_loads
       mix power_model.ingest map_bas [/path/to/egrid/]   # balancing authorities + bus assignment
@@ -20,11 +24,33 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       mix power_model.ingest validate [--update-baseline] # ingest-time validation gates
       mix power_model.ingest full_pipeline    # runs EVERY documented step in order
 
+  ## Network sources (ROADMAP Phase 2 / REVIEW DAT-19)
+
+  `substations` and `transmission_lines` default to the PINNED VENDORED
+  SNAPSHOTS in `data/vendored/` (checksums and fetch URLs in
+  `data/vendored/PROVENANCE.md`):
+
+    * `hifld_substations_mirror_2021vintage.geojson` — 77,946 real yards with
+      NAME/MAX_VOLT/MIN_VOLT. This is what lets line endpoints be keyed by
+      substation NAME instead of snapped to whatever bus was nearby.
+    * `hifld_next_transmission_lines_v1.geojsonl` — 94,619 lines, produced
+      from the pinned GeoParquet by
+      `python3 scripts/convert_vendored_hifld.py` (needs pyarrow).
+
+  `--api` still works and is the documented fallback, but it pulls an
+  unofficial 52,244-feature ArcGIS mirror — roughly half the network, from an
+  org that is not HIFLD; HIFLD Open was shut down by DHS on 2025-08-26 and
+  nothing authoritative is served live any more.
+
   Demand data pipeline (after the grid is built): `egrid` -> `map_bas` ->
   `demand` -> `population` -> `estimate_loads`. Download EIA930_BALANCE_*.csv
   bulk files from https://www.eia.gov/electricity/gridmonitor, plus
   co-est*-alldata.csv (Census PEP county totals) and
   *_Gaz_counties_national.txt (Census Gazetteer) into data/ first.
+
+  `prepare_eia860` runs `scripts/prepare_eia860.py`, which extracts the two
+  sheets `generators` needs out of `data/eia860_<year>.zip` (EIA ships XLSX
+  only). `full_pipeline` runs it automatically when the CSVs are absent.
 
   `full_pipeline` (DAT-16/PLT-11) runs the complete documented order —
   network from the HIFLD API, then the file-based steps (generators,
@@ -60,6 +86,9 @@ defmodule Mix.Tasks.PowerModel.Ingest do
         PowerModel.Ingestion.derive_substations_from_api()
         Mix.shell().info("Done.")
 
+      ["substations"] ->
+        ingest_substations_default()
+
       ["substations", path] ->
         Mix.shell().info("Ingesting substations from #{path}...")
         PowerModel.Ingestion.ingest_substations(path)
@@ -70,10 +99,31 @@ defmodule Mix.Tasks.PowerModel.Ingest do
         PowerModel.Ingestion.ingest_transmission_lines_from_api()
         Mix.shell().info("Done.")
 
+      ["transmission_lines"] ->
+        ingest_lines_default()
+
       ["transmission_lines", path] ->
         Mix.shell().info("Ingesting transmission lines from #{path}...")
         PowerModel.Ingestion.ingest_transmission_lines(path)
         Mix.shell().info("Done.")
+
+      ["prepare_eia860"] ->
+        prepare_eia860!()
+
+      ["augment_levels"] ->
+        Mix.shell().info("Merging terminating-line voltages into substation levels...")
+        result = PowerModel.Ingestion.HIFLD.Substations.augment_voltage_levels_from_lines()
+        Mix.shell().info("Done: #{inspect(result)}")
+
+      ["hvdc_ties"] ->
+        Mix.shell().info("Upserting curated HVDC ties...")
+        {:ok, result} = PowerModel.Ingestion.HvdcTies.run()
+        Mix.shell().info("Done: #{inspect(result)}")
+
+      ["connectivity_repair"] ->
+        Mix.shell().info("Repairing network connectivity (ROADMAP item 12)...")
+        result = PowerModel.Ingestion.BusMapper.repair_connectivity()
+        Mix.shell().info("Done: #{inspect(result)}")
 
       ["generators", path] ->
         Mix.shell().info("Ingesting generators from #{path}...")
@@ -186,12 +236,16 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       _ ->
         Mix.shell().error("""
         Usage:
-          mix power_model.ingest substations <path | --api>
-          mix power_model.ingest transmission_lines <path | --api>
+          mix power_model.ingest substations [<path> | --api]
+          mix power_model.ingest transmission_lines [<path> | --api]
+          mix power_model.ingest prepare_eia860
           mix power_model.ingest generators <path>
           mix power_model.ingest capacity_factors <path>
           mix power_model.ingest egrid <path>
           mix power_model.ingest map_buses
+          mix power_model.ingest augment_levels
+          mix power_model.ingest hvdc_ties
+          mix power_model.ingest connectivity_repair
           mix power_model.ingest estimate_parameters
           mix power_model.ingest estimate_loads
           mix power_model.ingest map_bas [<path>]
@@ -207,16 +261,130 @@ defmodule Mix.Tasks.PowerModel.Ingest do
     end
   end
 
+  @vendored_dir "data/vendored"
+  @vendored_lines_files [
+    "hifld_next_transmission_lines_v1.geojsonl",
+    "hifld_next_transmission_lines_v1.geojson"
+  ]
+  @vendored_substations_files ["hifld_substations_mirror_2021vintage.geojson"]
+
+  @doc """
+  Path to the vendored transmission-line snapshot, or nil when it has not been
+  converted yet.
+  """
+  def vendored_lines_path do
+    Enum.find_value(@vendored_lines_files, &existing_vendored/1)
+  end
+
+  @doc "Path to the vendored native substation layer, or nil."
+  def vendored_substations_path do
+    Enum.find_value(@vendored_substations_files, &existing_vendored/1)
+  end
+
+  defp existing_vendored(name) do
+    path = Path.join(@vendored_dir, name)
+    if File.regular?(path), do: path
+  end
+
+  defp ingest_lines_default do
+    case vendored_lines_path() do
+      nil ->
+        Mix.raise("""
+        No vendored transmission-line snapshot found in #{@vendored_dir}.
+
+        Expected one of: #{Enum.join(@vendored_lines_files, ", ")}
+
+        Convert the pinned GeoParquet first:
+
+            python3 scripts/convert_vendored_hifld.py
+
+        (needs pyarrow: `python3 -m pip install pyarrow`). Fetch URL and
+        checksum are in data/vendored/PROVENANCE.md. To use the unofficial
+        ArcGIS mirror instead, pass --api.
+        """)
+
+      path ->
+        Mix.shell().info("Source: #{provenance(path, :lines)}")
+        PowerModel.Ingestion.ingest_transmission_lines(path)
+    end
+  end
+
+  defp ingest_substations_default do
+    case vendored_substations_path() do
+      nil ->
+        Mix.raise("""
+        No vendored substation layer found in #{@vendored_dir}.
+
+        Expected: #{Enum.join(@vendored_substations_files, ", ")}
+        (fetch URL and checksum in data/vendored/PROVENANCE.md)
+
+        To derive substations from line endpoints instead — the fallback that
+        invents yards at endpoint centroids — pass --api.
+        """)
+
+      path ->
+        Mix.shell().info("Source: #{provenance(path, :substations)}")
+        PowerModel.Ingestion.ingest_substations(path)
+    end
+  end
+
+  # Recorded in the ingest output so a database can be traced back to the
+  # snapshot it was built from (REVIEW DAT-19).
+  defp provenance(path, kind) do
+    size_mb = Float.round(File.stat!(path).size / 1_000_000, 1)
+
+    label =
+      case kind do
+        :lines -> "HIFLD Next transmission lines, pinned 2026-08-15, public domain"
+        :substations -> "HIFLD substations mirror, 2021 vintage, pinned 2026-08-15"
+      end
+
+    "#{path} (#{size_mb} MB) — #{label}; see data/vendored/PROVENANCE.md"
+  end
+
+  @eia860_csvs ["data/3_1_Generator_Y2024.csv", "data/2___Plant_Y2024.csv"]
+
+  defp prepare_eia860! do
+    Mix.shell().info("Preparing EIA-860 CSVs from data/eia860_2024.zip...")
+
+    case System.cmd("python3", ["scripts/prepare_eia860.py"], stderr_to_stdout: true) do
+      {output, 0} ->
+        Mix.shell().info(output)
+        :ok
+
+      {output, status} ->
+        Mix.raise("""
+        scripts/prepare_eia860.py failed (exit #{status}):
+
+        #{output}
+        Needs openpyxl: `python3 -m pip install openpyxl`.
+        """)
+    end
+  end
+
+  # The generators stage reads CSVs EIA does not publish; extract them from
+  # the zip first when they are missing, so `full_pipeline` on a clean
+  # checkout is not a hidden manual step.
+  defp prepare_eia860_if_needed do
+    if Enum.all?(@eia860_csvs, &File.regular?/1) do
+      {:ok, :already_present}
+    else
+      prepare_eia860!()
+      {:ok, :prepared}
+    end
+  end
+
   # DAT-16 / PLT-11: the COMPLETE documented ingestion order. Every stage
   # runs, in dependency order, each printing its own result. File-based
   # stages read from data/ and raise if their inputs are missing rather than
   # silently producing a degenerate grid.
   defp pipeline_stages do
     [
-      {"Ingesting transmission lines from HIFLD API",
-       fn -> PowerModel.Ingestion.ingest_transmission_lines_from_api() end},
-      {"Deriving substations from transmission line data",
-       fn -> PowerModel.Ingestion.derive_substations_from_api() end},
+      {"Ingesting transmission lines (vendored HIFLD Next snapshot)",
+       fn -> ingest_lines_default() end},
+      {"Ingesting substations (vendored native HIFLD layer)",
+       fn -> ingest_substations_default() end},
+      {"Preparing EIA-860 CSVs from the published zip", fn -> prepare_eia860_if_needed() end},
       {"Ingesting generators from EIA-860 (data/)",
        fn -> PowerModel.Ingestion.ingest_generators("data") end},
       {"Updating capacity factors from EIA-923 (data/)",
@@ -228,6 +396,9 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       {"Estimating electrical parameters", fn -> PowerModel.Ingestion.estimate_parameters() end},
       {"Mapping balancing authorities (data/)",
        fn -> PowerModel.Ingestion.map_balancing_authorities("data") end},
+      # After map_bas: the ties are placed per interconnection, and a bus's
+      # interconnection is only trustworthy once its BA is known.
+      {"Upserting curated HVDC ties", fn -> PowerModel.Ingestion.HvdcTies.run() end},
       {"Ingesting EIA-930 demand (data/)", fn -> PowerModel.Ingestion.ingest_demand("data") end},
       {"Ingesting Census county population (data/)",
        fn -> PowerModel.Ingestion.ingest_population("data") end},
@@ -239,6 +410,10 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       {"Ingesting curated datacenters", fn -> PowerModel.Ingestion.ingest_datacenters() end},
       {"Mapping datacenters to grid buses", fn -> PowerModel.Grid.map_datacenters_to_grid() end},
       {"Cleanup: re-mapping synthetic components", fn -> PowerModel.Ingestion.Cleanup.run() end},
+      # ROADMAP item 12: runs after cleanup, so it sees the endpoints the
+      # 50 km last-resort search recovered and joins only what is still apart.
+      {"Repairing network connectivity",
+       fn -> PowerModel.Ingestion.BusMapper.repair_connectivity() end},
       # ROADMAP Phase 0 item 3: the gates run LAST, on the data every earlier
       # stage just wrote, and fail the pipeline on a topology regression.
       {"Validating ingested data", fn -> run_validation([]) end}

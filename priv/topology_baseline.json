@@ -1,45 +1,45 @@
 {
-  "generated_at": "2026-08-15T14:09:24Z",
+  "generated_at": "2026-08-15T16:44:34Z",
   "metrics": {
-    "bus_count": 160164,
-    "buses_without_ba": 82200,
-    "generator_count": 31664,
+    "bus_count": 89969,
+    "buses_without_ba": 0,
+    "generator_count": 26882,
     "generators_without_bus": 1,
-    "geolocated_bus_count": 77964,
+    "geolocated_bus_count": 89969,
     "geolocated_buses_without_ba": 0,
     "geolocated_buses_without_interconnection": 0,
     "interconnections": {
       "ERCOT": {
-        "component_count": 929,
-        "connected_bus_count": 5268,
-        "connected_fraction": 0.5669,
-        "geolocated_bus_count": 9293,
-        "largest_component_bus_count": 2847,
-        "largest_component_fraction": 0.3064
+        "component_count": 178,
+        "connected_bus_count": 6189,
+        "connected_fraction": 0.96,
+        "geolocated_bus_count": 6447,
+        "largest_component_bus_count": 5651,
+        "largest_component_fraction": 0.8765
       },
       "Eastern": {
-        "component_count": 4819,
-        "connected_bus_count": 29007,
-        "connected_fraction": 0.5266,
-        "geolocated_bus_count": 55085,
-        "largest_component_bus_count": 14996,
-        "largest_component_fraction": 0.2722
+        "component_count": 2029,
+        "connected_bus_count": 58124,
+        "connected_fraction": 0.9043,
+        "geolocated_bus_count": 64272,
+        "largest_component_bus_count": 51713,
+        "largest_component_fraction": 0.8046
       },
       "Western": {
-        "component_count": 974,
-        "connected_bus_count": 4445,
-        "connected_fraction": 0.3272,
-        "geolocated_bus_count": 13586,
-        "largest_component_bus_count": 2249,
-        "largest_component_fraction": 0.1655
+        "component_count": 268,
+        "connected_bus_count": 18081,
+        "connected_fraction": 0.9393,
+        "geolocated_bus_count": 19250,
+        "largest_component_bus_count": 17265,
+        "largest_component_fraction": 0.8969
       }
     },
-    "line_count": 135876,
-    "lines_in_service": 124869,
-    "lines_unmapped_endpoints": 1751,
-    "self_loop_lines": 1805,
+    "line_count": 91460,
+    "lines_in_service": 91348,
+    "lines_unmapped_endpoints": 4738,
+    "self_loop_lines": 0,
     "self_loop_transformers": 0,
-    "transformer_count": 29940,
+    "transformer_count": 11653,
     "transformers_unmapped_endpoints": 0
   },
   "note": "Topology census baseline written by PowerModel.Ingestion.Validation. Regenerate with `mix power_model.ingest validate --update-baseline` and commit the change together with the ingest change that caused it.",

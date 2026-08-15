@@ -2,10 +2,18 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
   @moduledoc """
   Ingest substations from HIFLD data.
 
-  Two modes:
-  1. From shapefile (if available)
-  2. Derived from transmission line endpoint data via the API
-     (using SUB_1/SUB_2 fields and line endpoint coordinates)
+  Three modes, in order of preference:
+
+  1. **Native substations from the vendored GeoJSON mirror** (`ingest/1` on a
+     `.geojson`/`.geojsonl` file) — 77,946 real yards with NAME, MAX_VOLT and
+     MIN_VOLT, checksummed in `data/vendored/PROVENANCE.md`. This is the
+     source the ingest task prefers, and the only one that gives line
+     endpoints a real substation to be keyed to by name.
+  2. From a shapefile directory (`ingest/1` on a directory).
+  3. Derived from transmission line endpoint data via the API
+     (`derive_from_api/0`, using SUB_1/SUB_2 and line endpoint coordinates) —
+     the fallback that invents substations at endpoint centroids because no
+     substation layer is available.
 
   ## Substation identity (API-derived mode)
 
@@ -20,6 +28,15 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
   each such endpoint gets a per-endpoint coordinate-derived id
   (`"NAME@lat,lon"` at 3 decimals, ~110 m).
 
+  ## Voltage levels
+
+  Each cluster's endpoint voltages are collapsed within 5% (115 kV and 120 kV
+  records of the same yard are one level) and the whole descending list is
+  stored in `voltage_levels`. `max_voltage_kv` / `min_voltage_kv` remain the head and tail
+  of that list for compatibility. `BusMapper` gives every stored level its own
+  bus, so line endpoints snap to their real level instead of the nearest
+  extreme (LIN-5).
+
   > #### Re-ingest note {: .warning}
   > The `hifld_id` format changed from the bare name to `NAME@lat,lon`.
   > Re-ingesting into an existing database creates the corrected clustered
@@ -29,11 +46,19 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
   > `hifld_id` does not contain `"@"` before re-deriving.
   """
 
+  import Ecto.Query
+
   alias PowerModel.Repo
   alias PowerModel.Grid.Substation
+  alias PowerModel.Grid.TransmissionLine
   alias PowerModel.Ingestion.HIFLD.API
+  alias PowerModel.Ingestion.HIFLD.EndpointMatcher
+  alias PowerModel.Ingestion.HIFLD.GeoJSON
 
   @service "Electric_Power_Transmission_Lines"
+
+  # HIFLD writes this in place of a missing numeric value.
+  @null_sentinel -999_999
 
   # Endpoints with the same name within this distance are one substation.
   @cluster_radius_km 5.0
@@ -186,9 +211,252 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
   end
 
   @doc """
-  Ingest from local shapefile directory.
+  Ingest from a local file or directory.
+
+  A `.geojson`/`.geojsonl`/`.json` FILE is the vendored native substation
+  layer (see `ingest_geojson/1`); a DIRECTORY is a HIFLD shapefile export.
   """
   def ingest(path) do
+    cond do
+      File.dir?(path) -> ingest_shapefile(path)
+      File.regular?(path) -> ingest_geojson(path)
+      true -> raise "HIFLD substation source not found at #{path}"
+    end
+  end
+
+  @doc """
+  Ingest the vendored native substation layer from GeoJSON.
+
+  Every feature is a real surveyed yard, so identity is HIFLD's own record id
+  rather than the name+cluster scheme `derive_from_api/0` has to invent
+  (LIN-1) — no two rows share an `ID`, and endpoints key to them by name.
+  Upserts on `hifld_id`, so re-running is idempotent.
+
+  `-999999` sentinels in MAX_VOLT/MIN_VOLT become nil rather than a
+  million-volt yard; a substation left with no voltage at all still ingests
+  (BusMapper gives it a default-kV bus) and, once lines are in, picks up its
+  real levels from `augment_voltage_levels_from_lines/0`.
+
+  Returns `{:ok, inserted}`.
+  """
+  def ingest_geojson(path) do
+    IO.puts("Ingesting substations from #{path}...")
+
+    # 1 = features seen, 2 = inserted, 3 = skipped (no geometry / no id)
+    counter = :counters.new(3, [:atomics])
+
+    path
+    |> GeoJSON.stream_features!()
+    |> Stream.map(fn feature ->
+      :counters.add(counter, 1, 1)
+      parse_geojson_substation(feature)
+    end)
+    |> Stream.filter(fn
+      nil ->
+        :counters.add(counter, 3, 1)
+        false
+
+      _ ->
+        true
+    end)
+    |> Stream.chunk_every(1000)
+    |> Stream.each(fn batch ->
+      insert_batch(batch)
+      :counters.add(counter, 2, length(batch))
+      count = :counters.get(counter, 2)
+      if rem(count, 10_000) < 1000, do: IO.puts("  #{count} substations inserted...")
+    end)
+    |> Stream.run()
+
+    seen = :counters.get(counter, 1)
+    inserted = :counters.get(counter, 2)
+    skipped = :counters.get(counter, 3)
+
+    IO.puts("Read #{seen} features: #{inserted} substations inserted, #{skipped} skipped.")
+
+    {:ok, inserted}
+  end
+
+  @doc """
+  Parse one native-layer GeoJSON feature into an insertable entry, or nil when
+  it has no point geometry or no id.
+  """
+  def parse_geojson_substation(%{"properties" => props} = feature) do
+    with {lon, lat} <- GeoJSON.point_coordinates(feature),
+         hifld_id when hifld_id != "" <- native_hifld_id(props) do
+      max_kv = sanitize_voltage(props["MAX_VOLT"])
+      min_kv = sanitize_voltage(props["MIN_VOLT"])
+
+      levels =
+        [max_kv, min_kv]
+        |> Enum.reject(&is_nil/1)
+        |> cluster_voltage_levels()
+
+      now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+
+      %{
+        name: props["NAME"] |> to_string() |> String.trim() |> default_name(hifld_id),
+        voltage_levels: levels,
+        max_voltage_kv: List.first(levels),
+        min_voltage_kv: if(length(levels) > 1, do: List.last(levels)),
+        coordinates: %Geo.Point{coordinates: {lon * 1.0, lat * 1.0}, srid: 4326},
+        hifld_id: hifld_id,
+        status: parse_status(props["STATUS"]),
+        inserted_at: now,
+        updated_at: now
+      }
+    else
+      _ -> nil
+    end
+  end
+
+  def parse_geojson_substation(_), do: nil
+
+  @doc """
+  Merge the voltages of terminating lines into each substation's stored level
+  list, and return `%{substations_updated: n, levels_added: n}`.
+
+  The native layer reports only MAX_VOLT and MIN_VOLT, and 18,589 rows report
+  neither. A 500/345/138 yard therefore stores 500 and 138 and offers no bus
+  at 345, so every 345 kV line terminating there fails its voltage-filtered
+  snap and the endpoint is dropped — LIN-5, arriving through the data instead
+  of through the code this time. The lines themselves carry the missing
+  levels: each one names the two yards it terminates at and its own voltage.
+
+  Endpoints are attributed by name (`EndpointMatcher`), so this runs after
+  both lines and substations are ingested and before `map_buses`.
+  """
+  def augment_voltage_levels_from_lines do
+    index = EndpointMatcher.build_index()
+
+    # Endpoints come back as four floats per line rather than the geometry:
+    # the national snapshot is 94,619 LineStrings and materializing them all
+    # to read their first and last point is gigabytes for eight numbers each.
+    voltages_by_substation =
+      from(l in TransmissionLine,
+        where: not is_nil(l.voltage_kv) and l.voltage_kv > 0.0 and not is_nil(l.geometry),
+        select: %{
+          sub_1: l.sub_1,
+          sub_2: l.sub_2,
+          voltage_kv: l.voltage_kv,
+          from_lon: fragment("ST_X(ST_StartPoint(?))", l.geometry),
+          from_lat: fragment("ST_Y(ST_StartPoint(?))", l.geometry),
+          to_lon: fragment("ST_X(ST_EndPoint(?))", l.geometry),
+          to_lat: fragment("ST_Y(ST_EndPoint(?))", l.geometry)
+        }
+      )
+      |> Repo.all()
+      |> Enum.reduce(%{}, fn line, acc ->
+        acc
+        |> add_endpoint_voltage(
+          index,
+          line.sub_1,
+          endpoint(line.from_lon, line.from_lat),
+          line.voltage_kv
+        )
+        |> add_endpoint_voltage(
+          index,
+          line.sub_2,
+          endpoint(line.to_lon, line.to_lat),
+          line.voltage_kv
+        )
+      end)
+
+    IO.puts(
+      "  Substations named by at least one line endpoint: #{map_size(voltages_by_substation)}"
+    )
+
+    apply_augmented_levels(voltages_by_substation)
+  end
+
+  defp add_endpoint_voltage(acc, _index, _name, nil, _kv), do: acc
+
+  defp add_endpoint_voltage(acc, index, name, point, kv) do
+    case EndpointMatcher.resolve(index, name, point, EndpointMatcher.name_match_radius_km()) do
+      {:ok, sub_id, _distance} -> Map.update(acc, sub_id, [kv], &[kv | &1])
+      _ -> acc
+    end
+  end
+
+  defp apply_augmented_levels(voltages_by_substation) when map_size(voltages_by_substation) == 0,
+    do: %{substations_updated: 0, levels_added: 0}
+
+  defp apply_augmented_levels(voltages_by_substation) do
+    ids = Map.keys(voltages_by_substation)
+
+    updates =
+      from(s in Substation, where: s.id in ^ids, select: {s.id, s.voltage_levels})
+      |> Repo.all()
+      |> Enum.flat_map(fn {id, stored} ->
+        stored = stored || []
+        merged = cluster_voltage_levels(stored ++ Map.fetch!(voltages_by_substation, id))
+
+        if merged != stored do
+          [{id, merged, length(merged) - length(stored)}]
+        else
+          []
+        end
+      end)
+
+    Enum.each(Enum.chunk_every(updates, 500), fn chunk ->
+      Repo.transaction(fn ->
+        Enum.each(chunk, fn {id, levels, _added} ->
+          from(s in Substation, where: s.id == ^id)
+          |> Repo.update_all(
+            set: [
+              voltage_levels: levels,
+              max_voltage_kv: List.first(levels),
+              min_voltage_kv: if(length(levels) > 1, do: List.last(levels)),
+              updated_at: NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+            ]
+          )
+        end)
+      end)
+    end)
+
+    added = Enum.reduce(updates, 0, fn {_, _, n}, sum -> sum + max(n, 0) end)
+
+    IO.puts(
+      "  Voltage levels augmented from lines: #{length(updates)} substations, +#{added} levels"
+    )
+
+    %{substations_updated: length(updates), levels_added: added}
+  end
+
+  defp endpoint(lon, lat) when is_number(lon) and is_number(lat), do: {lon, lat}
+  defp endpoint(_, _), do: nil
+
+  @doc """
+  Turn a HIFLD numeric cell into a voltage, mapping the `#{@null_sentinel}`
+  sentinel (18,589 MAX_VOLT / 24,365 MIN_VOLT rows in the vendored layer) and
+  any non-positive value to nil.
+  """
+  def sanitize_voltage(nil), do: nil
+
+  def sanitize_voltage(value) when is_number(value) do
+    if value > 0 and value != @null_sentinel, do: value * 1.0
+  end
+
+  def sanitize_voltage(value) when is_binary(value) do
+    case Float.parse(String.trim(value)) do
+      {f, _} -> sanitize_voltage(f)
+      :error -> nil
+    end
+  end
+
+  def sanitize_voltage(_), do: nil
+
+  # HIFLD's own record id. Unique across the vendored layer (verified: 77,946
+  # features, 77,946 distinct IDs), and unambiguous against the API-derived
+  # "NAME@lat,lon" ids, which always contain an "@".
+  defp native_hifld_id(props) do
+    (props["ID"] || props["OBJECTID"] || props["GlobalID"] || "") |> to_string() |> String.trim()
+  end
+
+  defp default_name("", hifld_id), do: "UNKNOWN#{hifld_id}"
+  defp default_name(name, _hifld_id), do: name
+
+  defp ingest_shapefile(path) do
     path
     |> read_shapefile()
     |> Flow.from_enumerable(max_demand: 100)
@@ -277,6 +545,10 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
 
     %{
       name: name,
+      # LIN-5: the whole clustered list, not just its ends. A 500/345/138/115
+      # yard used to store 500 and 115 and lose the two levels in between,
+      # which is why 345 kV endpoints there had no bus to snap to.
+      voltage_levels: voltages,
       max_voltage_kv: max_kv,
       min_voltage_kv: if(min_kv != max_kv, do: min_kv, else: nil),
       coordinates: %Geo.Point{coordinates: {avg_lon, avg_lat}, srid: 4326},
@@ -337,6 +609,10 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
           name: String.trim(name),
           max_voltage_kv: max_kv,
           min_voltage_kv: min_kv,
+          # The shapefile only reports the extremes, so the stored level list
+          # is those two. The API-derived path (build_entries/1) sees every
+          # terminating line's voltage and stores the full list.
+          voltage_levels: [max_kv, min_kv] |> Enum.reject(&is_nil/1) |> cluster_voltage_levels(),
           coordinates: coords,
           hifld_id: hifld_id,
           status: parse_status(get_field(dbf_row, "STATUS"))

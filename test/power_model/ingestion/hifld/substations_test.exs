@@ -151,6 +151,44 @@ defmodule PowerModel.Ingestion.HIFLD.SubstationsTest do
       assert Enum.any?(entries, &(&1.name == "TAP 7"))
     end
 
+    test "the full clustered level list is stored, not just its ends (LIN-5)" do
+      # A KEYSTONE-class yard: four levels terminate in the same cluster. The
+      # old entry kept 500 and 115 and threw 345 and 138 away, so nothing at
+      # those levels ever got a bus to snap to.
+      endpoints = [
+        {"KEYSTONE", -119.0, 35.0, 500.0},
+        {"KEYSTONE", -119.001, 35.0, 345.0},
+        {"KEYSTONE", -119.002, 35.0, 138.0},
+        {"KEYSTONE", -119.003, 35.0, 115.0}
+      ]
+
+      assert [entry] = Substations.build_entries(endpoints)
+
+      assert entry.voltage_levels == [500.0, 345.0, 138.0, 115.0]
+      assert entry.max_voltage_kv == 500.0
+      assert entry.min_voltage_kv == 115.0
+    end
+
+    test "stored levels carry the 5% clustering, deduplicated" do
+      endpoints = [
+        {"ALPHA", -119.0, 35.0, 345.0},
+        {"ALPHA", -119.001, 35.0, 345.0},
+        {"ALPHA", -119.002, 35.0, 138.0},
+        {"ALPHA", -119.003, 35.0, 138.4}
+      ]
+
+      assert [entry] = Substations.build_entries(endpoints)
+      assert entry.voltage_levels == [345.0, 138.4]
+    end
+
+    test "a substation with no voltage data stores an empty level list" do
+      assert [entry] = Substations.build_entries([{"GAMMA", -119.0, 35.0, nil}])
+
+      assert entry.voltage_levels == []
+      assert entry.max_voltage_kv == nil
+      assert entry.min_voltage_kv == nil
+    end
+
     test "voltage levels within 5% collapse to one level (single-level -> nil min)" do
       endpoints = [
         {"ALPHA", -119.0, 35.0, 115.0},
@@ -165,6 +203,7 @@ defmodule PowerModel.Ingestion.HIFLD.SubstationsTest do
     test "entries carry required insert fields" do
       assert [entry] = Substations.build_entries([{"BETA", -119.0, 35.0, 230.0}])
       assert entry.status == "in_service"
+      assert entry.voltage_levels == [230.0]
       assert %NaiveDateTime{} = entry.inserted_at
       assert %NaiveDateTime{} = entry.updated_at
       assert entry.hifld_id == "BETA@35.00,-119.00"

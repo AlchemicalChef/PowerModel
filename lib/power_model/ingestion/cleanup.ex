@@ -31,6 +31,11 @@ defmodule PowerModel.Ingestion.Cleanup do
   # Voltage tolerance for matching (±20%)
   @voltage_tolerance 0.20
 
+  # Degrees of longitude per km at the highest CONUS latitude (49 deg N), where
+  # a degree of longitude is shortest. Used to widen the planar bounding box in
+  # `within/2` so it can never exclude a point the geography test would accept.
+  @deg_per_km 1.0 / 73.0
+
   def run do
     IO.puts("=== Cleanup: Re-mapping synthetic components to real ones ===\n")
     remap_generators()
@@ -278,19 +283,46 @@ defmodule PowerModel.Ingestion.Cleanup do
   # interconnection id is given, only buses in that interconnection are
   # candidates (PLT-7); nil means the source interconnection is unknown and
   # no restriction applies.
+  #
+  # With a bus per voltage level, the nearest substation offers several buses
+  # at one coordinate. Prefer its LOWEST level: this call places generators and
+  # their synthetic ties, and the tie is a near-zero-impedance weld between the
+  # generator's 13.8 kV bus and whatever it lands on (LIN-8, still open) — the
+  # lowest level at least keeps that weld to the smallest ratio available
+  # instead of leaving the choice to the planner.
+  # Radius filter that can actually use the GiST index on `buses.coordinates`.
+  #
+  # `ST_DWithin(coordinates::geography, ...)` cannot: the index is on the
+  # GEOMETRY, so casting both sides to geography forces a sequential scan of
+  # every bus — measured at 23-41 ms per call, which at national scale is tens
+  # of thousands of full scans. The planar `ST_DWithin` on the raw geometry is
+  # index-backed but works in degrees, so it runs first as a deliberately
+  # generous bounding filter and the exact geography test runs on what
+  # survives.
+  defmacrop within(coordinates, point, radius_m) do
+    quote do
+      fragment(
+        "ST_DWithin(?, ?, ?) AND ST_DWithin(?::geography, ?::geography, ?)",
+        unquote(coordinates),
+        unquote(point),
+        ^(unquote(radius_m) / 1000.0 * @deg_per_km),
+        unquote(coordinates),
+        unquote(point),
+        ^unquote(radius_m)
+      )
+    end
+  end
+
   defp find_nearest_substation_bus(nil, _radius, _interconnection_id), do: nil
 
   defp find_nearest_substation_bus(point, radius_m, interconnection_id) do
     from(b in Bus,
-      where:
-        b.source == "substation" and
-          fragment(
-            "ST_DWithin(?::geography, ?::geography, ?)",
-            b.coordinates,
-            ^point,
-            ^radius_m
-          ),
-      order_by: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
+      where: b.source == "substation" and within(b.coordinates, ^point, radius_m),
+      order_by: [
+        asc: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
+        asc: b.base_kv,
+        asc: b.id
+      ],
       limit: 1
     )
     |> then(fn query ->
@@ -303,44 +335,48 @@ defmodule PowerModel.Ingestion.Cleanup do
     |> Repo.one()
   end
 
-  # Find nearest bus for a line endpoint: try voltage-matched first, then any
+  # Find nearest bus for a line endpoint: try voltage-matched substation buses
+  # first, then any bus at a matching voltage.
+  #
+  # A substation now carries a bus for EVERY voltage level it has, all at the
+  # same coordinate, so several of them fall inside the +/-20% window at once
+  # and distance cannot tell them apart. Rank the voltage match after distance
+  # so a 345 kV endpoint lands on the yard's 345 kV bus instead of whichever
+  # level the planner returned first (LIN-5).
   defp find_bus_for_line(nil, _kv), do: nil
 
   defp find_bus_for_line(point, voltage_kv) do
     tolerance = voltage_kv * @voltage_tolerance
+    low = voltage_kv - tolerance
+    high = voltage_kv + tolerance
 
-    # Try voltage-matched substation bus first
-    result =
+    substation_match =
       Repo.one(
         from b in Bus,
           where:
             b.source == "substation" and
-              fragment(
-                "ST_DWithin(?::geography, ?::geography, ?)",
-                b.coordinates,
-                ^point,
-                ^@line_remap_radius_m
-              ) and
-              b.base_kv >= ^(voltage_kv - tolerance) and
-              b.base_kv <= ^(voltage_kv + tolerance),
-          order_by: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
+              within(b.coordinates, ^point, @line_remap_radius_m) and
+              b.base_kv >= ^low and b.base_kv <= ^high,
+          order_by: [
+            asc: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
+            asc: fragment("abs(? - ?)", b.base_kv, ^voltage_kv),
+            asc: b.id
+          ],
           limit: 1
       )
 
     # Fall back to any bus (including synthetic) at matching voltage
-    result ||
+    substation_match ||
       Repo.one(
         from b in Bus,
           where:
-            fragment(
-              "ST_DWithin(?::geography, ?::geography, ?)",
-              b.coordinates,
-              ^point,
-              ^@line_remap_radius_m
-            ) and
-              b.base_kv >= ^(voltage_kv - tolerance) and
-              b.base_kv <= ^(voltage_kv + tolerance),
-          order_by: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
+            within(b.coordinates, ^point, @line_remap_radius_m) and
+              b.base_kv >= ^low and b.base_kv <= ^high,
+          order_by: [
+            asc: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
+            asc: fragment("abs(? - ?)", b.base_kv, ^voltage_kv),
+            asc: b.id
+          ],
           limit: 1
       )
   end
