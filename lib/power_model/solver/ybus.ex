@@ -102,8 +102,11 @@ defmodule PowerModel.Solver.YBus do
 
   # Private
 
+  # Prepend the (constant-size) branch entries: appending to the accumulator
+  # copies it per branch, which is O(branches^2) — hours at Eastern's 64,664.
+  # consolidate_triplets/2 group-sums by position, so order is irrelevant.
   defp add_line_triplets(triplets, line, bus_index_map) do
-    triplets ++ line_triplets(line, bus_index_map)
+    line_triplets(line, bus_index_map) ++ triplets
   end
 
   defp line_triplets(line, bus_index_map) do
@@ -133,7 +136,7 @@ defmodule PowerModel.Solver.YBus do
   end
 
   defp add_transformer_triplets(triplets, xfmr, bus_index_map) do
-    triplets ++ transformer_triplets(xfmr, bus_index_map)
+    transformer_triplets(xfmr, bus_index_map) ++ triplets
   end
 
   # Map.get, not struct access: buses arrive both as plain maps (tests) and
