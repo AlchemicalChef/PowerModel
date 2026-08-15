@@ -160,9 +160,26 @@ L ≈ multi-week.
 
 ## Decisions needed now (independent of build order)
 
-- **Vendor a pinned HIFLD snapshot.** The live source is an unofficial, unlicensed,
-  unversioned ArcGIS mirror of a dataset whose portal DHS shut down in Aug 2025.
-  Record fetch date + checksums; stop pulling live. Archives: HSDL, DataLumos.
+- **Vendor a pinned HIFLD snapshot — concrete targets verified live (2026-08):**
+  - **Transmission lines**: HIFLD Next (hifld.publicenvirodata.org, no login, public
+    domain) serves the final Data Rescue snapshot as GeoParquet — **94,619 features,
+    46.4 MB** — versus the **52,244** in the unofficial ArcGIS mirror we currently pull.
+    Switching sources nearly doubles line coverage AND fixes provenance in one move.
+    (Alt archive: SeerAI on Source Cooperative, CC-BY, anonymous S3.)
+  - **Substations**: the native layer was pulled from public HIFLD ~2022 and is ABSENT
+    from every official archive. The last public cut survives on one third-party ArcGIS
+    mirror (services6…OO2s4OoyCZkYJ6oE, **77,946 features**, full NAME/MAX_VOLT/MIN_VOLT
+    schema, 2021 vintage, ~24% voltage sentinels) owned by a personal account —
+    **one deletion away from extinction. Pin it immediately.** It directly feeds the
+    already-coded native-substations path and the Phase-2 connectivity work.
+  - **Power plants**: HIFLD Next has 16,317 features, but EIA-860/860M is the living
+    upstream — use the archive only as a convenience join.
+  - Record fetch dates + checksums for all three; stop pulling live.
+  - Bonus: EIA-930 six-month bulk CSVs reach back to **July 2015** (API only to 2019) —
+    the dispatch/validation work (Phases 0-1) should backfill from the CSVs.
+  - FERC 715 rejection is now evidence-backed: the CEII NDA bars "any derivative form"
+    of the data — a network model with traceable buses/branches is unpublishable, with
+    $25k/day exposure. Even DOE's National Transmission Planning Study routed around it.
 - **Schedule the re-ingest.** R3's substation-identity, status-recovery, and HVDC
   fixes are code-only until then; `line_type='dc'` matches zero rows today.
 - **Close the dev-DB schema drift** (rating_b/c columns exist without migrations) —
