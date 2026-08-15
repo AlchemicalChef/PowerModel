@@ -114,7 +114,37 @@ L ≈ multi-week.
     ERCOT ties…). Note: `line_type='dc'` matches ZERO rows in the live DB until
     re-ingest — the PDCI is still an AC line in the data.
 
-### Phase 3 — Frequency & cascade dynamics (S–M each)
+### Phase 3 — Frequency & cascade dynamics (S–M each) — **LANDED 2026-08-15**
+
+> **STATUS 2026-08-15: Phase 3 LANDED** (items 14–17 + REVIEW CAS-15/CAS-16/ENE-19,
+> ENE-14 closed in passing). Measured results:
+> - **β = ΔP/Δf in the BAL-003 ±30% band on all three interconnections**: Eastern
+>   1,961 (anchor 923–2,400 obligation basis), Western 892 (anchor 840), ERCOT 394
+>   (anchor 381) MW/0.1 Hz — from a machine-constants table (per-fuel H, governor
+>   duty/share, response rates), not tuned per-interconnection.
+> - **ERCOT N-1 design contingency (1,375 MW trip): 3,356.6 MW UFLS shed → 0 MW shed**,
+>   nadir 59.282 → 59.340 Hz. The reversal comes from ENE-19 (dispatch now holds back
+>   contingency reserve on governor-duty units: Eastern 2,600 / Western 2,626 / ERCOT
+>   1,375 MW) plus deliverable primary response (item 14) and ramp-limited secondary/
+>   tertiary tiers on a real cascade clock (item 16,
+>   `step_advance_s = max(relay_advance, frequency_advance)`).
+> - Reserve hold-back made fuel-mix TV slightly BETTER (0.009060 → 0.008945): the
+>   displaced MW land on p_min-blocked units.
+> - **Persistent island frequency state** (item 15): `Frequency.simulate_with_state/4`
+>   threads {f, governor state, UFLS stage} across cascade segments; islands inherit
+>   state by plurality of load; PRC-024 generator UF/OF trips feed back into the same
+>   step's deficit (protection.ex pure envelopes). Deep-deficit islands (≳27%) now
+>   collapse through the trip→deficit→trip loop instead of paper-balancing —
+>   the missing positive feedback of real blackouts. End-to-end ERCOT reference
+>   cascade: 2,653.5 → 582.8 MW shed (the old number was mostly phantom UFLS from
+>   restart-at-60.0-Hz double counting).
+> - **Storage as duty-cycle charge/discharge** (item 17): SOC-conserving daily
+>   schedule, discharge hard-ceilinged by the measured "other" column. Phantom
+>   always-on battery energy 27.4 GWh/day → 0; CISO hourly correlation 0.891.
+> - CAS-15: `island_dead?` is now "no generation", size-independent (consistent with
+>   SOL-3). CAS-16: redispatch draws sustained reserve only, ramp-limited.
+> - Follow-ups logged: CAS-18 (event volume at collapse scale), pumped-storage
+>   extension, UI surfacing of reserve/collapse state.
 14. **Deliverable primary response** (S–M): fuel-specific response-rate caps over the
     nadir window; governor-duty flags (nuclear ≈ none). Validate the β = ΔP/Δf slope
     against BAL-003 FRO per interconnection (±30% is a pass).

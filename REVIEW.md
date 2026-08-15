@@ -469,9 +469,9 @@ Close via ROADMAP item 9.
 written by older code versions are permanently uncorrectable — measured: EHV impedances
 and ratings exactly 2× off the current table (a 500 kV line rated equal to a 345 kV).
 ROADMAP item 8.
-**CAS-15 (LOW-MED) [OPEN]** `island_dead?/2` still declares single-bus islands dead,
+**CAS-15 (FIXED 2026-08-15)** `island_dead?/2` still declares single-bus islands dead,
 contradicting SOL-3's `min_buses = 1` fix; `cascade_test.exs` pins the old behavior.
-**CAS-16 (MED) [OPEN→roadmap]** `simulated_time` advances 0 s on steps whose only trips
+**CAS-16 (FIXED 2026-08-15)** `simulated_time` advances 0 s on steps whose only trips
 are non-thermal — any future ramp/AGC modeling is unlimited until fixed (ROADMAP item 16).
 **ENE-14 (LOW) [OPEN]** `Frequency.normalize_fuel` has no case for OIL or biomass/waste
 codes (~15 GW geolocated falls to gas dynamics); the 268 GW `COL` case is entirely on
@@ -494,6 +494,16 @@ needs work (e.g. no back-switching for genuinely-violating buses within a round,
 simultaneous-violation resolution). Guarded bus-for-bus at IEEE-118 scale where it
 works; the skipped ACTIVSg2000 AC tests are the acceptance gate. Found by the Phase 0
 validation ladder, 2026-08-15.
+**ENE-19 (FIXED 2026-08-15)** Fuel-anchored dispatch carries no
+contingency-reserve requirement: ERCOT's operating point leaves ~1.27 GW of
+governor-duty headroom against its 1,375 MW design contingency, so the island sheds
+customers for its own largest credible single loss (nadir 59.282, 3,357 MW shed at the
+modal hour). The old nameplate-droop model masked this by accident. Fix belongs in the
+Phase 3 reserve tiers (item 16): hold spinning reserve ≥ the BA/interconnection design
+contingency at dispatch time. Found by the β acceptance work, 2026-08-15.
+**CAS-18 (VOLUME, LOW) [OPEN]** Large cascades now emit ~16.7k ufls_shed events on the
+ERCOT reference case (was 948) — per-load event granularity at collapse scale. Needs a
+DAT-20-style aggregation decision when payloads are next reshaped (UI-H6 territory).
 **CAS-17 (DRIFT, LOW) [OPEN]** `FailureEvent` changeset whitelists component_type to
 transmission_line/generator/transformer/load/bus, but live event streams also carry
 water_facility, datacenter, island, cascade, and (new) btm_solar — nothing routes through
