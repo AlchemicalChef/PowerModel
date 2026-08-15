@@ -103,6 +103,10 @@
 [data-phx-session], [data-phx-teleported-src] { display: contents }
 
 /* This file is for your main application CSS */
+
+/* MapLibre GL base styles, bundled from the npm package (no CDN) */
+@import "maplibre-gl/dist/maplibre-gl.css";
+
 @import "./grid/map.css";
 @import "./grid/info_panel.css";
 @import "./grid/dashboard.css";

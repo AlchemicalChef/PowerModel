@@ -9,6 +9,7 @@ import { createDatacentersLayer } from "./layers/datacenters_layer";
 import { createTransformersLayer } from "./layers/transformers_layer";
 import { createDemandDensityLayer } from "./layers/demand_density_layer";
 import { COLOR_SCALES } from "./color_scales";
+import { ViewportTracker } from "./viewport_tracker";
 
 const MAPLIBRE_STYLE =
   "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
@@ -50,6 +51,9 @@ export class MapManager {
     this.selectedComponent = null; // { type, id }
     this.map = null;
     this.deckOverlay = null;
+    this.viewportTracker = null;
+    this._waterLoadPromise = null;
+    this._errorBanner = null;
 
     this._initMap();
   }
@@ -74,21 +78,50 @@ export class MapManager {
       this._updateLayers();
     });
 
-    this.map.on("moveend", () => {
-      if (this.onViewportChange) {
-        const bounds = this.map.getBounds();
-        this.onViewportChange(this.map.getZoom(), {
-          west: bounds.getWest(),
-          south: bounds.getSouth(),
-          east: bounds.getEast(),
-          north: bounds.getNorth(),
-        });
-      }
+    // Basemap/tile failures must be visible, not a silent blank page.
+    this.map.on("error", (e) => {
+      console.error("GridMap: basemap error", e && e.error);
+      this._showMapError(
+        "Basemap failed to load. Grid overlays may still work; check your network connection."
+      );
+    });
+
+    // Zoom LOD and label culling are computed client-side from the viewport
+    // (no server round trip); the server is still informed so it can adapt
+    // payloads. The tracker debounces and filters insignificant moves.
+    this.viewportTracker = new ViewportTracker(this.map, (zoom, bounds) => {
+      this._updateLayers();
+      if (this.onViewportChange) this.onViewportChange(zoom, bounds);
     });
   }
 
+  // One-time, dismissable error banner inside the map container
+  _showMapError(message) {
+    if (this._errorBanner || !this.container) return;
+    const banner = document.createElement("div");
+    banner.className = "map-error-banner";
+    banner.setAttribute("role", "alert");
+    const text = document.createElement("span");
+    text.textContent = message;
+    const dismiss = document.createElement("button");
+    dismiss.className = "map-error-dismiss";
+    dismiss.type = "button";
+    dismiss.setAttribute("aria-label", "Dismiss");
+    dismiss.textContent = "×";
+    // Keep this._errorBanner set after dismissal so repeated tile errors
+    // don't re-spawn the banner every pan.
+    dismiss.addEventListener("click", () => banner.remove());
+    banner.appendChild(text);
+    banner.appendChild(dismiss);
+    this.container.appendChild(banner);
+    this._errorBanner = banner;
+  }
+
   async loadInitialData() {
-    const [genData, transData, subData, waterData, dcData, xfmrData, loadData] = await Promise.all([
+    // Water facilities (17.7 MB JSON, default-off layer) are NOT fetched
+    // here — see _ensureWaterFacilitiesLoaded (lazy, on first toggle or
+    // first cascade impact).
+    const [genData, transData, subData, dcData, xfmrData, loadData] = await Promise.all([
       fetch("/grid_data/generators.bin").then((r) =>
         r.ok ? r.arrayBuffer() : null
       ),
@@ -97,9 +130,6 @@ export class MapManager {
       ),
       fetch("/grid_data/substations.bin").then((r) =>
         r.ok ? r.arrayBuffer() : null
-      ),
-      fetch("/grid_data/water_facilities.json").then((r) =>
-        r.ok ? r.json() : null
       ),
       fetch("/grid_data/datacenters.json").then((r) =>
         r.ok ? r.json() : null
@@ -115,12 +145,36 @@ export class MapManager {
     if (genData) this.dataStore.loadGenerators(genData);
     if (transData) this.dataStore.loadTransmissionLines(transData);
     if (subData) this.dataStore.loadSubstations(subData);
-    if (waterData) this.dataStore.loadWaterFacilities(waterData);
     if (dcData) this.dataStore.loadDatacenters(dcData);
     if (xfmrData) this.dataStore.loadTransformers(xfmrData);
     if (loadData) this.dataStore.loadBusLoads(loadData);
 
     this._updateLayers();
+  }
+
+  // Lazy-fetch the water facilities JSON once, on first need. The promise is
+  // cached only on success: a transient network failure must not permanently
+  // disable the layer for the session, so failures clear the cache and the
+  // next toggle/cascade impact retries the fetch.
+  _ensureWaterFacilitiesLoaded() {
+    if (this._waterLoadPromise) return this._waterLoadPromise;
+    this._waterLoadPromise = fetch("/grid_data/water_facilities.json")
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((json) => {
+        this.dataStore.loadWaterFacilities(json);
+        this._updateLayers();
+      })
+      .catch((err) => {
+        this._waterLoadPromise = null;
+        console.error(
+          "GridMap: water facilities load failed (will retry on next toggle)",
+          err
+        );
+      });
+    return this._waterLoadPromise;
   }
 
   setSelectedComponent(type, id) {
@@ -135,6 +189,18 @@ export class MapManager {
     const selectedId = this.selectedComponent ? this.selectedComponent.id : null;
     const selectedType = this.selectedComponent ? this.selectedComponent.type : null;
     const layers = [];
+
+    // Current viewport (plain object) for client-side label culling
+    let viewBounds = null;
+    if (this.map) {
+      const b = this.map.getBounds();
+      viewBounds = {
+        west: b.getWest(),
+        south: b.getSouth(),
+        east: b.getEast(),
+        north: b.getNorth(),
+      };
+    }
 
     const ca = this.cascadeActive;
 
@@ -194,7 +260,8 @@ export class MapManager {
               state: obj.state,
             });
           }
-        }, selectedType === "substation" ? selectedId : null, ca)
+        }, selectedType === "substation" ? selectedId : null, ca,
+        this.stateVersion)
       );
     }
 
@@ -233,7 +300,8 @@ export class MapManager {
         }, selectedType === "water_facility" ? selectedId : null, ca,
         { affectedOnly: !this.showWaterFacilities && ca,
           hiddenTypes: this.categoryFilters.water,
-          stateVersion: this.stateVersion })
+          stateVersion: this.stateVersion,
+          bounds: viewBounds })
       );
     }
 
@@ -264,7 +332,21 @@ export class MapManager {
 
   applyDCResults(data) {
     this.stateVersion++;
+    this._applyDCClassification(data);
 
+    // A settled classification arriving while cascade frames exist is the
+    // authoritative post-cascade view: attach it to the last frame so
+    // scrubbing to the end of the timeline reproduces the settled view
+    // (frames are replayed by ARRAY POSITION — see showCascadeStep).
+    if (this.cascadeHistory.length > 0) {
+      this.cascadeHistory[this.cascadeHistory.length - 1].__finalClassification =
+        data;
+    }
+
+    this._updateLayers();
+  }
+
+  _applyDCClassification(data) {
     // This is the authoritative flow classification for the current topology:
     // clear previous flow states (keeping tripped marks, which the solver
     // cannot see — tripped lines carry no flow) so recovered lines stop
@@ -299,7 +381,11 @@ export class MapManager {
     }
     this.dataStore.applyTransformerStateMap(xfmrStateMap);
 
-    this._updateLayers();
+    // Per-line loading percentages for the "Loading %" view mode
+    // (contract #3; the field is optional — older servers omit it).
+    if (data.line_loading) {
+      this.dataStore.applyLineLoading(data.line_loading);
+    }
   }
 
   applyACResults(data) {
@@ -322,7 +408,26 @@ export class MapManager {
       if (this.onCascadeActiveChange) this.onCascadeActiveChange(true);
     }
 
+    // The cascade forces the water layer visible for impacted facilities;
+    // fetch the (lazy) dataset the first time an impact actually appears.
+    // States arriving before the fetch resolves are buffered in the store.
+    if (data.water_facility_ids && data.water_facility_ids.length > 0) {
+      this._ensureWaterFacilitiesLoaded();
+    }
+
     this._applyCascadeData(data);
+    this._updateLayers();
+  }
+
+  // Cascade finished (server "cascade_done", contract #2): leave cascade
+  // mode — vignette, ghosting, forced layers — but KEEP the final
+  // classification marks on the map.
+  endCascade(_stable) {
+    if (this.cascadeActive) {
+      this.cascadeActive = false;
+      if (this.onCascadeActiveChange) this.onCascadeActiveChange(false);
+    }
+    this.stateVersion++;
     this._updateLayers();
   }
 
@@ -382,6 +487,7 @@ export class MapManager {
   resetToBaseline() {
     this.stateVersion++;
     this.dataStore.resetAllStates();
+    this.dataStore.resetLineLoading();
     this.cascadeHistory = [];
 
     if (this.cascadeActive) {
@@ -399,6 +505,10 @@ export class MapManager {
 
   setWaterFacilitiesVisible(visible) {
     this.showWaterFacilities = !!visible;
+    if (this.showWaterFacilities) {
+      // Lazy 17.7 MB fetch on first toggle; _updateLayers re-runs on load
+      this._ensureWaterFacilitiesLoaded();
+    }
     this._updateLayers();
   }
 
@@ -423,18 +533,27 @@ export class MapManager {
     this._updateLayers();
   }
 
-  showCascadeStep(step) {
-    // Reset and replay THROUGH the clicked step (inclusive). Step numbers
-    // start at 0 (the manual trip), matching cascadeHistory indexes.
+  showCascadeStep(position) {
+    // Reset and replay THROUGH the clicked frame (inclusive), indexing
+    // cascadeHistory by ARRAY POSITION (contract #4). Server step numbers
+    // reset at every manual trip and can repeat across cascades in one
+    // session, so they are never used as indexes here. A frame carrying the
+    // settled post-cascade classification (__finalClassification, attached
+    // by applyDCResults) replays that classification too, so scrubbing to
+    // the last frame agrees with the settled view.
     this.stateVersion++;
     this.dataStore.resetAllStates();
-    const shouldBeActive = step >= 0 && this.cascadeHistory.length > 0;
+    const shouldBeActive = position >= 0 && this.cascadeHistory.length > 0;
     if (shouldBeActive !== this.cascadeActive) {
       this.cascadeActive = shouldBeActive;
       if (this.onCascadeActiveChange) this.onCascadeActiveChange(shouldBeActive);
     }
-    for (let i = 0; i <= step && i < this.cascadeHistory.length; i++) {
-      this._applyCascadeData(this.cascadeHistory[i]);
+    for (let i = 0; i <= position && i < this.cascadeHistory.length; i++) {
+      const frame = this.cascadeHistory[i];
+      this._applyCascadeData(frame);
+      if (frame.__finalClassification) {
+        this._applyDCClassification(frame.__finalClassification);
+      }
     }
     this._updateLayers();
   }
@@ -444,6 +563,14 @@ export class MapManager {
   }
 
   destroy() {
+    if (this.viewportTracker) {
+      this.viewportTracker.destroy();
+      this.viewportTracker = null;
+    }
+    if (this._errorBanner) {
+      this._errorBanner.remove();
+      this._errorBanner = null;
+    }
     if (this.map) {
       this.map.remove();
     }

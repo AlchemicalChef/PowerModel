@@ -1,14 +1,33 @@
 defmodule PowerModelWeb.GridLive.Index do
   use PowerModelWeb, :live_view
 
+  require Logger
+
   alias PowerModel.Engine.SimulationServer
+
+  # UI-M11: an N-1 screen that neither reports nor dies within this window is
+  # declared failed so the button never sticks at "Scanning...".
+  @n1_screening_timeout 60_000
 
   @impl true
   def mount(_params, _session, socket) do
-    sim_id = "sim_#{:erlang.unique_integer([:positive])}"
+    # CAS-6: node-local unique_integer collides across cluster nodes on the
+    # cluster-wide PubSub; the sim id must be globally unique.
+    sim_id = "sim_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+    # ENE-1: default to the latest hour with real EIA-930 demand; the raw
+    # baseline is ~2x real demand and only acceptable as an explicit choice.
+    default_hour = PowerModel.Demand.latest_demand_hour()
 
     if connected?(socket) do
       Phoenix.PubSub.subscribe(PowerModel.PubSub, "simulation:#{sim_id}")
+
+      if is_nil(default_hour) do
+        Logger.warning(
+          "no EIA-930 demand data loaded -- simulations will run on the " <>
+            "synthetic BASELINE load (~2x real demand)"
+        )
+      end
     end
 
     socket =
@@ -22,21 +41,40 @@ defmodule PowerModelWeb.GridLive.Index do
       |> assign(:view_mode, "voltage_level")
       |> assign(:interconnection, "all")
       |> assign(:demand_range, PowerModel.Demand.available_range())
-      |> assign(:selected_hour, nil)
+      |> assign(:selected_hour, default_hour)
       |> assign(:show_water, false)
       |> assign(:show_datacenters, false)
       |> assign(:show_demand_density, false)
       |> assign(:hidden_legend, %{})
       |> assign(:show_utilization, false)
       |> assign(:utilization, nil)
+      |> assign(:sim_server, nil)
+      |> assign(:server_scope, nil)
+      |> assign(:trip_task, nil)
+      |> assign(:reset_task, nil)
+      |> assign(:n1_task, nil)
 
     {:ok, socket, layout: {PowerModelWeb.Layouts, :grid}}
   end
 
   @impl true
   def handle_params(params, _url, socket) do
-    interconnection = params["interconnection"] || "all"
+    # UI-H1: the raw query param used to reach String.to_integer unvalidated
+    interconnection = validate_interconnection(params["interconnection"])
     {:noreply, assign(socket, :interconnection, interconnection)}
+  end
+
+  # CAS-4: a closed browser session must not leave a permanent GenServer
+  # holding a full grid snapshot (the server's idle timeout is the backstop
+  # for brutal kills that skip terminate/2).
+  @impl true
+  def terminate(_reason, socket) do
+    with sim_id when is_binary(sim_id) <- socket.assigns[:sim_id],
+         [{pid, _}] <- Registry.lookup(PowerModel.SimulationRegistry, sim_id) do
+      DynamicSupervisor.terminate_child(PowerModel.SimulationSupervisor, pid)
+    end
+
+    :ok
   end
 
   @impl true
@@ -60,56 +98,67 @@ defmodule PowerModelWeb.GridLive.Index do
     {:noreply, assign(socket, :selected_component, component)}
   end
 
-  def handle_event("inject_failure", %{"type" => type, "id" => id}, socket) do
-    sim_id = socket.assigns.sim_id
-    component_id = String.to_integer(id)
+  def handle_event("inject_failure", %{"type" => type, "id" => id}, socket)
+      when type in ["transmission_line", "generator", "transformer"] do
+    # UI-H1: raw client id -- validate, ignore garbage instead of crashing
+    case parse_int(id) do
+      nil ->
+        {:noreply, socket}
 
-    socket = assign(socket, :cascade_active, true)
-    socket = assign(socket, :solver_status, :solving)
+      component_id ->
+        # CAS-5 / UI-C3: a failed server start must surface as an error
+        # state, not an eternal spinner.
+        case ensure_sim_server_for(socket, {type, component_id}) do
+          {:ok, socket} ->
+            socket =
+              socket
+              |> assign(:cascade_active, true)
+              |> assign(:solver_status, :solving)
+              # UI-M2: each injection is a new disturbance; the nadir
+              # tracking starts fresh at nominal frequency.
+              |> update(:system_metrics, &%{&1 | frequency_hz: 60.0})
+              |> start_trip_task(type, component_id)
 
-    # Ensure simulation server is running with the right interconnection
-    ensure_sim_server(
-      sim_id,
-      socket.assigns.interconnection,
-      socket.assigns.selected_hour,
-      {type, component_id}
-    )
+            {:noreply, socket}
 
-    lv = self()
-
-    trip = fn ->
-      result =
-        case type do
-          "transmission_line" -> SimulationServer.trip_branch(sim_id, component_id)
-          "generator" -> SimulationServer.trip_generator(sim_id, component_id)
-          "transformer" -> SimulationServer.trip_transformer(sim_id, component_id)
-          _ -> :ok
+          {:error, reason, socket} ->
+            Logger.error("simulation server start failed: #{inspect(reason)}")
+            {:noreply, fail_simulation(socket)}
         end
-
-      case result do
-        {:error, reason} when reason in [:not_in_network, :already_tripped] ->
-          send(lv, {:trip_rejected, reason, type, component_id})
-
-        _ ->
-          :ok
-      end
     end
-
-    if type in ["transmission_line", "generator", "transformer"], do: Task.start(trip)
-
-    {:noreply, socket}
   end
 
+  # Non-trippable component types (water facilities, datacenters, ...) must
+  # not flip the UI into a cascade state that never resolves.
+  def handle_event("inject_failure", _params, socket), do: {:noreply, socket}
+
   def handle_event("reset_simulation", _params, socket) do
+    # CAS-13 / UI-C2: the reset call used to run a full base-case solve
+    # inline in the LiveView (up to ~2 min frozen UI) and a dead server
+    # (:noproc) killed the view. Run it in a monitored task; exits caught.
     sim_id = socket.assigns.sim_id
-    SimulationServer.reset(sim_id)
+    lv = self()
+
+    {:ok, task_pid} =
+      Task.start(fn ->
+        result =
+          try do
+            SimulationServer.reset(sim_id)
+          catch
+            :exit, reason -> {:error, reason}
+          end
+
+        send(lv, {:reset_finished, result})
+      end)
 
     socket =
       socket
+      |> assign(:reset_task, Process.monitor(task_pid))
       |> assign(:cascade_steps, [])
       |> assign(:cascade_active, false)
       |> assign(:selected_component, nil)
-      |> assign(:solver_status, :idle)
+      |> assign(:solver_status, :resetting)
+      |> assign(:system_metrics, initial_metrics())
       |> push_event("reset_grid", %{})
       |> push_event("deselect_highlight", %{})
 
@@ -134,8 +183,12 @@ defmodule PowerModelWeb.GridLive.Index do
   end
 
   def handle_event("scrub_timeline", %{"step" => step}, socket) do
-    step = String.to_integer(step)
-    {:noreply, push_event(socket, "show_cascade_step", %{step: step})}
+    # Contract #4: `step` is the 0-based ARRAY POSITION in the frame list
+    # (never the cascade's own step number). UI-H1: validated, not trusted.
+    case parse_int(step) do
+      nil -> {:noreply, socket}
+      idx -> {:noreply, push_event(socket, "show_cascade_step", %{step: idx})}
+    end
   end
 
   def handle_event("deselect", _params, socket) do
@@ -148,16 +201,16 @@ defmodule PowerModelWeb.GridLive.Index do
   end
 
   def handle_event("select_hour", %{"date" => date_str, "hour" => hour_str}, socket) do
-    selected =
-      with {:ok, date} <- Date.from_iso8601(date_str),
-           {hour, ""} when hour in 0..23 <- Integer.parse(hour_str),
-           {:ok, naive} <- NaiveDateTime.new(date, Time.new!(hour, 0, 0)) do
-        DateTime.from_naive!(naive, "Etc/UTC")
-      else
-        _ -> nil
-      end
-
-    {:noreply, apply_selected_hour(socket, selected)}
+    with {:ok, date} <- Date.from_iso8601(date_str),
+         {hour, ""} when hour in 0..23 <- Integer.parse(hour_str),
+         {:ok, naive} <- NaiveDateTime.new(date, Time.new!(hour, 0, 0)) do
+      {:noreply, apply_selected_hour(socket, DateTime.from_naive!(naive, "Etc/UTC"))}
+    else
+      # UI-M5: an incomplete selection (date typed but no hour picked yet,
+      # or vice versa) must not destroy the running simulation -- keep the
+      # current hour until both fields are valid.
+      _ -> {:noreply, socket}
+    end
   end
 
   def handle_event("clear_hour", _params, socket) do
@@ -241,13 +294,20 @@ defmodule PowerModelWeb.GridLive.Index do
     {:noreply, socket}
   end
 
+  # UI-M13: an unknown or malformed client event must never crash the view.
+  def handle_event(event, params, socket) do
+    Logger.warning("ignoring unhandled event #{inspect(event)} with params #{inspect(params)}")
+
+    {:noreply, socket}
+  end
+
   # PubSub handlers
 
   @impl true
   def handle_info({:simulation_dc_update, payload}, socket) do
     socket =
       socket
-      |> assign(:solver_status, :dc_solved)
+      |> put_solver_result_status(:dc_solved)
       |> update_metrics(payload)
       |> push_event("dc_results", payload)
 
@@ -257,7 +317,7 @@ defmodule PowerModelWeb.GridLive.Index do
   def handle_info({:simulation_ac_update, payload}, socket) do
     socket =
       socket
-      |> assign(:solver_status, :ac_solved)
+      |> put_solver_result_status(:ac_solved)
       |> update_metrics(payload)
       |> push_event("ac_results", payload)
 
@@ -274,6 +334,10 @@ defmodule PowerModelWeb.GridLive.Index do
         m
         |> merge_balance(payload[:balance])
         |> Map.put(:islands, payload[:islands] || m.islands)
+        # UI-M3: the Tripped metric moves WITH the cascade, not only at the end
+        |> Map.update!(:tripped_count, &(&1 + step_component_trips(payload)))
+        # UI-M2: frequency = worst (minimum) nadir reported by shed events
+        |> track_frequency_nadir(payload)
       end)
       |> push_event("cascade_step", payload)
 
@@ -281,15 +345,23 @@ defmodule PowerModelWeb.GridLive.Index do
   end
 
   def handle_info({:simulation_cascade_done, payload}, socket) do
+    # CAS-3: an unstable end state (blackout, exhausted step budget) must not
+    # be presented as "Stable".
+    stable = payload[:stable] == true
+
     socket =
       socket
       |> assign(:cascade_active, false)
-      |> assign(:solver_status, :stable)
+      |> assign(:solver_status, if(stable, do: :stable, else: :unstable))
       |> update(:system_metrics, fn m ->
         m
         |> merge_balance(payload[:balance])
-        |> Map.put(:tripped_count, payload.total_events)
+        # CAS-8: component trips only -- never total_events (one per shed load)
+        |> Map.put(:tripped_count, payload[:tripped_count] || m.tripped_count)
       end)
+      # UI-C1 / contract #2: tell the map the cascade ended so it can leave
+      # cascade mode (ghosting, vignette, forced layers).
+      |> push_event("cascade_done", %{stable: stable})
 
     {:noreply, socket}
   end
@@ -301,6 +373,9 @@ defmodule PowerModelWeb.GridLive.Index do
       |> assign(:cascade_active, false)
       |> assign(:solver_status, :idle)
       |> assign(:system_metrics, initial_metrics())
+      # UI-M14: server-side frame list is cleared above; without this push the
+      # client keeps its frames and every later scrub replays the wrong prefix.
+      |> push_event("reset_grid", %{})
 
     {:noreply, socket}
   end
@@ -312,22 +387,34 @@ defmodule PowerModelWeb.GridLive.Index do
     interconnection = socket.assigns.interconnection
     hour = socket.assigns.selected_hour
 
-    Task.start(fn ->
-      ensure_sim_server(sim_id, interconnection, hour)
+    # UI-M11: the screening task is monitored and deadlined -- a dead or hung
+    # task must never leave the button stuck at "Scanning...".
+    {:ok, task_pid} =
+      Task.start(fn ->
+        result =
+          try do
+            with {:ok, _pid} <- ensure_sim_server(sim_id, interconnection, hour) do
+              case SimulationServer.get_state(sim_id) do
+                %{has_dc_solution: true} = state ->
+                  # N-1 screening would run here against the current DC solution
+                  # For now, broadcast the result count back
+                  {:ok, length(state.tripped_lines) + length(state.tripped_generators)}
 
-      case SimulationServer.get_state(sim_id) do
-        %{has_dc_solution: true} = state ->
-          # N-1 screening would run here against the current DC solution
-          # For now, broadcast the result count back
-          violations = length(state.tripped_lines) + length(state.tripped_generators)
-          send(lv, {:n1_screening_done, violations})
+                _ ->
+                  {:ok, 0}
+              end
+            end
+          catch
+            :exit, reason -> {:error, reason}
+          end
 
-        _ ->
-          send(lv, {:n1_screening_done, 0})
-      end
-    end)
+        send(lv, {:n1_screening_done, result})
+      end)
 
-    {:noreply, socket}
+    ref = Process.monitor(task_pid)
+    Process.send_after(self(), {:n1_screening_timeout, ref}, @n1_screening_timeout)
+
+    {:noreply, assign(socket, :n1_task, ref)}
   end
 
   def handle_info({:trip_rejected, reason, _type, _id}, socket) do
@@ -339,62 +426,367 @@ defmodule PowerModelWeb.GridLive.Index do
     {:noreply, socket}
   end
 
-  def handle_info({:n1_screening_done, violations}, socket) do
-    send_update(PowerModelWeb.GridLive.FailureControls,
-      id: "failure-controls",
-      screening: false,
-      violations: violations
-    )
+  # CAS-5 / UI-C3: the trip task hit a server crash or unexpected error --
+  # leave the cascade state instead of spinning forever.
+  def handle_info({:trip_failed, reason, type, id}, socket) do
+    Logger.error("trip of #{type} #{id} failed: #{inspect(reason)}")
+    {:noreply, fail_simulation(socket)}
+  end
+
+  def handle_info({:reset_finished, result}, socket) do
+    socket = assign(socket, :reset_task, nil)
+
+    case result do
+      :ok ->
+        # The server's "reset" broadcast flips :resetting -> :idle
+        {:noreply, socket}
+
+      {:error, {reason, _call}} when reason in [:noproc, :normal, :shutdown] ->
+        # No server running -- nothing to reset; the cleared UI is correct
+        {:noreply, assign(socket, :solver_status, :idle)}
+
+      {:error, reason} ->
+        Logger.error("simulation reset failed: #{inspect(reason)}")
+        {:noreply, assign(socket, :solver_status, :error)}
+    end
+  end
+
+  def handle_info({:n1_screening_done, result}, socket) do
+    socket = assign(socket, :n1_task, nil)
+
+    case result do
+      {:ok, violations} ->
+        send_update(PowerModelWeb.GridLive.FailureControls,
+          id: "failure-controls",
+          screening: false,
+          screen_error: false,
+          violations: violations
+        )
+
+      {:error, reason} ->
+        Logger.error("N-1 screening failed: #{inspect(reason)}")
+        n1_error_update()
+    end
 
     {:noreply, socket}
+  end
+
+  def handle_info({:n1_screening_timeout, ref}, socket) do
+    if socket.assigns.n1_task == ref do
+      Logger.error("N-1 screening timed out after #{@n1_screening_timeout}ms")
+      n1_error_update()
+      {:noreply, assign(socket, :n1_task, nil)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, socket) do
+    cond do
+      match?({_pid, ^ref}, socket.assigns.sim_server) ->
+        handle_sim_server_down(socket, reason)
+
+      socket.assigns.trip_task == ref ->
+        socket = assign(socket, :trip_task, nil)
+
+        if reason == :normal do
+          {:noreply, socket}
+        else
+          Logger.error("trip task died: #{inspect(reason)}")
+          {:noreply, fail_simulation(socket)}
+        end
+
+      socket.assigns.reset_task == ref ->
+        socket = assign(socket, :reset_task, nil)
+
+        if reason == :normal do
+          {:noreply, socket}
+        else
+          Logger.error("reset task died: #{inspect(reason)}")
+          {:noreply, assign(socket, :solver_status, :error)}
+        end
+
+      socket.assigns.n1_task == ref ->
+        socket = assign(socket, :n1_task, nil)
+
+        unless reason == :normal do
+          Logger.error("N-1 screening task died: #{inspect(reason)}")
+          n1_error_update()
+        end
+
+        {:noreply, socket}
+
+      true ->
+        {:noreply, socket}
+    end
   end
 
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   # Private
 
-  defp ensure_sim_server(sim_id, interconnection, hour, component \\ nil) do
-    case Registry.lookup(PowerModel.SimulationRegistry, sim_id) do
-      [{_pid, _}] ->
-        :ok
+  # UI-H1: only "all" or a positive integer are meaningful interconnection
+  # scopes; anything else (crafted URLs) falls back to "all" instead of
+  # crashing the mount/patch.
+  defp validate_interconnection(nil), do: "all"
+  defp validate_interconnection("all"), do: "all"
 
-      [] ->
-        interconnection_id =
-          case interconnection do
-            "all" -> resolve_interconnection(component)
-            id -> String.to_integer(id)
-          end
-
-        opts = [sim_id: sim_id, interconnection_id: interconnection_id, hour: hour]
-
-        DynamicSupervisor.start_child(
-          PowerModel.SimulationSupervisor,
-          {SimulationServer, opts}
-        )
+  defp validate_interconnection(raw) when is_binary(raw) do
+    case Integer.parse(raw) do
+      {id, ""} when id > 0 -> Integer.to_string(id)
+      _ -> "all"
     end
   end
+
+  defp validate_interconnection(_), do: "all"
+
+  # CAS-7 / UI-M6: the session used to be pinned forever to the scope of the
+  # FIRST server start ("all" mode resolves it from the first-clicked
+  # component); a later click in another interconnection was rejected until
+  # page reload. Track the running server's scope and restart on mismatch.
+  defp ensure_sim_server_for(socket, component) do
+    sim_id = socket.assigns.sim_id
+
+    desired =
+      case desired_scope(socket.assigns.interconnection, component) do
+        :keep -> socket.assigns.server_scope
+        scope -> scope
+      end
+
+    case Registry.lookup(PowerModel.SimulationRegistry, sim_id) do
+      [{pid, _}] ->
+        if desired == socket.assigns.server_scope do
+          {:ok, monitor_sim_server(socket, pid)}
+        else
+          socket = demonitor_sim_server(socket)
+          DynamicSupervisor.terminate_child(PowerModel.SimulationSupervisor, pid)
+          start_sim_server(socket, desired)
+        end
+
+      [] ->
+        start_sim_server(socket, desired)
+    end
+  end
+
+  defp desired_scope("all", component) do
+    case resolve_interconnection(component) do
+      nil -> :keep
+      id -> id
+    end
+  end
+
+  defp desired_scope(interconnection, _component) do
+    case parse_int(interconnection) do
+      nil -> :keep
+      id -> id
+    end
+  end
+
+  defp start_sim_server(socket, scope) do
+    opts = [
+      sim_id: socket.assigns.sim_id,
+      interconnection_id: scope,
+      hour: socket.assigns.selected_hour
+    ]
+
+    case DynamicSupervisor.start_child(PowerModel.SimulationSupervisor, {SimulationServer, opts}) do
+      {:ok, pid} ->
+        {:ok, socket |> assign(:server_scope, scope) |> monitor_sim_server(pid)}
+
+      {:error, {:already_started, pid}} ->
+        {:ok, socket |> assign(:server_scope, scope) |> monitor_sim_server(pid)}
+
+      {:error, reason} ->
+        {:error, reason, assign(socket, :server_scope, nil)}
+    end
+  end
+
+  # Non-socket variant for use from task processes (N-1 screening): only
+  # guarantees existence, never restarts on scope mismatch.
+  defp ensure_sim_server(sim_id, interconnection, hour) do
+    case Registry.lookup(PowerModel.SimulationRegistry, sim_id) do
+      [{pid, _}] ->
+        {:ok, pid}
+
+      [] ->
+        scope = if interconnection == "all", do: nil, else: parse_int(interconnection)
+        opts = [sim_id: sim_id, interconnection_id: scope, hour: hour]
+
+        case DynamicSupervisor.start_child(
+               PowerModel.SimulationSupervisor,
+               {SimulationServer, opts}
+             ) do
+          {:ok, pid} -> {:ok, pid}
+          {:error, {:already_started, pid}} -> {:ok, pid}
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  defp monitor_sim_server(socket, pid) do
+    case socket.assigns.sim_server do
+      {^pid, _ref} -> socket
+      _ -> assign(socket, :sim_server, {pid, Process.monitor(pid)})
+    end
+  end
+
+  defp demonitor_sim_server(socket) do
+    case socket.assigns.sim_server do
+      {_pid, ref} ->
+        Process.demonitor(ref, [:flush])
+        assign(socket, :sim_server, nil)
+
+      _ ->
+        socket
+    end
+  end
+
+  # CAS-5: the sim server vanished OUT FROM UNDER the session (crash or idle
+  # reap -- intentional stops demonitor first). The client's painted state no
+  # longer corresponds to any server; reset it rather than silently desync.
+  defp handle_sim_server_down(socket, reason) do
+    socket =
+      socket
+      |> assign(:sim_server, nil)
+      |> assign(:server_scope, nil)
+      |> assign(:cascade_steps, [])
+      |> assign(:cascade_active, false)
+      |> assign(:system_metrics, initial_metrics())
+      |> push_event("reset_grid", %{})
+
+    case reason do
+      normal when normal in [:normal, :shutdown] ->
+        {:noreply, assign(socket, :solver_status, :idle)}
+
+      {:shutdown, _} ->
+        {:noreply, assign(socket, :solver_status, :idle)}
+
+      other ->
+        Logger.error("simulation server crashed: #{inspect(other)}")
+        {:noreply, assign(socket, :solver_status, :error)}
+    end
+  end
+
+  defp start_trip_task(socket, type, component_id) do
+    sim_id = socket.assigns.sim_id
+    lv = self()
+
+    {:ok, task_pid} =
+      Task.start(fn ->
+        result =
+          try do
+            case type do
+              "transmission_line" -> SimulationServer.trip_branch(sim_id, component_id)
+              "generator" -> SimulationServer.trip_generator(sim_id, component_id)
+              "transformer" -> SimulationServer.trip_transformer(sim_id, component_id)
+            end
+          catch
+            :exit, reason -> {:error, {:exit, reason}}
+          end
+
+        case result do
+          {:error, reason} when reason in [:not_in_network, :already_tripped] ->
+            send(lv, {:trip_rejected, reason, type, component_id})
+
+          {:error, reason} ->
+            send(lv, {:trip_failed, reason, type, component_id})
+
+          _ ->
+            :ok
+        end
+      end)
+
+    assign(socket, :trip_task, Process.monitor(task_pid))
+  end
+
+  # CAS-3: once a cascade is classified (Stable/Unstable) the late-arriving
+  # AC refinement must not overwrite the classification with "AC Converged";
+  # its flows/metrics still land. A new trip or reset re-arms the status.
+  defp put_solver_result_status(socket, status) do
+    if socket.assigns.solver_status in [:stable, :unstable] do
+      socket
+    else
+      assign(socket, :solver_status, status)
+    end
+  end
+
+  # UI-C3: shared error path -- leave the cascade state (client included) and
+  # show an error instead of the eternal spinner.
+  defp fail_simulation(socket) do
+    socket
+    |> assign(:cascade_active, false)
+    |> assign(:solver_status, :error)
+    |> push_event("cascade_done", %{stable: false})
+  end
+
+  defp n1_error_update do
+    send_update(PowerModelWeb.GridLive.FailureControls,
+      id: "failure-controls",
+      screening: false,
+      screen_error: true,
+      violations: 0
+    )
+  end
+
+  # UI-M3: only component trips count toward the Tripped metric
+  defp step_component_trips(payload) do
+    length(payload[:tripped_line_ids] || []) +
+      length(payload[:tripped_transformer_ids] || []) +
+      length(payload[:tripped_generator_ids] || [])
+  end
+
+  # UI-M2: shed events carry the swing-simulation nadir in their details;
+  # the metric shows the worst (minimum) frequency seen this cascade.
+  defp track_frequency_nadir(metrics, payload) do
+    nadir =
+      (payload[:trips] || [])
+      |> Enum.map(fn trip -> trip |> Map.get(:details) |> nadir_from_details() end)
+      |> Enum.filter(&is_number/1)
+      |> Enum.min(fn -> nil end)
+
+    case nadir do
+      nil -> metrics
+      hz -> %{metrics | frequency_hz: min(metrics.frequency_hz, hz * 1.0)}
+    end
+  end
+
+  defp nadir_from_details(%{} = details), do: Map.get(details, :frequency_nadir)
+  defp nadir_from_details(_), do: nil
 
   # Changing the demand hour invalidates the running simulation's snapshot;
   # terminate it so the next failure injection rebuilds at the new hour.
+  # Re-selecting the SAME hour is a no-op (UI-M5).
   defp apply_selected_hour(socket, selected_hour) do
-    stop_sim_server(socket.assigns.sim_id)
+    if same_hour?(socket.assigns.selected_hour, selected_hour) do
+      socket
+    else
+      socket = stop_sim_server(socket)
 
-    socket
-    |> assign(:selected_hour, selected_hour)
-    |> assign(:cascade_steps, [])
-    |> assign(:cascade_active, false)
-    |> assign(:selected_component, nil)
-    |> assign(:solver_status, :idle)
-    |> assign(:system_metrics, initial_metrics())
-    |> push_event("reset_grid", %{})
-    |> push_event("deselect_highlight", %{})
+      socket
+      |> assign(:selected_hour, selected_hour)
+      |> assign(:cascade_steps, [])
+      |> assign(:cascade_active, false)
+      |> assign(:selected_component, nil)
+      |> assign(:solver_status, :idle)
+      |> assign(:system_metrics, initial_metrics())
+      |> push_event("reset_grid", %{})
+      |> push_event("deselect_highlight", %{})
+    end
   end
 
-  defp stop_sim_server(sim_id) do
-    case Registry.lookup(PowerModel.SimulationRegistry, sim_id) do
+  defp same_hour?(nil, nil), do: true
+  defp same_hour?(%DateTime{} = a, %DateTime{} = b), do: DateTime.compare(a, b) == :eq
+  defp same_hour?(_, _), do: false
+
+  defp stop_sim_server(socket) do
+    socket = demonitor_sim_server(socket)
+
+    case Registry.lookup(PowerModel.SimulationRegistry, socket.assigns.sim_id) do
       [{pid, _}] -> DynamicSupervisor.terminate_child(PowerModel.SimulationSupervisor, pid)
       [] -> :ok
     end
+
+    assign(socket, :server_scope, nil)
   end
 
   defp resolve_interconnection({"transmission_line", line_id}) do
@@ -485,22 +877,29 @@ defmodule PowerModelWeb.GridLive.Index do
 
   defp solver_status_class(:idle), do: "status-idle"
   defp solver_status_class(:solving), do: "status-solving"
+  defp solver_status_class(:resetting), do: "status-solving"
   defp solver_status_class(:dc_solved), do: "status-dc"
   defp solver_status_class(:ac_solved), do: "status-ac"
   defp solver_status_class(:stable), do: "status-stable"
+  defp solver_status_class(:unstable), do: "status-rejected"
+  defp solver_status_class(:error), do: "status-rejected"
   defp solver_status_class(:not_in_network), do: "status-rejected"
   defp solver_status_class(:already_tripped), do: "status-rejected"
   defp solver_status_class(_), do: "status-idle"
 
   defp solver_status_text(:idle), do: "Idle"
   defp solver_status_text(:solving), do: "Solving..."
+  defp solver_status_text(:resetting), do: "Resetting..."
   defp solver_status_text(:dc_solved), do: "DC Solved"
   defp solver_status_text(:ac_solved), do: "AC Converged"
   defp solver_status_text(:stable), do: "Stable"
+  defp solver_status_text(:unstable), do: "Unstable"
+  defp solver_status_text(:error), do: "Simulation failed"
   defp solver_status_text(:not_in_network), do: "Not in simulated network"
   defp solver_status_text(:already_tripped), do: "Already tripped"
   defp solver_status_text(_), do: "Idle"
 
+  # UI-L6: codes mirror the client's FUEL_COLORS table (color_scales.js)
   defp fuel_type_name(nil), do: nil
   defp fuel_type_name(0), do: "Unknown"
   defp fuel_type_name(1), do: "Natural Gas"
@@ -510,6 +909,11 @@ defmodule PowerModelWeb.GridLive.Index do
   defp fuel_type_name(5), do: "Hydro"
   defp fuel_type_name(6), do: "Wind"
   defp fuel_type_name(7), do: "Solar"
+  defp fuel_type_name(8), do: "Oil (Distillate)"
+  defp fuel_type_name(9), do: "Oil (Residual)"
+  defp fuel_type_name(10), do: "Wood/Biomass"
+  defp fuel_type_name(11), do: "Geothermal"
+  defp fuel_type_name(12), do: "Import (Intl)"
   defp fuel_type_name(_), do: "Other"
 
   defp facility_type_name("datacenter", code), do: datacenter_type_name(code)
@@ -753,9 +1157,13 @@ defmodule PowerModelWeb.GridLive.Index do
   # Legend visibility toggles
   # ---------------------------------------------------------------------------
 
+  # UI-L7: keys and colors mirror the client's VOLTAGE_COLORS classes
+  # (color_scales.js) -- a class missing here is untoggleable on the map.
   @voltage_legend [
     {"69", "69 kV", "rgb(100, 149, 237)"},
+    {"115", "115 kV", "rgb(70, 130, 180)"},
     {"138", "138 kV", "rgb(64, 224, 208)"},
+    {"161", "161 kV", "rgb(0, 206, 209)"},
     {"230", "230 kV", "rgb(50, 205, 50)"},
     {"345", "345 kV", "rgb(255, 165, 0)"},
     {"500", "500 kV", "rgb(255, 69, 0)"},
@@ -774,11 +1182,13 @@ defmodule PowerModelWeb.GridLive.Index do
     {"other", "Other", "rgb(150, 150, 150)"}
   ]
 
+  # UI-L7: mirrors the client's datacenter type table (datacenters_layer.js)
   @datacenter_legend [
     {"hyperscale", "Hyperscale", "rgb(80, 200, 255)"},
     {"colocation", "Colocation", "rgb(180, 140, 255)"},
     {"ai_training", "AI Training", "rgb(255, 120, 200)"},
-    {"enterprise", "Enterprise", "rgb(160, 180, 200)"}
+    {"enterprise", "Enterprise", "rgb(160, 180, 200)"},
+    {"crypto", "Crypto", "rgb(255, 190, 80)"}
   ]
 
   defp voltage_legend, do: @voltage_legend

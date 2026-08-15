@@ -4,7 +4,7 @@ import { getIconAtlas } from "../icon_atlas";
 
 const GHOST_COLOR = [110, 110, 130, 70];
 
-export function createSubstationsLayer(dataStore, viewMode, zoom, onClick, selectedId, cascadeActive) {
+export function createSubstationsLayer(dataStore, viewMode, zoom, onClick, selectedId, cascadeActive, stateVersion) {
   const data = dataStore.getSubstationData();
   const { atlas, mapping } = getIconAtlas();
 
@@ -27,8 +27,13 @@ export function createSubstationsLayer(dataStore, viewMode, zoom, onClick, selec
         : getSubstationColor(d, viewMode),
       onClick,
       updateTriggers: {
-        getColor: [viewMode, dataStore.substations.states, cascadeActive],
-        getSize: [cascadeActive],
+        // stateVersion is a monotonic counter bumped on every mutation; the
+        // states typed array itself is mutated in place, so its identity
+        // never changes and was an inert trigger.
+        getColor: [viewMode, stateVersion, cascadeActive],
+        // getSize also reads d.state (unaffected units shrink to ghosts), so
+        // it needs stateVersion for the same reason as getColor.
+        getSize: [cascadeActive, stateVersion],
       },
       transitions: {
         getColor: 500,

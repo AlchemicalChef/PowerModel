@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "test": "node --import ./js/test/register.mjs --test \"js/test/*.test.mjs\""
+  },
   "dependencies": {
     "@deck.gl/core": "^9.2.11",
     "@deck.gl/geo-layers": "9.2.11",

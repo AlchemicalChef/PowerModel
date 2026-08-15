@@ -17,7 +17,7 @@
       </select>
     </div>
 
-    <form phx-change="set_layer_visibility" class="layer-toggles">
+    <form phx-change="set_layer_visibility" class="layer-toggles" id="layer-toggles-form">
       <label class="layer-toggle" title="Show water / critical infrastructure facilities">
         <input type="hidden" name="water" value="false" />
         <input type="checkbox" name="water" value="true" checked={@show_water} />
@@ -76,7 +76,7 @@
       </form>
     <% end %>
 
-    <div class="solver-badge">
+    <div class="solver-badge" id="solver-badge" data-status={@solver_status}>
       <span class={"status-dot " <> solver_status_class(@solver_status)}></span>
       <span>{solver_status_text(@solver_status)}</span>
     </div>
@@ -359,6 +359,31 @@
                 d="M2 12 Q6 9 10 12 Q14 15 18 12"
                 stroke="rgb(0,100,180)"
                 stroke-width="2.5"
+                fill="none"
+                stroke-linecap="round"
+              />
+            </svg>
+          </.legend_item>
+          <%!-- UI-L7: pipeline facilities exist in the layer (type 6,
+               rgb(100,160,200)) but had no legend row, so they could never
+               be toggled. --%>
+          <.legend_item
+            category="water"
+            key="pipeline"
+            label="Pipeline"
+            hidden={legend_hidden?(@hidden_legend, "water", "pipeline")}
+          >
+            <svg class="legend-icon" viewBox="0 0 20 20">
+              <path
+                d="M2 10 L18 10"
+                stroke="rgb(100,160,200)"
+                stroke-width="3"
+                fill="none"
+                stroke-linecap="round"
+              /><path
+                d="M6 6.5 L6 13.5 M14 6.5 L14 13.5"
+                stroke="rgb(100,160,200)"
+                stroke-width="2"
                 fill="none"
                 stroke-linecap="round"
               />

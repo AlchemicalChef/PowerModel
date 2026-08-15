@@ -127,10 +127,14 @@ defmodule PowerModelWeb.GridLive.InfoPanel do
   defp can_trip?("transformer"), do: true
   defp can_trip?(_), do: false
 
+  # UI-L5: codes mirror the client's STATE_COLORS table (color_scales.js)
   defp state_name(0), do: "Normal"
   defp state_name(1), do: "Stressed"
   defp state_name(2), do: "Overloaded"
   defp state_name(3), do: "Tripped"
+  defp state_name(4), do: "Rerouted Flow"
+  defp state_name(5), do: "Load Shed"
+  defp state_name(6), do: "Islanded"
   defp state_name(_), do: "Unknown"
 
   defp format_number(nil), do: "—"

@@ -37,7 +37,9 @@ export function createTransformersLayer(dataStore, viewMode, zoom, onClick, sele
       onClick,
       updateTriggers: {
         getColor: [viewMode, stateVersion, cascadeActive],
-        getSize: [cascadeActive],
+        // getSize reads d.state (ghost shrink): stateVersion must retrigger
+        // it — the memoized data array's identity never changes.
+        getSize: [cascadeActive, stateVersion],
       },
       transitions: {
         getColor: 400,

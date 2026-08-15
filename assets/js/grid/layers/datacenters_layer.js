@@ -52,7 +52,9 @@ export function createDatacentersLayer(dataStore, viewMode, zoom, onClick, selec
       onClick,
       updateTriggers: {
         getColor: [viewMode, opts.stateVersion, cascadeActive],
-        getSize: [cascadeActive],
+        // getSize reads d.state (ghost shrink): stateVersion must retrigger
+        // it — with all filters off, the data array identity is stable.
+        getSize: [cascadeActive, opts.stateVersion],
       },
       transitions: {
         getColor: 500,

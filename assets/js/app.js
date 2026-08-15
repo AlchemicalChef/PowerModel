@@ -26,12 +26,10 @@ import {hooks as colocatedHooks} from "phoenix-colocated/power_model"
 import topbar from "../vendor/topbar"
 
 import GridMapHook from "./hooks/grid_map_hook"
-import CascadeTimelineHook from "./hooks/cascade_timeline_hook"
 
 const Hooks = {
   ...colocatedHooks,
   GridMap: GridMapHook,
-  CascadeTimeline: CascadeTimelineHook,
 }
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")

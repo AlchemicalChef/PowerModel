@@ -17,6 +17,15 @@ export class DataStore {
     this.transformers = { count: 0, ids: null, positions: null, ratings: null, states: null };
     this.busLoads = { count: 0, positions: null, demands: null };
     this._demandHexCache = {}; // resolution -> [{ hex, mw }]
+    // Memoized getData() arrays: built once per load, mutated in place on
+    // state changes so deck.gl's data identity stays stable and re-uploads
+    // only happen when updateTriggers (stateVersion) say so.
+    this._generatorData = null;
+    this._substationData = null;
+    this._transformerData = null;
+    // Water facilities load lazily (17.7 MB JSON): cascade state changes
+    // arriving before the data buffer here and are applied on load.
+    this._pendingWaterStates = new Map();
   }
 
   loadGenerators(buffer) {
@@ -40,6 +49,7 @@ export class DataStore {
     }
 
     this.generators = { count, ids, positions, capacities, fuelTypes, states };
+    this._generatorData = null;
   }
 
   loadTransmissionLines(buffer) {
@@ -88,6 +98,7 @@ export class DataStore {
     }
 
     this.substations = { count, ids, positions, voltages, states };
+    this._substationData = null;
   }
 
   loadTransformers(buffer) {
@@ -109,9 +120,11 @@ export class DataStore {
     }
 
     this.transformers = { count, ids, positions, ratings, states };
+    this._transformerData = null;
   }
 
   getTransformerData() {
+    if (this._transformerData) return this._transformerData;
     const data = [];
     for (let i = 0; i < this.transformers.count; i++) {
       data.push({
@@ -121,7 +134,15 @@ export class DataStore {
         state: this.transformers.states[i],
       });
     }
+    this._transformerData = data;
     return data;
+  }
+
+  // Mirror the typed-array states into a memoized object array (objects are
+  // what deck.gl accessors read; the arrays keep a stable identity).
+  _syncCachedStates(cache, states) {
+    if (!cache || !states) return;
+    for (let i = 0; i < cache.length; i++) cache[i].state = states[i];
   }
 
   applyTransformerStateMap(stateMap) {
@@ -131,6 +152,7 @@ export class DataStore {
       const s = stateMap[this.transformers.ids[i]];
       if (s !== undefined) this.transformers.states[i] = s;
     }
+    this._syncCachedStates(this._transformerData, this.transformers.states);
   }
 
   // Clear flow-derived transformer states, preserving tripped marks
@@ -141,6 +163,7 @@ export class DataStore {
         this.transformers.states[i] = STATE_NORMAL;
       }
     }
+    this._syncCachedStates(this._transformerData, this.transformers.states);
   }
 
   // Per-bus demand points for the H3 demand-density overlay.
@@ -200,6 +223,15 @@ export class DataStore {
     }));
 
     this.waterFacilities = { count: facilities.length, facilities };
+
+    // Apply cascade impacts that arrived while the lazy fetch was in flight
+    if (this._pendingWaterStates.size > 0) {
+      for (const f of facilities) {
+        const s = this._pendingWaterStates.get(f.id);
+        if (s !== undefined) f.state = s;
+      }
+      this._pendingWaterStates.clear();
+    }
   }
 
   getWaterFacilityData() {
@@ -242,6 +274,23 @@ export class DataStore {
     }
   }
 
+  // Per-line loading percentage from the solver ("line_loading" on dc_update
+  // payloads, contract #3). The server only sends lines loaded >= 30%; any id
+  // absent from the map is in the lowest band (0%).
+  applyLineLoading(loadingMap) {
+    if (!loadingMap) return;
+    for (const line of this.transmissionLines.lines) {
+      const pct = loadingMap[line.id];
+      line.loadingPct = pct !== undefined ? Number(pct) : 0;
+    }
+  }
+
+  resetLineLoading() {
+    for (const line of this.transmissionLines.lines) {
+      line.loadingPct = 0;
+    }
+  }
+
   // Apply per-ID states to transmission lines only
   applyLineStateMap(stateMap) {
     if (!stateMap || Object.keys(stateMap).length === 0) return;
@@ -259,6 +308,7 @@ export class DataStore {
       const s = stateMap[this.generators.ids[i]];
       if (s !== undefined) this.generators.states[i] = s;
     }
+    this._syncCachedStates(this._generatorData, this.generators.states);
   }
 
   // Apply per-ID states to substations only
@@ -269,11 +319,17 @@ export class DataStore {
       const s = stateMap[this.substations.ids[i]];
       if (s !== undefined) this.substations.states[i] = s;
     }
+    this._syncCachedStates(this._substationData, this.substations.states);
   }
 
-  // Update water facility states by ID list
+  // Update water facility states by ID list. Facilities load lazily; states
+  // arriving before the data are buffered and applied on load.
   applyWaterFacilityState(ids, newState) {
     if (!ids || ids.length === 0) return;
+    if (this.waterFacilities.count === 0) {
+      for (const id of ids) this._pendingWaterStates.set(id, newState);
+      return;
+    }
     const idSet = new Set(ids);
     for (const f of this.waterFacilities.facilities) {
       if (idSet.has(f.id)) f.state = newState;
@@ -287,9 +343,14 @@ export class DataStore {
     if (this.transformers.states) this.transformers.states.fill(STATE_NORMAL);
     for (const f of this.waterFacilities.facilities) f.state = STATE_NORMAL;
     for (const d of this.datacenters.datacenters) d.state = STATE_NORMAL;
+    this._pendingWaterStates.clear();
+    this._syncCachedStates(this._generatorData, this.generators.states);
+    this._syncCachedStates(this._substationData, this.substations.states);
+    this._syncCachedStates(this._transformerData, this.transformers.states);
   }
 
   getGeneratorData() {
+    if (this._generatorData) return this._generatorData;
     const data = [];
     for (let i = 0; i < this.generators.count; i++) {
       data.push({
@@ -300,10 +361,12 @@ export class DataStore {
         state: this.generators.states[i],
       });
     }
+    this._generatorData = data;
     return data;
   }
 
   getSubstationData() {
+    if (this._substationData) return this._substationData;
     const data = [];
     for (let i = 0; i < this.substations.count; i++) {
       data.push({
@@ -313,6 +376,7 @@ export class DataStore {
         state: this.substations.states[i],
       });
     }
+    this._substationData = data;
     return data;
   }
 }

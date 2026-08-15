@@ -39,7 +39,7 @@ defmodule PowerModelWeb.GridLive.SystemMetrics do
       </div>
       <div class="metric">
         <span class="metric-label">Frequency</span>
-        <span class={"metric-value " <> freq_class(@metrics.frequency_hz)}>
+        <span id="metric-frequency" class={"metric-value " <> freq_class(@metrics.frequency_hz)}>
           {:erlang.float_to_binary(@metrics.frequency_hz, decimals: 2)} Hz
         </span>
       </div>
@@ -49,7 +49,10 @@ defmodule PowerModelWeb.GridLive.SystemMetrics do
       </div>
       <div class="metric">
         <span class="metric-label">Tripped</span>
-        <span class={"metric-value " <> if(@metrics.tripped_count > 0, do: "text-red", else: "")}>
+        <span
+          id="metric-tripped"
+          class={"metric-value " <> if(@metrics.tripped_count > 0, do: "text-red", else: "")}
+        >
           {@metrics.tripped_count}
         </span>
       </div>

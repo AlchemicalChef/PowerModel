@@ -2,6 +2,23 @@
  * Tracks viewport state and provides LOD thresholds.
  * Debounces viewport change events to avoid overwhelming the server.
  */
+
+// Every zoom threshold at which client-side layer visibility, filtering, or
+// resolution changes: 4.5/6/7.5 (demand hex resolution), 5 (generators),
+// 6 (line declutter band, generator size scale), 7 (transformers),
+// 8 (substations, line declutter band), 10 (labels). A move that crosses one
+// of these MUST re-render even if it is otherwise "insignificant" — a small
+// zoom from 7.9 to 8.05 is what reveals substations.
+export const LOD_ZOOM_THRESHOLDS = [4.5, 5, 6, 7, 7.5, 8, 10];
+
+export function lodBand(zoom) {
+  let band = 0;
+  for (const t of LOD_ZOOM_THRESHOLDS) {
+    if (zoom >= t) band++;
+  }
+  return band;
+}
+
 export class ViewportTracker {
   constructor(map, onViewportChange, debounceMs = 300) {
     this.map = map;
@@ -29,10 +46,13 @@ export class ViewportTracker {
         north: bounds.getNorth(),
       };
 
-      // Only notify if zoom level changed significantly
+      // Notify when the zoom changed significantly, the viewport moved
+      // meaningfully, or the zoom crossed an LOD band boundary (a tiny zoom
+      // step across a visibility threshold must not be swallowed).
       if (
         this._lastZoom === null ||
         Math.abs(zoom - this._lastZoom) > 0.5 ||
+        lodBand(zoom) !== lodBand(this._lastZoom) ||
         this._boundsChanged(newBounds)
       ) {
         this._lastZoom = zoom;
@@ -44,12 +64,17 @@ export class ViewportTracker {
 
   _boundsChanged(newBounds) {
     if (!this._lastBounds) return true;
-    const threshold = 0.5; // degrees
+    // Threshold relative to the current viewport span: a fixed degree
+    // threshold ignored meaningful pans at high zoom (city-scale pans move
+    // the bounds far less than half a degree).
+    const lonSpan = Math.abs(newBounds.east - newBounds.west) || 1e-6;
+    const latSpan = Math.abs(newBounds.north - newBounds.south) || 1e-6;
+    const frac = 0.1; // 10% of the viewport
     return (
-      Math.abs(newBounds.west - this._lastBounds.west) > threshold ||
-      Math.abs(newBounds.south - this._lastBounds.south) > threshold ||
-      Math.abs(newBounds.east - this._lastBounds.east) > threshold ||
-      Math.abs(newBounds.north - this._lastBounds.north) > threshold
+      Math.abs(newBounds.west - this._lastBounds.west) > lonSpan * frac ||
+      Math.abs(newBounds.south - this._lastBounds.south) > latSpan * frac ||
+      Math.abs(newBounds.east - this._lastBounds.east) > lonSpan * frac ||
+      Math.abs(newBounds.north - this._lastBounds.north) > latSpan * frac
     );
   }
 

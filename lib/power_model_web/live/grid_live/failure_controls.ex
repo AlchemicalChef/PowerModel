@@ -10,6 +10,7 @@ defmodule PowerModelWeb.GridLive.FailureControls do
         <label class="control-label">Mode</label>
         <div class="mode-buttons">
           <button
+            id="failure-mode-single"
             class={"mode-btn " <> if(@mode == :single, do: "active", else: "")}
             phx-click="set_failure_mode"
             phx-value-mode="single"
@@ -18,6 +19,7 @@ defmodule PowerModelWeb.GridLive.FailureControls do
             Single
           </button>
           <button
+            id="failure-mode-n1"
             class={"mode-btn " <> if(@mode == :n1, do: "active", else: "")}
             phx-click="set_failure_mode"
             phx-value-mode="n1"
@@ -36,6 +38,7 @@ defmodule PowerModelWeb.GridLive.FailureControls do
         <div class="control-group">
           <label class="control-label">Contingency Screening</label>
           <button
+            id="run-n1-screen-btn"
             phx-click="run_n1_screening"
             phx-target={@myself}
             class="action-btn"
@@ -45,8 +48,14 @@ defmodule PowerModelWeb.GridLive.FailureControls do
           </button>
         </div>
 
+        <%= if @screen_error do %>
+          <div class="violation-summary" id="n1-screen-error">
+            <span class="violation-text">Screening failed — run again</span>
+          </div>
+        <% end %>
+
         <%= if @violations > 0 do %>
-          <div class="violation-summary">
+          <div class="violation-summary" id="n1-violations">
             <span class="violation-count">{@violations}</span>
             <span class="violation-text">contingencies with violations</span>
           </div>
@@ -57,7 +66,7 @@ defmodule PowerModelWeb.GridLive.FailureControls do
   end
 
   def mount(socket) do
-    {:ok, assign(socket, mode: :single, screening: false, violations: 0)}
+    {:ok, assign(socket, mode: :single, screening: false, screen_error: false, violations: 0)}
   end
 
   def update(assigns, socket) do
@@ -71,6 +80,6 @@ defmodule PowerModelWeb.GridLive.FailureControls do
 
   def handle_event("run_n1_screening", _params, socket) do
     send(self(), :run_n1_screening)
-    {:noreply, assign(socket, :screening, true)}
+    {:noreply, assign(socket, screening: true, screen_error: false)}
   end
 end

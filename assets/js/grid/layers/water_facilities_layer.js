@@ -17,8 +17,31 @@ const GHOST_COLOR = [110, 110, 130, 80];
 // Facility type code -> legend key (must match the legend entries)
 const WATER_LEGEND_KEY = {
   1: "desalination", 2: "wastewater", 3: "treatment",
-  4: "pump_station", 5: "reservoir",
+  4: "pump_station", 5: "reservoir", 6: "pipeline",
 };
+
+// TextLayer over ~95k facilities froze the GPU: labels render only for
+// facilities inside the current viewport, hard-capped.
+const LABEL_CAP = 250;
+
+export function cullLabels(data, bounds, cap) {
+  if (!bounds) return data.slice(0, cap);
+  const out = [];
+  for (const d of data) {
+    const lon = d.position[0];
+    const lat = d.position[1];
+    if (
+      lon >= bounds.west &&
+      lon <= bounds.east &&
+      lat >= bounds.south &&
+      lat <= bounds.north
+    ) {
+      out.push(d);
+      if (out.length >= cap) break;
+    }
+  }
+  return out;
+}
 
 export function createWaterFacilitiesLayer(dataStore, viewMode, zoom, onClick, selectedId, cascadeActive, opts = {}) {
   let data = dataStore.getWaterFacilityData();
@@ -54,7 +77,9 @@ export function createWaterFacilitiesLayer(dataStore, viewMode, zoom, onClick, s
       onClick,
       updateTriggers: {
         getColor: [viewMode, opts.stateVersion, cascadeActive],
-        getSize: [cascadeActive],
+        // getSize reads d.state (ghost shrink): stateVersion must retrigger
+        // it — with all filters off, the data array identity is stable.
+        getSize: [cascadeActive, opts.stateVersion],
       },
       transitions: {
         getColor: 500,
@@ -63,10 +88,16 @@ export function createWaterFacilitiesLayer(dataStore, viewMode, zoom, onClick, s
     }),
   ];
 
-  // Labels — only for affected facilities during cascade, or all at high zoom normally
-  const labelData = cascadeActive
+  // Labels — only for affected facilities during cascade, or at high zoom
+  // normally; always culled to the current viewport and capped (a national
+  // dataset or national blackout would otherwise label ~95k points).
+  const labelCandidates = cascadeActive
     ? data.filter((d) => d.state > 0)
     : (zoom >= 10 ? data : []);
+  const labelData =
+    labelCandidates.length > 0
+      ? cullLabels(labelCandidates, opts.bounds, LABEL_CAP)
+      : labelCandidates;
 
   if (labelData.length > 0) {
     layers.push(

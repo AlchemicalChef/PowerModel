@@ -1,12 +1,16 @@
 import { PathLayer } from "@deck.gl/layers";
-import { COLOR_SCALES } from "../color_scales";
+import { COLOR_SCALES, VOLTAGE_COLORS } from "../color_scales";
 
 // Dimmed ghost color for unaffected lines during cascade — dim, not gone:
 // the network must stay visible as context around the failure.
 const GHOST_COLOR = [90, 90, 110, 70];
 
-// Legend voltage classes used for filtering (must match the legend entries)
-const LEGEND_VOLTAGE_CLASSES = [69, 138, 230, 345, 500, 765];
+// Legend voltage classes used for filtering — derived from VOLTAGE_COLORS so
+// the classes the legend paints and the classes the toggle filters can never
+// drift apart (115 and 161 kV were missing from a hand-written copy).
+const LEGEND_VOLTAGE_CLASSES = Object.keys(VOLTAGE_COLORS)
+  .map(Number)
+  .sort((a, b) => a - b);
 
 function voltageClassKey(kv) {
   let closest = LEGEND_VOLTAGE_CLASSES[0];
@@ -16,8 +20,24 @@ function voltageClassKey(kv) {
   return String(closest);
 }
 
-export function createTransmissionLayer(dataStore, viewMode, zoom, onClick, selectedId, cascadeActive, hiddenVoltages, stateVersion) {
-  let lines = dataStore.transmissionLines.lines;
+// Memoized zoom/legend filter result. Filtering ~90k paths on every pan
+// produced a fresh array each call, defeating deck.gl's data memoization and
+// forcing a full GPU re-upload; identical inputs now return the same array.
+let _filterCache = { src: null, key: null, out: null };
+
+function filteredLines(dataStore, zoom, hiddenVoltages, stateVersion) {
+  const src = dataStore.transmissionLines.lines;
+  const band = zoom < 6 ? "z0" : zoom < 8 ? "z1" : "z2";
+  const hiddenKey =
+    hiddenVoltages && hiddenVoltages.size > 0
+      ? [...hiddenVoltages].sort().join(",")
+      : "";
+  const key = `${band}|${stateVersion}|${hiddenKey}`;
+  if (_filterCache.src === src && _filterCache.key === key) {
+    return _filterCache.out;
+  }
+
+  let lines = src;
 
   // Zoom decluttering must never hide an active alarm: affected lines
   // (tripped/overloaded/rerouted) render at every zoom level.
@@ -34,6 +54,13 @@ export function createTransmissionLayer(dataStore, viewMode, zoom, onClick, sele
       (l) => l.state > 0 || !hiddenVoltages.has(voltageClassKey(l.voltageKv))
     );
   }
+
+  _filterCache = { src, key, out: lines };
+  return lines;
+}
+
+export function createTransmissionLayer(dataStore, viewMode, zoom, onClick, selectedId, cascadeActive, hiddenVoltages, stateVersion) {
+  const lines = filteredLines(dataStore, zoom, hiddenVoltages, stateVersion);
 
   const layers = [];
 

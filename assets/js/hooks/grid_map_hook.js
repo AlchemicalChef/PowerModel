@@ -44,6 +44,12 @@ const GridMapHook = {
       this.mapManager.applyCascadeStep(data);
     });
 
+    // Cascade finished (contract #2): leave cascade mode (ghosting,
+    // vignette, forced layers) but keep the final classification on the map.
+    this.handleEvent("cascade_done", (data) => {
+      this.mapManager.endCascade(data && data.stable);
+    });
+
     this.handleEvent("reset_grid", () => {
       this.mapManager.resetToBaseline();
     });
@@ -103,6 +109,12 @@ const GridMapHook = {
     if (this.mapManager) {
       this.mapManager.destroy();
     }
+    // Drop the debug handle so a destroyed manager (and its WebGL context,
+    // data store, and map) can be garbage collected after navigation.
+    if (window.__gridMapManager === this.mapManager) {
+      window.__gridMapManager = null;
+    }
+    this.mapManager = null;
   },
 };
 

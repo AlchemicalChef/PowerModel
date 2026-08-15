@@ -28,6 +28,41 @@
   color: #888 !important;
 }
 
+/* Basemap error banner (map "error" events — style/tile fetch failures) */
+.map-error-banner {
+  position: absolute;
+  top: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(90vw, 480px);
+  background: rgba(60, 12, 8, 0.92);
+  border: 1px solid rgba(231, 76, 60, 0.6);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #ffd9d4;
+  z-index: 30;
+  backdrop-filter: blur(6px);
+}
+
+.map-error-dismiss {
+  background: none;
+  border: none;
+  color: #ffb3aa;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+
+.map-error-dismiss:hover {
+  color: #fff;
+}
+
 /* Deck.gl tooltip */
 .deck-tooltip {
   background: rgba(15, 15, 25, 0.95) !important;

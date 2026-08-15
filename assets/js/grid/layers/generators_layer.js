@@ -46,7 +46,10 @@ export function createGeneratorsLayer(dataStore, viewMode, zoom, onClick, select
       onClick,
       updateTriggers: {
         getColor: [viewMode, stateVersion, cascadeActive],
-        getSize: [cascadeActive, zoom],
+        // getSize reads d.state (tripped units shrink): data arrays are
+        // memoized and mutated in place, so stateVersion must trigger size
+        // re-evaluation too or mid-cascade trips keep their ghost size.
+        getSize: [cascadeActive, zoom, stateVersion],
         getIcon: [viewMode],
       },
       transitions: {

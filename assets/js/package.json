@@ -1,0 +1,4 @@
+{
+  "//": "Scopes ESM to assets/js only. Putting \"type\": \"module\" in assets/package.json instead would break the esbuild bundle, because vendor/topbar.js is a UMD/CommonJS file whose top-level `this` and `module.exports` are invalid under ESM parsing. This boundary silences MODULE_TYPELESS_PACKAGE_JSON for the source files under test while leaving vendor/ typeless.",
+  "type": "module"
+}

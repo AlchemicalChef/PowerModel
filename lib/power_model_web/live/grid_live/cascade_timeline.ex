@@ -3,7 +3,8 @@ defmodule PowerModelWeb.GridLive.CascadeTimeline do
 
   def render(assigns) do
     ~H"""
-    <div class="timeline-panel" id="cascade-timeline" phx-hook="CascadeTimeline">
+    <%!-- UI-L3: the CascadeTimeline JS hook was deleted; the DOM id stays. --%>
+    <div class="timeline-panel" id="cascade-timeline">
       <div class="timeline-header">
         <h4>Cascade Timeline</h4>
         <span class="step-count">{length(@steps)} steps</span>
@@ -11,10 +12,14 @@ defmodule PowerModelWeb.GridLive.CascadeTimeline do
 
       <div class="timeline-track">
         <%= for {step, idx} <- Enum.with_index(@steps) do %>
+          <%!-- UI-H3 / contract #4: scrubbing indexes frames by ARRAY
+               POSITION (idx). Step NUMBERS restart at every manual trip, so
+               they are ambiguous across cascades in one session. --%>
           <button
+            id={"timeline-step-#{idx}"}
             class={"timeline-step " <> if(idx == length(@steps) - 1, do: "active", else: "")}
             phx-click="scrub_timeline"
-            phx-value-step={step.step}
+            phx-value-step={idx}
             title={"Step #{step.step}: #{step.trip_count} trips, #{step.islands} islands"}
           >
             <span class="step-num">{step.step}</span>
