@@ -482,9 +482,15 @@ defmodule PowerModel.Failure.CascadeTest do
     test "changing loading preserves fractional relay operating progress" do
       buses = [bus(1, bus_type: 3), bus(2)]
 
+      # Both ratings are low enough that both lines are past RELAY PICKUP
+      # (rate C, not rate A) while sharing the load, so the second line is
+      # genuinely accruing operating duty when the first one trips. At a
+      # rate A of 45 the second line sits at 111% of rate A but only 82% of
+      # rate C, so it would not be timing at all and there would be no
+      # fractional progress for this test to preserve.
       lines = [
         line(1, 1, 2, rating_a_mva: 30.0, x_pu: 0.1),
-        line(2, 1, 2, rating_a_mva: 45.0, x_pu: 0.1)
+        line(2, 1, 2, rating_a_mva: 35.0, x_pu: 0.1)
       ]
 
       gens = [generator(1, 1, p_max_mw: 150.0)]
@@ -501,8 +507,13 @@ defmodule PowerModel.Failure.CascadeTest do
           base_mva: state.base_mva
         )
 
-      initial_second_loading = Map.fetch!(initial_solution.line_flows, {:line, 2}).loading_pct
-      initial_second_trip_time = Protection.overcurrent_trip_time(initial_second_loading)
+      initial_second_flow = Map.fetch!(initial_solution.line_flows, {:line, 2})
+      initial_second_loading = initial_second_flow.loading_pct
+
+      # Duty is integrated against the curve time the relay actually sees, so
+      # reconstruct it from the pickup basis (rate C) rather than rate A.
+      initial_second_trip_time =
+        Protection.overcurrent_trip_time(Cascade.trip_loading_pct(initial_second_flow))
 
       {final_state, step_results} = Cascade.run_cascade(state)
 
@@ -530,9 +541,25 @@ defmodule PowerModel.Failure.CascadeTest do
 
       second_interval = second_trip_step.simulated_time - first_trip_step.simulated_time
 
-      assert accrued_duty > 0.0 and accrued_duty < 1.0
+      # Guard the fixture first, and with a real margin. If a rating change ever
+      # drops line 2 back below relay pickup it accrues no duty at all, and
+      # every assertion below degenerates into `x * (1.0 - 0.0)` compared
+      # against `x` — a float tie that fails or passes on the last few ulps and
+      # says nothing about the behaviour under test.
+      assert accrued_duty > 0.01 and accrued_duty < 1.0,
+             "fixture must leave line 2 genuinely timing before line 1 trips; " <>
+               "accrued_duty was #{accrued_duty}"
+
       assert second_interval > 0.0
+
+      # The property this test exists for: the relay did NOT restart from zero
+      # when its loading changed. Its remaining time is the FRESH curve time
+      # discounted by the duty already banked, so the shortfall against a
+      # from-cold trip is exactly that duty. Asserting the ratio pins the
+      # relationship itself rather than the bare inequality it implies.
+      assert_in_delta second_interval / second_curve_time, 1.0 - accrued_duty, 1.0e-9
       assert second_interval < second_curve_time
+
       assert_in_delta second_trip_step.simulated_time, expected_total_time, 1.0e-8
       assert_in_delta final_state.simulated_time, expected_total_time, 1.0e-8
     end

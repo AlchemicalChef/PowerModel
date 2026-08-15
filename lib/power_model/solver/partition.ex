@@ -10,6 +10,7 @@ defmodule PowerModel.Solver.Partition do
   solve must therefore partition first and solve each island independently.
   """
 
+  alias PowerModel.Grid.DcTie
   alias PowerModel.Simulation.Cascading.IslandDetector
   alias PowerModel.Solver.Solution
 
@@ -21,10 +22,18 @@ defmodule PowerModel.Solver.Partition do
   Single-bus islands with generation are trivially solvable (θ = 0), so the
   default `min_buses` is 1; islands without any generator are dead
   (blacked out) regardless of size.
+
+  DC ties do NOT define islands. `IslandDetector` sees only lines and
+  transformers, so a tie can never fuse two asynchronous systems into one
+  electrical network — which is the whole point of an HVDC link. A tie is
+  attached to every island holding either of its terminals; if its two
+  terminals land in different islands each island keeps its own end and sees
+  only that end's injection.
   """
   def split(snapshot, min_buses \\ 1) do
     bus_ids = Enum.map(snapshot.buses, & &1.id)
     islands = IslandDetector.detect(bus_ids, snapshot.lines, snapshot.transformers)
+    dc_ties = Map.get(snapshot, :dc_ties, [])
 
     gen_buses = MapSet.new(snapshot.generators, & &1.bus_id)
 
@@ -47,7 +56,8 @@ defmodule PowerModel.Solver.Partition do
               MapSet.member?(island, t.from_bus_id) and MapSet.member?(island, t.to_bus_id)
             end),
           generators: Enum.filter(snapshot.generators, &MapSet.member?(island, &1.bus_id)),
-          loads: Enum.filter(snapshot.loads, &MapSet.member?(island, &1.bus_id))
+          loads: Enum.filter(snapshot.loads, &MapSet.member?(island, &1.bus_id)),
+          dc_ties: Enum.filter(dc_ties, &DcTie.touches?(&1, island))
         }
       end)
 

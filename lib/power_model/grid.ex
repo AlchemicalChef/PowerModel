@@ -8,6 +8,7 @@ defmodule PowerModel.Grid do
 
   alias PowerModel.Grid.{
     Bus,
+    DcTie,
     Generator,
     TransmissionLine,
     Load,
@@ -103,9 +104,12 @@ defmodule PowerModel.Grid do
   # VOLT_CLASS) are excluded from all AC snapshots — a DC link carries a
   # CONTROLLED flow, not one set by its series impedance, so modeling e.g.
   # the Pacific DC Intertie as a giant AC line absorbs Western N-S flow that
-  # actually rides the AC paths. Proper treatment is a pair of fixed
-  # injections at the converter buses (future work); until then the ties are
-  # simply not part of the AC network.
+  # actually rides the AC paths. The proper treatment -- a pair of fixed
+  # injections at the converter buses -- now exists as `dc_ties`
+  # (`PowerModel.Grid.DcTie`, populated by `PowerModel.Ingestion.HvdcTies`),
+  # which is what puts back what this exclusion removes. Snapshots carry both:
+  # DC lines stay out of the AC network, and their links come back as
+  # injections.
   def in_service_lines(interconnection_id) do
     from(tl in TransmissionLine,
       join: fb in Bus,
@@ -173,6 +177,47 @@ defmodule PowerModel.Grid do
       select: t
     )
     |> Repo.all()
+  end
+
+  # DC ties
+  #
+  # LIN-6 excludes `line_type == "dc"` rows from every AC snapshot because a DC
+  # link carries a controlled flow, not one set by its series impedance. These
+  # ties are the replacement for what that exclusion removes: the same links,
+  # modeled the way they behave — a pair of scheduled injections at the
+  # converter buses (see `PowerModel.Grid.DcTie` and
+  # `PowerModel.Ingestion.HvdcTies`).
+
+  def list_dc_ties, do: Repo.all(DcTie)
+
+  @doc """
+  In-service DC ties with at least one converter bus inside `bus_ids`.
+
+  Endpoints outside the given bus set are returned as `nil`, so every endpoint
+  a caller sees on a snapshot tie is guaranteed to resolve to a bus in that
+  same snapshot. That is what lets a one-interconnection snapshot carry an
+  ERCOT tie whose far terminal lives in the Eastern system: the ERCOT side
+  keeps its injection and the far side simply is not there.
+  """
+  def dc_ties_for_buses([]), do: []
+
+  def dc_ties_for_buses(bus_ids) when is_list(bus_ids) do
+    bus_set = MapSet.new(bus_ids)
+
+    from(t in DcTie,
+      where: t.status == "in_service",
+      where: t.from_bus_id in ^bus_ids or t.to_bus_id in ^bus_ids
+    )
+    |> Repo.all()
+    |> Enum.map(&resolve_tie_endpoints(&1, bus_set))
+  end
+
+  defp resolve_tie_endpoints(tie, bus_set) do
+    %{
+      tie
+      | from_bus_id: if(MapSet.member?(bus_set, tie.from_bus_id), do: tie.from_bus_id),
+        to_bus_id: if(MapSet.member?(bus_set, tie.to_bus_id), do: tie.to_bus_id)
+    }
   end
 
   # Topology helpers
@@ -277,7 +322,8 @@ defmodule PowerModel.Grid do
       generators: generators,
       loads: maybe_scale_loads(loads, buses, opts[:hour]),
       water_facilities: water_facilities,
-      datacenters: datacenters
+      datacenters: datacenters,
+      dc_ties: dc_ties_for_buses(main_list)
     }
   end
 
@@ -382,7 +428,8 @@ defmodule PowerModel.Grid do
       generators: generators,
       loads: maybe_scale_loads(loads, buses, opts[:hour]),
       water_facilities: water_facilities,
-      datacenters: datacenters
+      datacenters: datacenters,
+      dc_ties: dc_ties_for_buses(main_list)
     }
   end
 
@@ -1079,7 +1126,8 @@ defmodule PowerModel.Grid do
       generators: generators,
       loads: maybe_scale_loads(loads, all_buses, opts[:hour]),
       water_facilities: water_facilities,
-      datacenters: datacenters
+      datacenters: datacenters,
+      dc_ties: dc_ties_for_buses(all_bus_id_list)
     }
   end
 end

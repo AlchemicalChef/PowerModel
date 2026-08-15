@@ -36,6 +36,7 @@ defmodule PowerModel.Failure.Cascade do
   require Logger
 
   alias PowerModel.Dispatch
+  alias PowerModel.Grid.{DcTie, Ratings}
   alias PowerModel.Solver.DCPowerFlow
   alias PowerModel.Failure.{Protection, LoadShedding}
   alias PowerModel.Simulation.Cascading.IslandDetector
@@ -48,6 +49,7 @@ defmodule PowerModel.Failure.Cascade do
     :transformers,
     :generators,
     :loads,
+    :dc_ties,
     :water_facilities,
     :datacenters,
     :base_mva,
@@ -119,6 +121,7 @@ defmodule PowerModel.Failure.Cascade do
       transformers: Map.get(snapshot, :transformers, []),
       generators: snapshot.generators,
       loads: snapshot.loads,
+      dc_ties: Map.get(snapshot, :dc_ties, []),
       water_facilities: Map.get(snapshot, :water_facilities, []),
       datacenters: Map.get(snapshot, :datacenters, []),
       base_mva: base_mva,
@@ -151,6 +154,13 @@ defmodule PowerModel.Failure.Cascade do
 
   Conservation invariant: served + shed + blackout == original (within
   rounding), so the UI can always present a balance that adds up.
+
+  DC ties are absent from this by construction. A tie is a TRANSFER between
+  two converter buses, neither demand nor generation, so counting its MW as
+  either would break the invariant while describing nothing real: an imported
+  megawatt still shows up here as the load it serves. Its effect on the
+  island's power balance is applied where it belongs — in the deficit
+  arithmetic of `solve_islands_timed/9` and in the solver's injection vector.
   """
   def balance(%__MODULE__{} = state) do
     active_gens = Enum.reject(state.generators, &MapSet.member?(state.tripped_generators, &1.id))
@@ -177,16 +187,21 @@ defmodule PowerModel.Failure.Cascade do
       lines: snapshot.lines,
       transformers: Map.get(snapshot, :transformers, []),
       generators: dispatched_gens,
-      loads: snapshot.loads
+      loads: snapshot.loads,
+      dc_ties: Map.get(snapshot, :dc_ties, [])
     }
 
     try do
       solution = DCPowerFlow.solve_islands(base_snapshot, base_mva: base_mva)
 
-      # Overloaded set (>100%) for cascade trip filtering
+      # Trip-immune set, on the SAME basis the relays use (rate C). A branch
+      # over its continuous rating in the base case is a dispatch artifact and
+      # must not be masked from tripping — only one already past relay pickup
+      # before anything has happened is, since it would trip at t=0 on model
+      # error alone.
       overloaded =
         solution.line_flows
-        |> Enum.filter(fn {_key, flow} -> flow.loading_pct > 100.0 end)
+        |> Enum.filter(fn {_key, flow} -> trip_loading_pct(flow) > 100.0 end)
         |> Enum.map(fn {{type, id}, _flow} -> {type, id} end)
         |> MapSet.new()
 
@@ -668,6 +683,7 @@ defmodule PowerModel.Failure.Cascade do
         active_xfmrs,
         dispatched_gens,
         state.loads,
+        state.dc_ties,
         state.base_mva,
         state.base_overloaded
       )
@@ -886,6 +902,7 @@ defmodule PowerModel.Failure.Cascade do
          transformers,
          generators,
          loads,
+         dc_ties,
          base_mva,
          base_overloaded
        ) do
@@ -908,6 +925,16 @@ defmodule PowerModel.Failure.Cascade do
 
       island_gens = Enum.filter(generators, &MapSet.member?(island_set, &1.bus_id))
       island_loads = Enum.filter(lds, &MapSet.member?(island_set, &1.bus_id))
+
+      # DC ties with a converter in this island. A tie whose far terminal is in
+      # a different island contributes only its near-end injection here, which
+      # is exactly how an HVDC link behaves: it transfers power without
+      # synchronizing the two systems. A tie touching NO surviving island (both
+      # converters on blacked-out buses) is simply never assembled, so it moves
+      # nothing — a converter cannot run without an AC source to commutate
+      # against.
+      island_ties = Enum.filter(dc_ties, &DcTie.touches?(&1, island_set))
+      island_tie_mw = DcTie.net_injection_mw(island_ties, island_set)
 
       if island_dead?(island_buses, island_gens) do
         # Isolated bus or no generation -- all loads lost.
@@ -947,13 +974,21 @@ defmodule PowerModel.Failure.Cascade do
 
         load_mw = Enum.sum(Enum.map(island_loads, & &1.p_mw))
 
+        # A DC-tie import serves load exactly as generation does in the power
+        # balance, so it belongs in the deficit arithmetic — an island importing
+        # 3 GW is not short 3 GW. It contributes no inertia and no governor
+        # response, though, so it never joins the machine set the frequency
+        # model integrates. A net exporter (negative tie MW) deepens the deficit.
+        available_mw = gen_mw + island_tie_mw
+
         {island_gens, gen_mw, island_dispatch_updates} =
-          if load_mw > gen_mw do
-            raise_island_generation(island_gens, load_mw - gen_mw)
+          if load_mw > available_mw do
+            raise_island_generation(island_gens, load_mw - available_mw)
           else
             {island_gens, gen_mw, %{}}
           end
 
+        available_mw = gen_mw + island_tie_mw
         dispatch_updates = Map.merge(dispatch_updates, island_dispatch_updates)
 
         # Available headroom is raised first. Apply UFLS only to any remaining
@@ -961,9 +996,9 @@ defmodule PowerModel.Failure.Cascade do
         # dispatch and post-shed loads. Skipping the solve would leave thermal /
         # voltage / zone-3 protection unevaluated in the deficient island.
         {lds, island_loads, shed_events, event_shed_mw} =
-          if load_mw > gen_mw do
+          if load_mw > available_mw do
             {shed_loads, shed_events} =
-              LoadShedding.apply_ufls(island_loads, island_gens, gen_mw, load_mw)
+              LoadShedding.apply_ufls(island_loads, island_gens, available_mw, load_mw)
 
             # Residual force-shed round (mirrors trigger_ufls_for_deficit):
             # UFLS under-sheds when the frequency nadir stays above the first
@@ -971,7 +1006,7 @@ defmodule PowerModel.Failure.Cascade do
             # cumulative schedule cap. The remaining physical gap MUST still
             # be closed, otherwise the island is silently unbalanced and the
             # DC slack absorbs unserved load that no event accounts for.
-            deficit_mw = load_mw - gen_mw
+            deficit_mw = load_mw - available_mw
 
             ufls_shed_mw =
               Enum.sum(Enum.map(shed_events, fn e -> Map.get(e.details, :shed_mw, 0.0) end))
@@ -1015,7 +1050,8 @@ defmodule PowerModel.Failure.Cascade do
           lines: island_lines,
           transformers: island_xfmrs,
           generators: island_gens,
-          loads: island_loads
+          loads: island_loads,
+          dc_ties: island_ties
         }
 
         try do
@@ -1133,21 +1169,47 @@ defmodule PowerModel.Failure.Cascade do
     end
   end
 
-  # Compute trip time for each overloaded branch using Protection.overcurrent_trip_time/1.
+  @doc """
+  Loading percentage an overcurrent relay picks up on, against the short-time
+  emergency rating (rate C) rather than the normal rating.
+
+  Arming protection at 100% of the continuous rating made every branch a hair
+  over rate A start an inverse-time timer, which is a dispatch condition and
+  not a breaker operation. Relays are set above the short-time emergency
+  limit, so pickup is rate C and a branch only begins timing past that.
+
+  Flow maps built before the rating tiers existed (and hand-built test
+  fixtures) carry only `loading_pct`, which is against rate A; rate C is a
+  fixed multiple of rate A, so the fallback converts exactly.
+  """
+  def trip_loading_pct(flow) do
+    case Map.get(flow, :trip_loading_pct) do
+      pct when is_number(pct) -> pct
+      _ -> (Map.get(flow, :loading_pct) || 0.0) / Ratings.rate_c_factor()
+    end
+  end
+
+  # Compute trip time for each branch past relay pickup using
+  # Protection.overcurrent_trip_time/1.
   defp compute_timed_overloads(line_flows, base_overloaded) do
     line_flows
     |> Enum.filter(fn {{type, id}, flow} ->
-      flow.loading_pct > 100.0 and not MapSet.member?(base_overloaded, {type, id})
+      trip_loading_pct(flow) > 100.0 and not MapSet.member?(base_overloaded, {type, id})
     end)
     |> Enum.map(fn {{type, id}, flow} ->
-      trip_time = Protection.overcurrent_trip_time(flow.loading_pct)
+      # The inverse-time curve integrates against pickup, so it is fed the
+      # rate-C loading; `loading_pct` stays in the details as the operator-
+      # facing number against the normal rating.
+      trip_pct = trip_loading_pct(flow)
+      trip_time = Protection.overcurrent_trip_time(trip_pct)
 
       %{
         component_type: component_type_string(type),
         component_id: id,
         failure_cause: "thermal_overload",
         details: %{
-          loading_pct: flow.loading_pct,
+          loading_pct: Map.get(flow, :loading_pct),
+          trip_loading_pct: trip_pct,
           p_flow_mw: flow.p_flow_mw,
           trip_time_s: trip_time
         },

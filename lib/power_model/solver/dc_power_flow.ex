@@ -3,8 +3,27 @@ defmodule PowerModel.Solver.DCPowerFlow do
   DC Power Flow approximation.
   Assumes V=1.0 pu, lossless lines. Solves P = B' * theta.
   Target: <50ms per interconnection.
+
+  ## DC ties
+
+  A snapshot may carry `:dc_ties` (`PowerModel.Grid.DcTie`). These are NOT
+  branches: an HVDC link's flow is set by its converter controls, not by a
+  series impedance, so it never enters B'. Each tie contributes a fixed
+  injection at whichever of its terminals is in this snapshot — `+schedule_mw`
+  at `from_bus`, `-schedule_mw` at `to_bus` — and a terminal outside the
+  snapshot simply contributes nothing. A tie with both terminals inside one
+  island moves power between two of its buses and changes the island's total
+  by zero.
+
+  Tie power is a TRANSFER, not generation or load: `total_gen_mw` is the power
+  injected into the AC network (generators plus net tie imports) and stays
+  equal to `total_load_mw`, so the lossless-DC conservation identity holds
+  unchanged. `scheduled_gen_mw` remains pure generator scheduling, and
+  `mismatch_mw` is the gap the slack bus has to cover after both generators
+  and ties are counted.
   """
 
+  alias PowerModel.Grid.{DcTie, Ratings}
   alias PowerModel.Solver.{Partition, Solution, Sparse, YBus}
 
   require Logger
@@ -53,6 +72,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
     transformers = snapshot.transformers
     generators = snapshot.generators
     loads = snapshot.loads
+    dc_ties = Map.get(snapshot, :dc_ties, [])
 
     n = length(buses)
     if n == 0, do: throw({:error, :empty_grid})
@@ -80,13 +100,14 @@ defmodule PowerModel.Solver.DCPowerFlow do
         transformers,
         generators,
         loads,
+        dc_ties,
         bus_index,
         slack_idx,
         n,
         base_mva
       )
 
-    totals = compute_totals(generators, loads, bus_index, slack_idx, bus_ids)
+    totals = compute_totals(generators, loads, dc_ties, bus_index, slack_idx, bus_ids)
 
     # Solve: theta = B'^-1 * P (excluding slack row/col)
     non_slack_size = n - 1
@@ -112,11 +133,19 @@ defmodule PowerModel.Solver.DCPowerFlow do
     end
   end
 
-  # DC identities: the network is lossless, so actual generation equals served
-  # load, with the slack bus producing whatever the scheduled (non-slack)
-  # generation does not cover. The gap between scheduled generation and load is
-  # reported as mismatch_mw so silent slack pickup is visible to monitoring.
-  defp compute_totals(generators, loads, bus_index, slack_idx, bus_ids) do
+  # DC identities: the network is lossless, so power injected into the island
+  # equals served load, with the slack bus producing whatever the scheduled
+  # (non-slack) generation and the DC ties do not cover. The gap between those
+  # scheduled sources and load is reported as mismatch_mw so silent slack
+  # pickup is visible to monitoring.
+  #
+  # DC-tie power is a transfer: it is neither generation nor load, so it is
+  # folded into total_gen_mw (power injected into the AC network) but kept out
+  # of scheduled_gen_mw (what the generator fleet was told to produce).
+  defp compute_totals(generators, loads, dc_ties, bus_index, slack_idx, bus_ids) do
+    slack_bus_id = Enum.at(bus_ids, slack_idx)
+    {net_tie_mw, tie_at_slack_mw} = tie_totals(dc_ties, bus_index, slack_bus_id)
+
     {scheduled_gen_mw, gen_at_slack_mw} =
       Enum.reduce(generators, {0.0, 0.0}, fn gen, {total, at_slack} ->
         p = gen.p_max_mw * (Map.get(gen, :capacity_factor) || 1.0)
@@ -137,17 +166,31 @@ defmodule PowerModel.Solver.DCPowerFlow do
         {total + load.p_mw, at_slack}
       end)
 
-    slack_gen_mw = total_load_mw - (scheduled_gen_mw - gen_at_slack_mw)
+    slack_gen_mw = total_load_mw - net_tie_mw - (scheduled_gen_mw - gen_at_slack_mw)
 
     [
       total_gen_mw: total_load_mw,
       total_load_mw: total_load_mw,
       total_loss_mw: 0.0,
       scheduled_gen_mw: scheduled_gen_mw,
-      slack_bus_id: Enum.at(bus_ids, slack_idx),
-      slack_injection_mw: slack_gen_mw - load_at_slack_mw,
-      mismatch_mw: total_load_mw - scheduled_gen_mw
+      slack_bus_id: slack_bus_id,
+      slack_injection_mw: slack_gen_mw + tie_at_slack_mw - load_at_slack_mw,
+      mismatch_mw: total_load_mw - net_tie_mw - scheduled_gen_mw
     ]
+  end
+
+  # `{net injection into this snapshot, injection at the slack bus}`, in MW.
+  # The overwhelmingly common case is no ties at all, which must not pay for
+  # building a bus-id set on every solve.
+  defp tie_totals([], _bus_index, _slack_bus_id), do: {0.0, 0.0}
+
+  defp tie_totals(dc_ties, bus_index, slack_bus_id) do
+    in_snapshot = MapSet.new(Map.keys(bus_index))
+
+    tie_at_slack_mw =
+      Enum.reduce(dc_ties, 0.0, fn tie, acc -> acc + DcTie.injection_at(tie, slack_bus_id) end)
+
+    {DcTie.net_injection_mw(dc_ties, in_snapshot), tie_at_slack_mw}
   end
 
   # Invariant: net flow leaving the slack bus must equal its net injection.
@@ -209,6 +252,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
          transformers,
          generators,
          loads,
+         dc_ties,
          bus_index,
          slack_idx,
          n,
@@ -261,6 +305,19 @@ defmodule PowerModel.Solver.DCPowerFlow do
         idx = Map.fetch!(bus_index, load.bus_id)
         p_pu = load.p_mw / base_mva
         array_add(p, idx, -p_pu)
+      end)
+
+    # DC ties are scheduled injections, never branches: +schedule at from_bus,
+    # -schedule at to_bus. A terminal outside this snapshot is skipped rather
+    # than raising, which is what makes a tie into an unmodeled system (or into
+    # a different island) behave as a one-sided import or export.
+    p_full =
+      Enum.reduce(dc_ties, p_full, fn tie, p ->
+        schedule_pu = DcTie.scheduled_mw(tie) / base_mva
+
+        p
+        |> add_at_bus(bus_index, Map.get(tie, :from_bus_id), schedule_pu)
+        |> add_at_bus(bus_index, Map.get(tie, :to_bus_id), -schedule_pu)
       end)
 
     # Remove slack row/col to form B' and P'
@@ -442,17 +499,20 @@ defmodule PowerModel.Solver.DCPowerFlow do
         flow_pu = (theta_i - theta_j) / x
         flow_mw = flow_pu * base_mva
 
-        rating = Map.get(line, :rating_a_mva)
-        rated? = is_number(rating) and rating > 0
+        {rate_a, rate_b, rate_c} = Ratings.branch_ratings(line)
 
         {{:line, line.id},
          %{
            from_bus_id: line.from_bus_id,
            to_bus_id: line.to_bus_id,
            p_flow_mw: flow_mw,
-           rating_mva: rating,
-           loading_pct: if(rated?, do: abs(flow_mw) / rating * 100.0, else: 0.0),
-           overloaded: rated? and abs(flow_mw) > rating
+           rating_mva: rate_a,
+           rating_b_mva: rate_b,
+           rating_c_mva: rate_c,
+           loading_pct: Ratings.loading_pct(flow_mw, rate_a),
+           emergency_loading_pct: Ratings.loading_pct(flow_mw, rate_b),
+           trip_loading_pct: Ratings.loading_pct(flow_mw, rate_c),
+           overloaded: is_number(rate_a) and abs(flow_mw) > rate_a
          }}
       end)
 
@@ -470,17 +530,20 @@ defmodule PowerModel.Solver.DCPowerFlow do
         flow_pu = (theta_i - theta_j) / x
         flow_mw = flow_pu * base_mva
 
-        rating = Map.get(xfmr, :rated_mva)
-        rated? = is_number(rating) and rating > 0
+        {rate_a, rate_b, rate_c} = Ratings.branch_ratings(xfmr)
 
         {{:transformer, xfmr.id},
          %{
            from_bus_id: xfmr.from_bus_id,
            to_bus_id: xfmr.to_bus_id,
            p_flow_mw: flow_mw,
-           rating_mva: rating,
-           loading_pct: if(rated?, do: abs(flow_mw) / rating * 100.0, else: 0.0),
-           overloaded: rated? and abs(flow_mw) > rating
+           rating_mva: rate_a,
+           rating_b_mva: rate_b,
+           rating_c_mva: rate_c,
+           loading_pct: Ratings.loading_pct(flow_mw, rate_a),
+           emergency_loading_pct: Ratings.loading_pct(flow_mw, rate_b),
+           trip_loading_pct: Ratings.loading_pct(flow_mw, rate_c),
+           overloaded: is_number(rate_a) and abs(flow_mw) > rate_a
          }}
       end)
 
@@ -497,5 +560,15 @@ defmodule PowerModel.Solver.DCPowerFlow do
 
   defp array_add(arr, idx, val) do
     :array.set(idx, :array.get(idx, arr) + val, arr)
+  end
+
+  # Add an injection at a bus that may be absent from this snapshot (or nil).
+  defp add_at_bus(arr, _bus_index, nil, _val), do: arr
+
+  defp add_at_bus(arr, bus_index, bus_id, val) do
+    case Map.get(bus_index, bus_id) do
+      nil -> arr
+      idx -> array_add(arr, idx, val)
+    end
   end
 end

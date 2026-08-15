@@ -8,7 +8,17 @@ defmodule PowerModel.Grid.TransmissionLine do
     field :x_pu, :float
     field :b_pu, :float
     field :rating_a_mva, :float
+    # Emergency ratings (ROADMAP item 9). Rate A is the normal/continuous
+    # rating and stays the display and "stressed" basis; rate B is the 4-hour
+    # and rate C the short-time emergency rating. Relay pickup is rate C —
+    # see `PowerModel.Failure.Cascade.trip_loading_pct/1`.
+    field :rating_b_mva, :float
+    field :rating_c_mva, :float
     field :length_km, :float
+    # Version of the parameter estimator that last wrote r/x/b and the ratings.
+    # `PowerModel.Ingestion.ParameterEstimator` recomputes rows below its own
+    # version, so improved parameter tables reach existing rows (REVIEW DAT-18).
+    field :params_version, :integer, default: 0
     field :geometry, Geo.PostGIS.Geometry
     field :status, :string, default: "in_service"
     field :source, :string
@@ -32,7 +42,10 @@ defmodule PowerModel.Grid.TransmissionLine do
     :x_pu,
     :b_pu,
     :rating_a_mva,
+    :rating_b_mva,
+    :rating_c_mva,
     :length_km,
+    :params_version,
     :geometry,
     :status,
     :source,

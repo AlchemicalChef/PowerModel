@@ -12,6 +12,16 @@ defmodule PowerModel.Failure.Protection do
   Loading is computed from apparent power S = sqrt(P^2 + Q^2) when reactive
   power (`q_flow_mvar`) is available in the flow map (AC solutions).  For DC
   solutions where only `p_flow_mw` is present, loading falls back to |P|/rating.
+
+  > #### Not the relay pickup basis {: .warning}
+  >
+  > This compares against RATE A, the normal/continuous rating. Relay pickup
+  > in this model is rate C (ROADMAP item 9) — see
+  > `PowerModel.Failure.Cascade.trip_loading_pct/1`, which is what the cascade
+  > actually arms its timers on. Nothing calls this function today. A future
+  > caller wanting relay behaviour wants the rate-C basis; a caller wanting an
+  > operator-facing "over its continuous rating" alarm wants this one. Pick
+  > deliberately rather than by whichever was nearest to hand.
   """
   def check_thermal_overloads(line_flows, threshold_pct \\ 100.0) do
     line_flows
