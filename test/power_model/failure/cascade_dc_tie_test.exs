@@ -48,14 +48,16 @@ defmodule PowerModel.Failure.CascadeDcTieTest do
     }
   end
 
-  # 60 MW of local generation against 100 MW of load: 40 MW short unless a
-  # tie makes up the difference.
+  # 90 MW of local generation against 100 MW of load: 10 MW short unless a
+  # tie makes up the difference. The gap is deliberately inside what the UFLS
+  # program can reach — a deeper one collapses the island on generator
+  # under-frequency protection, which is a different test.
   defp deficient_island(dc_ties) do
     %{
       buses: [bus(1, 3), bus(2)],
       lines: [line(1, 1, 2)],
       transformers: [],
-      generators: [gen(1, 1, 60.0)],
+      generators: [gen(1, 1, 90.0)],
       loads: [%{id: 1, bus_id: 2, p_mw: 100.0, q_mvar: 0.0}],
       dc_ties: dc_ties
     }
@@ -75,8 +77,8 @@ defmodule PowerModel.Failure.CascadeDcTieTest do
       assert balance.served_load_mw < 100.0
     end
 
-    test "with a 40 MW import the island is balanced and sheds nothing" do
-      {_final, balance} = run(deficient_island([tie(1, 2, nil, 40.0)]))
+    test "with a 10 MW import the island is balanced and sheds nothing" do
+      {_final, balance} = run(deficient_island([tie(1, 2, nil, 10.0)]))
 
       assert balance.shed_load_mw == 0.0
       assert_in_delta balance.served_load_mw, 100.0, 1.0e-6
@@ -84,7 +86,7 @@ defmodule PowerModel.Failure.CascadeDcTieTest do
 
     test "a tie EXPORT deepens the deficit rather than relieving it" do
       shed_with_export =
-        deficient_island([tie(1, 2, nil, -20.0)]) |> run() |> elem(1) |> Map.fetch!(:shed_load_mw)
+        deficient_island([tie(1, 2, nil, -5.0)]) |> run() |> elem(1) |> Map.fetch!(:shed_load_mw)
 
       shed_without =
         deficient_island([]) |> run() |> elem(1) |> Map.fetch!(:shed_load_mw)
@@ -95,7 +97,7 @@ defmodule PowerModel.Failure.CascadeDcTieTest do
 
   describe "conservation" do
     test "served + shed + blackout still equals the original load, with ties present" do
-      for ties <- [[], [tie(1, 2, nil, 40.0)], [tie(1, 2, nil, -20.0)]] do
+      for ties <- [[], [tie(1, 2, nil, 10.0)], [tie(1, 2, nil, -5.0)]] do
         {_final, b} = run(deficient_island(ties))
 
         assert_in_delta b.served_load_mw + b.shed_load_mw + b.blackout_load_mw,
@@ -105,7 +107,7 @@ defmodule PowerModel.Failure.CascadeDcTieTest do
     end
 
     test "a tie adds nothing to served load: an imported MW shows up as the load it serves" do
-      {_final, with_tie} = run(deficient_island([tie(1, 2, nil, 40.0)]))
+      {_final, with_tie} = run(deficient_island([tie(1, 2, nil, 10.0)]))
 
       assert_in_delta with_tie.served_load_mw, 100.0, 1.0e-6
       assert_in_delta with_tie.original_load_mw, 100.0, 1.0e-6

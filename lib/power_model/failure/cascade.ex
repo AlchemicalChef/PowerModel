@@ -56,6 +56,84 @@ defmodule PowerModel.Failure.Cascade do
   `state.btm_tripped_mw` is an explicit bucket in `balance/1` because this MW
   was never in `original_load_mw` — see that function for the extended
   conservation identity.
+
+  ## The step ordering (ROADMAP item 15)
+
+  Everything an island does inside one step happens in this order, and the
+  order is the model:
+
+  1. **Reserves** — the ramp-limited tiers (`PowerModel.Failure.Reserves`)
+     raise the island's generation as far as the clock allows.
+  2. **Trajectory evaluation** — ONE swing-equation segment, resumed from the
+     island's persistent frequency state, for the deficit the reserves left.
+  3. **Protection reads that trajectory** — behind-the-meter inverters
+     (IEEE 1547) and generator frequency protection (PRC-024) are evaluated
+     against the SAME trajectory, so they cannot disagree about what the
+     island's frequency did.
+  4. **Recompute** — tripped rooftop is new load, tripped generators are lost
+     generation; both land in the same step's deficit.
+  5. **Residual shed** — UFLS (authoritative, re-simulated on the deepened
+     gap) and then the force-shed tier close whatever is left.
+  6. **Solve** — DC power flow on the post-shed island, feeding thermal,
+     voltage and zone-3 protection.
+
+  Step 3 is the positive feedback loop real blackouts run on: an island that
+  dips far enough loses generators, which deepens the same step's deficit,
+  which sheds more customers. Islands can therefore LOSE generation they did
+  not start losing.
+
+  ## Persistent island frequency state (ROADMAP item 15)
+
+  Each island carries a `PowerModel.Solver.Frequency` state across steps, so a
+  second disturbance starts from the depressed frequency, the governor output
+  already deployed, and the UFLS stages already spent — instead of restarting
+  at 60.0 Hz with fresh reserves. Two trips two steps apart reach a strictly
+  worse nadir than either would alone.
+
+  ### Island identity across re-splits
+
+  Islands are not stable objects: a trip splits one into two, a re-close would
+  merge them back. A new island **inherits the state of the prior island that
+  contributed the plurality of its LOAD**, with bus count as the tiebreak; a
+  new island that overlaps NO prior island starts fresh at 60.0 Hz.
+
+  Load is the weight because the frequency state is largely a statement about
+  the load base it was integrated against — damping, the UFLS stages already
+  spent, the megawatts already shed — so following the load keeps that
+  statement true for the largest part of it.
+
+  When one island becomes two, BOTH halves inherit: they were synchronised an
+  instant earlier, so they share the frequency, the governor output already
+  deployed and the UFLS stages already spent. The cumulative quantities are
+  apportioned by load share so a small fragment does not carry the whole
+  parent's shed megawatts into its damping base.
+
+  The rule's limits, stated rather than hidden. A split of a fleet mid-swing
+  is modelled as two islands each continuing the parent's trajectory, which
+  ignores the transient the separation itself causes (the two halves would in
+  reality diverge through a period of angular acceleration before settling to
+  their own frequencies). And a MERGE — two live islands reconnecting — keeps
+  only the winner's state; nothing here re-synchronises islands, so that path
+  is unreachable until restoration (ROADMAP item 28) exists.
+
+  ## The clock (REVIEW CAS-16)
+
+  A step advances `simulated_time` by the longer of the two processes that ran
+  in it: the relay wall-clock chosen by `advance_relay_timers/2` (unchanged),
+  and the frequency-trajectory duration any island actually simulated. That
+  duration is the 30 s window, or the trajectory's SETTLING time when it
+  settles sooner — in which case the island's own frequency clock is rewound
+  to the settling point too, so the two clocks never diverge. Steps whose only
+  trips are frequency-driven no longer advance 0 s, which is what makes the
+  ramp-limited reserve tiers mean anything.
+
+  The consequence of truncating at the settling point, stated rather than
+  hidden: an island that SETTLES at a depressed frequency stops accumulating
+  time there, so the generator-protection envelope's long allowances (three
+  minutes below 59.4 Hz) can only be exhausted by an excursion that is still
+  moving. An island parked at 59.35 Hz will not eventually trip its fleet the
+  way PRC-024 says it should. Closing that means a notion of time passing with
+  nothing happening, which this cascade does not have.
   """
 
   require Logger
@@ -63,10 +141,33 @@ defmodule PowerModel.Failure.Cascade do
   alias PowerModel.Dispatch
   alias PowerModel.Grid.{BtmSolar, DcTie, Ratings}
   alias PowerModel.Solver.{DCPowerFlow, Frequency}
-  alias PowerModel.Failure.{Protection, LoadShedding}
+  alias PowerModel.Failure.{Protection, LoadShedding, Reserves}
   alias PowerModel.Simulation.Cascading.IslandDetector
 
   @max_steps 50
+
+  # How much of an island's frequency response one cascade step integrates.
+  # Matches `PowerModel.Solver.Frequency`'s own default window, which is the
+  # window its primary-response ceilings are written against.
+  @frequency_window_s 30.0
+
+  # A trajectory has SETTLED once every later sample sits within this of the
+  # final frequency and no further load has been shed. The step's clock
+  # advance is truncated there (see the moduledoc's "The clock").
+  @settle_tolerance_hz 1.0e-3
+
+  # How much frequency history an island keeps for generator protection. The
+  # deepest PRC-024 allowance is 180 s below 59.4 Hz, so anything older than
+  # that can no longer change a verdict.
+  @exposure_window_s 180.0
+
+  # Imbalances smaller than this are not worth integrating a swing equation
+  # for; they are numerical residue from the reserve arithmetic.
+  @imbalance_epsilon_mw 1.0e-6
+
+  # An island is "in an excursion" — and therefore keeps being simulated even
+  # with no new imbalance — while its frequency is this far off nominal.
+  @excursion_epsilon_hz 1.0e-4
 
   # IEEE 1547-2003 must-trip settings for the legacy behind-the-meter fleet.
   # 1547-2018 units are required to ride through both of these, which is why
@@ -111,7 +212,13 @@ defmodule PowerModel.Failure.Cascade do
     :btm_by_bus,
     :btm_tripped_buses,
     :btm_tripped_mw,
-    relay_duty: %{}
+    relay_duty: %{},
+    # One record per island of the CURRENT topology — see `island_record/0`.
+    island_states: [],
+    # Transient governor MW inside `dispatch`, per generator (ROADMAP item 16).
+    # `dispatch[id] - primary_reserve[id]` is the unit's SUSTAINED output, and
+    # that is what the swing model is told about.
+    primary_reserve: %{}
   ]
 
   @doc """
@@ -130,6 +237,21 @@ defmodule PowerModel.Failure.Cascade do
 
   The fallback `dispatch` map is seeded per island from each generator's share
   of island capacity, capped so the slack bus keeps a little headroom.
+
+  ## The operating point is balanced here, not in the cascade
+
+  Whatever rule produced `dispatch`, it does not in general match the
+  snapshot's load island by island: the fuel-anchored dispatch places absolute
+  measured MW, and the load-following fallback leaves the slack bus a margin.
+  `init/3` closes that gap once, with UNBOUNDED reserves, because it is not an
+  event — the operating point had all the time in the world to reach itself.
+
+  That matters for ROADMAP item 16: every deficit that opens AFTER this point
+  is timed from the cascade clock and can only be covered as fast as the fleet
+  ramps. Leaving the initial gap to the cascade loop would have charged the
+  base operating point's own incompleteness to a contingency's ramp budget.
+  Any gap that survives here (an island whose nameplate cannot cover its load)
+  is left standing, and its deficit clock starts at zero.
   """
   def init(snapshot, base_mva \\ 100.0, opts \\ []) do
     # Dispatch is balanced PER ISLAND: snapshots may contain several
@@ -146,6 +268,10 @@ defmodule PowerModel.Failure.Cascade do
 
     {dispatch, dispatch_source, dispatch_coverage} =
       initial_dispatch(snapshot, islands, bus_ba, opts)
+
+    # Close the base operating point's own gap before anything is an event
+    # (see the docstring), and record where each island starts.
+    {dispatch, island_states} = balance_operating_point(dispatch, islands, snapshot)
 
     # Solve base case to identify lines already overloaded due to model limitations.
     # These are excluded from cascade trip consideration since they represent
@@ -186,7 +312,161 @@ defmodule PowerModel.Failure.Cascade do
       blackout_load_mw: 0.0,
       btm_by_bus: aggregate_btm_solar(Map.get(snapshot, :btm_solar) || []),
       btm_tripped_buses: MapSet.new(),
-      btm_tripped_mw: 0.0
+      btm_tripped_mw: 0.0,
+      island_states: island_states,
+      primary_reserve: %{}
+    }
+  end
+
+  # ---------------------------------------------------------------------------
+  # Island frequency records
+  # ---------------------------------------------------------------------------
+
+  # One per island of the current topology:
+  #
+  #   :buses            the island's bus set when the record was written
+  #   :frequency_state  `PowerModel.Solver.Frequency` state, or nil at nominal
+  #   :exposure         the island's recent frequency trajectory, trimmed to
+  #                     @exposure_window_s, which generator protection reads
+  #   :deficit_since_s  cascade-clock time the island's SUSTAINED deficit
+  #                     opened, or nil while it has none. The reserve tiers
+  #                     ramp on `simulated_time - deficit_since_s`.
+  defp fresh_island_record(buses, deficit_since_s \\ nil) do
+    %{
+      buses: buses,
+      frequency_state: nil,
+      exposure: [],
+      deficit_since_s: deficit_since_s
+    }
+  end
+
+  # Balance each island's dispatch against its load with unbounded reserves
+  # (see `init/3`). Returns the closed dispatch and one record per island,
+  # with the deficit clock started only where a gap survives.
+  defp balance_operating_point(dispatch, islands, snapshot) do
+    loads = snapshot.loads
+    generators = snapshot.generators
+    dc_ties = Map.get(snapshot, :dc_ties, [])
+
+    Enum.reduce(islands, {dispatch, []}, fn island, {dispatch, records} ->
+      gens = Enum.filter(generators, &MapSet.member?(island, &1.bus_id))
+      load_mw = loads |> Enum.filter(&MapSet.member?(island, &1.bus_id)) |> sum_mw(& &1.p_mw)
+
+      tie_mw =
+        dc_ties |> Enum.filter(&DcTie.touches?(&1, island)) |> DcTie.net_injection_mw(island)
+
+      gen_mw = sum_mw(gens, &Map.get(dispatch, &1.id, 0.0))
+
+      deficit = load_mw - gen_mw - tie_mw
+
+      # Deficits only. A SURPLUS is left exactly as the dispatch rule wrote it:
+      # the fuel-anchored rule places absolute measured MW so that a BA's
+      # generation minus its load reproduces its real interchange (ROADMAP
+      # item 6), and curtailing that here would replace a measured export with
+      # a fiction. The surplus lands on the slack bus, as it always has.
+      dispatch =
+        if deficit > 0.5 do
+          units = Enum.map(gens, &sustained_unit(&1, Map.get(dispatch, &1.id, 0.0), 0.0))
+          alloc = Reserves.allocate(units, deficit, :infinity)
+
+          Enum.reduce(units, dispatch, fn unit, d ->
+            added = Map.get(alloc.sustained_by_unit, unit.id, 0.0)
+            Map.update(d, unit.id, added, &(&1 + added))
+          end)
+        else
+          dispatch
+        end
+
+      residual = load_mw - sum_mw(gens, &Map.get(dispatch, &1.id, 0.0)) - tie_mw
+      record = fresh_island_record(island, if(residual > 0.5, do: 0.0, else: nil))
+
+      {dispatch, [record | records]}
+    end)
+    |> then(fn {dispatch, records} -> {dispatch, Enum.reverse(records)} end)
+  end
+
+  # A generator map shaped at its SUSTAINED operating point: what the swing
+  # model and the reserve tiers reason about, with the transient primary MW
+  # taken back out (ROADMAP item 16).
+  defp sustained_unit(generator, dispatch_mw, primary_mw) do
+    sustained = dispatch_mw - primary_mw
+    nameplate = Map.get(generator, :p_nameplate_mw) || generator.p_max_mw
+
+    %{generator | p_max_mw: sustained, capacity_factor: 1.0}
+    |> Map.put(:p_dispatch_mw, sustained)
+    |> Map.put(:p_nameplate_mw, nameplate)
+  end
+
+  defp sum_mw(list, fun), do: list |> Enum.map(fun) |> Enum.sum()
+
+  # A new island inherits the frequency state of the prior island that
+  # contributed the plurality of its LOAD (bus count breaks ties; no overlap
+  # at all means a fresh 60.0 Hz start). See the moduledoc for the rule and
+  # its limits.
+  defp inherit_island_states(prior_records, islands, loads) do
+    load_by_bus =
+      Enum.reduce(loads, %{}, fn l, acc -> Map.update(acc, l.bus_id, l.p_mw, &(&1 + l.p_mw)) end)
+
+    owner =
+      prior_records
+      |> Enum.with_index()
+      |> Enum.reduce(%{}, fn {record, index}, acc ->
+        Enum.reduce(record.buses, acc, &Map.put(&2, &1, index))
+      end)
+
+    by_index = prior_records |> Enum.with_index() |> Map.new(fn {r, i} -> {i, r} end)
+
+    prior_load =
+      Map.new(by_index, fn {index, record} ->
+        {index, record.buses |> Enum.map(&Map.get(load_by_bus, &1, 0.0)) |> Enum.sum()}
+      end)
+
+    Enum.map(islands, fn island ->
+      votes =
+        Enum.reduce(island, %{}, fn bus_id, acc ->
+          case Map.get(owner, bus_id) do
+            nil ->
+              acc
+
+            index ->
+              mw = Map.get(load_by_bus, bus_id, 0.0)
+              Map.update(acc, index, {mw, 1}, fn {m, c} -> {m + mw, c + 1} end)
+          end
+        end)
+
+      case Enum.max_by(votes, fn {_index, {mw, count}} -> {mw, count} end, fn -> nil end) do
+        nil ->
+          fresh_island_record(island)
+
+        {index, {mw, _count}} ->
+          by_index
+          |> Map.fetch!(index)
+          |> Map.put(:buses, island)
+          |> apportion_state(mw / max(Map.get(prior_load, index, 0.0), 1.0e-9))
+      end
+    end)
+  end
+
+  # When one island becomes two, both halves keep the frequency they were at
+  # and the governors they had deployed — they were synchronised an instant
+  # ago — but the CUMULATIVE quantities are shared out by load share, so a
+  # small fragment does not carry the whole parent's shed megawatts into its
+  # damping base. `Frequency`'s `gov_state` needs no help here: it is keyed by
+  # generator, so each half automatically keeps the units it still owns.
+  defp apportion_state(%{frequency_state: nil} = record, _share), do: record
+
+  defp apportion_state(record, share) when share >= 1.0, do: record
+
+  defp apportion_state(record, share) do
+    state = record.frequency_state
+
+    %{
+      record
+      | frequency_state: %{
+          state
+          | cumulative_shed_mw: Map.get(state, :cumulative_shed_mw, 0.0) * share,
+            lost_mw: Map.get(state, :lost_mw, 0.0) * share
+        }
     }
   end
 
@@ -498,6 +778,7 @@ defmodule PowerModel.Failure.Cascade do
         state
         | tripped_generators: MapSet.put(state.tripped_generators, gen_id),
           dispatch: Map.put(state.dispatch, gen_id, 0.0),
+          primary_reserve: Map.delete(state.primary_reserve, gen_id),
           events: [
             %{
               step: 0,
@@ -528,11 +809,30 @@ defmodule PowerModel.Failure.Cascade do
   end
 
   # Every accepted manual trip starts a NEW cascade event: the step budget,
-  # the simulated relay wall-clock, and the relay duty accumulators are
-  # per-cascade quantities, never per-session. Session-cumulative state
-  # (tripped sets, events, load accounting) is deliberately retained.
+  # the simulated wall-clock, and the relay duty accumulators are per-cascade
+  # quantities, never per-session. Session-cumulative state (tripped sets,
+  # events, load accounting, island frequency state) is deliberately retained.
+  #
+  # The per-island deficit clocks are rebased rather than cleared: an island
+  # still holding a deficit keeps holding it, but it has been holding it since
+  # the start of THIS cascade event, because that is where the clock now is.
   defp begin_cascade_event(state) do
-    %{state | step: 0, simulated_time: 0.0, relay_duty: %{}, stable: false}
+    records =
+      Enum.map(state.island_states, fn record ->
+        case record.deficit_since_s do
+          nil -> record
+          _ -> %{record | deficit_since_s: 0.0}
+        end
+      end)
+
+    %{
+      state
+      | step: 0,
+        simulated_time: 0.0,
+        relay_duty: %{},
+        stable: false,
+        island_states: records
+    }
   end
 
   @doc """
@@ -548,21 +848,31 @@ defmodule PowerModel.Failure.Cascade do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Redistribute `deficit_mw` (positive = need more generation) among online
-  generators in `island_bus_set`, mirroring how reserves are actually
-  activated:
+  Raise SUSTAINED reserves to cover `deficit_mw` (positive = need more
+  generation) among online generators in `island_bus_set`, in the order
+  reserves are actually activated:
 
-  1. **Origin BA** -- when `origin_ba` is known, contingency reserves inside
-     the balancing authority that lost the generation respond first (ACE
-     restoration / secondary control).
-  2. **Emergency assistance** -- any remaining deficit is covered by headroom
-     across the rest of the SAME island. Never beyond it: an asynchronous
-     neighbor interconnection cannot supply this power.
-  3. **UFLS** -- a deficit the whole island cannot cover sheds load, also
-     confined to the island (frequency is an island-wide quantity).
+  1. **Origin BA** -- when `origin_ba` is known, the balancing authority that
+     lost the generation restores its own ACE first (secondary control is a
+     BA-level function).
+  2. **Emergency assistance** -- any remaining deficit is covered from the
+     rest of the SAME island. Never beyond it: an asynchronous neighbor
+     interconnection cannot supply this power.
 
-  Returns the updated cascade state with modified `dispatch` (and possibly
-  modified `loads` / `events` when UFLS fires).
+  Both tiers are ramp-limited on the cascade clock
+  (`PowerModel.Failure.Reserves`): a balancing authority with 10 GW of idle
+  headroom and thirty seconds of notice delivers thirty seconds' worth of
+  ramp, not 10 GW.
+
+  PRIMARY (governor) response is deliberately NOT allocated here. It is not a
+  balancing-authority function — every governor in the synchronous island
+  answers a frequency deviation regardless of who lost the unit — so it is
+  allocated island-wide inside the step's own island evaluation, where the
+  swing model that produces it also lives.
+
+  Anything these tiers cannot reach in time is left standing: the step's
+  island evaluation closes it with UFLS and the force-shed tier, on the
+  frequency the island actually reached. Returns the updated state.
   """
   def redispatch(state, deficit_mw, island_bus_set, origin_ba \\ nil)
 
@@ -572,64 +882,81 @@ defmodule PowerModel.Failure.Cascade do
   end
 
   def redispatch(%__MODULE__{} = state, deficit_mw, island_bus_set, origin_ba) do
-    # Tier 1: reserves within the origin balancing authority
-    {state, remaining} =
+    elapsed_s = elapsed_since_deficit(state, island_bus_set)
+    island_gens = online_island_gens(state, island_bus_set)
+
+    {ba_gens, other_gens} =
       if origin_ba do
-        ba_gens =
-          state
-          |> online_island_gens(island_bus_set)
-          |> Enum.filter(fn g -> Map.get(state.bus_ba || %{}, g.bus_id) == origin_ba end)
-
-        apply_headroom(state, deficit_mw, ba_gens)
+        Enum.split_with(island_gens, fn g ->
+          Map.get(state.bus_ba || %{}, g.bus_id) == origin_ba
+        end)
       else
-        {state, deficit_mw}
+        {[], island_gens}
       end
 
-    # Tier 2: emergency assistance from all remaining island headroom
-    {state, remaining} =
-      if remaining > 0.5 do
-        apply_headroom(state, remaining, online_island_gens(state, island_bus_set))
-      else
-        {state, remaining}
-      end
+    {state, remaining} = apply_sustained_reserves(state, deficit_mw, ba_gens, elapsed_s)
+    {state, _remaining} = apply_sustained_reserves(state, remaining, other_gens, elapsed_s)
 
-    # Tier 3: island-wide UFLS for anything still uncovered
-    if remaining > 0.5 do
-      trigger_ufls_for_deficit(state, remaining, island_bus_set)
-    else
-      state
+    state
+  end
+
+  # Raise `gens` by as much sustained (secondary + tertiary) reserve as the
+  # clock allows. Returns `{state, remaining_deficit}`.
+  defp apply_sustained_reserves(state, deficit_mw, gens, elapsed_s)
+
+  defp apply_sustained_reserves(state, deficit_mw, [], _elapsed_s), do: {state, deficit_mw}
+
+  defp apply_sustained_reserves(state, deficit_mw, _gens, _elapsed_s) when deficit_mw <= 0.5,
+    do: {state, deficit_mw}
+
+  defp apply_sustained_reserves(state, deficit_mw, gens, elapsed_s) do
+    units = Enum.map(gens, &sustained_unit_of(state, &1))
+    alloc = Reserves.allocate(units, deficit_mw, elapsed_s)
+
+    dispatch =
+      Enum.reduce(units, state.dispatch, fn unit, d ->
+        case Map.get(alloc.sustained_by_unit, unit.id, 0.0) do
+          mw when mw > 0.0 -> Map.update(d, unit.id, mw, &(&1 + mw))
+          _ -> d
+        end
+      end)
+
+    {%{state | dispatch: dispatch}, deficit_mw - alloc.secondary_mw - alloc.tertiary_mw}
+  end
+
+  # One generator at its sustained operating point, read from the state's
+  # dispatch and primary-reserve maps.
+  defp sustained_unit_of(state, generator) do
+    dispatched =
+      Map.get(
+        state.dispatch,
+        generator.id,
+        generator.p_max_mw * (generator.capacity_factor || 1.0)
+      )
+
+    sustained_unit(generator, dispatched, Map.get(state.primary_reserve, generator.id, 0.0))
+  end
+
+  # How long this island's sustained deficit has been open, on the cascade
+  # clock. An island with no record at all has never been seen by the cascade,
+  # which means whatever gap it has is not an event — see `init/3`.
+  defp elapsed_since_deficit(state, island_bus_set) do
+    case island_record_for(state, island_bus_set) do
+      %{deficit_since_s: opened_at} when is_number(opened_at) ->
+        max(state.simulated_time - opened_at, 0.0)
+
+      %{} ->
+        0.0
+
+      nil ->
+        :infinity
     end
   end
 
-  # Raise the given generators proportionally to their headroom to cover as
-  # much of `deficit_mw` as possible. Returns `{state, remaining_deficit}`.
-  defp apply_headroom(state, deficit_mw, gens) do
-    headrooms =
-      Enum.map(gens, fn g ->
-        current = Map.get(state.dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
-        {g.id, max(g.p_max_mw - current, 0.0), current}
-      end)
-
-    total_headroom =
-      headrooms
-      |> Enum.map(fn {_id, h, _current} -> h end)
-      |> Enum.sum()
-
-    if total_headroom <= 0.0 do
-      {state, deficit_mw}
-    else
-      dispatchable = min(deficit_mw, total_headroom)
-      fraction = dispatchable / total_headroom
-
-      new_dispatch =
-        Enum.reduce(headrooms, state.dispatch, fn {gen_id, headroom, fallback_current}, d ->
-          increase = headroom * fraction
-          current = Map.get(d, gen_id, fallback_current)
-          Map.put(d, gen_id, current + increase)
-        end)
-
-      {%{state | dispatch: new_dispatch}, deficit_mw - dispatchable}
-    end
+  defp island_record_for(state, island_bus_set) do
+    Enum.find(state.island_states, fn record ->
+      not MapSet.disjoint?(record.buses, island_bus_set)
+    end)
   end
 
   defp online_island_gens(state, island_bus_set) do
@@ -652,98 +979,6 @@ defmodule PowerModel.Failure.Cascade do
       Enum.reject(state.transformers, &MapSet.member?(state.tripped_transformers, &1.id))
 
     IslandDetector.detect(Enum.map(state.buses, & &1.id), active_lines, active_xfmrs)
-  end
-
-  # Trigger UFLS to cover an unresolvable generation deficit within one island.
-  defp trigger_ufls_for_deficit(state, deficit_mw, island_bus_set) do
-    island_loads = Enum.filter(state.loads, &MapSet.member?(island_bus_set, &1.bus_id))
-    online_gens = online_island_gens(state, island_bus_set)
-    dispatched_gens = apply_dispatch(online_gens, state.dispatch)
-
-    total_load = Enum.sum(Enum.map(island_loads, & &1.p_mw))
-
-    total_gen =
-      online_gens
-      |> Enum.map(fn g -> Map.get(state.dispatch, g.id, 0.0) end)
-      |> Enum.sum()
-
-    # IEEE 1547 legacy rooftop trips FIRST, on the frequency this island
-    # reaches before any UFLS stage arms, and its output lands as load here —
-    # so `total_load` (and therefore the deficit both rounds below close)
-    # already carries it.
-    island_buses = Enum.filter(state.buses, &MapSet.member?(island_bus_set, &1.id))
-
-    {all_loads, island_loads, total_load, btm, btm_events} =
-      evaluate_btm_trip(
-        btm_context(state),
-        island_buses,
-        dispatched_gens,
-        island_loads,
-        state.loads,
-        total_load,
-        total_load - total_gen
-      )
-
-    state = %{
-      state
-      | loads: all_loads,
-        btm_tripped_buses: btm.tripped,
-        btm_tripped_mw: state.btm_tripped_mw + btm.tripped_mw
-    }
-
-    deficit_mw = deficit_mw + btm.tripped_mw
-
-    {shed_loads, ufls_events} =
-      LoadShedding.apply_ufls(
-        island_loads,
-        dispatched_gens,
-        total_gen,
-        total_load
-      )
-
-    # If UFLS didn't shed enough (e.g. frequency still above threshold),
-    # force-shed ONLY the remaining gap against the post-UFLS loads. This tier
-    # intentionally permits total deficit coverage beyond the canonical UFLS
-    # program's roughly 30% cumulative shed so the remaining physical gap is
-    # actually closed. Both rounds' events are kept for exact conservation.
-    ufls_shed_mw =
-      Enum.sum(Enum.map(ufls_events, fn e -> Map.get(e.details, :shed_mw, 0.0) end))
-
-    remaining_mw = deficit_mw - ufls_shed_mw
-    current_total = total_load - ufls_shed_mw
-
-    {shed_loads, force_events} =
-      if remaining_mw > 0.5 and current_total > 0 do
-        fraction = min(remaining_mw / current_total, 1.0)
-
-        # gen/load args express exactly the remaining gap so the internal cap
-        # cannot re-shed what round 1 already removed
-        LoadShedding.apply_proportional_shedding(
-          shed_loads,
-          fraction,
-          current_total - remaining_mw,
-          current_total
-        )
-      else
-        {shed_loads, []}
-      end
-
-    shed_events = ufls_events ++ force_events
-
-    shed_map = Map.new(shed_loads, &{&1.id, &1})
-    updated_loads = Enum.map(state.loads, fn l -> Map.get(shed_map, l.id, l) end)
-
-    events_with_step = Enum.map(btm_events ++ shed_events, &Map.put(&1, :step, state.step))
-
-    event_shed_mw =
-      Enum.sum(Enum.map(shed_events, fn e -> Map.get(e.details, :shed_mw, 0.0) end))
-
-    %{
-      state
-      | loads: updated_loads,
-        events: events_with_step ++ state.events,
-        shed_load_mw: state.shed_load_mw + event_shed_mw
-    }
   end
 
   # ---------------------------------------------------------------------------
@@ -782,32 +1017,30 @@ defmodule PowerModel.Failure.Cascade do
 
     active_gens = Enum.reject(state.generators, &MapSet.member?(state.tripped_generators, &1.id))
 
-    # Build dispatched generators -- override p_max_mw/capacity_factor to match dispatch
-    dispatched_gens = apply_dispatch(active_gens, state.dispatch)
-
-    # Detect islands
+    # Detect islands and carry each one's frequency state across whatever the
+    # last trip did to the topology (see the moduledoc's inheritance rule).
     bus_ids = Enum.map(state.buses, & &1.id)
     islands = IslandDetector.detect(bus_ids, active_lines, active_xfmrs)
+    records = inherit_island_states(state.island_states, islands, state.loads)
 
     # Solve each island and collect ALL overloaded components with trip times
-    {non_thermal_trips, island_results, updated_loads, timed_overloads, step_shed_mw,
-     step_blackout_mw, dispatch_updates, btm} =
-      solve_islands_timed(
-        islands,
-        state.buses,
-        active_lines,
-        active_xfmrs,
-        dispatched_gens,
-        state.loads,
-        state.dc_ties,
-        state.base_mva,
-        state.base_overloaded,
-        btm_context(state)
-      )
+    island_step = solve_islands_timed(state, islands, records, active_lines, active_xfmrs)
+
+    %{
+      trips: non_thermal_trips,
+      results: island_results,
+      loads: updated_loads,
+      overloads: timed_overloads,
+      shed_mw: step_shed_mw,
+      blackout_mw: step_blackout_mw,
+      btm: btm
+    } = island_step
 
     state = %{
       state
-      | dispatch: Map.merge(state.dispatch, dispatch_updates),
+      | dispatch: island_step.dispatch,
+        primary_reserve: island_step.primary_reserve,
+        island_states: island_step.records,
         btm_tripped_buses: btm.tripped,
         btm_tripped_mw: state.btm_tripped_mw + btm.tripped_mw
     }
@@ -843,6 +1076,7 @@ defmodule PowerModel.Failure.Cascade do
       state = %{
         state
         | stable: true,
+          simulated_time: state.simulated_time + island_step.frequency_advance_s,
           loads: updated_loads,
           shed_load_mw: state.shed_load_mw + step_shed_mw,
           blackout_load_mw: state.blackout_load_mw + step_blackout_mw,
@@ -907,12 +1141,17 @@ defmodule PowerModel.Failure.Cascade do
 
       state = %{state | relay_duty: relay_duty}
 
-      {thermal_trips, state} =
-        if tripped_component do
-          {[tripped_component], %{state | simulated_time: state.simulated_time + time_advance_s}}
-        else
-          {[], state}
-        end
+      # The step's wall clock advances by the LONGER of the two processes that
+      # ran in it (REVIEW CAS-16): the relay that finished timing, and the
+      # frequency window any island actually integrated. They are concurrent —
+      # an island swinging while a relay times is one 30 s stretch of real
+      # time, not two — and thermal duty still accrues over its own advance
+      # alone, so relay timing is unchanged by the frequency clock.
+      relay_advance_s = if tripped_component, do: time_advance_s, else: 0.0
+      step_advance_s = max(relay_advance_s, island_step.frequency_advance_s)
+      state = %{state | simulated_time: state.simulated_time + step_advance_s}
+
+      thermal_trips = if tripped_component, do: [tripped_component], else: []
 
       all_trips_this_step = non_thermal_trips ++ thermal_trips ++ facility_trips
 
@@ -956,355 +1195,750 @@ defmodule PowerModel.Failure.Cascade do
     end
   end
 
-  # After a line/component trips, recompute generation-load balance PER
-  # ISLAND and rebalance within each: deficits raise reserves (or shed),
-  # SURPLUSES curtail generation. An island split leaves the exporting half
-  # over-dispatched -- without curtailment that surplus becomes a phantom
-  # sink at the slack bus, creating fictitious flows that trip healthy lines.
-  # Islands without online generation are skipped -- their loads are
-  # accounted as blackouts by the island solver, not as UFLS shedding.
+  # After a line/component trips, recompute generation-load balance PER ISLAND
+  # and rebalance within each: deficits raise ramp-limited reserves, SURPLUSES
+  # curtail generation. An island split leaves the exporting half
+  # over-dispatched -- without curtailment that surplus becomes a phantom sink
+  # at the slack bus, creating fictitious flows that trip healthy lines.
+  # Islands without online generation are skipped -- their loads are accounted
+  # as blackouts by the island solver, not as UFLS shedding.
+  #
+  # Deficits are measured against the island's SUSTAINED generation, so a gap
+  # currently held up by governor response still reads as a deficit and the
+  # slower tiers keep working to replace it (ROADMAP item 16: primary arrests,
+  # secondary replaces). Nothing here sheds load: a deficit the tiers cannot
+  # reach in time is left for the step's island evaluation, which is the one
+  # place that owns the frequency trajectory and everything that reads it.
   defp maybe_redispatch_after_trip(state) do
-    state
-    |> active_topology_islands()
-    |> Enum.reduce(state, fn island, st ->
+    {state, islands} = refresh_island_states(state)
+
+    Enum.reduce(islands, state, fn island, st ->
       island_gens = online_island_gens(st, island)
 
       if island_gens == [] do
         st
       else
-        island_dispatch =
-          island_gens
-          |> Enum.map(fn g -> Map.get(st.dispatch, g.id, 0.0) end)
-          |> Enum.sum()
+        sustained_mw = sum_mw(island_gens, &sustained_mw_of(st, &1))
+        primary_mw = sum_mw(island_gens, &Map.get(st.primary_reserve, &1.id, 0.0))
 
         island_load =
           st.loads
           |> Enum.filter(&MapSet.member?(island, &1.bus_id))
-          |> Enum.map(& &1.p_mw)
-          |> Enum.sum()
+          |> sum_mw(& &1.p_mw)
 
-        deficit = island_load - island_dispatch
+        tie_mw =
+          st.dc_ties
+          |> Enum.filter(&DcTie.touches?(&1, island))
+          |> DcTie.net_injection_mw(island)
+
+        sustained_deficit = island_load - sustained_mw - tie_mw
+        output_surplus = sustained_mw + primary_mw + tie_mw - island_load
+
+        st = mark_deficit_clock(st, island, sustained_deficit)
 
         cond do
-          deficit > 0.5 -> redispatch(st, deficit, island)
-          deficit < -0.5 -> curtail_island(st, island_gens, island_dispatch, island_load)
+          sustained_deficit > 0.5 -> redispatch(st, sustained_deficit, island)
+          output_surplus > 0.5 -> curtail_island(st, island_gens, island_load - tie_mw)
           true -> st
         end
       end
     end)
   end
 
-  # Scale an island's generation down proportionally to match its load.
-  defp curtail_island(state, island_gens, island_dispatch, island_load)
-       when island_dispatch > 0.0 do
-    factor = max(island_load, 0.0) / island_dispatch
-
-    new_dispatch =
-      Enum.reduce(island_gens, state.dispatch, fn g, d ->
-        Map.update(d, g.id, 0.0, &(&1 * factor))
-      end)
-
-    %{state | dispatch: new_dispatch}
+  # Re-detect islands and carry each one's frequency record across whatever
+  # splitting the last trip did (see the moduledoc's inheritance rule).
+  defp refresh_island_states(state) do
+    islands = active_topology_islands(state)
+    records = inherit_island_states(state.island_states, islands, state.loads)
+    {%{state | island_states: records}, islands}
   end
 
-  defp curtail_island(state, _gens, _dispatch, _load), do: state
+  # Start the island's deficit clock when a sustained gap opens, stop it when
+  # the gap closes. The reserve tiers ramp on the elapsed time this records.
+  defp mark_deficit_clock(state, island_bus_set, sustained_deficit) do
+    now = state.simulated_time
+
+    records =
+      Enum.map(state.island_states, fn record ->
+        if MapSet.disjoint?(record.buses, island_bus_set) do
+          record
+        else
+          update_deficit_clock(record, sustained_deficit, now)
+        end
+      end)
+
+    %{state | island_states: records}
+  end
+
+  defp update_deficit_clock(record, sustained_deficit, now) when sustained_deficit > 0.5 do
+    %{record | deficit_since_s: record.deficit_since_s || now}
+  end
+
+  defp update_deficit_clock(record, _sustained_deficit, _now) do
+    %{record | deficit_since_s: nil}
+  end
+
+  defp sustained_mw_of(state, generator) do
+    dispatched =
+      Map.get(
+        state.dispatch,
+        generator.id,
+        generator.p_max_mw * (generator.capacity_factor || 1.0)
+      )
+
+    dispatched - Map.get(state.primary_reserve, generator.id, 0.0)
+  end
+
+  # Scale an island's generation down to match `target_mw` of net demand.
+  # Transient governor MW is released first — a governor that is holding a gap
+  # the island no longer has has nothing to hold — and only then is the
+  # sustained operating point scaled back.
+  defp curtail_island(state, island_gens, target_mw) do
+    primary_released =
+      Enum.reduce(island_gens, state.dispatch, fn g, d ->
+        case Map.get(state.primary_reserve, g.id, 0.0) do
+          mw when mw > 0.0 -> Map.update(d, g.id, 0.0, &max(&1 - mw, 0.0))
+          _ -> d
+        end
+      end)
+
+    primary_reserve =
+      Enum.reduce(island_gens, state.primary_reserve, &Map.delete(&2, &1.id))
+
+    sustained_mw = sum_mw(island_gens, &Map.get(primary_released, &1.id, 0.0))
+
+    dispatch =
+      if sustained_mw > 0.0 and sustained_mw > target_mw do
+        factor = max(target_mw, 0.0) / sustained_mw
+
+        Enum.reduce(island_gens, primary_released, fn g, d ->
+          Map.update(d, g.id, 0.0, &(&1 * factor))
+        end)
+      else
+        primary_released
+      end
+
+    %{state | dispatch: dispatch, primary_reserve: primary_reserve}
+  end
 
   # ---------------------------------------------------------------------------
   # Island solving (timed variant)
   #
-  # Instead of returning thermal trips directly, this collects all overloaded
-  # components with their inverse-time trip times so the caller can pick the
-  # single fastest-to-trip component.
+  # One step's work for every island, in the order the moduledoc documents:
+  # reserves, trajectory, protection, recompute, residual shed, solve. Thermal
+  # and zone-3 overloads are returned WITH their inverse-time trip times rather
+  # than tripped here, so the caller can pick the single fastest relay.
   # ---------------------------------------------------------------------------
 
-  defp solve_islands_timed(
-         islands,
-         buses,
-         lines,
-         transformers,
-         generators,
-         loads,
-         dc_ties,
-         base_mva,
-         base_overloaded,
-         btm
-       ) do
-    Enum.reduce(islands, {[], [], loads, [], 0.0, 0.0, %{}, btm}, fn island, acc ->
-      {trips, results, lds, overloads, shed_mw, blackout_mw, dispatch_updates, btm} = acc
+  defp solve_islands_timed(state, islands, records, lines, transformers) do
+    ctx = %{
+      buses: state.buses,
+      lines: lines,
+      transformers: transformers,
+      dc_ties: state.dc_ties,
+      base_mva: state.base_mva,
+      base_overloaded: state.base_overloaded,
+      now: state.simulated_time
+    }
 
-      island_set = island
-      island_buses = Enum.filter(buses, &MapSet.member?(island_set, &1.id))
+    active_gens = Enum.reject(state.generators, &MapSet.member?(state.tripped_generators, &1.id))
 
-      island_lines =
-        Enum.filter(lines, fn l ->
-          MapSet.member?(island_set, l.from_bus_id) and MapSet.member?(island_set, l.to_bus_id)
-        end)
+    acc = %{
+      trips: [],
+      results: [],
+      loads: state.loads,
+      overloads: [],
+      shed_mw: 0.0,
+      blackout_mw: 0.0,
+      dispatch: state.dispatch,
+      primary_reserve: state.primary_reserve,
+      btm: btm_context(state),
+      records: [],
+      frequency_advance_s: 0.0
+    }
 
-      island_xfmrs =
-        Enum.filter(transformers, fn t ->
-          MapSet.member?(island_set, t.from_bus_id) and MapSet.member?(island_set, t.to_bus_id)
-        end)
+    islands
+    |> Enum.zip(records)
+    |> Enum.reduce(acc, fn {island, record}, acc ->
+      solve_one_island(island, record, active_gens, acc, ctx)
+    end)
+  end
 
-      island_gens = Enum.filter(generators, &MapSet.member?(island_set, &1.bus_id))
-      island_loads = Enum.filter(lds, &MapSet.member?(island_set, &1.bus_id))
+  defp solve_one_island(island, record, active_gens, acc, ctx) do
+    island_buses = Enum.filter(ctx.buses, &MapSet.member?(island, &1.id))
 
-      # DC ties with a converter in this island. A tie whose far terminal is in
-      # a different island contributes only its near-end injection here, which
-      # is exactly how an HVDC link behaves: it transfers power without
-      # synchronizing the two systems. A tie touching NO surviving island (both
-      # converters on blacked-out buses) is simply never assembled, so it moves
-      # nothing — a converter cannot run without an AC source to commutate
-      # against.
-      island_ties = Enum.filter(dc_ties, &DcTie.touches?(&1, island_set))
-      island_tie_mw = DcTie.net_injection_mw(island_ties, island_set)
+    island_lines =
+      Enum.filter(ctx.lines, fn l ->
+        MapSet.member?(island, l.from_bus_id) and MapSet.member?(island, l.to_bus_id)
+      end)
 
-      if island_dead?(island_buses, island_gens) do
-        # Isolated bus or no generation -- all loads lost.
-        # Only loads still carrying demand black out (already-zeroed loads were
-        # accounted in an earlier step); their p_mw is zeroed so redispatch and
-        # frequency simulation no longer see phantom demand.
-        lost_loads = Enum.filter(island_loads, &(&1.p_mw > 0.0))
+    island_xfmrs =
+      Enum.filter(ctx.transformers, fn t ->
+        MapSet.member?(island, t.from_bus_id) and MapSet.member?(island, t.to_bus_id)
+      end)
 
-        new_trips =
-          Enum.map(lost_loads, fn load ->
-            %{
-              component_type: "load",
-              component_id: load.id,
-              failure_cause: "island_blackout",
-              details: %{lost_mw: load.p_mw}
-            }
-          end)
+    gens = Enum.filter(active_gens, &MapSet.member?(island, &1.bus_id))
+    island_loads = Enum.filter(acc.loads, &MapSet.member?(island, &1.bus_id))
 
-        lost_mw = Enum.sum(Enum.map(lost_loads, & &1.p_mw))
-        lost_ids = MapSet.new(lost_loads, & &1.id)
+    # DC ties with a converter in this island. A tie whose far terminal is in
+    # a different island contributes only its near-end injection here, which
+    # is exactly how an HVDC link behaves: it transfers power without
+    # synchronizing the two systems. A tie touching NO surviving island (both
+    # converters on blacked-out buses) is simply never assembled, so it moves
+    # nothing — a converter cannot run without an AC source to commutate
+    # against.
+    island_ties = Enum.filter(ctx.dc_ties, &DcTie.touches?(&1, island))
+    tie_mw = DcTie.net_injection_mw(island_ties, island)
 
-        lds =
-          Enum.map(lds, fn l ->
-            if MapSet.member?(lost_ids, l.id), do: %{l | p_mw: 0.0, q_mvar: 0.0}, else: l
-          end)
-
-        {trips ++ new_trips, results, lds, overloads, shed_mw, blackout_mw + lost_mw,
-         dispatch_updates, btm}
-      else
-        # Check generation-load balance using dispatched values
-        gen_mw =
-          Enum.sum(
-            Enum.map(island_gens, fn g ->
-              g.p_max_mw * (g.capacity_factor || 1.0)
-            end)
-          )
-
-        load_mw = Enum.sum(Enum.map(island_loads, & &1.p_mw))
-
-        # A DC-tie import serves load exactly as generation does in the power
-        # balance, so it belongs in the deficit arithmetic — an island importing
-        # 3 GW is not short 3 GW. It contributes no inertia and no governor
-        # response, though, so it never joins the machine set the frequency
-        # model integrates. A net exporter (negative tie MW) deepens the deficit.
-        available_mw = gen_mw + island_tie_mw
-
-        {island_gens, gen_mw, island_dispatch_updates} =
-          if load_mw > available_mw do
-            raise_island_generation(island_gens, load_mw - available_mw)
-          else
-            {island_gens, gen_mw, %{}}
-          end
-
-        available_mw = gen_mw + island_tie_mw
-        dispatch_updates = Map.merge(dispatch_updates, island_dispatch_updates)
-
-        # IEEE 1547 legacy inverters trip HERE — after reserves are raised (so
-        # the frequency they see is the one the island actually reaches) and
-        # before UFLS, which is the vicious pairing: the rooftop fleet is gone
-        # at 59.3 Hz while the first UFLS stage only arms BELOW 59.3 Hz, so the
-        # deficit UFLS opens on is the one this trip just deepened.
-        {lds, island_loads, load_mw, btm, btm_events} =
-          evaluate_btm_trip(
-            btm,
-            island_buses,
-            island_gens,
-            island_loads,
-            lds,
-            load_mw,
-            load_mw - available_mw
-          )
-
-        # Available headroom is raised first. Apply UFLS only to any remaining
-        # deficit, then ALWAYS power-flow solve the island with the raised
-        # dispatch and post-shed loads. Skipping the solve would leave thermal /
-        # voltage / zone-3 protection unevaluated in the deficient island.
-        {lds, island_loads, shed_events, event_shed_mw} =
-          if load_mw > available_mw do
-            {shed_loads, shed_events} =
-              LoadShedding.apply_ufls(island_loads, island_gens, available_mw, load_mw)
-
-            # Residual force-shed round (mirrors trigger_ufls_for_deficit):
-            # UFLS under-sheds when the frequency nadir stays above the first
-            # stage (small deficits) or when the deficit exceeds the ~30%
-            # cumulative schedule cap. The remaining physical gap MUST still
-            # be closed, otherwise the island is silently unbalanced and the
-            # DC slack absorbs unserved load that no event accounts for.
-            deficit_mw = load_mw - available_mw
-
-            ufls_shed_mw =
-              Enum.sum(Enum.map(shed_events, fn e -> Map.get(e.details, :shed_mw, 0.0) end))
-
-            remaining_mw = deficit_mw - ufls_shed_mw
-            current_total = load_mw - ufls_shed_mw
-
-            {shed_loads, force_events} =
-              if remaining_mw > 0.5 and current_total > 0 do
-                fraction = min(remaining_mw / current_total, 1.0)
-
-                # gen/load args express exactly the remaining gap so the
-                # internal cap cannot re-shed what round 1 already removed
-                LoadShedding.apply_proportional_shedding(
-                  shed_loads,
-                  fraction,
-                  current_total - remaining_mw,
-                  current_total
-                )
-              else
-                {shed_loads, []}
-              end
-
-            shed_events = shed_events ++ force_events
-
-            shed_map = Map.new(shed_loads, &{&1.id, &1})
-            lds = Enum.map(lds, fn l -> Map.get(shed_map, l.id, l) end)
-            island_loads = Enum.map(island_loads, fn l -> Map.get(shed_map, l.id, l) end)
-
-            event_shed_mw =
-              Enum.sum(Enum.map(shed_events, fn e -> Map.get(e.details, :shed_mw, 0.0) end))
-
-            {lds, island_loads, shed_events, event_shed_mw}
-          else
-            {lds, island_loads, [], 0.0}
-          end
-
-        # Run DC power flow
-        snapshot = %{
+    if island_dead?(island_buses, gens) do
+      acc
+      |> black_out_island(island_loads)
+      |> put_record(fresh_island_record(island))
+    else
+      live_island(
+        %{
+          island: island,
           buses: island_buses,
           lines: island_lines,
           transformers: island_xfmrs,
-          generators: island_gens,
+          gens: gens,
           loads: island_loads,
-          dc_ties: island_ties
+          ties: island_ties,
+          tie_mw: tie_mw
+        },
+        record,
+        acc,
+        ctx
+      )
+    end
+  end
+
+  # Every load in a generation-less island loses power. Only loads still
+  # carrying demand black out (already-zeroed loads were accounted in an
+  # earlier step); their p_mw is zeroed so redispatch and the frequency
+  # simulation no longer see phantom demand.
+  defp black_out_island(acc, island_loads) do
+    lost_loads = Enum.filter(island_loads, &(&1.p_mw > 0.0))
+
+    trips =
+      Enum.map(lost_loads, fn load ->
+        %{
+          component_type: "load",
+          component_id: load.id,
+          failure_cause: "island_blackout",
+          details: %{lost_mw: load.p_mw}
         }
+      end)
 
-        try do
-          solution = DCPowerFlow.solve(snapshot, base_mva: base_mva)
+    lost_mw = sum_mw(lost_loads, & &1.p_mw)
+    lost_ids = MapSet.new(lost_loads, & &1.id)
 
-          # Compute trip times for each overloaded branch (inverse-time curve)
-          # Exclude lines already overloaded in the base case (model artifacts)
-          timed = compute_timed_overloads(solution.line_flows, base_overloaded)
+    loads =
+      Enum.map(acc.loads, fn l ->
+        if MapSet.member?(lost_ids, l.id), do: %{l | p_mw: 0.0, q_mvar: 0.0}, else: l
+      end)
 
-          voltage_trips =
-            Protection.check_voltage_violations(
-              solution.bus_ids,
-              solution.vm_pu
-            )
+    %{acc | trips: acc.trips ++ trips, loads: loads, blackout_mw: acc.blackout_mw + lost_mw}
+  end
 
-          # Zone 3 distance relay check (load encroachment)
-          bus_index =
-            solution.bus_ids
-            |> Enum.with_index()
-            |> Map.new()
+  defp put_record(acc, record), do: %{acc | records: [record | acc.records]}
 
-          zone3_trips =
-            Protection.check_zone3_encroachment(
-              solution.line_flows,
-              island_lines ++ island_xfmrs,
-              island_buses,
-              solution.vm_pu,
-              solution.va_rad,
-              bus_index
-            )
+  # One live island, start to finish. `env` carries the island's slice of the
+  # network; `record` its persistent frequency state.
+  defp live_island(env, record, acc, ctx) do
+    load_mw = sum_mw(env.loads, & &1.p_mw)
 
-          # Zone 3 trips integrate duty while continuously asserted using their
-          # own fixed 0.5 s timer. The cause-specific relay key keeps this duty
-          # completely separate from thermal exposure on the same branch.
-          zone3_timed =
-            Enum.map(zone3_trips, fn t ->
-              Map.put(t, :trip_time_s, 0.5)
-            end)
+    # --- 1. Reserves ---------------------------------------------------------
+    units =
+      Enum.map(env.gens, fn g ->
+        sustained_unit(g, dispatch_of(acc, g), Map.get(acc.primary_reserve, g.id, 0.0))
+      end)
 
-          {trips ++ btm_events ++ shed_events ++ voltage_trips, [solution | results], lds,
-           overloads ++ timed ++ zone3_timed, shed_mw + event_shed_mw, blackout_mw,
-           dispatch_updates, btm}
-        rescue
-          e ->
-            error = Exception.message(e)
+    sustained_mw = sum_mw(units, & &1.p_dispatch_mw)
+    deficit_mw = load_mw - sustained_mw - env.tie_mw
 
-            Logger.error(
-              "island solve raised #{Exception.message(e)}; island dropped from this step"
-            )
+    record = update_deficit_clock(record, deficit_mw, ctx.now)
+    elapsed_s = record_elapsed(record, ctx.now)
 
-            # A numerical failure is not evidence that a live island lost load,
-            # so its loads remain served. The explicit event plus error log is
-            # the honesty mechanism, while consumption conservation is unchanged.
-            failure_event = island_solve_failure_event(island_buses, island_loads, error)
+    alloc = Reserves.allocate(units, max(deficit_mw, 0.0), elapsed_s)
 
-            {trips ++ btm_events ++ shed_events ++ [failure_event], results, lds, overloads,
-             shed_mw + event_shed_mw, blackout_mw, dispatch_updates, btm}
-        catch
-          thrown ->
-            error = inspect(thrown)
-            Logger.error("island solve threw #{error}; island dropped from this step")
-            failure_event = island_solve_failure_event(island_buses, island_loads, error)
+    raised =
+      Enum.map(units, fn unit ->
+        sustained = unit.p_dispatch_mw + Map.get(alloc.sustained_by_unit, unit.id, 0.0)
+        {unit, sustained, Map.get(alloc.primary_by_unit, unit.id, 0.0)}
+      end)
 
-            {trips ++ btm_events ++ shed_events ++ [failure_event], results, lds, overloads,
-             shed_mw + event_shed_mw, blackout_mw, dispatch_updates, btm}
+    sustained_gens = Enum.map(raised, fn {unit, sustained, _p} -> shape_at(unit, sustained) end)
+    available_sustained = sum_mw(sustained_gens, & &1.p_dispatch_mw) + env.tie_mw
+
+    acc = %{
+      acc
+      | dispatch: put_dispatch(acc.dispatch, raised),
+        primary_reserve: put_primary(acc.primary_reserve, raised)
+    }
+
+    # --- 2. Trajectory evaluation -------------------------------------------
+    # ONE segment of this island's frequency, resumed from where the last
+    # disturbance left it. Everything below reads THIS trajectory, so the
+    # rooftop inverters and the generator relays cannot disagree about what
+    # the frequency did.
+    {trajectory, eval_state} =
+      simulate_island(record, sustained_gens, env.loads, load_mw - available_sustained)
+
+    nadir = if trajectory, do: Frequency.nadir(trajectory), else: @nominal_frequency_hz
+
+    # --- 3. Protection reads it ---------------------------------------------
+    # IEEE 1547 legacy inverters trip on the frequency the island reached with
+    # its rooftop still on, and what they leave behind is LOAD — the vicious
+    # pairing of item 31: the fleet is gone at 59.3 Hz while the first UFLS
+    # stage only arms BELOW 59.3 Hz.
+    {loads, island_loads, load_mw, btm, btm_events} =
+      evaluate_btm_trip(acc.btm, env.buses, env.loads, acc.loads, load_mw, nadir)
+
+    acc = %{acc | loads: loads, btm: btm}
+    env = %{env | loads: island_loads}
+
+    exposure = accumulate_exposure(record.exposure, trajectory)
+
+    gen_trips =
+      if trajectory, do: Protection.generator_frequency_trips(exposure, sustained_gens), else: []
+
+    # --- 4. Recompute --------------------------------------------------------
+    tripped_ids = MapSet.new(gen_trips, & &1.component_id)
+
+    {survivors, acc} =
+      if MapSet.size(tripped_ids) > 0 do
+        {Enum.reject(raised, fn {unit, _s, _p} -> MapSet.member?(tripped_ids, unit.id) end),
+         %{
+           acc
+           | dispatch: Enum.reduce(tripped_ids, acc.dispatch, &Map.put(&2, &1, 0.0)),
+             primary_reserve: Enum.reduce(tripped_ids, acc.primary_reserve, &Map.delete(&2, &1))
+         }}
+      else
+        {raised, acc}
+      end
+
+    tripped_mw =
+      raised
+      |> Enum.filter(fn {unit, _s, _p} -> MapSet.member?(tripped_ids, unit.id) end)
+      |> sum_mw(fn {_unit, sustained, primary} -> sustained + primary end)
+
+    gen_events =
+      if gen_trips == [],
+        do: [],
+        else: gen_trips ++ [island_gen_trip_event(env, gen_trips, tripped_mw)]
+
+    events = btm_events ++ gen_events
+
+    surviving_gens = Enum.map(survivors, fn {unit, _s, _p} -> unit end)
+
+    if island_dead?(env.buses, surviving_gens) do
+      # The island lost every machine it had — the frequency feedback loop
+      # closing on itself. What is left is a blackout, not a deficit: there is
+      # nothing to shed against and nothing to solve. The segment it died in
+      # still happened, so it still moves the clock.
+      {advance_s, _state, _exposure} = settle_segment(trajectory, eval_state, [])
+
+      acc
+      |> black_out_island(env.loads)
+      |> add_trips(events)
+      |> put_record(fresh_island_record(env.island))
+      |> Map.update!(:frequency_advance_s, &max(&1, advance_s))
+    else
+      settle_island(env, record, acc, ctx, %{
+        survivors: survivors,
+        events: events,
+        trajectory: trajectory,
+        eval_state: eval_state,
+        recompute?: MapSet.size(tripped_ids) > 0 or btm_events != [],
+        load_mw: load_mw
+      })
+    end
+  end
+
+  # --- 5. Residual shed, and 6. solve ---------------------------------------
+  defp settle_island(env, record, acc, ctx, step) do
+    sustained_gens = Enum.map(step.survivors, fn {u, s, _p} -> shape_at(u, s) end)
+    available_sustained = sum_mw(sustained_gens, & &1.p_dispatch_mw) + env.tie_mw
+    available_output = sum_mw(step.survivors, fn {_u, s, p} -> s + p end) + env.tie_mw
+
+    imbalance_mw = step.load_mw - available_sustained
+
+    # The authoritative trajectory: when the rooftop or a generator left, the
+    # island is answering a DEEPER gap than the evaluation saw, so the segment
+    # is re-integrated from the same starting state rather than patched.
+    {trajectory, eval_state} =
+      if step.recompute? do
+        simulate_island(record, sustained_gens, env.loads, imbalance_mw)
+      else
+        {step.trajectory, step.eval_state}
+      end
+
+    lost_mw = frequency_lost_mw(record.frequency_state, imbalance_mw)
+
+    {shed_loads, ufls_events, frequency_state} =
+      if lost_mw > 0.5 do
+        LoadShedding.apply_ufls_with_state(
+          env.loads,
+          sustained_gens,
+          step.load_mw - lost_mw,
+          step.load_mw,
+          frequency_state: record.frequency_state,
+          duration_seconds: @frequency_window_s
+        )
+      else
+        {env.loads, [], eval_state}
+      end
+
+    ufls_shed_mw = sum_mw(ufls_events, &Map.get(&1.details, :shed_mw, 0.0))
+
+    # Residual force-shed. UFLS under-sheds when the frequency nadir stays
+    # above the first stage (small deficits) or when the deficit exceeds the
+    # ~30% cumulative schedule cap. The remaining PHYSICAL gap — measured
+    # against the island's actual output, primary response included — must
+    # still be closed, otherwise the island is silently unbalanced and the DC
+    # slack absorbs unserved load that no event accounts for.
+    remaining_mw = step.load_mw - available_output - ufls_shed_mw
+    current_total = step.load_mw - ufls_shed_mw
+
+    {shed_loads, force_events} =
+      if remaining_mw > 0.5 and current_total > 0.0 do
+        fraction = min(remaining_mw / current_total, 1.0)
+
+        # gen/load args express exactly the remaining gap so the internal cap
+        # cannot re-shed what round 1 already removed
+        LoadShedding.apply_proportional_shedding(
+          shed_loads,
+          fraction,
+          current_total - remaining_mw,
+          current_total
+        )
+      else
+        {shed_loads, []}
+      end
+
+    shed_events = ufls_events ++ force_events
+    shed_mw = sum_mw(shed_events, &Map.get(&1.details, :shed_mw, 0.0))
+    served_mw = step.load_mw - shed_mw
+
+    shed_map = Map.new(shed_loads, &{&1.id, &1})
+    loads = Enum.map(acc.loads, fn l -> Map.get(shed_map, l.id, l) end)
+    island_loads = Enum.map(env.loads, fn l -> Map.get(shed_map, l.id, l) end)
+
+    # UFLS opens breakers on FREQUENCY, so a program stage can take more load
+    # off than the physical gap needed. Release the transient governor MW and
+    # curtail back to what the island is actually serving, so the DC solve
+    # never sees a surplus this step's own shedding created.
+    #
+    # Only a surplus THIS STEP created is curtailed. An island that was
+    # already generating more than it serves is exporting — the fuel-anchored
+    # dispatch's absolute measured MW say so — and that surplus is left where
+    # it was, on the slack bus, exactly as it was before this step ran.
+    {dispatch, primary_reserve} =
+      if shed_mw > 0.0 and available_output > served_mw + 0.5 do
+        curtail_dispatch(
+          acc.dispatch,
+          acc.primary_reserve,
+          sustained_gens,
+          served_mw - env.tie_mw
+        )
+      else
+        {acc.dispatch, acc.primary_reserve}
+      end
+
+    solver_gens =
+      Enum.map(step.survivors, fn {unit, _s, _p} ->
+        shape_at(unit, Map.get(dispatch, unit.id, 0.0))
+      end)
+
+    frequency_state = credit_shed(frequency_state, record.frequency_state, shed_mw)
+
+    {advance_s, frequency_state, exposure} =
+      settle_segment(trajectory, frequency_state, record.exposure)
+
+    record = %{
+      record
+      | frequency_state: frequency_state,
+        exposure: exposure,
+        deficit_since_s:
+          update_deficit_clock(record, served_mw - available_sustained, ctx.now).deficit_since_s
+    }
+
+    acc =
+      %{
+        acc
+        | loads: loads,
+          dispatch: dispatch,
+          primary_reserve: primary_reserve,
+          shed_mw: acc.shed_mw + shed_mw,
+          frequency_advance_s: max(acc.frequency_advance_s, advance_s)
+      }
+      |> add_trips(step.events ++ shed_events)
+      |> put_record(record)
+
+    solve_island_flows(%{env | loads: island_loads}, solver_gens, acc, ctx)
+  end
+
+  # --- 6. DC power flow, and the protection that reads it -------------------
+  defp solve_island_flows(env, solver_gens, acc, ctx) do
+    snapshot = %{
+      buses: env.buses,
+      lines: env.lines,
+      transformers: env.transformers,
+      generators: solver_gens,
+      loads: env.loads,
+      dc_ties: env.ties
+    }
+
+    try do
+      solution = DCPowerFlow.solve(snapshot, base_mva: ctx.base_mva)
+
+      # Trip times for each overloaded branch (inverse-time curve), excluding
+      # lines already overloaded in the base case (model artifacts).
+      timed = compute_timed_overloads(solution.line_flows, ctx.base_overloaded)
+
+      voltage_trips = Protection.check_voltage_violations(solution.bus_ids, solution.vm_pu)
+
+      bus_index = solution.bus_ids |> Enum.with_index() |> Map.new()
+
+      zone3_trips =
+        Protection.check_zone3_encroachment(
+          solution.line_flows,
+          env.lines ++ env.transformers,
+          env.buses,
+          solution.vm_pu,
+          solution.va_rad,
+          bus_index
+        )
+
+      # Zone 3 trips integrate duty while continuously asserted using their
+      # own fixed 0.5 s timer. The cause-specific relay key keeps this duty
+      # completely separate from thermal exposure on the same branch.
+      zone3_timed = Enum.map(zone3_trips, &Map.put(&1, :trip_time_s, 0.5))
+
+      %{
+        acc
+        | trips: acc.trips ++ voltage_trips,
+          results: [solution | acc.results],
+          overloads: acc.overloads ++ timed ++ zone3_timed
+      }
+    rescue
+      e ->
+        error = Exception.message(e)
+        Logger.error("island solve raised #{error}; island dropped from this step")
+        island_solve_failed(acc, env, error)
+    catch
+      thrown ->
+        error = inspect(thrown)
+        Logger.error("island solve threw #{error}; island dropped from this step")
+        island_solve_failed(acc, env, error)
+    end
+  end
+
+  # A numerical failure is not evidence that a live island lost load, so its
+  # loads remain served. The explicit event plus error log is the honesty
+  # mechanism, while consumption conservation is unchanged.
+  defp island_solve_failed(acc, env, error) do
+    add_trips(acc, [island_solve_failure_event(env.buses, env.loads, error)])
+  end
+
+  defp add_trips(acc, []), do: acc
+  defp add_trips(acc, trips), do: %{acc | trips: acc.trips ++ trips}
+
+  defp dispatch_of(acc, generator) do
+    Map.get(acc.dispatch, generator.id, generator.p_max_mw * (generator.capacity_factor || 1.0))
+  end
+
+  # A unit's whole output — sustained plus whatever primary response it is
+  # holding — is what the network sees; the split is what the swing model and
+  # the slower reserve tiers need (ROADMAP item 16).
+  defp put_dispatch(dispatch, raised) do
+    Enum.reduce(raised, dispatch, fn {unit, sustained, primary}, d ->
+      Map.put(d, unit.id, sustained + primary)
+    end)
+  end
+
+  defp put_primary(primary_reserve, raised) do
+    Enum.reduce(raised, primary_reserve, fn {unit, _sustained, primary}, p ->
+      if primary > 0.0, do: Map.put(p, unit.id, primary), else: Map.delete(p, unit.id)
+    end)
+  end
+
+  defp shape_at(unit, mw) do
+    %{unit | p_max_mw: mw, capacity_factor: 1.0} |> Map.put(:p_dispatch_mw, mw)
+  end
+
+  defp record_elapsed(%{deficit_since_s: nil}, _now), do: :infinity
+  defp record_elapsed(%{deficit_since_s: opened_at}, now), do: max(now - opened_at, 0.0)
+
+  # Curtail an island's generation back to `target_mw`, releasing transient
+  # governor MW first. Pure: takes and returns the dispatch maps.
+  defp curtail_dispatch(dispatch, primary_reserve, gens, target_mw) do
+    released =
+      Enum.reduce(gens, dispatch, fn g, d ->
+        case Map.get(primary_reserve, g.id, 0.0) do
+          mw when mw > 0.0 -> Map.update(d, g.id, 0.0, &max(&1 - mw, 0.0))
+          _ -> d
         end
+      end)
+
+    primary_reserve = Enum.reduce(gens, primary_reserve, &Map.delete(&2, &1.id))
+    sustained_mw = sum_mw(gens, &Map.get(released, &1.id, 0.0))
+
+    dispatch =
+      if sustained_mw > 0.0 and sustained_mw > target_mw do
+        factor = max(target_mw, 0.0) / sustained_mw
+        Enum.reduce(gens, released, fn g, d -> Map.update(d, g.id, 0.0, &(&1 * factor)) end)
+      else
+        released
+      end
+
+    {dispatch, primary_reserve}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Island frequency: one segment, and what the cascade reads off it
+  # ---------------------------------------------------------------------------
+
+  # Integrate one window of this island's frequency, resuming from its state.
+  # Returns `{trajectory | nil, state}`; nil means nothing happened and there
+  # was nothing to integrate — an island at nominal with no new imbalance
+  # costs nothing at all, which is the overwhelmingly common case.
+  defp simulate_island(record, gens, loads, imbalance_mw) do
+    lost_mw = frequency_lost_mw(record.frequency_state, imbalance_mw)
+
+    if abs(lost_mw) > @imbalance_epsilon_mw or in_excursion?(record.frequency_state) do
+      Frequency.simulate_with_state(gens, loads, lost_mw,
+        initial_state: record.frequency_state,
+        duration_seconds: @frequency_window_s
+      )
+    else
+      {nil, record.frequency_state}
+    end
+  end
+
+  # The NEW imbalance to hand the swing model, given what it has already been
+  # told (ROADMAP item 15).
+  #
+  # `Frequency`'s balance is `-lost_mw + governor + its own UFLS shed`, so the
+  # imbalance it believes in is `lost_mw - cumulative_shed_mw`. The cascade
+  # sheds outside the simulator too (the force-shed tier), raises reserves
+  # between segments, and loses generators mid-step; every one of those moves
+  # the physical imbalance without the simulator knowing. So each segment is
+  # told the DIFFERENCE between the imbalance the island actually has and the
+  # one the state implies — which is negative when the cascade closed part of
+  # the gap, and that is exactly how secondary reserve replacing primary
+  # response reaches the frequency model.
+  #
+  # A SURPLUS is floored at zero rather than handed over as an over-frequency
+  # excursion. An island generating more than it serves is exporting — that is
+  # what the fuel-anchored dispatch's absolute measured MW mean — and the model
+  # has no representation for the export beyond the slack bus. Handing the
+  # swing model a negative imbalance would turn every net-exporting balancing
+  # authority into a 61.8 Hz over-frequency trip. The cost, stated plainly: the
+  # over-frequency half of the PRC-024 envelope cannot fire from a dispatch
+  # surplus, only from an over-shed inside a single trajectory.
+  defp frequency_lost_mw(nil, imbalance_mw), do: max(imbalance_mw, 0.0)
+
+  defp frequency_lost_mw(state, imbalance_mw) do
+    max(imbalance_mw, 0.0) + Map.get(state, :cumulative_shed_mw, 0.0) -
+      Map.get(state, :lost_mw, 0.0)
+  end
+
+  # Credit the frequency state with the megawatts the cascade ACTUALLY shed,
+  # which is not the same number the simulator shed internally.
+  #
+  # The simulator's UFLS stages fire on frequency and take a fixed share of
+  # connected load; `LoadShedding.apply_proportional_shedding/5` then caps the
+  # applied shed at the deficit, and the force-shed tier adds whatever the
+  # program left uncovered. Leaving the simulator believing its own figure
+  # breaks the invariant every resumed segment depends on —
+  # `lost_mw - cumulative_shed_mw` must equal the island's PHYSICAL imbalance
+  # — and the breakage compounds: an over-shedding stage would make the next
+  # segment believe in an imbalance that does not exist, shed for it, and do
+  # it again on the step after that.
+  #
+  # Both rounds count. UFLS and the force-shed tier open real breakers, and
+  # the load behind them is gone either way.
+  defp credit_shed(nil, _prior, _applied_mw), do: nil
+
+  defp credit_shed(state, prior, applied_mw) do
+    prior_shed = if prior, do: Map.get(prior, :cumulative_shed_mw, 0.0), else: 0.0
+    %{state | cumulative_shed_mw: prior_shed + applied_mw}
+  end
+
+  defp in_excursion?(nil), do: false
+
+  defp in_excursion?(state) do
+    abs(Map.get(state, :frequency, @nominal_frequency_hz) - @nominal_frequency_hz) >
+      @excursion_epsilon_hz
+  end
+
+  # Generator protection reads the island's recent history, not just this
+  # segment: the PRC-024 envelope's allowances run to 180 s, which no single
+  # 30 s window can exhaust. Older samples are dropped because they can no
+  # longer change a verdict.
+  defp accumulate_exposure(exposure, nil), do: exposure
+
+  defp accumulate_exposure(exposure, trajectory) do
+    combined = exposure ++ trajectory
+    cutoff = List.last(combined).time - @exposure_window_s
+
+    Enum.filter(combined, &(&1.time >= cutoff))
+  end
+
+  # How much simulated time this segment actually took, and the state and
+  # exposure truncated to match (REVIEW CAS-16, see the moduledoc's clock
+  # section). A trajectory that settles after 4 s of a 30 s window advances
+  # the clock 4 s, and the island's own frequency clock is rewound with it so
+  # the two never drift apart.
+  defp settle_segment(nil, state, exposure), do: {0.0, state, exposure}
+
+  defp settle_segment(trajectory, state, exposure) do
+    started_at = hd(trajectory).time
+    settled_at = settle_time(trajectory)
+
+    trimmed = Enum.filter(trajectory, &(&1.time <= settled_at))
+
+    {settled_at - started_at, %{state | time: settled_at}, accumulate_exposure(exposure, trimmed)}
+  end
+
+  # The earliest time from which the trajectory never moves again: every later
+  # sample within @settle_tolerance_hz of the final frequency, with no further
+  # load shed.
+  defp settle_time(trajectory) do
+    last = List.last(trajectory)
+
+    trajectory
+    |> Enum.reverse()
+    |> Enum.reduce_while(last.time, fn record, earliest ->
+      if abs(record.frequency - last.frequency) <= @settle_tolerance_hz and
+           record.load_shed_mw == last.load_shed_mw do
+        {:cont, record.time}
+      else
+        {:halt, earliest}
       end
     end)
   end
 
-  # Raise dispatched generation proportionally into physical nameplate headroom.
-  # The returned generator shapes feed both UFLS/frequency and the DC solve,
-  # while the update map is merged into the cascade state's persistent dispatch.
-  defp raise_island_generation(generators, deficit_mw) do
-    headrooms =
-      Enum.map(generators, fn g ->
-        current =
-          Map.get(g, :p_dispatch_mw) ||
-            g.p_max_mw * (Map.get(g, :capacity_factor) || 1.0)
+  # One aggregated event per island per step, beside the individual generator
+  # trips: a national snapshot can lose thousands of machines in one step and
+  # the timeline needs a single line that says so.
+  defp island_gen_trip_event(env, gen_trips, tripped_mw) do
+    %{details: details, failure_cause: cause} = hd(gen_trips)
 
-        nameplate = Map.get(g, :p_nameplate_mw) || g.p_max_mw
-        {g, current, nameplate, max(nameplate - current, 0.0)}
-      end)
-
-    total_headroom = Enum.sum(Enum.map(headrooms, fn {_g, _current, _nameplate, h} -> h end))
-
-    if total_headroom <= 0.0 do
-      {generators,
-       Enum.sum(
-         Enum.map(generators, fn g ->
-           Map.get(g, :p_dispatch_mw) ||
-             g.p_max_mw * (Map.get(g, :capacity_factor) || 1.0)
-         end)
-       ), %{}}
-    else
-      dispatchable = min(deficit_mw, total_headroom)
-      fraction = dispatchable / total_headroom
-
-      {raised_gens, dispatch_updates} =
-        Enum.map_reduce(headrooms, %{}, fn {g, current, nameplate, headroom}, updates ->
-          raised_dispatch = current + headroom * fraction
-
-          raised_gen =
-            %{g | p_max_mw: raised_dispatch, capacity_factor: 1.0}
-            |> Map.put(:p_dispatch_mw, raised_dispatch)
-            |> Map.put(:p_nameplate_mw, nameplate)
-
-          {raised_gen, Map.put(updates, g.id, raised_dispatch)}
-        end)
-
-      raised_gen_mw =
-        Enum.sum(Enum.map(raised_gens, &Map.fetch!(&1, :p_dispatch_mw)))
-
-      {raised_gens, raised_gen_mw, dispatch_updates}
-    end
+    %{
+      component_type: "island",
+      component_id: env.buses |> Enum.map(& &1.id) |> Enum.min(),
+      failure_cause: "generator_frequency_trips",
+      details: %{
+        unit_count: length(gen_trips),
+        tripped_mw: tripped_mw,
+        trip_cause: cause,
+        band_hz: Map.get(details, :band_hz),
+        frequency_hz: Map.get(details, :frequency_hz)
+      }
+    }
   end
 
   # ---------------------------------------------------------------------------
@@ -1330,39 +1964,20 @@ defmodule PowerModel.Failure.Cascade do
   # lists are grossed up in place so both the deficit arithmetic that follows
   # and the DC solve see the new demand within this same step.
   #
-  # `deficit_mw` is the island's post-reserve generation shortfall, which is
-  # exactly the imbalance `LoadShedding.apply_ufls/4` will hand the swing model
-  # a moment later: probing with the same number means the frequency this trip
-  # reacts to is the frequency UFLS would have seen, not a second opinion.
-  defp evaluate_btm_trip(
-         btm,
-         island_buses,
-         island_gens,
-         island_loads,
-         all_loads,
-         island_load_mw,
-         deficit_mw
-       ) do
+  # `nadir` is the low point of the island's OWN frequency trajectory for this
+  # step — the same trajectory the generator relays and (a moment later) UFLS
+  # read, so no two mechanisms can hold different opinions about what the
+  # frequency did. An island with no excursion to evaluate is handed nominal.
+  defp evaluate_btm_trip(btm, island_buses, island_loads, all_loads, island_load_mw, nadir) do
     case btm_candidates(btm, island_buses) do
       [] ->
         # No rooftop left to lose in this island. The overwhelmingly common
-        # case (no layer, night, already tripped), and it must cost nothing —
-        # in particular it must not run the frequency probe below.
+        # case (no layer, night, already tripped), and it costs nothing.
         {all_loads, island_loads, island_load_mw, btm, []}
 
       candidates ->
-        # No deficit means no under-frequency excursion to evaluate. The
-        # voltage trigger is still checked, since a bus can be depressed
-        # without the island being short of generation.
-        nadir =
-          if deficit_mw > 0.0 do
-            island_gens
-            |> Frequency.simulate(island_loads, deficit_mw)
-            |> Frequency.nadir()
-          else
-            @nominal_frequency_hz
-          end
-
+        # The voltage trigger is checked whatever the frequency did, since a
+        # bus can be depressed without the island being short of generation.
         tripping =
           Enum.filter(candidates, fn {_bus_id, _legacy_mw, vm_pu} ->
             legacy_btm_trips?(nadir, vm_pu)
@@ -1698,8 +2313,15 @@ defmodule PowerModel.Failure.Cascade do
     end)
   end
 
+  # REVIEW CAS-15: an island is dead when it has no generation, full stop.
+  # SIZE is not a death sentence — a single bus carrying a generator and its
+  # load is trivially solvable (theta = 0), which is exactly what SOL-3 fixed
+  # in `PowerModel.Solver.Partition` (`min_buses = 1`). This predicate used to
+  # declare every one-bus island dead, so the two halves of the codebase
+  # disagreed about the same island: the solver would solve it and the cascade
+  # would black it out, taking its facilities down with it.
   defp island_dead?(island_buses_or_ids, island_gens) do
-    Enum.count(island_buses_or_ids) < 2 or Enum.empty?(island_gens)
+    Enum.empty?(island_buses_or_ids) or Enum.empty?(island_gens)
   end
 
   # Facilities on dead buses that aren't already marked lose power.

@@ -164,9 +164,12 @@ defmodule PowerModel.Analysis.NetworkMetricsTest do
       assert b.dispatch_source == "proportional"
       assert b.dispatch_coverage == nil
 
-      # balance_dispatch caps commitment at 95% of capacity, so the slack bus
-      # carries the rest; the ratio makes that visible rather than implicit.
-      assert_in_delta b.dispatch_to_load, 0.95, 0.001
+      # `Cascade.init/3` closes the base operating point's own gap before
+      # anything is an event (ROADMAP item 16), so the commitment the base
+      # case is measured at covers its load exactly. The ratio still reports
+      # a fuel-anchored dispatch that OVER-generates, which is the case where
+      # a BA's measured MW encode a real export.
+      assert_in_delta b.dispatch_to_load, 1.0, 0.001
     end
 
     test "an unrated branch is excluded from the loading distribution" do

@@ -540,10 +540,16 @@ defmodule PowerModel.Failure.BtmTripTest do
       assert_in_delta event.details.tripped_mw, 12.0, 1.0e-9
       assert_in_delta with_legacy.btm_tripped_mw, 12.0, 1.0e-9
 
-      # Feedback: reserves covered all but ~2 MW of the unit loss, and that
-      # 2 MW residual turns into 14 MW of shed once the rooftop answers it.
-      assert_in_delta shed_mw(without_legacy), 2.0, 0.01
-      assert_in_delta shed_mw(with_legacy), 14.0, 0.01
+      # Feedback: governors answered 10 MW of the 17 MW loss inside the nadir
+      # window (ROADMAP item 16 — the rest of the machine's headroom is real
+      # but unreachable in ten seconds), the island shed two UFLS stages for
+      # the residual, and the rooftop leaving pushed it onto a third.
+      assert_in_delta shed_mw(without_legacy), 15.3, 0.01
+      assert_in_delta shed_mw(with_legacy), 25.65, 0.01
+
+      # The extra shed is bigger than the rooftop that caused it, because the
+      # deeper excursion reaches a further UFLS stage on a larger base.
+      assert shed_mw(with_legacy) - shed_mw(without_legacy) > 0.0
 
       # ...via a deeper frequency excursion, which is the loop closing.
       assert ufls_nadir(with_legacy) < ufls_nadir(without_legacy)
@@ -554,9 +560,10 @@ defmodule PowerModel.Failure.BtmTripTest do
     end
 
     test "the generator-trip redispatch path accounts its rooftop trip too" do
-      # This scenario reaches the rooftop through `redispatch/4` tier 3
-      # (`trigger_ufls_for_deficit`), not through the island solve, so it pins
-      # the second call site's accounting independently.
+      # This scenario opens its deficit through `redispatch/4` — the manual
+      # generator trip raises reserves before the cascade loop starts — and
+      # the rooftop is then evaluated inside the island solve that follows,
+      # which is the single place that owns the frequency trajectory.
       {state, _} = blue_cut_snapshot(0.30) |> Cascade.init() |> Cascade.trip_generator(2)
 
       b = assert_conserved(state)

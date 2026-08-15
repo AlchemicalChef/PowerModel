@@ -285,6 +285,14 @@ defmodule PowerModel.Validation.Replay do
     buses = Enum.flat_map(snapshots, fn {_ic, s, _i} -> s.buses end)
     bus_ba = Map.new(buses, &{&1.id, Map.get(&1, :balancing_authority_id)})
 
+    # The dispatch holds contingency reserve per INTERCONNECTION (REVIEW
+    # ENE-19), so the harness has to name each bus's system or it would
+    # measure an operating point no simulation actually runs.
+    ic_names = Map.new(ics, &{&1.id, &1.name})
+
+    bus_interconnection =
+      Map.new(buses, &{&1.id, Map.get(ic_names, Map.get(&1, :interconnection_id))})
+
     %{
       interconnections: Enum.map(ics, & &1.name),
       buses: buses,
@@ -292,6 +300,7 @@ defmodule PowerModel.Validation.Replay do
       base_loads: Enum.flat_map(snapshots, fn {_ic, s, _i} -> s.loads end),
       islands: Enum.flat_map(snapshots, fn {_ic, _s, i} -> i end),
       bus_ba: bus_ba,
+      bus_interconnection: bus_interconnection,
       ba_codes: ba_codes(),
       ba_interconnection: ba_interconnection(snapshots),
       ba_bus_coverage: ba_bus_coverage(bus_ba)
@@ -362,6 +371,7 @@ defmodule PowerModel.Validation.Replay do
       loads: Demand.scale_loads(context.base_loads, context.buses, hour),
       baseline_loads: context.base_loads,
       bus_ba: context.bus_ba,
+      bus_interconnection: Map.get(context, :bus_interconnection, %{}),
       islands: context.islands,
       fuel_totals: Demand.fuel_generation_at(hour),
       demand: Demand.demand_at(hour),
@@ -410,6 +420,7 @@ defmodule PowerModel.Validation.Replay do
       loads: [],
       baseline_loads: Map.get(input, :loads, []),
       islands: nil,
+      bus_interconnection: %{},
       fuel_totals: %{},
       demand: %{},
       interchange: %{},
@@ -436,6 +447,7 @@ defmodule PowerModel.Validation.Replay do
 
     dispatch_opts = [
       bus_ba: input.bus_ba,
+      bus_interconnection: input.bus_interconnection,
       islands: input.islands,
       loads: input.loads,
       fuel_totals: input.fuel_totals

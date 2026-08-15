@@ -33,7 +33,7 @@ defmodule PowerModel.Failure.CascadeTest do
     }
   end
 
-  defp transformer(id, from, to, opts \\ []) do
+  defp transformer(id, from, to, opts) do
     %{
       id: id,
       from_bus_id: from,
@@ -45,7 +45,7 @@ defmodule PowerModel.Failure.CascadeTest do
     }
   end
 
-  defp generator(id, bus_id, opts \\ []) do
+  defp generator(id, bus_id, opts) do
     %{
       id: id,
       bus_id: bus_id,
@@ -56,7 +56,7 @@ defmodule PowerModel.Failure.CascadeTest do
     }
   end
 
-  defp load(id, bus_id, opts \\ []) do
+  defp load(id, bus_id, opts) do
     %{
       id: id,
       bus_id: bus_id,
@@ -289,7 +289,7 @@ defmodule PowerModel.Failure.CascadeTest do
       snapshot = three_bus_snapshot()
       state = Cascade.init(snapshot)
 
-      {final_state, step_results} = Cascade.trip_line(state, 1)
+      {final_state, _step_results} = Cascade.trip_line(state, 1)
 
       # Check that blackout events were generated for loads on bus 2 and 3
       blackout_events =
@@ -331,9 +331,13 @@ defmodule PowerModel.Failure.CascadeTest do
       assert step1.islands == 1
     end
 
-    test "single-bus island with generator is treated as blackout (< 2 buses)" do
-      # When a bus is isolated (single bus island), the cascade code treats it
-      # as insufficient (length(island_buses) < 2) and blacks out loads.
+    test "a single-bus island is dead only if it has no generation (CAS-15)" do
+      # Isolating bus 2 leaves three one-bus islands: bus 1 and bus 3 each
+      # carry a generator and are trivially solvable (theta = 0), which is
+      # what SOL-3 established for the solver; bus 2 carries load and no
+      # generation and is genuinely dead. `island_dead?/2` used to call all
+      # three dead on SIZE alone, so the cascade blacked out islands the
+      # solver was perfectly willing to solve.
       buses = [bus(1, bus_type: 3), bus(2), bus(3)]
       lines = [line(1, 1, 2), line(2, 2, 3)]
       gens = [generator(1, 1, p_max_mw: 100.0), generator(2, 3, p_max_mw: 100.0)]
@@ -364,14 +368,26 @@ defmodule PowerModel.Failure.CascadeTest do
           ]
       }
 
-      {final_state, _step_results} = Cascade.run_cascade(state)
+      {final_state, step_results} = Cascade.run_cascade(state)
 
-      # Bus 2 is isolated with a load — should produce blackout event
+      # Bus 2 is isolated with a load and no generation — it blacks out.
       blackout_events =
         final_state.events
         |> Enum.filter(&(&1.failure_cause == "island_blackout"))
 
-      assert length(blackout_events) >= 1
+      assert [event] = blackout_events
+      assert event.component_id == 1
+      assert_in_delta event.details.lost_mw, 50.0, 1.0e-9
+
+      # Buses 1 and 3 are one-bus islands WITH generation: both are solved.
+      solved_bus_sets =
+        step_results
+        |> Enum.flat_map(& &1.solution)
+        |> Enum.map(&MapSet.new(&1.bus_ids))
+        |> Enum.uniq()
+
+      assert MapSet.new([1]) in solved_bus_sets
+      assert MapSet.new([3]) in solved_bus_sets
     end
   end
 
@@ -609,11 +625,12 @@ defmodule PowerModel.Failure.CascadeTest do
 
   describe "load shedding on deficit" do
     test "island with deficit triggers UFLS load shedding" do
-      # Gen 80 MW, Load 120 MW => deficit 40 MW => UFLS kicks in
+      # Gen 100 MW, load 115 MW => a 13% deficit, inside what the four-stage
+      # UFLS program can reach, so the island sheds and SURVIVES.
       buses = [bus(1, bus_type: 3), bus(2)]
       lines = [line(1, 1, 2, rating_a_mva: 500.0, x_pu: 0.1)]
-      gens = [generator(1, 1, p_max_mw: 80.0)]
-      loads = [load(1, 2, p_mw: 120.0)]
+      gens = [generator(1, 1, p_max_mw: 100.0)]
+      loads = [load(1, 2, p_mw: 115.0)]
 
       snapshot = make_snapshot(buses, lines, [], gens, loads)
       state = Cascade.init(snapshot)
@@ -628,7 +645,51 @@ defmodule PowerModel.Failure.CascadeTest do
 
       # Load should have been reduced
       updated_load = Enum.find(final_state.loads, &(&1.id == 1))
-      assert updated_load.p_mw < 120.0
+      assert updated_load.p_mw < 115.0
+
+      # ...and the machine rode it out: nothing tripped on under-frequency.
+      assert final_state.tripped_generators == MapSet.new()
+    end
+
+    test "a deficit past the UFLS program's reach takes the island's machines with it" do
+      # Gen 80 MW against 120 MW of load: a 33% deficit, and the whole UFLS
+      # program cumulates to only ~27% of connected load. The stages fire, the
+      # frequency keeps falling through them, and at 57.0 Hz the PRC-024
+      # envelope has no allowance left — every machine in the island trips.
+      # That is ROADMAP item 15's positive feedback loop closing on itself:
+      # the model can now produce a total island collapse, which the old
+      # force-shed tier quietly prevented by balancing the island on paper.
+      buses = [bus(1, bus_type: 3), bus(2)]
+      lines = [line(1, 1, 2, rating_a_mva: 500.0, x_pu: 0.1)]
+      gens = [generator(1, 1, p_max_mw: 80.0)]
+      loads = [load(1, 2, p_mw: 120.0)]
+
+      state = Cascade.init(make_snapshot(buses, lines, [], gens, loads))
+      {final_state, _steps} = Cascade.run_cascade(state)
+
+      assert MapSet.member?(final_state.tripped_generators, 1)
+
+      [trip] = Enum.filter(final_state.events, &(&1.failure_cause == "underfrequency_trip"))
+      assert trip.component_type == "generator"
+      assert trip.details.band_hz == 57.0
+      assert trip.details.allowance_s == 0.0
+
+      # One aggregated island-level event beside the per-unit trips.
+      [aggregate] =
+        Enum.filter(final_state.events, &(&1.failure_cause == "generator_frequency_trips"))
+
+      assert aggregate.component_type == "island"
+      assert aggregate.details.unit_count == 1
+      assert aggregate.details.tripped_mw > 0.0
+
+      # The island is dark, and the accounting says so.
+      balance = Cascade.balance(final_state)
+      assert_in_delta balance.served_load_mw, 0.0, 1.0e-9
+      assert_in_delta balance.blackout_load_mw, 120.0, 0.01
+
+      assert_in_delta balance.served_load_mw + balance.shed_load_mw + balance.blackout_load_mw,
+                      balance.original_load_mw + balance.btm_tripped_mw,
+                      0.01
     end
   end
 
@@ -831,11 +892,13 @@ defmodule PowerModel.Failure.CascadeTest do
     end
 
     test "UFLS deficit: shed accounting matches event details" do
-      # Gen 80 MW, Load 120 MW -> UFLS sheds part of the load
+      # Gen 100 MW, load 115 MW -> UFLS sheds part of the load and the island
+      # survives (a deficit past the program's reach collapses it instead —
+      # see "load shedding on deficit").
       buses = [bus(1, bus_type: 3), bus(2)]
       lines = [line(1, 1, 2, rating_a_mva: 500.0, x_pu: 0.1)]
-      gens = [generator(1, 1, p_max_mw: 80.0)]
-      loads = [load(1, 2, p_mw: 120.0)]
+      gens = [generator(1, 1, p_max_mw: 100.0)]
+      loads = [load(1, 2, p_mw: 115.0)]
 
       state = Cascade.init(make_snapshot(buses, lines, [], gens, loads))
       {final_state, _steps} = Cascade.run_cascade(state)
@@ -874,8 +937,8 @@ defmodule PowerModel.Failure.CascadeTest do
       ]
 
       gens = [
-        generator(1, 1, p_max_mw: 200.0),
-        generator(2, 1, p_max_mw: 100.0),
+        generator(1, 1, p_max_mw: 20.0),
+        generator(2, 1, p_max_mw: 400.0),
         generator(3, 3, p_max_mw: 200.0)
       ]
 
@@ -901,8 +964,11 @@ defmodule PowerModel.Failure.CascadeTest do
 
       {final_state, _steps} = Cascade.trip_generator(state, 1)
 
-      # Island A's deficit is covered by island A's other generator
+      # Island A's deficit is inside the primary response its other machine
+      # can deliver in the nadir window (10% of a 400 MW nameplate), so island
+      # A covers it from its own governor without shedding a customer.
       assert Map.get(final_state.dispatch, 2) > Map.get(state.dispatch, 2)
+      assert Enum.filter(final_state.events, &(&1.failure_cause == "ufls_shed")) == []
 
       # Island B: dispatch and load are bit-identical
       assert Map.get(final_state.dispatch, 3) == dispatch_b_before
@@ -939,7 +1005,53 @@ defmodule PowerModel.Failure.CascadeTest do
       assert load_b.p_mw == 100.0
     end
 
-    test "manual island split raises local reserves before UFLS and writes dispatch back" do
+    test "an island split is covered by primary response when the gap is small enough" do
+      # Island A ends up 10 MW short of 110 MW — inside the 20 MW its 200 MW
+      # machine's governor can deliver inside the nadir window, so reserves
+      # cover it with nothing left for UFLS. The MW is TRANSIENT (governor
+      # response, not a new setpoint), so it is tracked in `primary_reserve`
+      # as well as in `dispatch`.
+      buses = [bus(1, bus_type: 3), bus(2), bus(3, bus_type: 3), bus(4)]
+
+      lines = [
+        line(1, 1, 2, rating_a_mva: 500.0),
+        line(2, 3, 4, rating_a_mva: 500.0),
+        line(3, 2, 3, rating_a_mva: 500.0)
+      ]
+
+      gens = [generator(1, 1, p_max_mw: 400.0), generator(2, 3, p_max_mw: 400.0)]
+      loads = [load(1, 2, p_mw: 110.0), load(2, 4, p_mw: 90.0)]
+
+      state = Cascade.init(make_snapshot(buses, lines, [], gens, loads))
+      assert_in_delta Map.fetch!(state.dispatch, 1), 100.0, 1.0e-6
+
+      {final_state, step_results} = Cascade.trip_line(state, 3)
+
+      assert_in_delta Map.fetch!(final_state.dispatch, 1), 110.0, 1.0e-6
+      assert_in_delta Map.fetch!(final_state.primary_reserve, 1), 10.0, 1.0e-6
+      refute Enum.any?(final_state.events, &(&1.failure_cause == "ufls_shed"))
+
+      reserve_island_solution =
+        step_results
+        |> Enum.flat_map(& &1.solution)
+        |> Enum.find(&(MapSet.new(&1.bus_ids) == MapSet.new([1, 2])))
+
+      assert_in_delta reserve_island_solution.scheduled_gen_mw, 110.0, 1.0e-6
+      assert_in_delta reserve_island_solution.total_load_mw, 110.0, 1.0e-6
+
+      balance = Cascade.balance(final_state)
+
+      assert_in_delta balance.served_load_mw + balance.shed_load_mw + balance.blackout_load_mw,
+                      balance.original_load_mw + balance.btm_tripped_mw,
+                      0.01
+    end
+
+    test "a split too big for primary response sheds, however much nameplate is idle" do
+      # The same split, 50 MW short instead of 10. The machine has 100 MW of
+      # idle nameplate and it does not matter: governors reach 20 MW in the
+      # nadir window and AGC has had no time at all, so the rest is shed.
+      # This is ROADMAP item 16's whole point — reserve is a rate, not a
+      # quantity.
       buses = [bus(1, bus_type: 3), bus(2), bus(3, bus_type: 3), bus(4)]
 
       lines = [
@@ -952,20 +1064,13 @@ defmodule PowerModel.Failure.CascadeTest do
       loads = [load(1, 2, p_mw: 150.0), load(2, 4, p_mw: 50.0)]
 
       state = Cascade.init(make_snapshot(buses, lines, [], gens, loads))
-      assert_in_delta Map.fetch!(state.dispatch, 1), 100.0, 1.0e-6
+      {final_state, _steps} = Cascade.trip_line(state, 3)
 
-      {final_state, step_results} = Cascade.trip_line(state, 3)
+      assert Enum.any?(final_state.events, &(&1.failure_cause == "ufls_shed"))
+      assert Enum.find(final_state.loads, &(&1.id == 1)).p_mw < 150.0
 
-      assert_in_delta Map.fetch!(final_state.dispatch, 1), 150.0, 1.0e-6
-      refute Enum.any?(final_state.events, &(&1.failure_cause == "ufls_shed"))
-
-      reserve_island_solution =
-        step_results
-        |> Enum.flat_map(& &1.solution)
-        |> Enum.find(&(MapSet.new(&1.bus_ids) == MapSet.new([1, 2])))
-
-      assert_in_delta reserve_island_solution.scheduled_gen_mw, 150.0, 1.0e-6
-      assert_in_delta reserve_island_solution.total_load_mw, 150.0, 1.0e-6
+      # 100 MW of nameplate headroom sat unused on the machine that was short.
+      assert Map.fetch!(final_state.dispatch, 1) < 150.0
 
       balance = Cascade.balance(final_state)
 
@@ -1040,9 +1145,9 @@ defmodule PowerModel.Failure.CascadeTest do
       ]
 
       gens = [
-        generator(1, 1, p_max_mw: 100.0),
+        generator(1, 1, p_max_mw: 20.0),
         generator(2, 1, p_max_mw: gen2_max),
-        generator(3, 2, p_max_mw: 200.0)
+        generator(3, 2, p_max_mw: 400.0)
       ]
 
       loads = [load(1, 3, p_mw: 150.0)]
@@ -1059,7 +1164,11 @@ defmodule PowerModel.Failure.CascadeTest do
       assert after_second.loads == after_first.loads
     end
 
-    test "lost generation is replaced by the origin BA when it has reserves" do
+    test "primary response answers island-wide, whoever lost the unit" do
+      # Governors do not know about balancing-authority boundaries: every
+      # machine in the synchronous island sees the same frequency and answers
+      # it. The BA ordering below applies to SECONDARY reserve, which is a
+      # BA-level control (ACE restoration), not to the governors.
       state = Cascade.init(two_ba_snapshot(gen2_max: 200.0))
       gen3_before = Map.get(state.dispatch, 3)
       lost = Map.get(state.dispatch, 1)
@@ -1067,30 +1176,99 @@ defmodule PowerModel.Failure.CascadeTest do
 
       {final_state, _steps} = Cascade.trip_generator(state, 1)
 
-      # Same-BA unit (gen 2) covers the loss...
-      assert Map.get(final_state.dispatch, 2) - Map.get(state.dispatch, 2) > lost * 0.99
-      # ...and the neighboring BA's unit does not move
-      assert Map.get(final_state.dispatch, 3) == gen3_before
-    end
-
-    test "neighboring BA provides emergency assistance only when origin BA reserves run out" do
-      # Gen 2 has barely any headroom: origin BA cannot cover the loss alone
-      state = Cascade.init(two_ba_snapshot(gen2_max: 30.0))
-      gen3_before = Map.get(state.dispatch, 3)
-      lost = Map.get(state.dispatch, 1)
-
-      {final_state, _steps} = Cascade.trip_generator(state, 1)
-
       gen2_delta = Map.get(final_state.dispatch, 2) - Map.get(state.dispatch, 2)
       gen3_delta = Map.get(final_state.dispatch, 3) - gen3_before
 
-      # Origin BA exhausted its headroom first, neighbor covered the rest
       assert gen2_delta > 0.0
       assert gen3_delta > 0.0
-      assert_in_delta gen2_delta + gen3_delta, lost, 0.5
 
-      # No load shedding was needed
+      # They answer in proportion to what each can deliver, which rides on
+      # nameplate: gen 3 is twice gen 2's machine, so it carries twice the
+      # response. Together they cover the loss.
+      assert_in_delta gen3_delta, 2.0 * gen2_delta, 1.0e-6
+      assert_in_delta gen2_delta + gen3_delta, lost, 0.5
       assert Enum.filter(final_state.events, &(&1.failure_cause == "ufls_shed")) == []
+    end
+
+    test "secondary reserve answers inside the origin BA first" do
+      # Ten minutes into a standing deficit, so the ramp-limited secondary
+      # tier has real megawatts to offer (`redispatch/4` reads the elapsed
+      # time from the island's deficit clock).
+      state = Cascade.init(two_ba_snapshot(gen2_max: 200.0))
+      island = MapSet.new([1, 2, 3])
+
+      state = %{
+        state
+        | simulated_time: 600.0,
+          island_states: [
+            %{buses: island, frequency_state: nil, exposure: [], deficit_since_s: 0.0}
+          ]
+      }
+
+      before = state.dispatch
+      raised = Cascade.redispatch(state, 40.0, island, 10)
+
+      # BA 10's own units (gens 1 and 2, both on bus 1) carried the whole
+      # 40 MW between them; BA 20's did not move at all.
+      ba_10_delta =
+        Map.fetch!(raised.dispatch, 1) - Map.fetch!(before, 1) +
+          (Map.fetch!(raised.dispatch, 2) - Map.fetch!(before, 2))
+
+      assert_in_delta ba_10_delta, 40.0, 1.0e-6
+      assert Map.fetch!(raised.dispatch, 3) == Map.fetch!(before, 3)
+    end
+
+    test "the neighboring BA assists once the origin BA's ramp is exhausted" do
+      # BA 10 is a 20 MW machine and a 30 MW machine: even ten minutes of
+      # ramp cannot cover a 40 MW hole, so BA 20 is asked for the rest.
+      state = Cascade.init(two_ba_snapshot(gen2_max: 30.0))
+      island = MapSet.new([1, 2, 3])
+
+      state = %{
+        state
+        | simulated_time: 600.0,
+          island_states: [
+            %{buses: island, frequency_state: nil, exposure: [], deficit_since_s: 0.0}
+          ]
+      }
+
+      before = state.dispatch
+      raised = Cascade.redispatch(state, 40.0, island, 10)
+
+      ba_10_delta =
+        Map.fetch!(raised.dispatch, 1) - Map.fetch!(before, 1) +
+          (Map.fetch!(raised.dispatch, 2) - Map.fetch!(before, 2))
+
+      gen3_delta = Map.fetch!(raised.dispatch, 3) - Map.fetch!(before, 3)
+
+      assert ba_10_delta > 0.0
+      assert gen3_delta > 0.0
+      assert_in_delta ba_10_delta + gen3_delta, 40.0, 0.5
+    end
+
+    test "a deficit seconds old gets seconds' worth of secondary reserve" do
+      # The same 40 MW hole in the same fleet, thirty seconds in instead of
+      # ten minutes: an 8%/min ramp over half a minute delivers 4% of BA 10's
+      # 220 MW of nameplate, and the rest waits for the clock.
+      state = Cascade.init(two_ba_snapshot(gen2_max: 200.0))
+      island = MapSet.new([1, 2, 3])
+
+      state = %{
+        state
+        | simulated_time: 30.0,
+          island_states: [
+            %{buses: island, frequency_state: nil, exposure: [], deficit_since_s: 0.0}
+          ]
+      }
+
+      before = state.dispatch
+      raised = Cascade.redispatch(state, 40.0, island, 10)
+
+      ba_10_delta =
+        Map.fetch!(raised.dispatch, 1) - Map.fetch!(before, 1) +
+          (Map.fetch!(raised.dispatch, 2) - Map.fetch!(before, 2))
+
+      assert_in_delta ba_10_delta, 8.8, 1.0e-6
     end
   end
 
@@ -1099,11 +1277,11 @@ defmodule PowerModel.Failure.CascadeTest do
   # ===========================================================================
 
   describe "water facility impacts" do
-    test "facility on a single-bus generator island loses power with its load" do
+    test "facility on a single-bus island WITHOUT generation loses power with its load" do
       buses = [bus(1, bus_type: 3), bus(2)]
       lines = [line(1, 1, 2, rating_a_mva: 500.0)]
       gens = [generator(1, 1, p_max_mw: 100.0)]
-      loads = [load(1, 1, p_mw: 40.0)]
+      loads = [load(1, 2, p_mw: 40.0)]
 
       snapshot =
         make_snapshot(buses, lines, [], gens, loads)
@@ -1113,7 +1291,7 @@ defmodule PowerModel.Failure.CascadeTest do
             name: "Island Water",
             facility_type: "treatment_plant",
             power_consumption_mw: 5.0,
-            bus_id: 1
+            bus_id: 2
           }
         ])
 
@@ -1135,6 +1313,38 @@ defmodule PowerModel.Failure.CascadeTest do
       assert streamed_event.failure_cause == "power_loss"
       assert persisted_event.failure_cause == "power_loss"
       assert persisted_event.step == streamed_event.step
+    end
+
+    test "facility on a single-bus island WITH generation keeps its power (CAS-15)" do
+      # The mirror image of the test above, and the behaviour CAS-15 changed:
+      # a lone bus carrying a generator, its load and a treatment plant is a
+      # live island, not a blackout.
+      buses = [bus(1, bus_type: 3), bus(2)]
+      lines = [line(1, 1, 2, rating_a_mva: 500.0)]
+      gens = [generator(1, 1, p_max_mw: 100.0)]
+      loads = [load(1, 1, p_mw: 40.0)]
+
+      snapshot =
+        make_snapshot(buses, lines, [], gens, loads)
+        |> Map.put(:water_facilities, [
+          %{
+            id: 8,
+            name: "Island Water",
+            facility_type: "treatment_plant",
+            power_consumption_mw: 5.0,
+            bus_id: 1
+          }
+        ])
+
+      {final_state, _steps} = snapshot |> Cascade.init() |> Cascade.trip_line(1)
+
+      assert final_state.affected_water_facilities == MapSet.new()
+      refute Enum.any?(final_state.events, &(&1.failure_cause == "island_blackout"))
+      assert Enum.find(final_state.loads, &(&1.id == 1)).p_mw == 40.0
+
+      balance = Cascade.balance(final_state)
+      assert_in_delta balance.served_load_mw, 40.0, 1.0e-9
+      assert balance.blackout_load_mw == 0.0
     end
 
     test "facility power loss persists when it is the only stable-step trip" do
@@ -1351,9 +1561,15 @@ defmodule PowerModel.Failure.CascadeTest do
                       0.01
     end
 
-    test "deficit beyond the UFLS schedule cap is fully closed" do
-      # 50% deficit: the canonical UFLS program cumulates to roughly 30%,
-      # the residual must be force-shed so the island actually balances.
+    test "a deficit beyond the UFLS schedule cap collapses the island, and still balances" do
+      # 50% deficit. The canonical UFLS program cumulates to roughly 30%, so
+      # the stages fire and the frequency falls through all of them into the
+      # PRC-024 instantaneous band: the machine trips and the island goes
+      # dark. The old force-shed tier used to balance this island on paper
+      # instead, which is the behaviour ROADMAP item 15 replaced.
+      #
+      # What must NOT change is the accounting: every MW leaves through a
+      # bucket, and the identity closes.
       buses = [bus(1, bus_type: 3), bus(2)]
       lines = [line(1, 1, 2, rating_a_mva: 500.0, x_pu: 0.1)]
       gens = [generator(1, 1, p_max_mw: 50.0)]
@@ -1362,9 +1578,11 @@ defmodule PowerModel.Failure.CascadeTest do
       state = Cascade.init(make_snapshot(buses, lines, [], gens, loads))
       {final_state, _steps} = Cascade.run_cascade(state)
 
+      assert MapSet.member?(final_state.tripped_generators, 1)
+
       balance = Cascade.balance(final_state)
 
-      assert_in_delta balance.served_load_mw, 50.0, 0.6
+      assert_in_delta balance.served_load_mw, 0.0, 1.0e-9
       assert_in_delta balance.dispatched_gen_mw, balance.served_load_mw, 0.6
 
       assert_in_delta balance.served_load_mw + balance.shed_load_mw + balance.blackout_load_mw,
@@ -1381,16 +1599,16 @@ defmodule PowerModel.Failure.CascadeTest do
         line(3, 2, 3, rating_a_mva: 500.0)
       ]
 
-      gens = [generator(1, 1, p_max_mw: 200.0), generator(2, 3, p_max_mw: 200.0)]
-      loads = [load(1, 2, p_mw: 150.0), load(2, 4, p_mw: 50.0)]
+      gens = [generator(1, 1, p_max_mw: 400.0), generator(2, 3, p_max_mw: 400.0)]
+      loads = [load(1, 2, p_mw: 110.0), load(2, 4, p_mw: 90.0)]
 
       state = Cascade.init(make_snapshot(buses, lines, [], gens, loads))
       {final_state, step_results} = Cascade.trip_line(state, 3)
 
-      # Deficit half raised its reserves, surplus half CURTAILED (the 50 MW
+      # Deficit half raised its reserves, surplus half CURTAILED (the 10 MW
       # export from island B has nowhere to go after the split).
-      assert_in_delta Map.fetch!(final_state.dispatch, 1), 150.0, 0.6
-      assert_in_delta Map.fetch!(final_state.dispatch, 2), 50.0, 0.6
+      assert_in_delta Map.fetch!(final_state.dispatch, 1), 110.0, 0.6
+      assert_in_delta Map.fetch!(final_state.dispatch, 2), 90.0, 0.6
 
       balance = Cascade.balance(final_state)
       assert_in_delta balance.dispatched_gen_mw, balance.served_load_mw, 0.6
@@ -1400,14 +1618,15 @@ defmodule PowerModel.Failure.CascadeTest do
       end
     end
 
-    test "single-bus blackout curtails its generator in the same step" do
-      # Bus 1 carries both the generator and the load; tripping the only line
-      # makes bus 1 a dead singleton island: its load blacks out and its
-      # generator must be curtailed before the step balance is emitted.
+    test "a blacked-out island curtails the generator left stranded beside it" do
+      # Bus 1 carries the generator, bus 2 the load. Tripping the only line
+      # leaves a dead load island (blackout) and a live generator island with
+      # nothing to serve: that generator must be curtailed to zero before the
+      # step balance is emitted, or its MW becomes a phantom slack injection.
       buses = [bus(1, bus_type: 3), bus(2)]
       lines = [line(1, 1, 2, rating_a_mva: 500.0, x_pu: 0.1)]
       gens = [generator(1, 1, p_max_mw: 100.0)]
-      loads = [load(1, 1, p_mw: 40.0)]
+      loads = [load(1, 2, p_mw: 40.0)]
 
       state = Cascade.init(make_snapshot(buses, lines, [], gens, loads))
       {final_state, step_results} = Cascade.trip_line(state, 1)
