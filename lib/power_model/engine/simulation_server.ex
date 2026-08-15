@@ -16,7 +16,7 @@ defmodule PowerModel.Engine.SimulationServer do
   require Logger
 
   alias PowerModel.Grid
-  alias PowerModel.Solver.{DCPowerFlow, NewtonRaphson, Solution, Partition}
+  alias PowerModel.Solver.{DCPowerFlow, FDPF, Solution, Partition}
   alias PowerModel.Failure.Cascade
 
   defstruct [
@@ -463,9 +463,12 @@ defmodule PowerModel.Engine.SimulationServer do
     Enum.reduce(snapshot.loads, 0.0, fn load, acc -> acc + (load.p_mw || 0.0) end)
   end
 
-  # Dense Newton-Raphson is O(n^2) per iteration; beyond this it is not a
-  # refinement, it is a space heater.
-  @max_ac_island_buses 3_000
+  # `FDPF.solve/2` picks its own path per island — dense Newton-Raphson below
+  # its cutoff, fast-decoupled above — so this cap is no longer about which
+  # solver runs. It is a budget: an AC attempt on the Eastern interconnection
+  # is seconds of background CPU per step whether or not it converges, and this
+  # covers all three interconnections with room to spare.
+  @max_ac_island_buses 60_000
 
   defp spawn_ac_refinement(state) do
     server = self()
@@ -482,12 +485,7 @@ defmodule PowerModel.Engine.SimulationServer do
 
       solutions =
         tractable
-        |> Enum.map(fn sub ->
-          case NewtonRaphson.solve(sub, base_mva: state.base_mva, warm_start: state.dc_solution) do
-            {:ok, solution} -> solution
-            _ -> nil
-          end
-        end)
+        |> Enum.map(&solve_island_ac(&1, state))
         |> Enum.reject(&is_nil/1)
         |> Enum.filter(& &1.converged)
 
@@ -513,6 +511,26 @@ defmodule PowerModel.Engine.SimulationServer do
           )
       end
     end)
+  end
+
+  # One island's AC solve. `FDPF.solve/2` chooses dense Newton-Raphson or
+  # fast-decoupled by island size and falls back between them on its own; what
+  # is handled here is the case it cannot solve at all, which throws (a system
+  # that cannot be solved must never come back as quietly wrong numbers). A
+  # nil result drops out of the merge, and CAS-1 then keeps the DC picture.
+  defp solve_island_ac(sub, state) do
+    case FDPF.solve(sub, base_mva: state.base_mva, warm_start: state.dc_solution) do
+      {:ok, solution} -> solution
+      _ -> nil
+    end
+  catch
+    thrown ->
+      Logger.info(
+        "[sim #{state.sim_id}] AC solve of a #{length(sub.buses)}-bus island " <>
+          "failed: #{inspect(thrown)}"
+      )
+
+      nil
   end
 
   @doc """
