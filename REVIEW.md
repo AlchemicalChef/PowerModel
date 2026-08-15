@@ -476,9 +476,57 @@ are non-thermal — any future ramp/AGC modeling is unlimited until fixed (ROADM
 **ENE-14 (LOW) [OPEN]** `Frequency.normalize_fuel` has no case for OIL or biomass/waste
 codes (~15 GW geolocated falls to gas dynamics); the 268 GW `COL` case is entirely on
 coordinate-less MATPOWER buses and never simulated — worth a comment in the fuel table.
-**DAT-19 (DECISION) [OPEN]** Ingestion pulls HIFLD from an unofficial, unlicensed,
-unversioned ArcGIS mirror; HIFLD Open was shut down by DHS 2025-08-26. Vendor a pinned
-snapshot with recorded fetch date (ROADMAP "Decisions needed now").
+**DAT-19 (DECISION) [RESOLVED 2026-08-15]** Ingestion pulls HIFLD from an unofficial,
+unlicensed, unversioned ArcGIS mirror; HIFLD Open was shut down by DHS 2025-08-26.
+Snapshots pinned with checksums — see data/vendored/PROVENANCE.md; source switch is
+ROADMAP Phase 2.
+**SOL-12 (MED) [OPEN]** `YBus.effective_reactance/1` floors |x| at 1.0e-3 pu — far
+coarser than the divide-by-zero guard requires. Three real ACTIVSg2000 branches
+(true x 7.0e-4–8.8e-4) are inflated 14–43%, confirmed as the sole source of the case's
+DC deviation. Lower the floor (e.g. 1e-5) with the sign-preserving semantics intact.
+**SOL-13 (HIGH, scale-blocking) [OPEN→Phase 4]** Q-limit outer-loop switching does not
+scale: on ACTIVSg2000, 32 of 195 buses that should switch to PQ never do (1 spurious) —
+e.g. bus 1070 genuinely exceeds q_max but lands above setpoint once 175 others clamp,
+satisfies the back-switch condition, returns to PV, and oscillates until
+@max_qlim_rounds ends it. Worst bus voltage 2.86% off (5.7× contract) at converged
+mismatch 3.1e-10. Faster linear algebra will NOT fix this — the switching mechanism
+needs work (e.g. no back-switching for genuinely-violating buses within a round, or
+simultaneous-violation resolution). Guarded bus-for-bus at IEEE-118 scale where it
+works; the skipped ACTIVSg2000 AC tests are the acceptance gate. Found by the Phase 0
+validation ladder, 2026-08-15.
+**ENE-17 (HIGH) [OPEN]** Regional snapshots inflate straddling BAs: `Demand.scale_loads/3`
+lands a BA's ENTIRE demand on whatever slice of its buses the snapshot contains. Nine BAs
+straddle interconnection boundaries — MISO's 69 GW lands on stray ERCOT-labelled buses at
+17.2×, AECI 191×, TEPC 28.8× — so hour-scaled ERCOT simulations carry ~151 GW against a
+real ~45 GW. Regional and national runs are not comparable until per-interconnection
+scaling restricts a BA's demand to its in-snapshot share. Found by the replay harness
+2026-08-15 (`outsized scaling` flag: 16 BAs / 40.35 GW nationally).
+**ENE-18 (DATA CAVEAT) [DOCUMENTED]** EIA-930's own generation identity (NG − TI = D)
+never closes for BPAT (0/4,417 hours), MISO (5/4,389), CISO (611/2,473) — those BAs are
+essentially unvalidatable against their own published totals. The harness's screened-hours
+logic excludes them from balance gates; expect their metrics to carry wider error bars.
+**LIN-12 (DATA DEFECT, LOW) [OPEN]** Western carries a 765 kV+ voltage class (1 line,
+3 transformers), all 100% overloaded at rest — WECC has no 765 kV; bad voltage data.
+Found by `mix grid.accuracy` 2026-08-15.
+**ENE-15 (MEASURED GAP) [OPEN→Phase 2]** With fuel-anchored dispatch live (2026-08-15),
+23.3 GW of measured nuclear cannot be placed on geolocated units: the BA-mapped fleet
+holds 84.2 GW of nuclear capability vs 97.4 GW measured (101 GW of nuclear nameplate is
+on coordinate-less MATPOWER buses; SRP 4.0 GW measured vs 1.4 mapped is BA attribution).
+Concentrated: PJM 33.6 vs 26.4, MISO 11.1 vs 8.0, SOCO 8.1 vs 4.1. The dispatch coverage
+report now tracks this per BA — it is the scoreboard for ROADMAP Phase 2
+connectivity/plant-mapping work.
+**ENE-16 (BUG, FIXED 2026-08-15)** Form 930's single-column field resolver made
+`total_interchange_mw` NULL for the entire table (EIA blanks Imputed columns on rows
+needing no imputation) and silently served RAW demand instead of Adjusted. Fixed with
+tiered Adjusted→Imputed→raw resolution per row; older ingests must re-run (dev DB
+re-ingested).
+**DAT-20 (SYSTEMIC, MED) [OPEN]** OTP logger overload protection silently drops ~90% of
+large per-row warning bursts (measured 2026-08-15: 1,079 Logger.warning calls through
+Flow → only ~103-114 lines reach output, no drop notice). Any ingest path that reports
+data anomalies per row under-counts them invisibly. Pattern fix (implemented in
+form860.ex seasonal warnings): tally via :counters and emit one authoritative summary
+line after the Flow, keeping per-row detail as best-effort. Apply to other per-row
+warning sites as they are touched.
 
 ## Cross-package contracts (all agents read this)
 

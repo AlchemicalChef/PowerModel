@@ -39,6 +39,16 @@ reproduced here so the document stands alone.
 Ordering favors accuracy-per-effort and measured dependency; S ≈ days, M ≈ 1–2 wk,
 L ≈ multi-week.
 
+> **STATUS 2026-08-15: Phases 0 and 1 LANDED** (items 1–7). Measured result via the new
+> `mix power_model.validate --legacy`: fuel-mix TV distance 0.293 (legacy proportional)
+> → 0.107 (fuel-anchored), a 64% reduction; interchange MAE −42%. The residual 0.107 is
+> decomposed as fleet-mapping gap (60.1 GW unplaced, 24.2 GW nuclear — REVIEW ENE-15),
+> which Phases 2's connectivity work will drive down, measured by these instruments.
+> Caveats: seasonal capability columns exist but are NULL until the re-ingest (dispatch
+> caps at nameplate meanwhile); ACTIVSg2000 AC assertions are honestly skipped pending
+> Phase 4 (see REVIEW SOL-13 — the Q-limit switching mechanism, not just speed, gates
+> them).
+
 ### Phase 0 — Make accuracy measurable (S, do first, parallelizable)
 1. **EIA-930 replay harness** (`mix power_model.validate`): per-BA fuel-mix TV distance,
    interchange error, served-load error, conservation residual. Seed with the measured
