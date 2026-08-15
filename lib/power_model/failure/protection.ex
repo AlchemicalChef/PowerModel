@@ -10,7 +10,27 @@ defmodule PowerModel.Failure.Protection do
   whose frequency protection has operated, with the band and the time-in-band
   that did it. It reads no state and mutates nothing, so it can be evaluated
   inside a cascade step, in a test, or against a recorded trajectory.
+
+  ## Distance protection and conductor thermals (ROADMAP item 20)
+
+  The voltage-driven half of protection, added as pure functions ahead of the
+  Q–V/QSS-AC solve that will feed them:
+
+    * `apparent_impedance/3` and friends — what the relay measures.
+    * `distance_zone/3`, `mho_reaches/2`, `inside_mho?/2` — mho zones 1/2/3
+      and the delay each carries.
+    * `loadability_limit_pu/2`, `load_encroachment?/3` — the PRC-023-4 load
+      blinder that keeps a heavily-loaded healthy line from being called a
+      fault.
+    * `advance_conductor_temperature/4` and friends — the SLOW timescale: a
+      first-order conductor thermal model, complementing (not replacing) the
+      fast inverse-time relay the cascade already runs.
+
+  Everything here takes voltages, flows and impedances as plain numbers, so it
+  works the moment an AC solution exists and can be tested without one.
   """
+
+  alias PowerModel.Grid.Ratings
 
   @doc """
   Check thermal overloads and return components to trip.
@@ -464,6 +484,7 @@ defmodule PowerModel.Failure.Protection do
 
   defp component_type_string(:line), do: "transmission_line"
   defp component_type_string(:transformer), do: "transformer"
+  defp component_type_string(other) when is_binary(other), do: other
   defp component_type_string(other), do: Atom.to_string(other)
 
   @doc """
@@ -476,6 +497,654 @@ defmodule PowerModel.Failure.Protection do
     else
       ratio = loading_pct / 100.0
       k / (:math.pow(ratio, 0.02) - 1.0)
+    end
+  end
+
+  # ===========================================================================
+  # Mho distance relays — zones 1/2/3 + PRC-023 load blinder (ROADMAP item 20)
+  # ===========================================================================
+
+  # Zone reaches as a multiple of the protected line's own series impedance.
+  #
+  # Zone 1 underreaches deliberately: it must never see past the remote bus,
+  # because it has no coordinating delay to lose the race with. 80–85% of the
+  # line is the usual setting, the margin covering line-parameter and CT/PT
+  # error.
+  #
+  # Zone 2 overreaches to cover the far end of the line that zone 1 gives up,
+  # and is delayed so the remote line's own zone 1 clears an adjacent fault
+  # first. 120–150% is the usual band.
+  @zone1_reach 0.85
+  @zone2_reach 1.25
+
+  # Zone 3 is remote backup: the protected line PLUS the longest line leaving
+  # the remote bus, with a margin. This is the zone that made 2003 — its reach
+  # is long enough that heavy load can look like a fault, which is exactly what
+  # the PRC-023 blinder below exists to prevent.
+  @zone3_margin 1.2
+
+  # Intentional time delays, seconds. Zone 1 carries no coordination delay at
+  # all; its number is physical operate time — roughly one cycle of relay
+  # decision plus two of breaker interruption at 60 Hz. Zones 2 and 3 carry
+  # real coordination timers.
+  @zone_delays %{1 => 0.05, 2 => 0.40, 3 => 1.50}
+
+  # PRC-023-4 R1 criterion 1: a load-responsive phase protection system must
+  # not operate at or below 150% of the highest seasonal facility rating, at
+  # 0.85 pu voltage and a 30° power-factor angle.
+  @blinder_loadability 1.5
+  @blinder_voltage_pu 0.85
+  @blinder_angle_deg 30.0
+
+  @default_base_mva 100.0
+
+  @doc """
+  Zone reach multiples and intentional delays, as
+  `%{zone1_reach:, zone2_reach:, zone3_margin:, delays_s: %{1 => .., 2 => .., 3 => ..}}`.
+
+  Single source of truth for the settings; `distance_zone/3` accepts the same
+  keys as overrides.
+  """
+  def distance_settings do
+    %{
+      zone1_reach: @zone1_reach,
+      zone2_reach: @zone2_reach,
+      zone3_margin: @zone3_margin,
+      delays_s: @zone_delays
+    }
+  end
+
+  @doc """
+  Apparent impedance `{r_pu, x_pu}` seen looking into the line from the FROM
+  terminal, computed from the terminal voltage magnitude and the branch flow.
+
+  From `S = V · I*`,
+
+      Z = V / I = |V|² / S*  =  |V|² · (P + jQ) / (P² + Q²)
+
+  so the relay's measurement depends on the voltage MAGNITUDE and the flow
+  only — the bus angle cancels, which is why this is usable straight out of a
+  power-flow solution without reconstructing phasors.
+
+  ## Units
+
+  `vm_pu` per unit; `p_pu` and `q_pu` per unit on the same base (100 MVA
+  system base unless the caller says otherwise — see
+  `apparent_impedance_mva/4` for the MW/MVAr form). The result is per unit on
+  that base's impedance base, directly comparable to a line's `r_pu`/`x_pu`.
+
+  ## Sign convention
+
+  P and Q flow OUT of the from-bus INTO the branch. A fault ahead of the relay
+  draws lagging current, putting Z in the first quadrant near the line angle.
+  Reverse flow gives a negative R, which no forward mho circle contains — the
+  characteristic is inherently directional and needs no extra test.
+
+  Returns `:infinite` when there is no flow at all: no current means no
+  measurable impedance, not a zero one.
+  """
+  @spec apparent_impedance(number(), number(), number()) :: {float(), float()} | :infinite
+  def apparent_impedance(vm_pu, p_pu, q_pu) do
+    s_sq = p_pu * p_pu + q_pu * q_pu
+
+    if s_sq <= 0.0 do
+      :infinite
+    else
+      v_sq = vm_pu * vm_pu * 1.0
+      {v_sq * p_pu / s_sq, v_sq * q_pu / s_sq}
+    end
+  end
+
+  @doc """
+  `apparent_impedance/3` for callers holding MW/MVAr rather than per unit.
+
+  `base_mva` is the system base the voltage is per-unit on (default 100 MVA).
+  """
+  @spec apparent_impedance_mva(number(), number(), number(), number()) ::
+          {float(), float()} | :infinite
+  def apparent_impedance_mva(vm_pu, p_mw, q_mvar, base_mva \\ @default_base_mva) do
+    if base_mva <= 0.0 do
+      :infinite
+    else
+      apparent_impedance(vm_pu, p_mw / base_mva, q_mvar / base_mva)
+    end
+  end
+
+  @doc """
+  `Z = V / I` from rectangular phasors `{re, im}`, for callers that already
+  have the current (a fault study, or a solver that returns branch currents).
+
+  Both phasors must be per unit on the same base. Returns `:infinite` on zero
+  current.
+  """
+  @spec apparent_impedance_phasor({number(), number()}, {number(), number()}) ::
+          {float(), float()} | :infinite
+  def apparent_impedance_phasor({v_re, v_im}, {i_re, i_im}) do
+    i_sq = i_re * i_re + i_im * i_im
+
+    if i_sq <= 0.0 do
+      :infinite
+    else
+      {(v_re * i_re + v_im * i_im) / i_sq, (v_im * i_re - v_re * i_im) / i_sq}
+    end
+  end
+
+  @doc "Magnitude of an impedance `{r, x}`."
+  def impedance_magnitude({r, x}), do: :math.sqrt(r * r + x * x)
+
+  @doc """
+  Angle of an impedance `{r, x}` in degrees, in `(-180, 180]`.
+
+  For an apparent impedance this equals the power-factor angle of the flow,
+  which is what the PRC-023 blinder is stated in terms of.
+  """
+  def impedance_angle_deg({r, x}), do: :math.atan2(x, r) * 180.0 / :math.pi()
+
+  @doc """
+  The three mho reach impedances for a line, as `%{1 => z, 2 => z, 3 => z}`.
+
+  Each reach is a complex impedance along the line's own angle — the relay
+  characteristic angle of a self-polarized mho element is set to the protected
+  line's impedance angle, so a fault anywhere on the line sits on the circle's
+  diameter.
+
+  Zone 3's reach is `margin × (|Z_line| + |Z_adjacent|)` in magnitude, still at
+  the line angle. Pass `:z_adjacent` as the LONGEST line leaving the remote
+  bus; it defaults to the protected line itself, which is what a screening
+  pass with no adjacency data can honestly assume.
+
+  ## Options
+
+    * `:z_adjacent` — `{r_pu, x_pu}` of the longest adjacent line
+    * `:zone1_reach`, `:zone2_reach`, `:zone3_margin` — override the settings
+      in `distance_settings/0`
+  """
+  @spec mho_reaches({number(), number()}, keyword()) :: map()
+  def mho_reaches({r, x} = z_line, opts \\ []) do
+    z1 = Keyword.get(opts, :zone1_reach, @zone1_reach)
+    z2 = Keyword.get(opts, :zone2_reach, @zone2_reach)
+    margin = Keyword.get(opts, :zone3_margin, @zone3_margin)
+    z_adjacent = Keyword.get(opts, :z_adjacent) || z_line
+
+    mag = impedance_magnitude(z_line)
+
+    # Zone 3 as a multiple of the line, so the angle is preserved by the same
+    # scalar multiplication the other zones use. A degenerate zero-impedance
+    # line has no angle to preserve and no reach worth setting.
+    zone3_multiple =
+      if mag > 0.0 do
+        margin * (mag + impedance_magnitude(z_adjacent)) / mag
+      else
+        0.0
+      end
+
+    %{
+      1 => {z1 * r, z1 * x},
+      2 => {z2 * r, z2 * x},
+      3 => {zone3_multiple * r, zone3_multiple * x}
+    }
+  end
+
+  @doc """
+  Is `z` inside the mho circle of reach `z_reach`?
+
+  The self-polarized mho characteristic is the circle with the origin and
+  `z_reach` as the ends of a diameter, i.e. centre `z_reach/2` and radius
+  `|z_reach|/2`:
+
+      |Z - Z_r/2| <= |Z_r|/2
+
+  A zero reach is a degenerate point at the origin and contains nothing.
+  """
+  @spec inside_mho?({number(), number()} | :infinite, {number(), number()}) :: boolean()
+  def inside_mho?(:infinite, _z_reach), do: false
+
+  def inside_mho?({r, x}, {rr, rx}) do
+    radius = impedance_magnitude({rr, rx}) / 2.0
+
+    if radius <= 0.0 do
+      false
+    else
+      dr = r - rr / 2.0
+      dx = x - rx / 2.0
+      :math.sqrt(dr * dr + dx * dx) <= radius
+    end
+  end
+
+  @doc """
+  The PRC-023-4 loadability impedance magnitude, in per unit.
+
+  NERC PRC-023-4 Requirement R1 criterion 1: a load-responsive phase
+  protection system must not operate at or below 150% of the highest seasonal
+  facility rating, evaluated at 0.85 pu voltage and a 30° power-factor angle.
+  The impedance the relay sees at that operating point is
+
+      |Z| = V² / S = 0.85² / (1.5 · S_rating_pu)
+
+  and the relay must stay clear of everything AT OR BEYOND it on the load
+  side. Lighter load means larger apparent impedance, so the standard's point
+  is the CLOSEST-IN load condition the relay has to tolerate.
+
+  Returns `:infinity` for an unrated branch — nothing is known to be load, so
+  nothing is excluded.
+
+  ## Options
+
+    * `:base_mva` — system base for the per-unit conversion (default 100.0)
+    * `:loadability_factor` — default 1.5
+    * `:blinder_voltage_pu` — default 0.85
+  """
+  @spec loadability_limit_pu(number() | nil, keyword()) :: float() | :infinity
+  def loadability_limit_pu(rating_mva, opts \\ [])
+
+  def loadability_limit_pu(rating_mva, opts) when is_number(rating_mva) and rating_mva > 0 do
+    base_mva = Keyword.get(opts, :base_mva, @default_base_mva)
+    factor = Keyword.get(opts, :loadability_factor, @blinder_loadability)
+    v = Keyword.get(opts, :blinder_voltage_pu, @blinder_voltage_pu)
+
+    rating_pu = rating_mva / base_mva
+
+    if base_mva > 0.0 and factor > 0.0 do
+      v * v / (factor * rating_pu)
+    else
+      :infinity
+    end
+  end
+
+  def loadability_limit_pu(_rating_mva, _opts), do: :infinity
+
+  @doc """
+  Highest-rating loadability limit for a branch record, using
+  `PowerModel.Grid.Ratings.branch_ratings/1`.
+
+  PRC-023 is stated against the HIGHEST seasonal facility rating, so the
+  short-time emergency rating (rate C) is the basis here, not the continuous
+  rate A the display uses. Falls back through the tiers a branch actually has.
+  """
+  @spec branch_loadability_limit_pu(map(), keyword()) :: float() | :infinity
+  def branch_loadability_limit_pu(branch, opts \\ []) do
+    {rate_a, rate_b, rate_c} = Ratings.branch_ratings(branch)
+
+    highest =
+      [rate_c, rate_b, rate_a]
+      |> Enum.filter(&(is_number(&1) and &1 > 0))
+      |> Enum.max(fn -> nil end)
+
+    loadability_limit_pu(highest, opts)
+  end
+
+  @doc """
+  The exact PRC-023-4 loadability test point as an impedance `{r_pu, x_pu}`:
+  the loadability limit magnitude at the 30° blinder angle.
+
+  This is the point the standard says a relay must not trip on. It exists so
+  callers and tests can name it rather than re-deriving it.
+  """
+  @spec prc023_load_point(number() | nil, keyword()) :: {float(), float()} | :infinite
+  def prc023_load_point(rating_mva, opts \\ []) do
+    case loadability_limit_pu(rating_mva, opts) do
+      :infinity ->
+        :infinite
+
+      mag ->
+        theta = Keyword.get(opts, :blinder_angle_deg, @blinder_angle_deg) * :math.pi() / 180.0
+        {mag * :math.cos(theta), mag * :math.sin(theta)}
+    end
+  end
+
+  @doc """
+  Is this apparent impedance LOAD rather than a fault, per the PRC-023-4
+  blinder?
+
+  Load is the region at or beyond the loadability limit magnitude and within
+  the blinder angle of the resistance axis: heavy real power at a plausible
+  power factor. A fault is close in and near the line angle (70–85° for
+  transmission), so it satisfies neither condition — the two regions do not
+  overlap, which is why the blinder can be applied to every zone without
+  blinding the relay to real faults.
+
+  The boundary is inclusive on both tests, so the standard's own 150%/0.85
+  pu/30° point is excluded, as PRC-023 requires. Load HEAVIER than that point
+  (smaller |Z|) is outside the required loadability envelope and is not
+  blocked; the standard sets a floor on loadability, not a licence to ignore
+  every load condition.
+  """
+  @spec load_encroachment?({number(), number()} | :infinite, number() | nil, keyword()) ::
+          boolean()
+  def load_encroachment?(z, rating_mva, opts \\ [])
+
+  def load_encroachment?(:infinite, _rating_mva, _opts), do: false
+
+  def load_encroachment?(z, rating_mva, opts) do
+    case loadability_limit_pu(rating_mva, opts) do
+      :infinity ->
+        false
+
+      limit ->
+        blinder_deg = Keyword.get(opts, :blinder_angle_deg, @blinder_angle_deg)
+
+        impedance_magnitude(z) >= limit and abs(impedance_angle_deg(z)) <= blinder_deg
+    end
+  end
+
+  @doc """
+  Evaluate a mho distance relay: which zone (if any) an apparent impedance
+  falls in, and the delay that zone carries.
+
+  Pure. The caller turns `delay_s` into trip timing — the cascade's existing
+  relay-duty accumulator integrates `dt / delay_s` the same way it does for
+  the inverse-time overcurrent elements.
+
+  ## Parameters
+
+    * `z_apparent` — `{r_pu, x_pu}` from `apparent_impedance/3`, or `:infinite`
+    * `z_line` — the protected line's series impedance `{r_pu, x_pu}`
+    * `opts` — `:z_adjacent`, `:rating_mva` (enables the blinder), plus any
+      key `mho_reaches/2` or `loadability_limit_pu/2` accepts, and
+      `:delays_s` to override the zone timers
+
+  ## Returns
+
+      %{
+        zone: 1 | 2 | 3 | nil,          # the zone that will trip
+        delay_s: float() | :infinity,   # its delay
+        zone_reached: 1 | 2 | 3 | nil,  # the zone the characteristic saw
+        blocked: boolean(),             # ...but the blinder held it
+        block_reason: nil | :prc023_load_blinder,
+        z_pu: {float(), float()} | :infinite,
+        z_mag_pu: float() | :infinity,
+        z_angle_deg: float() | nil,
+        reaches: %{1 => {float(), float()}, ...},
+        loadability_limit_pu: float() | :infinity
+      }
+
+  `zone` is `nil` whenever nothing operates, whether because the impedance is
+  outside every circle or because the blinder blocked it; `zone_reached` and
+  `blocked` say which of the two happened, which is what makes a load-driven
+  near-miss visible in a cascade log instead of silent.
+
+  > #### Supersedes the heuristic {: .info}
+  >
+  > `check_zone3_encroachment/6` is the loading-and-voltage HEURISTIC the
+  > cascade uses today, because there was no AC solution to measure an
+  > impedance from. This function is the real characteristic. They are not
+  > interchangeable: the heuristic is probabilistic and needs no impedance,
+  > this one is deterministic and needs one.
+  """
+  @spec distance_zone({number(), number()} | :infinite, {number(), number()}, keyword()) :: map()
+  def distance_zone(z_apparent, z_line, opts \\ []) do
+    reaches = mho_reaches(z_line, opts)
+    delays = Keyword.get(opts, :delays_s, @zone_delays)
+    rating_mva = Keyword.get(opts, :rating_mva)
+    limit = loadability_limit_pu(rating_mva, opts)
+
+    zone_reached =
+      Enum.find([1, 2, 3], fn zone -> inside_mho?(z_apparent, Map.fetch!(reaches, zone)) end)
+
+    blocked? = zone_reached != nil and load_encroachment?(z_apparent, rating_mva, opts)
+    zone = if blocked?, do: nil, else: zone_reached
+
+    %{
+      zone: zone,
+      delay_s: if(zone, do: Map.get(delays, zone, :infinity), else: :infinity),
+      zone_reached: zone_reached,
+      blocked: blocked?,
+      block_reason: if(blocked?, do: :prc023_load_blinder),
+      z_pu: z_apparent,
+      z_mag_pu: magnitude_or_infinity(z_apparent),
+      z_angle_deg: angle_or_nil(z_apparent),
+      reaches: reaches,
+      loadability_limit_pu: limit
+    }
+  end
+
+  defp magnitude_or_infinity(:infinite), do: :infinity
+  defp magnitude_or_infinity(z), do: impedance_magnitude(z)
+
+  defp angle_or_nil(:infinite), do: nil
+  defp angle_or_nil(z), do: impedance_angle_deg(z)
+
+  @doc """
+  Distance-relay pickups across a set of branches, in the codebase's usual
+  trip-map shape. Pure — the caller decides what to do with the timing.
+
+  ## Input
+
+  A list of per-branch maps:
+
+      %{
+        component_type: :line | :transformer | String.t(),
+        component_id: term(),
+        z_line: {r_pu, x_pu},               # required
+        z_apparent: {r_pu, x_pu},           # or vm_pu + p_pu + q_pu
+        vm_pu: float(), p_pu: float(), q_pu: float(),
+        z_adjacent: {r_pu, x_pu} | nil,     # longest line off the remote bus
+        rating_mva: float() | nil           # highest rating, arms the blinder
+      }
+
+  ## Output
+
+  One map per picked-up branch, fastest zone first:
+
+      %{
+        component_type: "transmission_line",
+        component_id: id,
+        failure_cause: "distance_zone1" | "distance_zone2" | "distance_zone3",
+        details: %{zone:, delay_s:, r_pu:, x_pu:, z_mag_pu:, z_angle_deg:,
+                   reach_pu:, loadability_limit_pu:}
+      }
+
+  Branches the blinder held are NOT returned — a blocked relay does not trip.
+  Use `distance_zone/3` directly if the near-misses are wanted.
+  """
+  @spec distance_relay_trips(list(map()), keyword()) :: list(map())
+  def distance_relay_trips(branches, opts \\ []) do
+    branches
+    |> Enum.map(&evaluate_branch_relay(&1, opts))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.sort_by(& &1.details.delay_s)
+  end
+
+  defp evaluate_branch_relay(branch, opts) do
+    z_line = Map.get(branch, :z_line)
+
+    with true <- match?({_, _}, z_line),
+         z_apparent when z_apparent != :infinite <- branch_apparent_impedance(branch),
+         result <-
+           distance_zone(z_apparent, z_line, branch_relay_opts(branch, opts)),
+         %{zone: zone} when not is_nil(zone) <- result do
+      {r, x} = z_apparent
+
+      %{
+        component_type: component_type_string(Map.get(branch, :component_type, :line)),
+        component_id: Map.get(branch, :component_id),
+        failure_cause: "distance_zone#{result.zone}",
+        details: %{
+          zone: result.zone,
+          delay_s: result.delay_s,
+          r_pu: r,
+          x_pu: x,
+          z_mag_pu: result.z_mag_pu,
+          z_angle_deg: result.z_angle_deg,
+          reach_pu: impedance_magnitude(Map.fetch!(result.reaches, result.zone)),
+          loadability_limit_pu: result.loadability_limit_pu
+        }
+      }
+    else
+      _ -> nil
+    end
+  end
+
+  defp branch_relay_opts(branch, opts) do
+    opts
+    |> Keyword.put_new(:z_adjacent, Map.get(branch, :z_adjacent))
+    |> Keyword.put_new(:rating_mva, Map.get(branch, :rating_mva))
+    |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+  end
+
+  defp branch_apparent_impedance(%{z_apparent: z}) when is_tuple(z), do: z
+
+  defp branch_apparent_impedance(%{vm_pu: v, p_pu: p, q_pu: q}),
+    do: apparent_impedance(v, p, q)
+
+  defp branch_apparent_impedance(_), do: :infinite
+
+  # ===========================================================================
+  # Two-timescale conductor thermal model (ROADMAP item 20)
+  # ===========================================================================
+
+  # Simplified IEEE 738 heat balance. The full standard integrates convective,
+  # radiative and solar heat transfer against I²R; the simplification here is
+  # that, for a fixed ambient and wind, the STEADY-STATE rise above ambient is
+  # proportional to I² and the approach to it is first order:
+  #
+  #     T_ss(m) = T_ambient + ΔT_rated · m²          m = S / rate A
+  #     T(t+dt) = T_ss + (T(t) - T_ss) · exp(-dt/τ)
+  #
+  # The exponential form is the exact solution for constant loading over the
+  # step, so it is stable at any dt — the cascade's step sizes vary by orders
+  # of magnitude and an Euler update would blow up on the long ones.
+  #
+  # Design basis: ACSR at a 40 °C ambient, 75 °C continuous (so the conductor
+  # sits exactly at its continuous limit at 100% of RATE A — that is what rate
+  # A means) and a 100 °C short-time emergency limit. Utility practice varies
+  # (75/100 and 100/125 are both common); these are configurable.
+  @thermal_ambient_c 40.0
+  @thermal_rated_rise_c 35.0
+  @thermal_emergency_c 100.0
+
+  # Conductor thermal time constant. ACSR runs roughly 5–20 minutes depending
+  # on conductor size and wind speed; 12 minutes is a mid-size transmission
+  # conductor in light wind.
+  @thermal_tau_s 720.0
+
+  @doc """
+  Conductor thermal defaults as a keyword list — `:ambient_c`, `:rated_rise_c`,
+  `:emergency_c`, `:tau_s`. Single source of truth; every thermal function
+  takes the same keys as overrides.
+  """
+  def conductor_thermal_defaults do
+    [
+      ambient_c: @thermal_ambient_c,
+      rated_rise_c: @thermal_rated_rise_c,
+      emergency_c: @thermal_emergency_c,
+      tau_s: @thermal_tau_s
+    ]
+  end
+
+  @doc """
+  A fresh conductor thermal state, sitting at ambient.
+
+  Shape: `%{temp_c:, steady_state_c:, loading_fraction:, elapsed_s:}`. Persist
+  it per branch and thread it through `advance_conductor_temperature/4`.
+  """
+  @spec conductor_thermal_state(keyword()) :: map()
+  def conductor_thermal_state(opts \\ []) do
+    ambient = Keyword.get(opts, :ambient_c, @thermal_ambient_c)
+
+    %{temp_c: ambient, steady_state_c: ambient, loading_fraction: 0.0, elapsed_s: 0.0}
+  end
+
+  @doc """
+  Steady-state conductor temperature at a given loading, in °C.
+
+  `loading_fraction` is apparent flow over RATE A — the continuous rating, not
+  the rate C relay-pickup basis. Rate A is by definition the current at which
+  the conductor settles at its continuous design temperature, which is the
+  only anchor this curve has.
+
+  > #### Basis mismatch is the landmine here {: .warning}
+  >
+  > `PowerModel.Failure.Cascade.trip_loading_pct/1` reports loading on the
+  > RATE C basis (rate A ÷ 1.35) because that is where relays pick up. Feeding
+  > that number in here understates conductor temperature by the square of
+  > 1.35. Convert, or read `loading_pct` (the rate A basis) directly.
+  """
+  @spec conductor_steady_state_temp_c(number(), keyword()) :: float()
+  def conductor_steady_state_temp_c(loading_fraction, opts \\ []) do
+    ambient = Keyword.get(opts, :ambient_c, @thermal_ambient_c)
+    rise = Keyword.get(opts, :rated_rise_c, @thermal_rated_rise_c)
+    m = abs(loading_fraction)
+
+    ambient + rise * m * m
+  end
+
+  @doc """
+  Advance a conductor's temperature by `dt_s` at a constant `loading_fraction`.
+
+  This is the SLOW timescale of ROADMAP item 20. The cascade's existing
+  IEC 60255-151 duty integral is the fast one: it decides, in seconds, whether
+  a relay operates on an overload. This decides, in tens of minutes, whether
+  the conductor itself reaches an emergency temperature — the sag-and-contact
+  mechanism that took out the Ohio lines in 2003 with no relay involvement at
+  all. The two mechanisms answer different questions and must both be run;
+  neither substitutes for the other.
+
+  Passing `nil` as the state starts from ambient.
+  """
+  @spec advance_conductor_temperature(map() | nil, number(), number(), keyword()) :: map()
+  def advance_conductor_temperature(state, loading_fraction, dt_s, opts \\ []) do
+    state = state || conductor_thermal_state(opts)
+    tau = Keyword.get(opts, :tau_s, @thermal_tau_s)
+    target = conductor_steady_state_temp_c(loading_fraction, opts)
+    dt = max(dt_s * 1.0, 0.0)
+
+    temp =
+      if tau > 0.0 do
+        target + (state.temp_c - target) * :math.exp(-dt / tau)
+      else
+        target
+      end
+
+    %{
+      state
+      | temp_c: temp,
+        steady_state_c: target,
+        loading_fraction: loading_fraction * 1.0,
+        elapsed_s: state.elapsed_s + dt
+    }
+  end
+
+  @doc """
+  Has the conductor reached its emergency temperature?
+
+  This is the thermal trip predicate: at the emergency limit the utility's
+  clearance and annealing basis is exhausted and the line must come out,
+  regardless of what any overcurrent relay thinks.
+  """
+  @spec conductor_overtemperature?(map(), keyword()) :: boolean()
+  def conductor_overtemperature?(%{temp_c: temp}, opts \\ []) do
+    temp >= Keyword.get(opts, :emergency_c, @thermal_emergency_c)
+  end
+
+  @doc """
+  Seconds until a conductor at `state` reaches its emergency temperature if
+  `loading_fraction` is held, or `:infinity` if it never does.
+
+  Inverting the first-order response,
+
+      t = -τ · ln((T_ss - T_limit) / (T_ss - T_0))
+
+  Returns `0.0` if it is already there. `:infinity` when the steady state sits
+  at or below the limit — which is the whole point of a two-timescale model:
+  sustained loading below about 131% of rate A (the point where 35 · m² first
+  exceeds a 60 °C rise) NEVER cooks the conductor, however long it lasts, so
+  the slow mechanism must not be allowed to trip it.
+
+  Usable as a candidate trip time alongside the cascade's inverse-time relay
+  times; the fastest mechanism wins.
+  """
+  @spec conductor_trip_time_s(map(), number(), keyword()) :: float() | :infinity
+  def conductor_trip_time_s(%{temp_c: temp}, loading_fraction, opts \\ []) do
+    limit = Keyword.get(opts, :emergency_c, @thermal_emergency_c)
+    tau = Keyword.get(opts, :tau_s, @thermal_tau_s)
+    target = conductor_steady_state_temp_c(loading_fraction, opts)
+
+    cond do
+      temp >= limit -> 0.0
+      target <= limit -> :infinity
+      tau <= 0.0 -> 0.0
+      true -> -tau * :math.log((target - limit) / (target - temp))
     end
   end
 end
