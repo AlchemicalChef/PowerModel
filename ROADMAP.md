@@ -150,6 +150,8 @@ L ≈ multi-week.
 
 ### Phase 5 — Spatial load & new sources (M–L)
 22. **EIA-861** (M): service territory + sectoral sales (verified live, 4.6 MB).
+    NOTE: item 30 (BTM solar) consumes this zip's Net_Metering + Service_Territory
+    files and can front-run the sales half.
     Two payoffs: county-by-sector metered MWh replacing the population proxy, AND a
     county-resolution BA boundary map that retires the DAT-5 blocker. Gotcha: three-row
     stacked headers. Supersedes LODES/CBP (noise-infused; data centers employ nobody).
@@ -166,6 +168,51 @@ L ≈ multi-week.
     literature) + heat-wave/winter scenarios. NOT for demand fidelity (the model
     already replays measured demand); justify as scenario generation only. NOAA ISD is
     retired — use GHCNh or IEM ASOS.
+
+### Phase 2.5 — Distributed solar (added 2026-08-15)
+
+Motivating profile (measured from the ingested 2024 fleet): all 122.9 GW of modeled PV
+is utility-metered EIA-860 plant — 122.1 GW genuinely grid-scale (IPP 102.6 + utility
+19.5), ~0.75 GW onsite C&I — while the ~50 GW of US residential/BTM rooftop appears
+NOWHERE as generation. It is not missing from the energy balance: EIA-930 demand is
+metered NET of BTM, so rooftop lives invisibly inside the demand signal we replay. The
+work below makes it explicit without double counting, because the cases that matter —
+inverter tripping mid-cascade, cloud-cover scenarios — are exactly where net-zero stops
+holding.
+
+29. **Sector tagging of the existing fleet** (S, independent, do first): store EIA-860
+    `Sector Name` (already in the parsed CSV, currently dropped) on generators +
+    a derived `utility_scale`/`onsite` classification for ALL fuels; migration +
+    ingest capture; surface in dispatch coverage, exports, and the info panel.
+    Refinement while in there: EIA-930's solar/wind columns are utility-scale
+    generation, so fuel-anchored dispatch should allocate them to utility_scale units
+    only, with onsite units on their own CF (0.6% effect today; correctness, not
+    magnitude). Validate against the measured sector profile (7,132 PV units:
+    694 utility / 6,113 IPP / ~320 onsite).
+30. **Behind-the-meter solar layer** (M, needs the EIA-861 net-metering +
+    service-territory files — a subset of item 22, downloadable now, no key):
+    capacity by utility × state × sector from Net_Metering (+ non-NEM distributed
+    file), allocated utility→county via Service_Territory, county→bus via the
+    existing residential/commercial load weights; hourly output shaped by the BA's
+    own utility-solar capacity factor from ba_fuel_hour (same insolation; Phase 5
+    HRRR upgrade later). REPRESENTATION RULE (the double-counting guard): model BTM
+    as bus-level gross-up + generation pair — load.gross = EIA-930 net + btm_output,
+    btm_output subtracted back at the same bus — so every steady-state solve is
+    IDENTICAL with the layer on or off (pin with a regression test). The layer only
+    acts when something perturbs btm_output. Anchors: ~50 GW national capacity,
+    CAISO ≈ 15 GW; validate state capacity totals against EIA's published
+    small-scale estimates.
+31. **IEEE 1547 trip behavior in the cascade** (M, needs 30; implement with or right
+    after item 15 — it is the same feedback loop): split BTM capacity into legacy
+    (1547-2003: MUST-trip at 59.3 Hz / 0.88 pu, ~0.16 s) and modern (1547-2018:
+    mandatory ride-through) buckets — documented configurable split (~30/70 default)
+    until per-vintage 861 history refines it. Tripped BTM feeds back as an INSTANT
+    NET-LOAD INCREASE on the island within the same step (the Blue Cut mechanism;
+    note the vicious pairing: an island dipping to 59.3 Hz sheds its legacy rooftop
+    fleet before the first UFLS stage arms at the same frequency). No auto-reconnect
+    inside a cascade (1547 mandates delayed return — item 28 territory). Validate:
+    Blue Cut-style scenario, duck-curve day replay of net demand, and β
+    (frequency-response) must not degrade.
 
 ### Phase 6 — System-level validation (M–L)
 26. **Historical event replays**, in feasibility order: 2021 Uri (resource-adequacy
