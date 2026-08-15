@@ -480,20 +480,36 @@ coordinate-less MATPOWER buses and never simulated — worth a comment in the fu
 unlicensed, unversioned ArcGIS mirror; HIFLD Open was shut down by DHS 2025-08-26.
 Snapshots pinned with checksums — see data/vendored/PROVENANCE.md; source switch is
 ROADMAP Phase 2.
+**LIN-13 (MEASURED, HIGH → Phase 2 gate) [OPEN]** No AC solution EXISTS at real demand
+on any interconnection — the network data, not the solver, is now the blocker. A lossless
+branch carries at most V·V/x; wherever DC needs >90° across a branch, AC is infeasible.
+Census at hour-scaled demand (2026-08-15): ERCOT 1 branch >90° + 58 radial buses >50 MW
+(worst 721 MW on one spur), converges only ≤25% of demand with a textbook nose curve;
+Western 3 branches (max 193°), fails from BOTH sides (voltage collapse above ~13% load,
+Ferranti >1.1 pu on 5,337 buses below — 44 GVAr of line charging doesn't scale with
+load), and at α=0.12 exactly TWO buses at the floor sit behind one placeholder
+x=1.148 pu radial branch; Eastern 15 branches (max 243°), converges ≤15%. Fix is Phase 2
+items 8/10/12 + DAT-21 (impedance recompute, EHV classes, connectivity repair) — more
+solver is not. Until then the voltage chain (UVLS, distance relays, IBR LVRT) is inert
+at real demand: CAS-1's honest-degradation rule correctly keeps DC. Found by FDPF
+convergence probing, 2026-08-15.
 **SOL-12 (MED) [OPEN]** `YBus.effective_reactance/1` floors |x| at 1.0e-3 pu — far
 coarser than the divide-by-zero guard requires. Three real ACTIVSg2000 branches
 (true x 7.0e-4–8.8e-4) are inflated 14–43%, confirmed as the sole source of the case's
 DC deviation. Lower the floor (e.g. 1e-5) with the sign-preserving semantics intact.
-**SOL-13 (HIGH, scale-blocking) [OPEN→Phase 4]** Q-limit outer-loop switching does not
-scale: on ACTIVSg2000, 32 of 195 buses that should switch to PQ never do (1 spurious) —
-e.g. bus 1070 genuinely exceeds q_max but lands above setpoint once 175 others clamp,
-satisfies the back-switch condition, returns to PV, and oscillates until
-@max_qlim_rounds ends it. Worst bus voltage 2.86% off (5.7× contract) at converged
-mismatch 3.1e-10. Faster linear algebra will NOT fix this — the switching mechanism
-needs work (e.g. no back-switching for genuinely-violating buses within a round, or
-simultaneous-violation resolution). Guarded bus-for-bus at IEEE-118 scale where it
-works; the skipped ACTIVSg2000 AC tests are the acceptance gate. Found by the Phase 0
-validation ladder, 2026-08-15.
+**SOL-13 (FIXED 2026-08-15)** The original diagnosis was wrong in one respect: traced
+on ACTIVSg2000, the outer loop does NOT oscillate to the round cap — it reaches a fixed
+point in 5 rounds where no bus wants to change type, and bus 1070's required Q
+legitimately falls inside its limit once the other 175 buses settle. The 2.86% voltage
+gap was a POLICY difference, not a bug: the pandapower/MATPOWER reference never
+back-switches, and its fixed point violates complementarity at 48 of its 195 pinned
+buses (30 at q_max with V above setpoint). Our default (`:complementary`) satisfies
+complementarity at all 392 generator buses; a latch (a re-violating bus stays pinned,
+≤3 type changes per bus) makes termination a guarantee. A `:q_limit_policy: :matpower`
+option reproduces the reference's rule — 191/195 buses agree, losses 0.0151% — and the
+un-skipped ACTIVSg2000 AC tests run under it as the "same rule ⇒ same answer" gate,
+while fdpf_test.exs asserts the complementarity property the reference itself fails.
+Closed for both NR and FDPF paths (the rule is shared). Fixed by p4-fdpf with item 19.
 **ENE-19 (FIXED 2026-08-15)** Fuel-anchored dispatch carries no
 contingency-reserve requirement: ERCOT's operating point leaves ~1.27 GW of
 governor-duty headroom against its 1,375 MW design contingency, so the island sheds
@@ -521,6 +537,16 @@ straddle interconnection boundaries — MISO's 69 GW lands on stray ERCOT-labell
 real ~45 GW. Regional and national runs are not comparable until per-interconnection
 scaling restricts a BA's demand to its in-snapshot share. Found by the replay harness
 2026-08-15 (`outsized scaling` flag: 16 BAs / 40.35 GW nationally).
+**ENE-20 (MEASURED, HIGH) [OPEN]** Eastern's as-dispatched operating point runs ~65 GW
+long: dispatched generation 300.3 GW against 235.0 GW connected load, with the slack bus
+absorbing −60.6 GW (`mismatch_mw` −65,100). Every flow-derived number on Eastern is
+suspect at that operating point — the first N-1 census measured the dispatch imbalance,
+not the network: base overloads 4,366 (6.8%) vs 712 (1.1%) under a balanced control
+scaling gen to load, worst mw_at_risk 362 GW vs 10.6 GW, and the two top-10 contingency
+lists share ZERO entries. Likely interacts with ENE-17's cross-boundary BA scaling.
+ERCOT/Western dispatch was validated in Phase 3 and does not show this. Found by the
+LODF screening sweep 2026-08-15. Fix belongs in dispatch/balance_operating_point
+ownership; until then, Eastern screening results should use the balanced control.
 **ENE-18 (DATA CAVEAT) [DOCUMENTED]** EIA-930's own generation identity (NG − TI = D)
 never closes for BPAT (0/4,417 hours), MISO (5/4,389), CISO (611/2,473) — those BAs are
 essentially unvalidatable against their own published totals. The harness's screened-hours

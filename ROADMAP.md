@@ -190,6 +190,40 @@ L ≈ multi-week.
 >   dropped (obsolete). Wave 3 wants a "longest line off the remote bus"
 >   topology precompute for real zone-3 reaches.
 
+> **STATUS 2026-08-15 (later): Wave 2 LANDED** (items 19 + 21; SOL-13 closed).
+> Measured:
+> - **FDPF (item 19)**: ACTIVSg2000 AC in 128 ms where dense NR took 347 s /
+>   3.2 GB (2,708×), same answer to 8e-9 pu; faster than dense NR at EVERY size
+>   measured (2× at 10 buses), cutoff 25 buses chosen for robustness not speed.
+>   XB variant; B′ = the DC B′ exactly (shared handle); B″ = −Im(Ybus) over PQ
+>   rows, refactorized alone on Q-limit switch rounds. No faer NIF needed —
+>   exactly as the plan predicted. Hot paths: compute_power 631 ms → 0.3 ms
+>   (Y-bus nonzeros), warm start 15.9 → 0.3 ms, YBus.build quadratic append
+>   fixed. **Eastern AC converged for the first time** (51,713 buses, 46 iters,
+>   4.8 s) — but only at ≤15% of real demand, which is the finding:
+> - **The network, not the solver, is now the AC blocker** (REVIEW LIN-13): at
+>   real demand DC needs >90° across 1/3/15 branches (ERCOT/Western/Eastern) so
+>   no AC solution exists; Western also Ferranti-overvolts at low load (44 GVAr
+>   of charging doesn't scale). ERCOT's nose curve is textbook — the solver is
+>   behaving; Phase 2 items 8/10/12 + DAT-21 are the unlock for the whole
+>   voltage chain (item 20 wiring is otherwise inert at real demand).
+> - **SOL-13 closed with a diagnosis reversal**: the reference (MATPOWER-style,
+>   no back-switching) violates complementarity at 48/195 pinned buses; our
+>   default policy satisfies it at all 392 and a `:matpower` policy reproduces
+>   the reference 191/195 bus-for-bus (losses 0.0151%). ACTIVSg2000 AC tests
+>   un-skipped under `:matpower`.
+> - **LODF/PTDF screening (item 21)**: exact vs full re-solve to 6e-11 (ERCOT)
+>   / 3e-9 (Eastern); full N-1 sweeps 0.3 s / 3.2 s / 63 s for ERCOT/Western/
+>   Eastern (~350× one-resolve-each); bridges by Tarjan (27.8–40.9% of branches
+>   are bridges — itself a connectivity indictment); multi-outage via exact
+>   rank-k Woodbury (sequential compounding measured at 6.5% error and
+>   rejected). N-2 delivered (2.2 ms/pair). UI wiring = Wave 3 (UI-M15).
+> - **ENE-20 found (HIGH, open)**: Eastern's operating point runs ~65 GW long
+>   (gen 300.3 vs load 235.0 GW, slack absorbs −60.6 GW) — its N-1 census
+>   currently measures the dispatch imbalance, not the network (top-10 lists
+>   share zero entries with a balanced control). Needs a dispatch-side fix
+>   before Eastern screening numbers mean anything.
+
 > **Salvage note (2026-08-15):** the absorbed pre-reset history (tip `159e900`,
 > retrievable via `git show 159e900:<path>` — do NOT use `origin/master`, which
 > now points at current work; the richer harmonics-era `lib.rs` is blob
