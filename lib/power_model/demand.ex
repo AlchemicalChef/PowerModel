@@ -29,7 +29,7 @@ defmodule PowerModel.Demand do
   import Ecto.Query
 
   alias PowerModel.Repo
-  alias PowerModel.Demand.BADemandHour
+  alias PowerModel.Demand.{BADemandHour, BAFuelHour}
   alias PowerModel.Grid.{BalancingAuthority, Bus, Generator}
 
   # Per-BA scale factors outside this range usually indicate bad demand data
@@ -52,12 +52,97 @@ defmodule PowerModel.Demand do
   end
 
   @doc """
-  The most recent UTC hour with ingested EIA-930 demand rows, or nil when no
-  demand data is loaded. Used as the default simulation hour so that
+  The most recent UTC hour with COMPLETE ingested EIA-930 demand, or nil when
+  no demand data is loaded. Used as the default simulation hour so that
   simulations run against real demand rather than the ~2x synthetic baseline.
+
+  ENE-13: the last hour in a bulk file is a boundary hour that only the BAs
+  which had already reported appear in — measured at 17 of 53 BAs. Defaulting
+  to it left two-thirds of the country on the synthetic baseline while looking
+  like a real-demand run. An hour therefore qualifies only if the number of
+  BAs reporting it is at least the MODAL count across all hours minus one (the
+  slack absorbs a single BA's routine gap without accepting a truncated hour).
   """
   def latest_demand_hour do
-    Repo.one(from d in BADemandHour, select: max(d.timestamp_utc))
+    hour_counts =
+      from d in BADemandHour,
+        group_by: d.timestamp_utc,
+        select: %{hour: d.timestamp_utc, bas: count(d.id)}
+
+    modal_bas =
+      Repo.one(
+        from hc in subquery(hour_counts),
+          group_by: hc.bas,
+          order_by: [desc: count(hc.bas), desc: hc.bas],
+          limit: 1,
+          select: hc.bas
+      )
+
+    case modal_bas do
+      nil ->
+        nil
+
+      modal_bas ->
+        threshold = max(modal_bas - 1, 1)
+
+        Repo.one(
+          from hc in subquery(hour_counts),
+            where: hc.bas >= ^threshold,
+            select: max(hc.hour)
+        )
+    end
+  end
+
+  @doc """
+  Per-fuel net generation for the given hour, as
+  `%{ba_id => %{fuel => net_generation_mw}}`.
+
+  Rows are stored against the EIA BA code; codes with no
+  `balancing_authorities` row (hence no buses) are dropped. Returns an empty
+  map when the hour has no per-fuel data, which is how `PowerModel.Dispatch`
+  detects that it must decline.
+  """
+  def fuel_generation_at(%DateTime{} = timestamp) do
+    hour = truncate_to_hour(timestamp)
+
+    from(f in BAFuelHour,
+      join: ba in BalancingAuthority,
+      on: ba.code == f.ba_code,
+      where: f.timestamp_utc == ^hour,
+      select: {ba.id, f.fuel, f.net_generation_mw}
+    )
+    |> Repo.all()
+    |> Enum.reduce(%{}, fn {ba_id, fuel, mw}, acc ->
+      Map.update(acc, ba_id, %{fuel => mw}, &Map.put(&1, fuel, mw))
+    end)
+  end
+
+  @doc """
+  Whether any BA reported per-fuel generation for the given hour.
+  """
+  def fuel_data_available?(%DateTime{} = timestamp) do
+    hour = truncate_to_hour(timestamp)
+
+    Repo.exists?(from f in BAFuelHour, where: f.timestamp_utc == ^hour)
+  end
+
+  @doc """
+  Total interchange per balancing authority for the given hour:
+  `%{ba_id => interchange_mw}` (positive = net exporter).
+
+  EIA's own accounting of what each BA sent to its neighbors — the figure a
+  dispatch built from absolute per-fuel MW should reproduce as
+  generation minus load.
+  """
+  def interchange_at(%DateTime{} = timestamp) do
+    hour = truncate_to_hour(timestamp)
+
+    from(d in BADemandHour,
+      where: d.timestamp_utc == ^hour and not is_nil(d.total_interchange_mw),
+      select: {d.balancing_authority_id, d.total_interchange_mw}
+    )
+    |> Repo.all()
+    |> Map.new()
   end
 
   @doc """

@@ -3,11 +3,16 @@ defmodule PowerModel.Ingestion.EIA.Form930Test do
 
   @moduletag :db
 
-  alias PowerModel.Demand.BADemandHour
+  alias PowerModel.Demand.{BADemandHour, BAFuelHour}
   alias PowerModel.Grid.BalancingAuthority
   alias PowerModel.Ingestion.EIA.Form930
 
   @fixture Path.expand("../../fixtures/eia930_balance_sample.csv", __DIR__)
+  @fuels_fixture Path.expand("../../fixtures/eia930_balance_fuels_sample.csv", __DIR__)
+  @legacy_fuels_fixture Path.expand(
+                          "../../fixtures/eia930_balance_legacy_fuels_sample.csv",
+                          __DIR__
+                        )
 
   setup do
     Repo.insert!(%BalancingAuthority{code: "CISO", name: "California ISO"})
@@ -72,6 +77,110 @@ defmodule PowerModel.Ingestion.EIA.Form930Test do
 
     assert Repo.aggregate(BADemandHour, :count) == 9
     assert demand_for("CISO", "2024-07-15T17:00:00Z") == 41_123.0
+  end
+
+  describe "per-fuel ingestion" do
+    defp fuel_mw(code, iso8601, fuel) do
+      {:ok, ts, 0} = DateTime.from_iso8601(iso8601)
+
+      Repo.one(
+        from f in BAFuelHour,
+          where: f.ba_code == ^code and f.timestamp_utc == ^ts and f.fuel == ^fuel,
+          select: f.net_generation_mw
+      )
+    end
+
+    defp fuels_for(code, iso8601) do
+      {:ok, ts, 0} = DateTime.from_iso8601(iso8601)
+
+      Repo.all(
+        from f in BAFuelHour,
+          where: f.ba_code == ^code and f.timestamp_utc == ^ts,
+          select: f.fuel
+      )
+      |> Enum.sort()
+    end
+
+    test "stores one row per reported fuel, on the hour-START timestamp" do
+      {:ok, _} = Form930.ingest_file(@fuels_fixture)
+
+      # Row is timestamped 19:00 END of hour, so it is stored at 18:00 -- the
+      # same convention as the demand rows it accompanies.
+      assert fuel_mw("CISO", "2024-07-15T18:00:00Z", "coal") == 1_000.0
+      assert fuel_mw("CISO", "2024-07-15T18:00:00Z", "natural_gas") == 12_000.0
+      assert fuel_mw("CISO", "2024-07-15T18:00:00Z", "nuclear") == 2_240.0
+      assert fuel_mw("CISO", "2024-07-15T18:00:00Z", "hydro") == 3_000.0
+      assert demand_for("CISO", "2024-07-15T18:00:00Z") == 41_123.0
+    end
+
+    test "sums the split storage columns into one solar and one wind row" do
+      {:ok, _} = Form930.ingest_file(@fuels_fixture)
+
+      # 8,000 without battery + 250 with battery
+      assert fuel_mw("CISO", "2024-07-15T18:00:00Z", "solar") == 8_250.0
+      # 1,500 without battery + 100 with battery
+      assert fuel_mw("CISO", "2024-07-15T18:00:00Z", "wind") == 1_600.0
+    end
+
+    test "resolves EIA's two malformed header names" do
+      {:ok, _} = Form930.ingest_file(@fuels_fixture)
+
+      # "other" = pumped storage (-500, header has a DOUBLE SPACE before the
+      # suffix) + battery (-300) + geothermal (900) + other fuels (200). The
+      # 250 MW with-battery solar column ("Solar witho ...", EIA's typo for
+      # "with") must land in solar, never in "other" and never be dropped.
+      assert fuel_mw("CISO", "2024-07-15T18:00:00Z", "other") == 300.0
+      assert fuel_mw("CISO", "2024-07-15T18:00:00Z", "solar") == 8_250.0
+    end
+
+    test "records only fuels the BA reported, using canonical values" do
+      {:ok, _} = Form930.ingest_file(@fuels_fixture)
+
+      # Petroleum is blank for CISO -- a 0.0 row would claim coverage the file
+      # does not have.
+      assert fuels_for("CISO", "2024-07-15T18:00:00Z") ==
+               ~w(coal hydro natural_gas nuclear other solar wind)
+
+      # ERCO reports no hydro and no geothermal
+      assert fuels_for("ERCO", "2024-07-15T18:00:00Z") ==
+               ~w(coal natural_gas nuclear other solar wind)
+
+      stored = Repo.all(from f in BAFuelHour, select: f.fuel, distinct: true)
+      assert Enum.sort(stored) -- BAFuelHour.fuels() == []
+    end
+
+    test "ingests fuel rows for generation-only BAs that have no demand row" do
+      {:ok, _} = Form930.ingest_file(@fuels_fixture)
+
+      assert demand_for("GRID", "2024-07-15T18:00:00Z") == nil
+      assert fuel_mw("GRID", "2024-07-15T18:00:00Z", "coal") == 620.0
+    end
+
+    test "re-ingestion refreshes fuel values without duplicating rows" do
+      {:ok, _} = Form930.ingest_file(@fuels_fixture)
+      before = Repo.aggregate(BAFuelHour, :count)
+
+      Repo.update_all(BAFuelHour, set: [net_generation_mw: 1.0])
+      {:ok, _} = Form930.ingest_file(@fuels_fixture)
+
+      assert Repo.aggregate(BAFuelHour, :count) == before
+      assert fuel_mw("CISO", "2024-07-15T18:00:00Z", "natural_gas") == 12_000.0
+    end
+
+    test "reads vintages that predate the storage split" do
+      {:ok, _} = Form930.ingest_file(@legacy_fuels_fixture)
+
+      assert fuel_mw("CISO", "2016-07-15T18:00:00Z", "solar") == 4_000.0
+      assert fuel_mw("CISO", "2016-07-15T18:00:00Z", "wind") == 1_200.0
+      # Legacy files report hydro and pumped storage in one column
+      assert fuel_mw("CISO", "2016-07-15T18:00:00Z", "hydro") == 2_500.0
+    end
+
+    test "a vintage with no per-fuel columns stores no fuel rows" do
+      {:ok, _} = Form930.ingest_file(@fixture)
+
+      assert Repo.aggregate(BAFuelHour, :count) == 0
+    end
   end
 
   test "directory ingest globs EIA930_BALANCE_*.csv" do

@@ -1,6 +1,8 @@
 defmodule PowerModel.Failure.CascadeTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias PowerModel.Failure.{Cascade, Protection}
   alias PowerModel.Solver.DCPowerFlow
 
@@ -124,6 +126,115 @@ defmodule PowerModel.Failure.CascadeTest do
       assert length(state.lines) == 2
       assert length(state.generators) == 1
       assert length(state.loads) == 2
+    end
+  end
+
+  # ===========================================================================
+  # init/3 – measured EIA-930 dispatch
+  # ===========================================================================
+
+  describe "init/3 dispatch source" do
+    @hour ~U[2024-07-15 18:00:00Z]
+
+    # Bus 1 and 2 in BA 7; one gas unit, one coal unit, one nuclear unit.
+    defp ba_snapshot do
+      buses = [
+        bus(1, bus_type: 3) |> Map.put(:balancing_authority_id, 7),
+        bus(2) |> Map.put(:balancing_authority_id, 7)
+      ]
+
+      gens = [
+        generator(1, 1, p_max_mw: 200.0, capacity_factor: 0.5)
+        |> Map.merge(%{fuel_type: "NG", prime_mover: "CC", p_min_mw: 0.0}),
+        generator(2, 1, p_max_mw: 200.0, capacity_factor: 0.4)
+        |> Map.merge(%{fuel_type: "BIT", prime_mover: "ST", p_min_mw: 0.0}),
+        generator(3, 2, p_max_mw: 200.0, capacity_factor: 0.95)
+        |> Map.merge(%{fuel_type: "NUC", prime_mover: "ST", p_min_mw: 0.0})
+      ]
+
+      make_snapshot(buses, [line(1, 1, 2)], [], gens, [load(1, 2, p_mw: 150.0)])
+    end
+
+    test "an hour with per-fuel data commits units at the measured MW" do
+      state =
+        Cascade.init(ba_snapshot(), 100.0,
+          hour: @hour,
+          fuel_totals: %{7 => %{"natural_gas" => 120.0, "nuclear" => 180.0}}
+        )
+
+      assert state.dispatch_source == :eia_fuel
+      assert state.dispatch[1] == 120.0
+      assert state.dispatch[3] == 180.0
+      # Coal was not measured for this BA-hour and the measured 300 MW already
+      # exceed the island's 150 MW of load, so the coal unit stays OFFLINE --
+      # explicitly at 0.0, never absent (an absent generator would be
+      # redispatched at p_max * capacity_factor).
+      assert state.dispatch[2] === 0.0
+      assert Map.has_key?(state.dispatch, 2)
+    end
+
+    test "offline units carry no inertia and no governor into the frequency model" do
+      state =
+        Cascade.init(ba_snapshot(), 100.0,
+          hour: @hour,
+          fuel_totals: %{7 => %{"natural_gas" => 120.0, "nuclear" => 180.0}}
+        )
+
+      solver_gens = Cascade.dispatched_generators(state)
+      offline = Enum.find(solver_gens, &(&1.id == 2))
+
+      # Frequency.simulate/5 keeps generators with capacity_factor > 0 AND
+      # p_max_mw > 0 as its online set; the offline unit fails the second test.
+      assert offline.p_max_mw == 0.0
+      assert offline.p_dispatch_mw == 0.0
+      assert offline.p_nameplate_mw == 200.0
+
+      online = Enum.find(solver_gens, &(&1.id == 1))
+      assert online.p_max_mw == 120.0
+      assert online.p_nameplate_mw == 200.0
+    end
+
+    test "without an hour, dispatch falls back to the load-following rule" do
+      state = Cascade.init(ba_snapshot())
+
+      assert state.dispatch_source == :proportional
+      assert state.dispatch_coverage == nil
+      # Proportional rule: every unit runs at the same fraction of capacity
+      assert state.dispatch[1] == state.dispatch[2]
+      assert state.dispatch[2] == state.dispatch[3]
+    end
+
+    test "an hour with no fuel data falls back and logs why" do
+      # The suite runs at :warning; the fallback notice is an info line.
+      previous_level = Logger.level()
+      Logger.configure(level: :info)
+      on_exit(fn -> Logger.configure(level: previous_level) end)
+
+      log =
+        capture_log(fn ->
+          state = Cascade.init(ba_snapshot(), 100.0, hour: @hour, fuel_totals: %{})
+
+          assert state.dispatch_source == :proportional
+        end)
+
+      assert log =~ "load-following dispatch"
+      assert log =~ "no EIA-930 per-fuel generation ingested for 2024-07-15T18:00:00Z"
+    end
+
+    test "measured dispatch keeps the consumption balance conserved" do
+      state =
+        Cascade.init(ba_snapshot(), 100.0,
+          hour: @hour,
+          fuel_totals: %{7 => %{"natural_gas" => 120.0, "nuclear" => 180.0}}
+        )
+
+      balance = Cascade.balance(state)
+
+      assert_in_delta balance.dispatched_gen_mw, 300.0, 1.0e-9
+
+      assert_in_delta balance.original_load_mw,
+                      balance.served_load_mw + balance.shed_load_mw + balance.blackout_load_mw,
+                      1.0e-9
     end
   end
 

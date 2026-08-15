@@ -239,6 +239,65 @@ defmodule PowerModel.DemandTest do
     assert Demand.latest_demand_hour() == nil
   end
 
+  describe "latest_demand_hour/0 hour completeness (ENE-13)" do
+    @full_hour ~U[2024-07-15 18:00:00Z]
+    @near_full_hour ~U[2024-07-15 19:00:00Z]
+    @boundary_hour ~U[2024-07-15 20:00:00Z]
+
+    # The tail of a bulk EIA-930 file: 53 BAs report the body of the file, one
+    # BA has a routine gap in the second-to-last hour, and only the 17 BAs that
+    # had already filed appear in the file's final hour.
+    defp seed_boundary_file do
+      Repo.delete_all(BADemandHour)
+
+      now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+
+      {_, bas} =
+        Repo.insert_all(
+          BalancingAuthority,
+          for i <- 1..53 do
+            %{code: "B#{i}", name: "BA #{i}", inserted_at: now, updated_at: now}
+          end,
+          returning: [:id]
+        )
+
+      ids = Enum.map(bas, & &1.id)
+
+      rows =
+        for {hour, reporting} <- [
+              {@full_hour, ids},
+              {@near_full_hour, Enum.drop(ids, 1)},
+              {@boundary_hour, Enum.take(ids, 17)}
+            ],
+            ba_id <- reporting do
+          %{
+            balancing_authority_id: ba_id,
+            timestamp_utc: hour,
+            demand_mw: 1_000.0,
+            inserted_at: now,
+            updated_at: now
+          }
+        end
+
+      Repo.insert_all(BADemandHour, rows)
+    end
+
+    test "skips the truncated final hour and returns the last complete one" do
+      seed_boundary_file()
+
+      # 17 of 53 is the measured boundary-hour case: defaulting to it left
+      # two-thirds of the country on the synthetic baseline.
+      assert DateTime.compare(Demand.latest_demand_hour(), @near_full_hour) == :eq
+    end
+
+    test "an hour missing a single BA still counts as complete" do
+      seed_boundary_file()
+      Repo.delete_all(from d in BADemandHour, where: d.timestamp_utc == ^@boundary_hour)
+
+      assert DateTime.compare(Demand.latest_demand_hour(), @near_full_hour) == :eq
+    end
+  end
+
   test "regional snapshot with no BA-scalable loads keeps baseline (ENE-2)" do
     # All buses in ONE interconnection, none BA-mapped: scaling the region to
     # NATIONAL demand would inflate it severalfold. Must stay at baseline.

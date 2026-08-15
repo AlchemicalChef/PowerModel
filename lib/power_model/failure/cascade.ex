@@ -14,10 +14,28 @@ defmodule PowerModel.Failure.Cascade do
      based on their available headroom (`p_max_mw - current_dispatch`).
      Only the residual numerical mismatch is left for the DC slack bus.
      When total headroom is insufficient the deficit triggers UFLS.
+
+  ## Initial operating point
+
+  `init/3` prefers the MEASURED unit commitment: given `hour:`, it asks
+  `PowerModel.Dispatch` to place each BA's actual EIA-930 per-fuel MW on that
+  BA's units. Units the measurement did not need get an explicit `0.0` and are
+  OFFLINE for the whole run — `apply_dispatch/2` turns that into
+  `p_max_mw = 0.0, capacity_factor = 1.0`, which
+  `PowerModel.Solver.Frequency.simulate/5` filters out of its online set, so
+  an offline unit contributes zero inertia and zero governor response. The
+  explicit zero matters: a generator merely MISSING from the dispatch map
+  falls back to `p_max_mw * capacity_factor` here and would come back online
+  with full inertia and droop.
+
+  `state.dispatch_source` records which rule produced the operating point
+  (`:eia_fuel` or `:proportional`) and `state.dispatch_coverage` carries the
+  dispatch coverage report for the measured case.
   """
 
   require Logger
 
+  alias PowerModel.Dispatch
   alias PowerModel.Solver.DCPowerFlow
   alias PowerModel.Failure.{Protection, LoadShedding}
   alias PowerModel.Simulation.Cascading.IslandDetector
@@ -47,6 +65,8 @@ defmodule PowerModel.Failure.Cascade do
     :solution,
     :simulated_time,
     :dispatch,
+    :dispatch_source,
+    :dispatch_coverage,
     :bus_ba,
     :original_load_mw,
     :shed_load_mw,
@@ -57,10 +77,21 @@ defmodule PowerModel.Failure.Cascade do
   @doc """
   Initialize cascade state from a grid snapshot.
 
-  The `dispatch` map is seeded from `p_max_mw * capacity_factor` for each
-  generator, representing the initial operating point.
+  ## Options
+
+    * `:hour` — the UTC hour being simulated. When EIA-930 per-fuel generation
+      exists for it, the initial operating point is the MEASURED dispatch
+      (`PowerModel.Dispatch`): every unit sits where its BA's fuel mix actually
+      put it that hour, and units the measurement did not need are OFFLINE.
+      Without an hour, or without fuel data for it, dispatch falls back to the
+      per-island load-following rule below and says so in the log.
+    * `:fuel_totals` — `%{ba_id => %{fuel => mw}}` passed straight through to
+      `PowerModel.Dispatch`, which then reads nothing from the database.
+
+  The fallback `dispatch` map is seeded per island from each generator's share
+  of island capacity, capped so the slack bus keeps a little headroom.
   """
-  def init(snapshot, base_mva \\ 100.0) do
+  def init(snapshot, base_mva \\ 100.0, opts \\ []) do
     # Dispatch is balanced PER ISLAND: snapshots may contain several
     # electrically separate systems (Eastern/Western/ERCOT), and generation
     # in one never serves load in another.
@@ -71,7 +102,10 @@ defmodule PowerModel.Failure.Cascade do
         Map.get(snapshot, :transformers, [])
       )
 
-    dispatch = balance_dispatch_per_island(islands, snapshot.generators, snapshot.loads)
+    bus_ba = Map.new(snapshot.buses, &{&1.id, Map.get(&1, :balancing_authority_id)})
+
+    {dispatch, dispatch_source, dispatch_coverage} =
+      initial_dispatch(snapshot, islands, bus_ba, opts)
 
     # Solve base case to identify lines already overloaded due to model limitations.
     # These are excluded from cascade trip consideration since they represent
@@ -103,7 +137,9 @@ defmodule PowerModel.Failure.Cascade do
       simulated_time: 0.0,
       relay_duty: %{},
       dispatch: dispatch,
-      bus_ba: Map.new(snapshot.buses, &{&1.id, Map.get(&1, :balancing_authority_id)}),
+      dispatch_source: dispatch_source,
+      dispatch_coverage: dispatch_coverage,
+      bus_ba: bus_ba,
       original_load_mw: Enum.sum(Enum.map(snapshot.loads, & &1.p_mw)),
       shed_load_mw: 0.0,
       blackout_load_mw: 0.0
@@ -186,6 +222,47 @@ defmodule PowerModel.Failure.Cascade do
         {MapSet.new(), %{}, %{}}
     end
   end
+
+  # Measured EIA-930 dispatch when the hour has per-fuel data, otherwise the
+  # load-following fallback. Returns `{dispatch, source, coverage}`.
+  defp initial_dispatch(snapshot, islands, bus_ba, opts) do
+    hour = Keyword.get(opts, :hour)
+
+    result =
+      if match?(%DateTime{}, hour) do
+        dispatch_opts =
+          [bus_ba: bus_ba, islands: islands, loads: snapshot.loads]
+          |> then(fn o ->
+            case Keyword.fetch(opts, :fuel_totals) do
+              {:ok, totals} -> Keyword.put(o, :fuel_totals, totals)
+              :error -> o
+            end
+          end)
+
+        Dispatch.for_hour(snapshot.generators, hour, dispatch_opts)
+      else
+        {:error, :no_hour}
+      end
+
+    case result do
+      {:ok, %{dispatch: dispatch, coverage: coverage}} ->
+        {dispatch, :eia_fuel, coverage}
+
+      {:error, reason} ->
+        Logger.info(
+          "Cascade: using load-following dispatch (#{fallback_reason(reason, hour)}) -- " <>
+            "unit commitment is proportional to capacity, not measured generation"
+        )
+
+        {balance_dispatch_per_island(islands, snapshot.generators, snapshot.loads), :proportional,
+         nil}
+    end
+  end
+
+  defp fallback_reason(:no_hour, _hour), do: "no simulation hour supplied"
+
+  defp fallback_reason(:no_fuel_data, hour),
+    do: "no EIA-930 per-fuel generation ingested for #{DateTime.to_iso8601(hour)}"
 
   # Balance dispatch independently within each electrical island and merge.
   defp balance_dispatch_per_island(islands, generators, loads) do

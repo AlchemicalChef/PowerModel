@@ -103,7 +103,9 @@ defmodule PowerModel.Engine.SimulationServer do
         Grid.get_full_grid_snapshot(hour: hour)
       end
 
-    cascade_state = Cascade.init(snapshot, base_mva)
+    # The hour is what lets the cascade start from the measured EIA-930 unit
+    # commitment instead of a proportional guess.
+    cascade_state = Cascade.init(snapshot, base_mva, hour: hour)
 
     state = %__MODULE__{
       sim_id: sim_id,
@@ -290,7 +292,7 @@ defmodule PowerModel.Engine.SimulationServer do
 
   @impl true
   def handle_continue(:reset, state) do
-    cascade = Cascade.init(state.snapshot, state.base_mva)
+    cascade = Cascade.init(state.snapshot, state.base_mva, hour: state.hour)
 
     state = %{
       state
