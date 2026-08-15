@@ -12,6 +12,12 @@ defmodule PowerModel.Grid.Generator do
     field :prime_mover, :string
     field :p_max_mw, :float
     field :p_min_mw, :float, default: 0.0
+    # EIA-860 seasonal net capability. Nameplate (`p_max_mw`) overstates what
+    # a unit can actually deliver — nationally by 83.1 GW in summer — so
+    # dispatch should prefer the seasonal value. NULL means EIA did not report
+    # one (~0.3% of operable units); callers fall back to `p_max_mw`.
+    field :summer_capacity_mw, :float
+    field :winter_capacity_mw, :float
     field :q_max_mvar, :float
     field :q_min_mvar, :float
     field :capacity_factor, :float
@@ -32,6 +38,8 @@ defmodule PowerModel.Grid.Generator do
       :prime_mover,
       :p_max_mw,
       :p_min_mw,
+      :summer_capacity_mw,
+      :winter_capacity_mw,
       :q_max_mvar,
       :q_min_mvar,
       :capacity_factor,

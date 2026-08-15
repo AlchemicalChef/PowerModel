@@ -8,11 +8,19 @@ defmodule PowerModel.Ingestion.EIA.Form860Test do
   alias PowerModel.Ingestion.EIA.Form860
 
   defp write_fixtures(dir, gen1_capacity, gen1_status) do
+    write_generators(dir, """
+    100,GEN1,NUC,ST,#{gen1_capacity},#{gen1_capacity * 0.95},#{gen1_capacity},500,#{gen1_status}
+    100,GEN2,NG,CT,500,460,520,100,OP
+    200,1,SUB,ST,600,590,600,200,OP
+    """)
+  end
+
+  # Schedule 3.1 column order as EIA publishes it, trimmed to the columns the
+  # ingest reads.
+  defp write_generators(dir, data_rows) do
     File.write!(Path.join(dir, "generators.csv"), """
-    Plant Code,Generator ID,Energy Source 1,Prime Mover,Nameplate Capacity (MW),Minimum Load (MW),Status
-    100,GEN1,NUC,ST,#{gen1_capacity},500,#{gen1_status}
-    100,GEN2,NG,CT,500,100,OP
-    200,1,SUB,ST,600,200,OP
+    Plant Code,Generator ID,Energy Source 1,Prime Mover,Nameplate Capacity (MW),Summer Capacity (MW),Winter Capacity (MW),Minimum Load (MW),Status
+    #{data_rows}
     """)
 
     File.write!(Path.join(dir, "2___Plant_Y2024.csv"), """
@@ -206,6 +214,9 @@ defmodule PowerModel.Ingestion.EIA.Form860Test do
       assert gen1.status == "standby"
       # Measured CF survives the upsert (not in the replace list)
       assert gen1.capacity_factor == 0.77
+      # Seasonal capability is EIA-sourced, so it IS refreshed by re-ingest
+      assert_in_delta gen1.summer_capacity_mw, 1045.0, 1.0e-6
+      assert gen1.winter_capacity_mw == 1100.0
     end
 
     @tag :tmp_dir
@@ -220,6 +231,129 @@ defmodule PowerModel.Ingestion.EIA.Form860Test do
       assert Repo.get_by!(Generator, generator_id: "GEN1").capacity_factor == 0.93
       assert Repo.get_by!(Generator, generator_id: "GEN2").capacity_factor == 0.55
       assert Repo.get_by!(Generator, eia_plant_id: "200").capacity_factor == 0.50
+    end
+  end
+
+  describe "ingest/1 seasonal capability (db)" do
+    @describetag :db
+
+    @tag :tmp_dir
+    test "stores summer and winter net capability alongside nameplate", %{tmp_dir: tmp_dir} do
+      write_fixtures(tmp_dir, 1000, "OP")
+      capture_io(fn -> assert :ok = Form860.ingest(tmp_dir) end)
+
+      gen1 = Repo.get_by!(Generator, eia_plant_id: "100", generator_id: "GEN1")
+      assert gen1.p_max_mw == 1000.0
+      assert gen1.summer_capacity_mw == 950.0
+      assert gen1.winter_capacity_mw == 1000.0
+
+      # Nameplate is NOT the seasonal value: dispatching against it invents
+      # 50 MW of summer capability this unit does not have.
+      refute gen1.summer_capacity_mw == gen1.p_max_mw
+    end
+
+    @tag :tmp_dir
+    test "a blank or non-numeric seasonal cell stores NULL, never 0.0", %{tmp_dir: tmp_dir} do
+      # EIA leaves these blank for ~0.3% of operable units and also emits a
+      # bare "." A stored 0.0 would read as a unit with no capability at all;
+      # NULL lets consumers fall back to nameplate.
+      write_generators(tmp_dir, """
+      100,BLANK,NG,CT,300,,
+      100,DOT,NG,CT,400,.,.
+      100,ZERO,NG,CT,500,0,0
+      """)
+
+      capture_io(fn -> assert :ok = Form860.ingest(tmp_dir) end)
+
+      blank = Repo.get_by!(Generator, generator_id: "BLANK")
+      assert blank.summer_capacity_mw == nil
+      assert blank.winter_capacity_mw == nil
+
+      dot = Repo.get_by!(Generator, generator_id: "DOT")
+      assert dot.summer_capacity_mw == nil
+
+      # A reported zero is real data and is kept as 0.0, distinct from NULL.
+      zero = Repo.get_by!(Generator, generator_id: "ZERO")
+      assert zero.summer_capacity_mw == 0.0
+      assert zero.winter_capacity_mw == 0.0
+    end
+
+    @tag :tmp_dir
+    test "summer capability above nameplate is warned per row, never clamped",
+         %{tmp_dir: tmp_dir} do
+      # A summer capability above nameplate has no benign explanation, so the
+      # offending unit is named. Clamping would erase the evidence.
+      write_generators(tmp_dir, """
+      100,HOT,NG,CT,100,130,140,10,OP
+      100,COOL,NG,CT,100,100,120,10,OP
+      """)
+
+      log =
+        capture_log(fn ->
+          capture_io(fn -> assert :ok = Form860.ingest(tmp_dir) end)
+        end)
+
+      hot = Repo.get_by!(Generator, generator_id: "HOT")
+      assert hot.summer_capacity_mw == 130.0
+      refute hot.summer_capacity_mw == hot.p_max_mw
+
+      assert log =~ "Summer Capacity (MW)"
+      assert log =~ "plant 100 unit HOT"
+      assert log =~ "exceeds nameplate"
+
+      # The exact count is also reported from a counter, because the logger
+      # silently drops most of a large burst of per-row warnings.
+      assert log =~ "summer capability above nameplate on 1 generator"
+      assert log =~ "+30 MW total"
+
+      # COOL's summer capability equals nameplate, so it is never named.
+      assert Repo.get_by!(Generator, generator_id: "COOL").summer_capacity_mw == 100.0
+      refute log =~ "unit COOL"
+    end
+
+    @tag :tmp_dir
+    test "winter capability above nameplate is counted once, not warned per row",
+         %{tmp_dir: tmp_dir} do
+      # Combustion turbines genuinely uprate in cold air, so ~1,900 units on
+      # the national file exceed nameplate in winter. Naming each one would
+      # bury the summer anomalies that actually need chasing.
+      write_generators(tmp_dir, """
+      100,HOT,NG,CT,100,100,140,10,OP
+      100,COOL,NG,CT,100,100,120,10,OP
+      200,WARM,NG,CT,100,100,100,10,OP
+      """)
+
+      log =
+        capture_log(fn ->
+          capture_io(fn -> assert :ok = Form860.ingest(tmp_dir) end)
+        end)
+
+      # Stored as reported.
+      assert Repo.get_by!(Generator, generator_id: "HOT").winter_capacity_mw == 140.0
+      assert Repo.get_by!(Generator, generator_id: "COOL").winter_capacity_mw == 120.0
+
+      # One summary line covering both offenders (+40 and +20 MW), and no
+      # per-row warning naming either of them.
+      assert log =~ "winter capability above nameplate on 2 generators"
+      assert log =~ "+60 MW total"
+      refute log =~ "Winter Capacity (MW)"
+      refute log =~ "unit HOT"
+      refute log =~ "unit COOL"
+    end
+
+    @tag :tmp_dir
+    test "a file with no seasonal anomalies reports nothing", %{tmp_dir: tmp_dir} do
+      write_generators(tmp_dir, """
+      100,FINE,NG,CT,100,95,100,10,OP
+      """)
+
+      log =
+        capture_log(fn ->
+          capture_io(fn -> assert :ok = Form860.ingest(tmp_dir) end)
+        end)
+
+      refute log =~ "above nameplate"
+      refute log =~ "exceeds nameplate"
     end
   end
 

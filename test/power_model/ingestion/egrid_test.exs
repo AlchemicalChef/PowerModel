@@ -1,6 +1,8 @@
 defmodule PowerModel.Ingestion.EPA.EGridTest do
   use PowerModel.DataCase, async: false
 
+  import ExUnit.CaptureIO
+
   alias PowerModel.Grid.Generator
   alias PowerModel.Ingestion.EPA.EGrid
 
@@ -12,6 +14,15 @@ defmodule PowerModel.Ingestion.EPA.EGridTest do
     SEQGEN,ORISPL,PNAME,GENID,CFACT,NAMEPCAP
     #{Enum.join(data_rows, "\n")}
     """
+  end
+
+  defp insert_gen!(plant_id, gen_id, p_max_mw) do
+    Repo.insert!(%Generator{
+      eia_plant_id: plant_id,
+      generator_id: gen_id,
+      p_max_mw: p_max_mw,
+      status: "in_service"
+    })
   end
 
   describe "parse_gen_sheet/1 (PLT-2 CSV parsing)" do
@@ -26,8 +37,8 @@ defmodule PowerModel.Ingestion.EPA.EGridTest do
           ~s(2,8102,"General James M. Gavin, Unit 2",2,0.75,1300)
         ])
 
-      assert {:ok, plant_cfs} = EGrid.parse_gen_sheet(csv)
-      assert plant_cfs == %{"8102" => 0.8}
+      assert {:ok, %{plants: plants}} = EGrid.parse_gen_sheet(csv)
+      assert plants == %{"8102" => 0.8}
     end
 
     test "capacity-weights unit CFs within a plant" do
@@ -37,7 +48,7 @@ defmodule PowerModel.Ingestion.EPA.EGridTest do
           "2,10,Plant A,2,0.1,100"
         ])
 
-      assert {:ok, %{"10" => cf}} = EGrid.parse_gen_sheet(csv)
+      assert {:ok, %{plants: %{"10" => cf}}} = EGrid.parse_gen_sheet(csv)
       assert_in_delta cf, 0.7, 1.0e-9
     end
 
@@ -50,8 +61,10 @@ defmodule PowerModel.Ingestion.EPA.EGridTest do
           "2,20,Plant B,2,0.5,100"
         ])
 
-      assert {:ok, %{"20" => cf}} = EGrid.parse_gen_sheet(csv)
+      assert {:ok, %{plants: %{"20" => cf}, units: units}} = EGrid.parse_gen_sheet(csv)
       assert_in_delta cf, 0.75, 1.0e-9
+      # The same clamp applies to the value stored per unit.
+      assert units[{"20", "1"}] == 1.0
     end
 
     test "all-nonpositive plants resolve to 0.0, not dropped and not floored (PLT-9)" do
@@ -61,10 +74,11 @@ defmodule PowerModel.Ingestion.EPA.EGridTest do
           "2,30,Idle Plant,2,-0.2,100"
         ])
 
-      assert {:ok, plant_cfs} = EGrid.parse_gen_sheet(csv)
+      assert {:ok, %{plants: plants, units: units}} = EGrid.parse_gen_sheet(csv)
       # Present (would previously be skipped, leaving CF NULL -> 100%
       # dispatch), exactly 0.0 (previously floored at 0.01).
-      assert Map.fetch!(plant_cfs, "30") == 0.0
+      assert Map.fetch!(plants, "30") == 0.0
+      assert Map.fetch!(units, {"30", "2"}) == 0.0
     end
 
     test "units without a CFACT are skipped; zero-capacity units fall back to a simple mean" do
@@ -75,15 +89,17 @@ defmodule PowerModel.Ingestion.EPA.EGridTest do
           "3,40,Plant C,3,0.4,0"
         ])
 
-      assert {:ok, %{"40" => cf}} = EGrid.parse_gen_sheet(csv)
+      assert {:ok, %{plants: %{"40" => cf}, units: units}} = EGrid.parse_gen_sheet(csv)
       assert_in_delta cf, 0.5, 1.0e-9
+      # The CFACT-less unit produces no unit entry either.
+      refute Map.has_key?(units, {"40", "1"})
     end
 
     test "ORISPL float cell form is normalized to the stored integer string" do
       csv = gen_csv(["1,613.0,Plant D,1,0.5,100"])
 
-      assert {:ok, plant_cfs} = EGrid.parse_gen_sheet(csv)
-      assert Map.has_key?(plant_cfs, "613")
+      assert {:ok, %{plants: plants}} = EGrid.parse_gen_sheet(csv)
+      assert Map.has_key?(plants, "613")
     end
 
     test "missing ORISPL/CFACT columns are reported" do
@@ -98,6 +114,63 @@ defmodule PowerModel.Ingestion.EPA.EGridTest do
 
     test "a truncated sheet is reported" do
       assert {:error, :gen_sheet_too_short} = EGrid.parse_gen_sheet("only one row\n")
+    end
+  end
+
+  describe "parse_gen_sheet/1 per-unit CFs" do
+    test "keeps divergent unit CFs distinct instead of collapsing to the plant mean" do
+      # 31.4% of eGRID's multi-unit plants report divergent unit CFs; a plant
+      # average dispatches a base-loaded unit and its idle twin identically.
+      csv =
+        gen_csv([
+          "1,100,Two Unit Plant,1,0.9,500",
+          "2,100,Two Unit Plant,2,0.1,500"
+        ])
+
+      assert {:ok, %{plants: plants, units: units}} = EGrid.parse_gen_sheet(csv)
+
+      assert units[{"100", "1"}] == 0.9
+      assert units[{"100", "2"}] == 0.1
+      assert_in_delta plants["100"], 0.5, 1.0e-9
+      refute units[{"100", "1"}] == plants["100"]
+    end
+
+    test "a GENID-less row feeds the plant average but yields no unit entry" do
+      csv =
+        gen_csv([
+          "1,110,Plant E,,0.8,100",
+          "2,110,Plant E,B,0.4,100"
+        ])
+
+      assert {:ok, %{plants: %{"110" => plant_cf}, units: units}} = EGrid.parse_gen_sheet(csv)
+      assert_in_delta plant_cf, 0.6, 1.0e-9
+      assert map_size(units) == 1
+      assert units[{"110", "B"}] == 0.4
+    end
+
+    test "GENID float artifacts are normalized but real decimal IDs survive" do
+      # openpyxl renders a numeric GENID cell as "1.0"; EIA-860 also issues
+      # genuine IDs like "5.1" that must not be truncated.
+      csv =
+        gen_csv([
+          "1,120,Plant F,1.0,0.5,100",
+          "2,120,Plant F,5.1,0.5,100"
+        ])
+
+      assert {:ok, %{units: units}} = EGrid.parse_gen_sheet(csv)
+      assert Map.has_key?(units, {"120", "1"})
+      assert Map.has_key?(units, {"120", "5.1"})
+    end
+
+    test "a repeated {ORISPL, GENID} pair is capacity-weighted, not last-write-wins" do
+      csv =
+        gen_csv([
+          "1,130,Plant G,1,1.0,300",
+          "2,130,Plant G,1,0.0,100"
+        ])
+
+      assert {:ok, %{units: units}} = EGrid.parse_gen_sheet(csv)
+      assert_in_delta units[{"130", "1"}], 0.75, 1.0e-9
     end
   end
 
@@ -122,12 +195,7 @@ defmodule PowerModel.Ingestion.EPA.EGridTest do
 
     test "updates every generator of the plant and returns the row count" do
       for gid <- ~w(A B) do
-        Repo.insert!(%Generator{
-          eia_plant_id: "50",
-          generator_id: gid,
-          p_max_mw: 100.0,
-          status: "in_service"
-        })
+        insert_gen!("50", gid, 100.0)
       end
 
       assert EGrid.apply_plant_capacity_factors(%{"50" => 0.42}) == 2
@@ -136,6 +204,101 @@ defmodule PowerModel.Ingestion.EPA.EGridTest do
         Repo.all(from g in Generator, where: g.eia_plant_id == "50", select: g.capacity_factor)
 
       assert cfs == [0.42, 0.42]
+    end
+  end
+
+  describe "apply_capacity_factors/1 (db)" do
+    @describetag :db
+
+    test "per-unit CFs land on their own units and diverge from the plant mean" do
+      a = insert_gen!("100", "1", 500.0)
+      b = insert_gen!("100", "2", 500.0)
+
+      cfs = %{
+        plants: %{"100" => 0.5},
+        units: %{{"100", "1"} => 0.9, {"100", "2"} => 0.1}
+      }
+
+      capture_io(fn -> assert %{updated: 2, unit_rows: 2} = EGrid.apply_capacity_factors(cfs) end)
+
+      assert Repo.reload!(a).capacity_factor == 0.9
+      assert Repo.reload!(b).capacity_factor == 0.1
+    end
+
+    test "a unit the join misses keeps the plant average" do
+      # Reasons a unit misses: no generator_id at all (pre-identity rows), or
+      # an ID that only exists in the newer EIA-860 vintage.
+      hit = insert_gen!("200", "1", 400.0)
+      newer = insert_gen!("200", "3", 100.0)
+      unidentified = Repo.insert!(%Generator{eia_plant_id: "200", p_max_mw: 50.0})
+
+      cfs = %{plants: %{"200" => 0.6}, units: %{{"200", "1"} => 0.95}}
+
+      report = capture_report(cfs)
+
+      assert report.updated == 3
+      assert report.unit_rows == 1
+      assert report.fallback_rows == 2
+      assert report.unit_mw == 400.0
+      assert report.fallback_mw == 150.0
+
+      assert Repo.reload!(hit).capacity_factor == 0.95
+      assert Repo.reload!(newer).capacity_factor == 0.6
+      assert Repo.reload!(unidentified).capacity_factor == 0.6
+    end
+
+    test "the unit pass is not gated on the plant pass having covered the plant" do
+      # Real GEN-sheet output always carries the plant too, but the unit write
+      # must not be conditional on it — otherwise a change to plant coverage
+      # would silently take unit CFs with it.
+      orphan = insert_gen!("300", "1", 200.0)
+
+      report = capture_report(%{plants: %{}, units: %{{"300", "1"} => 0.33}})
+
+      assert report.unit_rows == 1
+      assert Repo.reload!(orphan).capacity_factor == 0.33
+    end
+
+    test "re-applying the same sheet is idempotent" do
+      a = insert_gen!("400", "1", 300.0)
+      b = insert_gen!("400", "2", 100.0)
+
+      cfs = %{plants: %{"400" => 0.7}, units: %{{"400", "1"} => 0.88}}
+
+      first = capture_report(cfs)
+      second = capture_report(cfs)
+
+      assert first == second
+      assert Repo.reload!(a).capacity_factor == 0.88
+      assert Repo.reload!(b).capacity_factor == 0.7
+    end
+
+    test "reports the join hit-rate in units and MW" do
+      insert_gen!("500", "1", 900.0)
+      insert_gen!("500", "2", 100.0)
+
+      output =
+        capture_io(fn ->
+          EGrid.apply_capacity_factors(%{
+            plants: %{"500" => 0.4},
+            units: %{{"500", "1"} => 0.8}
+          })
+        end)
+
+      assert output =~ "per-unit CFACT join: 1 of 2 eGRID-covered units (50.0%)"
+      assert output =~ "900.0 of 1000.0 MW (90.0%)"
+      assert output =~ "plant-average fallback: 1 units / 100.0 MW"
+    end
+  end
+
+  # apply_capacity_factors/1 prints its hit-rate report; capture_io/1 runs the
+  # function in the calling process, so the return value comes back by message.
+  defp capture_report(cfs) do
+    me = self()
+    capture_io(fn -> send(me, {:report, EGrid.apply_capacity_factors(cfs)}) end)
+
+    receive do
+      {:report, report} -> report
     end
   end
 end

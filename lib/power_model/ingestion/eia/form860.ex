@@ -9,7 +9,8 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
 
     * `3_1_Generator_Y<year>.csv` — Schedule 3.1 generator list. Must include
       the `Plant Code`, `Generator ID`, `Nameplate Capacity (MW)`, and
-      `Status` columns.
+      `Status` columns. `Summer Capacity (MW)` and `Winter Capacity (MW)` are
+      read when present (see "Seasonal capability" below).
     * `2___Plant_Y<year>.csv` — Schedule 2 plant list, the ONLY source of
       plant coordinates (`Plant Code`, `Latitude`, `Longitude`).
 
@@ -26,6 +27,34 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
   updates units in place instead of duplicating the fleet. Rows without a
   `Generator ID` column (non-standard files) cannot be deduplicated and will
   duplicate on re-ingest.
+
+  ## Seasonal capability
+
+  `Summer Capacity (MW)` and `Winter Capacity (MW)` are the net capability a
+  unit can actually deliver in each season; nameplate is a rating-plate number
+  that overstates it (measured: 83.1 GW of phantom summer capability
+  nationally, concentrated in the reserve-providing gas fleet). Both columns
+  are ~99.7% populated in the 2024 Operable sheet and land in
+  `summer_capacity_mw` / `winter_capacity_mw`.
+
+  A blank or non-numeric cell stores NULL, never 0.0 — a zero would read as a
+  unit with no capability at all, while NULL lets consumers fall back to
+  `p_max_mw`. Nothing is ever clamped: a value flattened to nameplate would
+  hide the fact that the two disagree.
+
+  Values more than 5% above nameplate are counted per season and reported at
+  the end of the ingest. Summer is additionally warned about per row, because
+  the two seasons mean different things:
+
+    * **Summer** (1,079 units / +12.9 GW on the 2024 file) has no benign
+      explanation, so each offender is named for chasing upstream.
+    * **Winter** (1,868 units / +22.2 GW) is usually genuine — combustion
+      turbines gain output in cold, dense air. Naming ~1,900 units would bury
+      the summer anomalies that matter, so only the total is reported.
+
+  The end-of-ingest totals come from counters, not from the log: a burst of
+  per-row warnings that size is silently truncated by the logger (measured:
+  1,079 emitted, 114 printed), so the log alone undercounts by ~90%.
 
   ## Capacity-factor defaults
 
@@ -100,6 +129,15 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
   # simple cycle is GT/IC).
   @combined_cycle_prime_movers ~w(CC CA CT CS)
 
+  # How far a reported seasonal capability may sit above nameplate before the
+  # row is flagged (see the "Seasonal capability" moduledoc section).
+  @seasonal_tolerance 1.05
+
+  # Slots in the seasonal-excess counter: each season occupies a unit count
+  # followed by its accumulated whole MW above nameplate.
+  @summer_units 1
+  @winter_units 3
+
   @plant_file_patterns ~w(
     2___Plant_Y2024.csv
     2___Plant_Y2023.csv
@@ -136,6 +174,12 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
 
       plant_coords = build_plant_coords(plant_path)
 
+      # Seasonal over-capability is tallied across Flow's parallel stages.
+      # Counters, not log lines, are the authoritative count: a burst of
+      # per-row warnings this large is silently truncated by the logger
+      # (measured: 1,079 emitted, 114 printed).
+      seasonal_excess = :counters.new(4, [:write_concurrency])
+
       generators_path
       |> File.stream!([:trim_bom])
       |> EIA860Parser.parse_stream(skip_headers: false)
@@ -145,11 +189,12 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
         row, headers -> {[Enum.zip(headers, row) |> Map.new()], headers}
       end)
       |> Flow.from_enumerable(max_demand: 200)
-      |> Flow.map(&parse_generator(&1, plant_coords))
+      |> Flow.map(&parse_generator(&1, plant_coords, seasonal_excess))
       |> Flow.filter(&(&1 != nil))
       |> Flow.map(&insert_generator/1)
       |> Flow.run()
 
+      report_seasonal_excess(seasonal_excess)
       backfill_missing_capacity_factors()
 
       :ok
@@ -179,7 +224,7 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
     end)
   end
 
-  defp parse_generator(row, plant_coords) do
+  defp parse_generator(row, plant_coords, seasonal_excess) do
     try do
       plant_id = Map.get(row, "Plant Code") || Map.get(row, "Plant ID")
 
@@ -190,6 +235,8 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
         )
 
       if plant_id && nameplate && nameplate > 0 do
+        generator_id = parse_generator_id(Map.get(row, "Generator ID"))
+
         # Try coordinates from row first, then from plant lookup
         lat = parse_float(Map.get(row, "Latitude"))
         lon = parse_float(Map.get(row, "Longitude"))
@@ -208,11 +255,14 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
 
         %{
           eia_plant_id: to_string(plant_id),
-          generator_id: parse_generator_id(Map.get(row, "Generator ID")),
+          generator_id: generator_id,
           fuel_type: Map.get(row, "Energy Source 1") || Map.get(row, "Fuel Type"),
           prime_mover: Map.get(row, "Prime Mover") || Map.get(row, "Technology"),
           p_max_mw: nameplate,
           p_min_mw: parse_float(Map.get(row, "Minimum Load (MW)")) || 0.0,
+          summer_capacity_mw:
+            summer_capacity(row, nameplate, plant_id, generator_id, seasonal_excess),
+          winter_capacity_mw: winter_capacity(row, nameplate, seasonal_excess),
           coordinates: coords,
           status: parse_status(Map.get(row, "Status") || Map.get(row, "Operating Status")),
           # Set by BusMapper
@@ -222,6 +272,88 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
     rescue
       _ -> nil
     end
+  end
+
+  # Summer capability above nameplate has no benign physical explanation, so
+  # each offending row is named: these are the ones worth chasing upstream.
+  defp summer_capacity(row, nameplate, plant_id, generator_id, seasonal_excess) do
+    mw = parse_seasonal(row, "Summer Capacity (MW)")
+
+    if mw && mw > nameplate * @seasonal_tolerance do
+      tally(seasonal_excess, @summer_units, mw - nameplate)
+
+      Logger.warning(
+        "EIA-860: Summer Capacity (MW) #{mw} exceeds nameplate #{nameplate} MW by >5% " <>
+          "for plant #{plant_id} unit #{generator_id || "?"}; storing as reported"
+      )
+    end
+
+    mw
+  end
+
+  # Winter capability above nameplate is usually real — combustion turbines
+  # gain output in cold, dense air — so the rows are tallied and reported once
+  # rather than warned about individually (a per-row warning fires ~1,900
+  # times on the national file and buries the summer anomalies).
+  defp winter_capacity(row, nameplate, seasonal_excess) do
+    mw = parse_seasonal(row, "Winter Capacity (MW)")
+
+    if mw && mw > nameplate * @seasonal_tolerance do
+      tally(seasonal_excess, @winter_units, mw - nameplate)
+    end
+
+    mw
+  end
+
+  defp tally(seasonal_excess, units_slot, excess_mw) do
+    :counters.add(seasonal_excess, units_slot, 1)
+    :counters.add(seasonal_excess, units_slot + 1, round(excess_mw))
+  end
+
+  # Seasonal net capability, stored as reported. A blank cell yields nil (NOT
+  # 0.0 — a zero would read as a unit with no capability, while nil lets
+  # consumers fall back to nameplate). Nothing is clamped: flattening a
+  # reported value to nameplate would destroy the evidence that the two
+  # disagree.
+  defp parse_seasonal(row, column), do: parse_float(Map.get(row, column))
+
+  # The authoritative counts. Each summer offender is also named in its own
+  # warning above, but the logger drops most of a burst that size, so the
+  # totals are reported here where nothing can discard them.
+  defp report_seasonal_excess(seasonal_excess) do
+    summer = :counters.get(seasonal_excess, @summer_units)
+    winter = :counters.get(seasonal_excess, @winter_units)
+
+    if summer > 0 do
+      warn_excess(
+        "summer",
+        summer,
+        :counters.get(seasonal_excess, @summer_units + 1),
+        "each named in a warning above, unless the logger truncated the burst"
+      )
+    end
+
+    if winter > 0 do
+      warn_excess(
+        "winter",
+        winter,
+        :counters.get(seasonal_excess, @winter_units + 1),
+        "expected for combustion turbines in cold, dense air"
+      )
+    end
+
+    {summer, winter}
+  end
+
+  defp warn_excess(season, units, excess_mw, note) do
+    generators = if units == 1, do: "1 generator", else: "#{units} generators"
+
+    msg =
+      "EIA-860: #{season} capability above nameplate on #{generators} " <>
+        "(+#{excess_mw} MW total, stored as reported) — #{note}"
+
+    IO.puts("  " <> msg)
+    Logger.warning(msg)
   end
 
   defp parse_generator_id(nil), do: nil
@@ -247,7 +379,17 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
     |> Repo.insert(
       on_conflict:
         {:replace,
-         [:fuel_type, :prime_mover, :p_max_mw, :p_min_mw, :status, :coordinates, :updated_at]},
+         [
+           :fuel_type,
+           :prime_mover,
+           :p_max_mw,
+           :p_min_mw,
+           :summer_capacity_mw,
+           :winter_capacity_mw,
+           :status,
+           :coordinates,
+           :updated_at
+         ]},
       conflict_target:
         {:unsafe_fragment,
          "(eia_plant_id, generator_id) WHERE eia_plant_id IS NOT NULL AND generator_id IS NOT NULL"}
