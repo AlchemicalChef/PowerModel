@@ -494,6 +494,11 @@ needs work (e.g. no back-switching for genuinely-violating buses within a round,
 simultaneous-violation resolution). Guarded bus-for-bus at IEEE-118 scale where it
 works; the skipped ACTIVSg2000 AC tests are the acceptance gate. Found by the Phase 0
 validation ladder, 2026-08-15.
+**CAS-17 (DRIFT, LOW) [OPEN]** `FailureEvent` changeset whitelists component_type to
+transmission_line/generator/transformer/load/bus, but live event streams also carry
+water_facility, datacenter, island, cascade, and (new) btm_solar — nothing routes through
+the changeset today, so it is drift, not breakage. Reconcile when events are next persisted
+through it. Found at item-31 integration, 2026-08-15.
 **DAT-21 (DATA QUALITY, MED) [OPEN→Phase 5]** 13,520 substations (17%) in the native
 layer report no voltage and receive the default 138 kV bus; 70% of connectivity-repair
 joints connect two such yards (mean 0.78 km apart — the joins are right, the level and

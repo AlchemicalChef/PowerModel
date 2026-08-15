@@ -169,7 +169,16 @@ L ≈ multi-week.
     already replays measured demand); justify as scenario generation only. NOAA ISD is
     retired — use GHCNh or IEM ASOS.
 
-### Phase 2.5 — Distributed solar (added 2026-08-15)
+### Phase 2.5 — Distributed solar (added 2026-08-15) — **LANDED same day**
+
+> Measured results: fleet tagged (23,477 utility-scale / 1,288.6 GW vs 3,378 onsite /
+> 36.2 GW; dispatch carve-out verified with zero double-counting); 55.8 GW of BTM solar
+> allocated onto 51,138 buses (100% allocation coverage, CAISO 14.0 GW, steady-state
+> byte-identity proven on all three snapshots); 1547 trip feedback live — at the 0.30
+> legacy default, a 2 MW island shortfall sheds 14 MW (7× amplification), the extra shed
+> exactly equaling the tripped rooftop MW; conservation identity extended to
+> served + shed + blackout == original + btm_tripped (Lean divergence noted). Voltage
+> trigger (0.88 pu) implemented but DC-unreachable until the Q-V/QSS-AC work.
 
 Motivating profile (measured from the ingested 2024 fleet): all 122.9 GW of modeled PV
 is utility-metered EIA-860 plant — 122.1 GW genuinely grid-scale (IPP 102.6 + utility
