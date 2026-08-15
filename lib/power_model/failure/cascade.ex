@@ -31,17 +31,52 @@ defmodule PowerModel.Failure.Cascade do
   `state.dispatch_source` records which rule produced the operating point
   (`:eia_fuel` or `:proportional`) and `state.dispatch_coverage` carries the
   dispatch coverage report for the measured case.
+
+  ## Behind-the-meter solar (IEEE 1547, ROADMAP item 31)
+
+  The snapshot's `:btm_solar` entries are rooftop PV that is INVISIBLE in the
+  operating point: EIA-930 demand is metered net of it, so no generator was
+  ever materialized for it (see `PowerModel.Grid.BtmSolar`). The consequence
+  for this module is the whole point of the layer — **tripping rooftop is a
+  LOAD INCREASE, not a generation loss**. Legacy (IEEE 1547-2003) inverters
+  must trip at 59.3 Hz / 0.88 pu, and what they leave behind is the gross
+  demand that was always there behind the meter.
+
+  That trip is evaluated per island in the SAME step as UFLS and strictly
+  BEFORE it — the vicious pairing item 31 names: the first UFLS stage arms
+  below 59.3 Hz while the legacy rooftop fleet is already gone at 59.3 Hz, so
+  UFLS opens on a deficit that the trip itself deepened. Modern (1547-2018)
+  inverters ride through and are never touched.
+
+  Once tripped, a bus's rooftop stays tripped for the rest of the run: 1547
+  mandates a delayed, permissive reconnection that no cascade timescale
+  reaches (restoration is ROADMAP item 28). The tripped set is keyed by BUS so
+  it survives islands splitting and re-forming underneath it.
+
+  `state.btm_tripped_mw` is an explicit bucket in `balance/1` because this MW
+  was never in `original_load_mw` — see that function for the extended
+  conservation identity.
   """
 
   require Logger
 
   alias PowerModel.Dispatch
-  alias PowerModel.Grid.{DcTie, Ratings}
-  alias PowerModel.Solver.DCPowerFlow
+  alias PowerModel.Grid.{BtmSolar, DcTie, Ratings}
+  alias PowerModel.Solver.{DCPowerFlow, Frequency}
   alias PowerModel.Failure.{Protection, LoadShedding}
   alias PowerModel.Simulation.Cascading.IslandDetector
 
   @max_steps 50
+
+  # IEEE 1547-2003 must-trip settings for the legacy behind-the-meter fleet.
+  # 1547-2018 units are required to ride through both of these, which is why
+  # only the legacy SHARE of each bus's rooftop output is ever at stake.
+  @btm_trip_frequency_hz 59.3
+  @btm_trip_voltage_pu 0.88
+
+  # Nominal frequency, used when an island carries no deficit and therefore no
+  # under-frequency excursion to evaluate. Matches `Frequency`'s f0.
+  @nominal_frequency_hz 60.0
 
   defstruct [
     :buses,
@@ -73,6 +108,9 @@ defmodule PowerModel.Failure.Cascade do
     :original_load_mw,
     :shed_load_mw,
     :blackout_load_mw,
+    :btm_by_bus,
+    :btm_tripped_buses,
+    :btm_tripped_mw,
     relay_duty: %{}
   ]
 
@@ -145,22 +183,72 @@ defmodule PowerModel.Failure.Cascade do
       bus_ba: bus_ba,
       original_load_mw: Enum.sum(Enum.map(snapshot.loads, & &1.p_mw)),
       shed_load_mw: 0.0,
-      blackout_load_mw: 0.0
+      blackout_load_mw: 0.0,
+      btm_by_bus: aggregate_btm_solar(Map.get(snapshot, :btm_solar) || []),
+      btm_tripped_buses: MapSet.new(),
+      btm_tripped_mw: 0.0
     }
+  end
+
+  # Fold the snapshot's `{bus_id, sector}` rows into ONE legacy-MW figure per
+  # bus. A bus appears once per sector (up to three rows), so anything that
+  # walks the raw entries applies the same bus three times.
+  #
+  # Only the legacy share is stored, because only it can ever trip: the
+  # 1547-2018 remainder must ride through. The share is uniform and
+  # config-driven (`PowerModel.Grid.BtmSolar.legacy_fraction/0`), so it is
+  # multiplied through here rather than inspected per entry.
+  #
+  # Entries with nothing to lose are dropped rather than stored as zero —
+  # night hours, a BA with no fuel row for the hour, an all-1547-2018 fleet.
+  # Those are COMMON, correct states, and a bus absent from this map costs the
+  # cascade nothing at all: no candidate, no frequency probe, no event.
+  defp aggregate_btm_solar(entries) do
+    Enum.reduce(entries, %{}, fn entry, acc ->
+      bus_id = Map.get(entry, :bus_id)
+      output_mw = Map.get(entry, :output_mw) || 0.0
+      fraction = Map.get(entry, :legacy_fraction) || BtmSolar.legacy_fraction()
+      legacy_mw = output_mw * fraction
+
+      if is_nil(bus_id) or legacy_mw <= 0.0 do
+        acc
+      else
+        Map.update(acc, bus_id, legacy_mw, &(&1 + legacy_mw))
+      end
+    end)
   end
 
   @doc """
   Consumption accounting for the current cascade state.
 
-  Conservation invariant: served + shed + blackout == original (within
-  rounding), so the UI can always present a balance that adds up.
+  Conservation invariant:
+
+      served + shed + blackout == original + btm_tripped
+
+  within rounding, so the UI can always present a balance that adds up.
+
+  ## Why there is a `btm_tripped_mw` term
+
+  `original_load_mw` is the sum of the snapshot's loads, and those are EIA-930
+  demand — metered NET of behind-the-meter solar. When legacy inverters trip
+  (IEEE 1547, see the moduledoc), the gross demand they were hiding appears at
+  the bus as load that was never counted in `original_load_mw`. It is not
+  shed, not blacked out, and not served-from-somewhere-else: it is new demand
+  entering the accounting mid-run, so it needs its own source term rather than
+  a fudge in one of the sinks.
+
+  With no BTM layer, or before anything trips, `btm_tripped_mw` is `0.0` and
+  the identity reduces to the original `served + shed + blackout == original`.
+  Every MW in this bucket is downstream-accountable exactly like any other:
+  once it is standing at the bus, UFLS can shed it and an island blackout can
+  take it, and it moves into those buckets normally when that happens.
 
   DC ties are absent from this by construction. A tie is a TRANSFER between
   two converter buses, neither demand nor generation, so counting its MW as
   either would break the invariant while describing nothing real: an imported
   megawatt still shows up here as the load it serves. Its effect on the
   island's power balance is applied where it belongs — in the deficit
-  arithmetic of `solve_islands_timed/9` and in the solver's injection vector.
+  arithmetic of `solve_islands_timed/10` and in the solver's injection vector.
   """
   def balance(%__MODULE__{} = state) do
     active_gens = Enum.reject(state.generators, &MapSet.member?(state.tripped_generators, &1.id))
@@ -170,6 +258,7 @@ defmodule PowerModel.Failure.Cascade do
       served_load_mw: Enum.sum(Enum.map(state.loads, & &1.p_mw)),
       shed_load_mw: state.shed_load_mw,
       blackout_load_mw: state.blackout_load_mw,
+      btm_tripped_mw: state.btm_tripped_mw || 0.0,
       dispatched_gen_mw: Enum.sum(Enum.map(active_gens, &Map.get(state.dispatch, &1.id, 0.0))),
       online_capacity_mw: Enum.sum(Enum.map(active_gens, & &1.p_max_mw))
     }
@@ -569,6 +658,7 @@ defmodule PowerModel.Failure.Cascade do
   defp trigger_ufls_for_deficit(state, deficit_mw, island_bus_set) do
     island_loads = Enum.filter(state.loads, &MapSet.member?(island_bus_set, &1.bus_id))
     online_gens = online_island_gens(state, island_bus_set)
+    dispatched_gens = apply_dispatch(online_gens, state.dispatch)
 
     total_load = Enum.sum(Enum.map(island_loads, & &1.p_mw))
 
@@ -577,10 +667,36 @@ defmodule PowerModel.Failure.Cascade do
       |> Enum.map(fn g -> Map.get(state.dispatch, g.id, 0.0) end)
       |> Enum.sum()
 
+    # IEEE 1547 legacy rooftop trips FIRST, on the frequency this island
+    # reaches before any UFLS stage arms, and its output lands as load here —
+    # so `total_load` (and therefore the deficit both rounds below close)
+    # already carries it.
+    island_buses = Enum.filter(state.buses, &MapSet.member?(island_bus_set, &1.id))
+
+    {all_loads, island_loads, total_load, btm, btm_events} =
+      evaluate_btm_trip(
+        btm_context(state),
+        island_buses,
+        dispatched_gens,
+        island_loads,
+        state.loads,
+        total_load,
+        total_load - total_gen
+      )
+
+    state = %{
+      state
+      | loads: all_loads,
+        btm_tripped_buses: btm.tripped,
+        btm_tripped_mw: state.btm_tripped_mw + btm.tripped_mw
+    }
+
+    deficit_mw = deficit_mw + btm.tripped_mw
+
     {shed_loads, ufls_events} =
       LoadShedding.apply_ufls(
         island_loads,
-        apply_dispatch(online_gens, state.dispatch),
+        dispatched_gens,
         total_gen,
         total_load
       )
@@ -617,7 +733,7 @@ defmodule PowerModel.Failure.Cascade do
     shed_map = Map.new(shed_loads, &{&1.id, &1})
     updated_loads = Enum.map(state.loads, fn l -> Map.get(shed_map, l.id, l) end)
 
-    events_with_step = Enum.map(shed_events, &Map.put(&1, :step, state.step))
+    events_with_step = Enum.map(btm_events ++ shed_events, &Map.put(&1, :step, state.step))
 
     event_shed_mw =
       Enum.sum(Enum.map(shed_events, fn e -> Map.get(e.details, :shed_mw, 0.0) end))
@@ -675,7 +791,7 @@ defmodule PowerModel.Failure.Cascade do
 
     # Solve each island and collect ALL overloaded components with trip times
     {non_thermal_trips, island_results, updated_loads, timed_overloads, step_shed_mw,
-     step_blackout_mw, dispatch_updates} =
+     step_blackout_mw, dispatch_updates, btm} =
       solve_islands_timed(
         islands,
         state.buses,
@@ -685,10 +801,16 @@ defmodule PowerModel.Failure.Cascade do
         state.loads,
         state.dc_ties,
         state.base_mva,
-        state.base_overloaded
+        state.base_overloaded,
+        btm_context(state)
       )
 
-    state = %{state | dispatch: Map.merge(state.dispatch, dispatch_updates)}
+    state = %{
+      state
+      | dispatch: Map.merge(state.dispatch, dispatch_updates),
+        btm_tripped_buses: btm.tripped,
+        btm_tripped_mw: state.btm_tripped_mw + btm.tripped_mw
+    }
 
     # Facilities on dead-island buses lose power (water + datacenters)
     dead_bus_ids = dead_island_buses(islands, active_gens)
@@ -904,12 +1026,12 @@ defmodule PowerModel.Failure.Cascade do
          loads,
          dc_ties,
          base_mva,
-         base_overloaded
+         base_overloaded,
+         btm
        ) do
-    Enum.reduce(islands, {[], [], loads, [], 0.0, 0.0, %{}}, fn island,
-                                                                {trips, results, lds, overloads,
-                                                                 shed_mw, blackout_mw,
-                                                                 dispatch_updates} ->
+    Enum.reduce(islands, {[], [], loads, [], 0.0, 0.0, %{}, btm}, fn island, acc ->
+      {trips, results, lds, overloads, shed_mw, blackout_mw, dispatch_updates, btm} = acc
+
       island_set = island
       island_buses = Enum.filter(buses, &MapSet.member?(island_set, &1.id))
 
@@ -962,7 +1084,7 @@ defmodule PowerModel.Failure.Cascade do
           end)
 
         {trips ++ new_trips, results, lds, overloads, shed_mw, blackout_mw + lost_mw,
-         dispatch_updates}
+         dispatch_updates, btm}
       else
         # Check generation-load balance using dispatched values
         gen_mw =
@@ -990,6 +1112,22 @@ defmodule PowerModel.Failure.Cascade do
 
         available_mw = gen_mw + island_tie_mw
         dispatch_updates = Map.merge(dispatch_updates, island_dispatch_updates)
+
+        # IEEE 1547 legacy inverters trip HERE — after reserves are raised (so
+        # the frequency they see is the one the island actually reaches) and
+        # before UFLS, which is the vicious pairing: the rooftop fleet is gone
+        # at 59.3 Hz while the first UFLS stage only arms BELOW 59.3 Hz, so the
+        # deficit UFLS opens on is the one this trip just deepened.
+        {lds, island_loads, load_mw, btm, btm_events} =
+          evaluate_btm_trip(
+            btm,
+            island_buses,
+            island_gens,
+            island_loads,
+            lds,
+            load_mw,
+            load_mw - available_mw
+          )
 
         # Available headroom is raised first. Apply UFLS only to any remaining
         # deficit, then ALWAYS power-flow solve the island with the raised
@@ -1091,9 +1229,9 @@ defmodule PowerModel.Failure.Cascade do
               Map.put(t, :trip_time_s, 0.5)
             end)
 
-          {trips ++ shed_events ++ voltage_trips, [solution | results], lds,
+          {trips ++ btm_events ++ shed_events ++ voltage_trips, [solution | results], lds,
            overloads ++ timed ++ zone3_timed, shed_mw + event_shed_mw, blackout_mw,
-           dispatch_updates}
+           dispatch_updates, btm}
         rescue
           e ->
             error = Exception.message(e)
@@ -1107,16 +1245,16 @@ defmodule PowerModel.Failure.Cascade do
             # the honesty mechanism, while consumption conservation is unchanged.
             failure_event = island_solve_failure_event(island_buses, island_loads, error)
 
-            {trips ++ shed_events ++ [failure_event], results, lds, overloads,
-             shed_mw + event_shed_mw, blackout_mw, dispatch_updates}
+            {trips ++ btm_events ++ shed_events ++ [failure_event], results, lds, overloads,
+             shed_mw + event_shed_mw, blackout_mw, dispatch_updates, btm}
         catch
           thrown ->
             error = inspect(thrown)
             Logger.error("island solve threw #{error}; island dropped from this step")
             failure_event = island_solve_failure_event(island_buses, island_loads, error)
 
-            {trips ++ shed_events ++ [failure_event], results, lds, overloads,
-             shed_mw + event_shed_mw, blackout_mw, dispatch_updates}
+            {trips ++ btm_events ++ shed_events ++ [failure_event], results, lds, overloads,
+             shed_mw + event_shed_mw, blackout_mw, dispatch_updates, btm}
         end
       end
     end)
@@ -1167,6 +1305,176 @@ defmodule PowerModel.Failure.Cascade do
 
       {raised_gens, raised_gen_mw, dispatch_updates}
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Behind-the-meter solar: IEEE 1547 inverter tripping (ROADMAP item 31)
+  # ---------------------------------------------------------------------------
+
+  # The per-step BTM working set. `by_bus` is fixed for the run; `tripped`
+  # carries forward across steps (and across island re-splits, since it is
+  # keyed by bus); `tripped_mw` accumulates only what THIS pass tripped, so the
+  # caller adds it to the state's running total exactly once.
+  defp btm_context(%__MODULE__{} = state) do
+    %{
+      by_bus: state.btm_by_bus || %{},
+      tripped: state.btm_tripped_buses || MapSet.new(),
+      tripped_mw: 0.0
+    }
+  end
+
+  # Evaluate the legacy behind-the-meter fleet of ONE island against the
+  # frequency it reaches and the voltage its buses hold.
+  #
+  # Returns `{all_loads, island_loads, island_load_mw, btm, events}` — the load
+  # lists are grossed up in place so both the deficit arithmetic that follows
+  # and the DC solve see the new demand within this same step.
+  #
+  # `deficit_mw` is the island's post-reserve generation shortfall, which is
+  # exactly the imbalance `LoadShedding.apply_ufls/4` will hand the swing model
+  # a moment later: probing with the same number means the frequency this trip
+  # reacts to is the frequency UFLS would have seen, not a second opinion.
+  defp evaluate_btm_trip(
+         btm,
+         island_buses,
+         island_gens,
+         island_loads,
+         all_loads,
+         island_load_mw,
+         deficit_mw
+       ) do
+    case btm_candidates(btm, island_buses) do
+      [] ->
+        # No rooftop left to lose in this island. The overwhelmingly common
+        # case (no layer, night, already tripped), and it must cost nothing —
+        # in particular it must not run the frequency probe below.
+        {all_loads, island_loads, island_load_mw, btm, []}
+
+      candidates ->
+        # No deficit means no under-frequency excursion to evaluate. The
+        # voltage trigger is still checked, since a bus can be depressed
+        # without the island being short of generation.
+        nadir =
+          if deficit_mw > 0.0 do
+            island_gens
+            |> Frequency.simulate(island_loads, deficit_mw)
+            |> Frequency.nadir()
+          else
+            @nominal_frequency_hz
+          end
+
+        tripping =
+          Enum.filter(candidates, fn {_bus_id, _legacy_mw, vm_pu} ->
+            legacy_btm_trips?(nadir, vm_pu)
+          end)
+
+        apply_btm_trip(btm, tripping, island_loads, all_loads, island_load_mw, nadir)
+    end
+  end
+
+  # Buses in this island that still have legacy rooftop to lose, with the
+  # voltage each currently holds.
+  defp btm_candidates(btm, island_buses) do
+    Enum.reduce(island_buses, [], fn bus, acc ->
+      legacy_mw = Map.get(btm.by_bus, bus.id, 0.0)
+
+      if legacy_mw > 0.0 and not MapSet.member?(btm.tripped, bus.id) do
+        [{bus.id, legacy_mw, Map.get(bus, :vm_pu) || 1.0} | acc]
+      else
+        acc
+      end
+    end)
+  end
+
+  # IEEE 1547-2003 must-trip envelope. Frequency is an island-wide quantity, so
+  # every candidate bus sees the same nadir; voltage is local to the bus.
+  #
+  # > #### The voltage trigger is unreachable today {: .warning}
+  # >
+  # > `vm_pu` comes from the bus as the snapshot carries it, and the DC power
+  # > flow neither models voltage magnitude nor writes one back — every bus
+  # > sits at a flat 1.0 pu (the CAS-14 family of caveats). So the 0.88 pu term
+  # > below is correct and inert: it can only fire once the Q-V / QSS-AC work
+  # > gives buses real magnitudes. It is implemented rather than deferred so
+  # > that landing those voltages turns the mechanism on without anyone having
+  # > to remember this clause exists.
+  defp legacy_btm_trips?(nadir_hz, vm_pu) do
+    nadir_hz <= @btm_trip_frequency_hz or vm_pu <= @btm_trip_voltage_pu
+  end
+
+  defp apply_btm_trip(btm, [], island_loads, all_loads, island_load_mw, _nadir) do
+    {all_loads, island_loads, island_load_mw, btm, []}
+  end
+
+  defp apply_btm_trip(btm, tripping, island_loads, all_loads, island_load_mw, nadir) do
+    loads_by_bus = Enum.group_by(island_loads, & &1.bus_id)
+
+    {additions, tripped_mw, tripped_bus_ids} =
+      Enum.reduce(tripping, {%{}, 0.0, []}, fn {bus_id, legacy_mw, _vm_pu},
+                                               {additions, tripped_mw, bus_ids} ->
+        bus_loads = Map.get(loads_by_bus, bus_id, [])
+        bus_load_mw = Enum.sum(Enum.map(bus_loads, & &1.p_mw))
+
+        if bus_load_mw <= 0.0 do
+          # Nothing energized at this bus to hand the demand back to: the load
+          # is already dark (blacked out, or fully shed), and rooftop behind a
+          # de-energized feeder is disconnected with it. Left untripped rather
+          # than tripped-for-zero, so it is re-evaluated if it ever comes back.
+          {additions, tripped_mw, bus_ids}
+        else
+          additions =
+            Enum.reduce(bus_loads, additions, fn load, acc ->
+              share = legacy_mw * load.p_mw / bus_load_mw
+              Map.update(acc, load.id, share, &(&1 + share))
+            end)
+
+          {additions, tripped_mw + legacy_mw, [bus_id | bus_ids]}
+        end
+      end)
+
+    if tripped_mw <= 0.0 do
+      {all_loads, island_loads, island_load_mw, btm, []}
+    else
+      # ONE event for the whole island's trip, never one per bus: a national
+      # snapshot has tens of thousands of BTM buses and per-bus events would
+      # bury every other cause in the timeline (the DAT-20 counter pattern).
+      # `component_id` is the island's lowest bus id, matching how island-level
+      # events already identify themselves.
+      event = %{
+        component_type: "btm_solar",
+        component_id: Enum.min(tripped_bus_ids),
+        failure_cause: "btm_trip",
+        details: %{
+          tripped_mw: tripped_mw,
+          bus_count: length(tripped_bus_ids),
+          nadir: nadir
+        }
+      }
+
+      btm = %{
+        btm
+        | tripped: MapSet.union(btm.tripped, MapSet.new(tripped_bus_ids)),
+          tripped_mw: btm.tripped_mw + tripped_mw
+      }
+
+      {gross_up_loads(all_loads, additions), gross_up_loads(island_loads, additions),
+       island_load_mw + tripped_mw, btm, [event]}
+    end
+  end
+
+  # Hand the tripped rooftop MW back to the loads at its own bus, split by each
+  # load's share of that bus's remaining demand.
+  #
+  # `q_mvar` is deliberately untouched: 1547 inverters run at or near unity
+  # power factor, so losing them releases real power and essentially no
+  # reactive power. The reactive side of distributed PV is Q-V territory.
+  defp gross_up_loads(loads, additions) do
+    Enum.map(loads, fn load ->
+      case Map.get(additions, load.id) do
+        nil -> load
+        added_mw -> %{load | p_mw: load.p_mw + added_mw}
+      end
+    end)
   end
 
   @doc """

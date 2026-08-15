@@ -718,7 +718,7 @@ defmodule PowerModel.Failure.CascadeTest do
 
       assert_in_delta balance.served_load_mw + balance.shed_load_mw +
                         balance.blackout_load_mw,
-                      balance.original_load_mw,
+                      balance.original_load_mw + balance.btm_tripped_mw,
                       0.01
     end
   end
@@ -727,6 +727,18 @@ defmodule PowerModel.Failure.CascadeTest do
   # Consumption accounting (balance)
   # ===========================================================================
 
+  # The invariant asserted throughout this block is the extended one,
+  #
+  #     served + shed + blackout == original + btm_tripped
+  #
+  # where `btm_tripped` is behind-the-meter solar that IEEE 1547 tripped into
+  # load mid-run (ROADMAP item 31, `PowerModel.Failure.Cascade.balance/1`).
+  # None of these scenarios carries a `:btm_solar` layer, so that term is 0.0
+  # in every one of them and the identity reduces to the original three-bucket
+  # form — which is the point of writing it this way: these tests keep proving
+  # the pre-BTM behaviour, and they now do it against the identity the code
+  # actually maintains. `test/power_model/failure/btm_trip_test.exs` drives the
+  # term off zero.
   describe "consumption accounting" do
     test "init records original load and zeroed accounting" do
       state = Cascade.init(three_bus_snapshot())
@@ -734,13 +746,28 @@ defmodule PowerModel.Failure.CascadeTest do
       assert_in_delta state.original_load_mw, 100.0, 1.0e-6
       assert state.shed_load_mw == 0.0
       assert state.blackout_load_mw == 0.0
+      assert state.btm_tripped_mw == 0.0
+      assert state.btm_tripped_buses == MapSet.new()
 
       balance = Cascade.balance(state)
       assert_in_delta balance.original_load_mw, 100.0, 1.0e-6
       assert_in_delta balance.served_load_mw, 100.0, 1.0e-6
       assert balance.shed_load_mw == 0.0
       assert balance.blackout_load_mw == 0.0
+      assert balance.btm_tripped_mw == 0.0
       assert balance.online_capacity_mw == 200.0
+    end
+
+    test "a snapshot with no btm_solar key keeps the term at zero throughout" do
+      # Every caller that predates the layer hands over a snapshot with no
+      # `:btm_solar` key at all. That must stay a no-op, not a crash.
+      state = Cascade.init(three_bus_snapshot())
+      assert state.btm_by_bus == %{}
+
+      {final, step_results} = Cascade.trip_line(state, 1)
+
+      assert final.btm_tripped_mw == 0.0
+      assert Enum.all?(step_results, &(&1.balance.btm_tripped_mw == 0.0))
     end
 
     test "every step result carries a balance map" do
@@ -753,6 +780,7 @@ defmodule PowerModel.Failure.CascadeTest do
                  served_load_mw: _,
                  shed_load_mw: _,
                  blackout_load_mw: _,
+                 btm_tripped_mw: _,
                  dispatched_gen_mw: _,
                  online_capacity_mw: _
                } = step.balance
@@ -768,7 +796,7 @@ defmodule PowerModel.Failure.CascadeTest do
 
       assert_in_delta balance.served_load_mw + balance.shed_load_mw +
                         balance.blackout_load_mw,
-                      balance.original_load_mw,
+                      balance.original_load_mw + balance.btm_tripped_mw,
                       0.01
 
       assert balance.blackout_load_mw > 0.0
@@ -825,7 +853,7 @@ defmodule PowerModel.Failure.CascadeTest do
 
       assert_in_delta balance.served_load_mw + balance.shed_load_mw +
                         balance.blackout_load_mw,
-                      balance.original_load_mw,
+                      balance.original_load_mw + balance.btm_tripped_mw,
                       0.01
     end
   end
@@ -942,7 +970,7 @@ defmodule PowerModel.Failure.CascadeTest do
       balance = Cascade.balance(final_state)
 
       assert_in_delta balance.served_load_mw + balance.shed_load_mw + balance.blackout_load_mw,
-                      balance.original_load_mw,
+                      balance.original_load_mw + balance.btm_tripped_mw,
                       0.01
     end
   end
@@ -1319,7 +1347,7 @@ defmodule PowerModel.Failure.CascadeTest do
       assert_in_delta balance.dispatched_gen_mw, balance.served_load_mw, 0.6
 
       assert_in_delta balance.served_load_mw + balance.shed_load_mw + balance.blackout_load_mw,
-                      balance.original_load_mw,
+                      balance.original_load_mw + balance.btm_tripped_mw,
                       0.01
     end
 
@@ -1340,7 +1368,7 @@ defmodule PowerModel.Failure.CascadeTest do
       assert_in_delta balance.dispatched_gen_mw, balance.served_load_mw, 0.6
 
       assert_in_delta balance.served_load_mw + balance.shed_load_mw + balance.blackout_load_mw,
-                      balance.original_load_mw,
+                      balance.original_load_mw + balance.btm_tripped_mw,
                       0.01
     end
 
