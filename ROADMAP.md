@@ -161,9 +161,40 @@ L ≈ multi-week.
 
 ### Phase 4 — The voltage chain (M then L)
 
-> **Salvage note (2026-08-15):** the pre-reset GitHub remote (`origin/master`,
-> retrievable via `git show origin/master:<path>`) contains prior-architecture
-> modules worth mining, not resurrecting wholesale: a Rust cached-factorization
+> **STATUS 2026-08-15: Wave 1 LANDED** (item 18 complete; item 20's protection
+> math layer complete, wiring pending Wave 3). Measured:
+> - **Eastern DC: unsolvable (dense B′ ≈ 400 GB, 3× machine RAM) → 404 ms
+>   median, ~1 GB peak** (51,713 buses / 64,664 branches). Western 29.1 s /
+>   45 GB → 92 ms / 339 MB; ERCOT 3.4 s → 27 ms (meets the <50 ms target).
+>   Dense path deleted; pure triplet assembly (4 COO entries per branch, slack
+>   dropped at emission); numerical equivalence vs old dense path at 1e-11
+>   relative. First-ever full Eastern base-case census: 2,223/64,664 branches
+>   overloaded (6.7%).
+> - **Cached-factorization NIF** (ported by API shape from the pre-reset
+>   snapshot, audited: RCM fill-reduction restored, ulp-symmetry panic fixed,
+>   residual-verified solves, zero unsafe): `sparse_factor` → handle,
+>   `sparse_cached_solve(_multi)`. Eastern: factor 120 ms, cached solve 2.9 ms
+>   (42×). The SPD guard lives on the SOLVE residual, not the factor — an
+>   indefinite B′ factors without complaint. Handles carry no topology memory:
+>   rebuild on every topology change (ideal for FDPF/PTDF, useless for
+>   cascade DC).
+> - **Protection math layer** (pure, wiring in Wave 3): apparent impedance from
+>   power flow (needs per-line Q at the from terminal — NEVER wire against DC:
+>   0° angles land inside the PRC-023 blinder wedge = silent universal
+>   blocking), mho zones 1/2/3 (0.85/1.25/adjacency-based, 0.05/0.40/1.50 s),
+>   PRC-023-4 R1 load blinder on rate C, per-bus timer-integrated UVLS
+>   (0.92/0.89/0.86 pu, 8/5/3 s, 5/5/10% — deeper = faster), exact-solution
+>   conductor thermal (τ = 12 min; takes rate-A loading, NOT the rate-C basis).
+> - Behaviour change: unsolvable large systems now throw instead of silently
+>   degrading to a dense path that would OOM. `mix grid.accuracy` default cap
+>   dropped (obsolete). Wave 3 wants a "longest line off the remote bus"
+>   topology precompute for real zone-3 reaches.
+
+> **Salvage note (2026-08-15):** the absorbed pre-reset history (tip `159e900`,
+> retrievable via `git show 159e900:<path>` — do NOT use `origin/master`, which
+> now points at current work; the richer harmonics-era `lib.rs` is blob
+> `de38f9d9` under commit `433bd4e`, via `git cat-file blob de38f9d9...`)
+> contains prior-architecture modules worth mining, not resurrecting wholesale: a Rust cached-factorization
 > NIF (`sparse_factor`/`sparse_cached_solve`/`sparse_cached_solve_multi`,
 > ResourceArc LDLᵀ handle — handed to p4-sparse for item 18; items 19/21 build on
 > it), `solver/lodf.ex` (439 lines: correct LODF core — sensitivity solve, bridge
