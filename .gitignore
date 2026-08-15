@@ -47,3 +47,7 @@ npm-debug.log
 
 data/vendored/*
 !data/vendored/PROVENANCE.md
+
+# Byte-compiled helper scripts (scripts/*.py)
+__pycache__/
+*.pyc

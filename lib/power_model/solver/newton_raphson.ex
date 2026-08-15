@@ -18,6 +18,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
     V_new     = V_old     + dV
   """
 
+  alias PowerModel.Grid.Ratings
   alias PowerModel.Solver.{YBus, Solution, Sparse, LoadModel}
 
   require Logger
@@ -991,8 +992,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
         s_ij = :math.sqrt(p_ij * p_ij + q_ij * q_ij) * base_mva
 
-        rating = Map.get(line, :rating_a_mva)
-        rated? = is_number(rating) and rating > 0
+        {rate_a, rate_b, rate_c} = Ratings.branch_ratings(line)
 
         {{:line, line.id},
          %{
@@ -1001,9 +1001,13 @@ defmodule PowerModel.Solver.NewtonRaphson do
            p_flow_mw: p_ij * base_mva,
            q_flow_mvar: q_ij * base_mva,
            s_flow_mva: s_ij,
-           rating_mva: rating,
-           loading_pct: if(rated?, do: s_ij / rating * 100.0, else: 0.0),
-           overloaded: rated? and s_ij > rating
+           rating_mva: rate_a,
+           rating_b_mva: rate_b,
+           rating_c_mva: rate_c,
+           loading_pct: Ratings.loading_pct(s_ij, rate_a),
+           emergency_loading_pct: Ratings.loading_pct(s_ij, rate_b),
+           trip_loading_pct: Ratings.loading_pct(s_ij, rate_c),
+           overloaded: is_number(rate_a) and s_ij > rate_a
          }}
       end)
 
@@ -1033,8 +1037,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
         s_ij = :math.sqrt(p_ij * p_ij + q_ij * q_ij) * base_mva
 
-        rating = Map.get(xfmr, :rated_mva)
-        rated? = is_number(rating) and rating > 0
+        {rate_a, rate_b, rate_c} = Ratings.branch_ratings(xfmr)
 
         {{:transformer, xfmr.id},
          %{
@@ -1043,9 +1046,13 @@ defmodule PowerModel.Solver.NewtonRaphson do
            p_flow_mw: p_ij * base_mva,
            q_flow_mvar: q_ij * base_mva,
            s_flow_mva: s_ij,
-           rating_mva: rating,
-           loading_pct: if(rated?, do: s_ij / rating * 100.0, else: 0.0),
-           overloaded: rated? and s_ij > rating
+           rating_mva: rate_a,
+           rating_b_mva: rate_b,
+           rating_c_mva: rate_c,
+           loading_pct: Ratings.loading_pct(s_ij, rate_a),
+           emergency_loading_pct: Ratings.loading_pct(s_ij, rate_b),
+           trip_loading_pct: Ratings.loading_pct(s_ij, rate_c),
+           overloaded: is_number(rate_a) and s_ij > rate_a
          }}
       end)
 
