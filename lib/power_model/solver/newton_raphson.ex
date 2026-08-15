@@ -20,6 +20,8 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
   alias PowerModel.Solver.{YBus, Solution, Sparse, LoadModel}
 
+  require Logger
+
   @max_iterations 50
   @tolerance 1.0e-6
   @max_dtheta 0.5
@@ -46,6 +48,15 @@ defmodule PowerModel.Solver.NewtonRaphson do
     if n == 0, do: throw({:error, :empty_grid})
 
     bus_index = buses |> Enum.with_index() |> Map.new(fn {b, i} -> {b.id, i} end)
+
+    # Duplicate bus ids make the Y-bus (sized by distinct ids) disagree with
+    # every length(buses)-sized structure here, silently corrupting the solve.
+    if map_size(bus_index) != n do
+      raise ArgumentError,
+            "snapshot contains duplicate bus ids: #{n} buses but only " <>
+              "#{map_size(bus_index)} distinct ids"
+    end
+
     bus_ids = Enum.map(buses, & &1.id)
 
     # Build Y-bus
@@ -211,7 +222,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
     p =
       Enum.reduce(generators, p, fn gen, acc ->
         idx = Map.fetch!(bus_index, gen.bus_id)
-        p_pu = gen.p_max_mw * (gen.capacity_factor || 1.0) / base_mva
+        p_pu = gen.p_max_mw * (Map.get(gen, :capacity_factor) || 1.0) / base_mva
         array_add(acc, idx, p_pu)
       end)
 
@@ -270,12 +281,18 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
   # Aggregate Q limits for each bus from all generators (in per-unit).
   # Returns a map: bus_index -> {q_min_pu, q_max_pu}
+  # Map.get, not dot access: generators arrive both as plain maps (tests,
+  # cascade fixtures) and structs, and older fixtures lack the q-limit keys.
   defp aggregate_q_limits(generators, bus_index, _n, base_mva) do
     generators
     |> Enum.group_by(fn gen -> Map.fetch!(bus_index, gen.bus_id) end)
     |> Map.new(fn {idx, gens} ->
-      q_min = Enum.sum(Enum.map(gens, fn g -> (g.q_min_mvar || -9999.0) / base_mva end))
-      q_max = Enum.sum(Enum.map(gens, fn g -> (g.q_max_mvar || 9999.0) / base_mva end))
+      q_min =
+        Enum.sum(Enum.map(gens, fn g -> (Map.get(g, :q_min_mvar) || -9999.0) / base_mva end))
+
+      q_max =
+        Enum.sum(Enum.map(gens, fn g -> (Map.get(g, :q_max_mvar) || 9999.0) / base_mva end))
+
       {idx, {q_min, q_max}}
     end)
   end
@@ -407,7 +424,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
     pv_eff = orig_pv |> Enum.reject(&Map.has_key?(switched, &1)) |> Enum.sort()
     pq_eff = Enum.sort(orig_pq ++ Map.keys(switched))
 
-    {vm, va, converged, iter, max_mis, p_calc, q_calc} =
+    {vm, va, converged, iter, max_mis, p_calc, q_calc, q_sched_pre} =
       do_iterate(
         vm,
         va,
@@ -430,32 +447,51 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
     total_iters = iters_so_far + iter
 
-    if converged and round < @max_qlim_rounds do
-      new_switched = update_pv_pq_switching(pv_eff, switched, q_calc, q_limits, vm, v_sched)
-
-      if new_switched == switched do
-        {vm, va, converged, total_iters, max_mis, p_calc}
-      else
-        outer_solve(
-          vm,
-          va,
-          y_data,
-          p_gen,
-          q_gen,
-          v_sched,
+    if converged do
+      new_switched =
+        update_pv_pq_switching(
+          pv_eff,
+          switched,
+          q_calc,
+          q_sched_pre,
           q_limits,
-          orig_pq,
-          orig_pv,
-          new_switched,
-          slack_idx,
-          n,
-          max_iter,
-          tol,
-          bus_loads,
-          base_mva,
-          round + 1,
-          total_iters
+          vm,
+          v_sched
         )
+
+      cond do
+        new_switched == switched ->
+          {vm, va, converged, total_iters, max_mis, p_calc}
+
+        round < @max_qlim_rounds ->
+          outer_solve(
+            vm,
+            va,
+            y_data,
+            p_gen,
+            q_gen,
+            v_sched,
+            q_limits,
+            orig_pq,
+            orig_pv,
+            new_switched,
+            slack_idx,
+            n,
+            max_iter,
+            tol,
+            bus_loads,
+            base_mva,
+            round + 1,
+            total_iters
+          )
+
+        true ->
+          Logger.warning(
+            "AC solve reached the Q-limit switching round cap " <>
+              "(#{@max_qlim_rounds}) while the PV/PQ switching set was still changing"
+          )
+
+          {vm, va, converged, total_iters, max_mis, p_calc}
       end
     else
       {vm, va, converged, total_iters, max_mis, p_calc}
@@ -482,7 +518,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
          _base_mva
        )
        when iter >= max_iter do
-    {vm, va, false, iter, :infinity, nil, nil}
+    {vm, va, false, iter, :infinity, nil, nil, nil}
   end
 
   defp do_iterate(
@@ -511,12 +547,14 @@ defmodule PowerModel.Solver.NewtonRaphson do
       end)
 
     # Recompute scheduled power with ZIP load model using current bus voltages
-    {p_sched, q_sched} = combine_gen_load(p_gen, q_gen, bus_loads, n, base_mva, vm)
+    {p_sched, q_sched_pre} = combine_gen_load(p_gen, q_gen, bus_loads, n, base_mva, vm)
 
-    # Buses switched to PQ by the outer Q-limit loop hold Q at the violated limit
+    # Buses switched to PQ hold generator output at the violated limit. Since
+    # q_sched_pre is negative effective load, the corresponding net-injection
+    # target is q_limit + q_sched_pre.
     q_sched =
-      Enum.reduce(switched, q_sched, fn {idx, {_side, q_lim}}, acc ->
-        :array.set(idx, q_lim, acc)
+      Enum.reduce(switched, q_sched_pre, fn {idx, {_side, q_lim}}, acc ->
+        :array.set(idx, q_lim + :array.get(idx, q_sched_pre), acc)
       end)
 
     # Compute power injections from current voltages
@@ -541,10 +579,12 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
     cond do
       max_mis < tol ->
-        {vm, va, true, iter + 1, max_mis, p_calc, q_calc}
+        {vm, va, true, iter + 1, max_mis, p_calc, q_calc, q_sched_pre}
 
-      not is_number(max_mis) or max_mis > 1.0e10 ->
-        {vm, va, false, iter + 1, max_mis, nil, nil}
+      # `max_mis != max_mis` catches NaN (e.g. leaked from the NIF linear
+      # solver), which passes both ordering comparisons unnoticed.
+      not is_number(max_mis) or max_mis != max_mis or max_mis > 1.0e10 ->
+        {vm, va, false, iter + 1, max_mis, nil, nil, nil}
 
       true ->
         j_size = length(non_slack) + length(pq_indices)
@@ -619,15 +659,23 @@ defmodule PowerModel.Solver.NewtonRaphson do
   end
 
   # PV/PQ switching with back-switching (standard criterion):
-  #   - a PV bus whose computed network Q injection violates a limit becomes
-  #     PQ with Q held at that limit;
+  #   - a PV bus whose computed generator Q output violates a limit becomes
+  #     PQ with generator Q held at that limit;
   #   - a switched bus returns to PV when its voltage crosses back over the
   #     setpoint in the direction that relaxes the binding limit (held at
   #     q_max while V rose above setpoint, or at q_min while V fell below).
   # Without the second rule a transient Q excursion during early iterations
   # locks the bus at its limit and the solution converges to sagged voltages.
   # Returns the updated switched map: bus_idx => {:max | :min, q_limit_pu}.
-  defp update_pv_pq_switching(pv_indices, switched, q_calc, q_limits, vm, v_sched) do
+  defp update_pv_pq_switching(
+         pv_indices,
+         switched,
+         q_calc,
+         q_sched_pre,
+         q_limits,
+         vm,
+         v_sched
+       ) do
     switched =
       Enum.reduce(pv_indices, switched, fn idx, acc ->
         case Map.get(q_limits, idx) do
@@ -635,11 +683,11 @@ defmodule PowerModel.Solver.NewtonRaphson do
             acc
 
           {q_min, q_max} ->
-            q_injected = :array.get(idx, q_calc)
+            q_generated = :array.get(idx, q_calc) - :array.get(idx, q_sched_pre)
 
             cond do
-              q_injected > q_max -> Map.put(acc, idx, {:max, q_max})
-              q_injected < q_min -> Map.put(acc, idx, {:min, q_min})
+              q_generated > q_max -> Map.put(acc, idx, {:max, q_max})
+              q_generated < q_min -> Map.put(acc, idx, {:min, q_min})
               true -> acc
             end
         end
@@ -877,23 +925,24 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
         pivot = arr_elem(aug, k, k)
 
-        if abs(pivot) < 1.0e-15 do
-          aug
-        else
-          Enum.reduce((k + 1)..(size - 1), aug, fn i, aug ->
-            factor = arr_elem(aug, i, k) / pivot
-            row_i = :array.get(i, aug)
-            row_k = :array.get(k, aug)
-            row_width = size + 1
+        # A vanishing pivot means the Jacobian is singular. Zeroing the free
+        # variables and continuing would fabricate a Newton step out of thin
+        # air, so error out like the DC solver's gaussian_solve does.
+        if abs(pivot) < 1.0e-15, do: throw({:error, :singular_matrix})
 
-            new_row =
-              Enum.map(0..(row_width - 1), fn col ->
-                :array.get(col, row_i) - factor * :array.get(col, row_k)
-              end)
+        Enum.reduce((k + 1)..(size - 1), aug, fn i, aug ->
+          factor = arr_elem(aug, i, k) / pivot
+          row_i = :array.get(i, aug)
+          row_k = :array.get(k, aug)
+          row_width = size + 1
 
-            :array.set(i, :array.from_list(new_row), aug)
-          end)
-        end
+          new_row =
+            Enum.map(0..(row_width - 1), fn col ->
+              :array.get(col, row_i) - factor * :array.get(col, row_k)
+            end)
+
+          :array.set(i, :array.from_list(new_row), aug)
+        end)
       end)
 
     x = :array.new(size, default: 0.0)
@@ -902,16 +951,14 @@ defmodule PowerModel.Solver.NewtonRaphson do
       row = :array.get(i, aug)
       diag = :array.get(i, row)
 
-      if abs(diag) < 1.0e-15 do
-        :array.set(i, 0.0, x)
-      else
-        sum =
-          Enum.reduce((i + 1)..(size - 1)//1, 0.0, fn j, acc ->
-            acc + :array.get(j, row) * :array.get(j, x)
-          end)
+      if abs(diag) < 1.0e-15, do: throw({:error, :singular_matrix})
 
-        :array.set(i, (:array.get(size, row) - sum) / diag, x)
-      end
+      sum =
+        Enum.reduce((i + 1)..(size - 1)//1, 0.0, fn j, acc ->
+          acc + :array.get(j, row) * :array.get(j, x)
+        end)
+
+      :array.set(i, (:array.get(size, row) - sum) / diag, x)
     end)
   end
 
@@ -929,9 +976,9 @@ defmodule PowerModel.Solver.NewtonRaphson do
         vj = :array.get(j, vm)
         theta_ij = :array.get(i, va) - :array.get(j, va)
 
-        r = line.r_pu || 0.0
-        x = line.x_pu || 0.001
-        b_sh = (line.b_pu || 0.0) / 2.0
+        r = Map.get(line, :r_pu) || 0.0
+        x = YBus.effective_reactance(line.x_pu)
+        b_sh = (Map.get(line, :b_pu) || 0.0) / 2.0
 
         denom = r * r + x * x
         g = r / denom
@@ -944,7 +991,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
         s_ij = :math.sqrt(p_ij * p_ij + q_ij * q_ij) * base_mva
 
-        rating = line.rating_a_mva
+        rating = Map.get(line, :rating_a_mva)
         rated? = is_number(rating) and rating > 0
 
         {{:line, line.id},
@@ -968,10 +1015,10 @@ defmodule PowerModel.Solver.NewtonRaphson do
         vi = :array.get(i, vm)
         vj = :array.get(j, vm)
         theta_ij = :array.get(i, va) - :array.get(j, va)
-        t = xfmr.tap_ratio || 1.0
+        t = effective_tap_ratio(Map.get(xfmr, :tap_ratio))
 
-        r = xfmr.r_pu || 0.0
-        x = xfmr.x_pu
+        r = Map.get(xfmr, :r_pu) || 0.0
+        x = YBus.effective_reactance(xfmr.x_pu)
         denom = r * r + x * x
         g = r / denom
         b = -x / denom
@@ -986,7 +1033,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
         s_ij = :math.sqrt(p_ij * p_ij + q_ij * q_ij) * base_mva
 
-        rating = xfmr.rated_mva
+        rating = Map.get(xfmr, :rated_mva)
         rated? = is_number(rating) and rating > 0
 
         {{:transformer, xfmr.id},
@@ -1006,12 +1053,15 @@ defmodule PowerModel.Solver.NewtonRaphson do
   end
 
   defp compute_total_gen(generators, _base_mva) do
-    Enum.sum(Enum.map(generators, fn g -> g.p_max_mw * (g.capacity_factor || 1.0) end))
+    Enum.sum(Enum.map(generators, fn g -> g.p_max_mw * (Map.get(g, :capacity_factor) || 1.0) end))
   end
 
   defp compute_total_load(loads) do
     Enum.sum(Enum.map(loads, & &1.p_mw))
   end
+
+  defp effective_tap_ratio(t) when is_number(t) and t > 0.0, do: t
+  defp effective_tap_ratio(_), do: 1.0
 
   defp array_add(arr, idx, val) do
     :array.set(idx, :array.get(idx, arr) + val, arr)

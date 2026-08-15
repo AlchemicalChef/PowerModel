@@ -17,8 +17,12 @@ defmodule PowerModel.Solver.Partition do
   Split a snapshot into per-island sub-snapshots (only islands that are
   solvable: at least `min_buses` buses and at least one generator).
   Returns `{solvable_subsnapshots, dead_island_bus_sets}`.
+
+  Single-bus islands with generation are trivially solvable (θ = 0), so the
+  default `min_buses` is 1; islands without any generator are dead
+  (blacked out) regardless of size.
   """
-  def split(snapshot, min_buses \\ 2) do
+  def split(snapshot, min_buses \\ 1) do
     bus_ids = Enum.map(snapshot.buses, & &1.id)
     islands = IslandDetector.detect(bus_ids, snapshot.lines, snapshot.transformers)
 
@@ -56,9 +60,17 @@ defmodule PowerModel.Solver.Partition do
   Totals sum across islands; `converged` is true only when every island
   converged; flows are the union (branch keys are disjoint across islands).
   `slack_bus_id` is taken from the largest island.
+
+  Merging zero solutions (nothing was solvable — e.g. a total blackout) is
+  NOT a converged solve: it yields `converged: false` with
+  `n_islands_solved: 0` so callers cannot mistake it for a healthy grid.
   """
   def merge_solutions([], base_mva) do
-    Solution.new([], [], [], %{}, base_mva)
+    Solution.new([], [], [], %{}, base_mva,
+      converged: false,
+      iterations: 0,
+      n_islands_solved: 0
+    )
   end
 
   def merge_solutions(solutions, base_mva) do
@@ -88,7 +100,10 @@ defmodule PowerModel.Solver.Partition do
       slack_bus_id: largest.slack_bus_id,
       slack_injection_mw: sum_field(solutions, :slack_injection_mw),
       mismatch_mw: mismatch_mw,
-      mismatch_abs_mw: mismatch_abs_mw
+      mismatch_abs_mw: mismatch_abs_mw,
+      n_islands_solved: length(solutions),
+      dead_load_mw: sum_field(solutions, :dead_load_mw),
+      dead_bus_count: Enum.reduce(solutions, 0, fn s, acc -> acc + (s.dead_bus_count || 0) end)
     }
   end
 

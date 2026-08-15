@@ -5,7 +5,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
   Target: <50ms per interconnection.
   """
 
-  alias PowerModel.Solver.{Sparse, Solution, Partition}
+  alias PowerModel.Solver.{Partition, Solution, Sparse, YBus}
 
   require Logger
 
@@ -17,17 +17,29 @@ defmodule PowerModel.Solver.DCPowerFlow do
 
   Each island is solved independently — flows and slack balancing never
   couple across asynchronous boundaries — and the per-island solutions are
-  merged into one `Solution`. Islands without generation are skipped (their
-  buses appear with no flows; the cascade layer accounts for them as
-  blackouts).
+  merged into one `Solution`. Islands without generation are dead
+  (blacked out): their buses and load are excluded from the solve but
+  surfaced on the merged solution as `dead_load_mw` / `dead_bus_count` so
+  unserved load never silently vanishes from the totals. A snapshot with no
+  solvable island at all yields `converged: false`.
   """
   def solve_islands(snapshot, opts \\ []) do
     base_mva = Keyword.get(opts, :base_mva, 100.0)
-    {subs, _dead} = Partition.split(snapshot)
+    {subs, dead} = Partition.split(snapshot)
 
-    subs
-    |> Enum.map(&solve(&1, opts))
-    |> Partition.merge_solutions(base_mva)
+    dead_buses = Enum.reduce(dead, MapSet.new(), &MapSet.union(&2, &1))
+
+    dead_load_mw =
+      snapshot.loads
+      |> Enum.filter(&MapSet.member?(dead_buses, &1.bus_id))
+      |> Enum.reduce(0.0, fn load, acc -> acc + (load.p_mw || 0.0) end)
+
+    merged =
+      subs
+      |> Enum.map(&solve(&1, opts))
+      |> Partition.merge_solutions(base_mva)
+
+    %{merged | dead_load_mw: dead_load_mw, dead_bus_count: MapSet.size(dead_buses)}
   end
 
   @doc """
@@ -46,6 +58,15 @@ defmodule PowerModel.Solver.DCPowerFlow do
     if n == 0, do: throw({:error, :empty_grid})
 
     bus_index = buses |> Enum.with_index() |> Map.new(fn {b, i} -> {b.id, i} end)
+
+    # Duplicate bus ids silently shrink the index map relative to the bus
+    # list, corrupting matrix sizing and injections. Fail loudly instead.
+    if map_size(bus_index) != n do
+      raise ArgumentError,
+            "snapshot contains duplicate bus ids: #{n} buses but only " <>
+              "#{map_size(bus_index)} distinct ids"
+    end
+
     bus_ids = Enum.map(buses, & &1.id)
 
     # Find slack bus (type 3, or largest generator)
@@ -98,7 +119,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
   defp compute_totals(generators, loads, bus_index, slack_idx, bus_ids) do
     {scheduled_gen_mw, gen_at_slack_mw} =
       Enum.reduce(generators, {0.0, 0.0}, fn gen, {total, at_slack} ->
-        p = gen.p_max_mw * (gen.capacity_factor || 1.0)
+        p = gen.p_max_mw * (Map.get(gen, :capacity_factor) || 1.0)
 
         at_slack =
           if Map.fetch!(bus_index, gen.bus_id) == slack_idx, do: at_slack + p, else: at_slack
@@ -200,7 +221,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
       Enum.reduce(lines, b_full, fn line, b ->
         i = Map.fetch!(bus_index, line.from_bus_id)
         j = Map.fetch!(bus_index, line.to_bus_id)
-        x = effective_reactance(line.x_pu)
+        x = YBus.effective_reactance(line.x_pu)
         b_ij = 1.0 / x
 
         b
@@ -214,8 +235,8 @@ defmodule PowerModel.Solver.DCPowerFlow do
       Enum.reduce(transformers, b_full, fn xfmr, b ->
         i = Map.fetch!(bus_index, xfmr.from_bus_id)
         j = Map.fetch!(bus_index, xfmr.to_bus_id)
-        x = effective_reactance(xfmr.x_pu)
-        t = xfmr.tap_ratio || 1.0
+        x = YBus.effective_reactance(xfmr.x_pu)
+        t = effective_tap_ratio(Map.get(xfmr, :tap_ratio))
         b_ij = 1.0 / (t * x)
 
         b
@@ -231,7 +252,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
     p_full =
       Enum.reduce(generators, p_full, fn gen, p ->
         idx = Map.fetch!(bus_index, gen.bus_id)
-        p_pu = gen.p_max_mw * (gen.capacity_factor || 1.0) / base_mva
+        p_pu = gen.p_max_mw * (Map.get(gen, :capacity_factor) || 1.0) / base_mva
         array_add(p, idx, p_pu)
       end)
 
@@ -320,16 +341,18 @@ defmodule PowerModel.Solver.DCPowerFlow do
     end
   end
 
-  # Branch reactance with a floor: nil and near-zero values (zero-impedance
-  # jumpers, missing data) would otherwise divide by zero. The floor preserves
-  # sign — negative reactance is legitimate (3-winding transformer star-point
-  # branches) and clamping it positive would flip the branch susceptance.
-  @x_floor 1.0e-3
-  defp effective_reactance(x) when is_number(x) and (x >= @x_floor or x <= -@x_floor), do: x
-  defp effective_reactance(x) when is_number(x) and x < 0.0, do: -@x_floor
-  defp effective_reactance(_), do: @x_floor
+  # Last-resort pure-Elixir O(n^3) elimination. Unbounded it takes ~21 s at
+  # 300 buses and hours at grid scale inside a GenServer call, so it is capped:
+  # beyond @gaussian_fallback_max the solve errors out and the caller's
+  # fallback chain surfaces the failure instead of hanging the system.
+  @gaussian_fallback_max 500
 
-  defp gaussian_solve(a, b, 1) do
+  @doc false
+  def gaussian_solve(_a, _b, n) when n > @gaussian_fallback_max do
+    throw({:error, {:gaussian_fallback_too_large, n}})
+  end
+
+  def gaussian_solve(a, b, 1) do
     # Single-equation system: the elimination ranges below assume n >= 2
     [[a11]] = a
     [b1] = b
@@ -337,7 +360,7 @@ defmodule PowerModel.Solver.DCPowerFlow do
     [b1 / a11]
   end
 
-  defp gaussian_solve(a, b, n) do
+  def gaussian_solve(a, b, n) do
     # Augmented matrix — each row stored as an :array for O(1) access
     aug =
       a
@@ -413,13 +436,13 @@ defmodule PowerModel.Solver.DCPowerFlow do
       Enum.map(lines, fn line ->
         i = Map.fetch!(bus_index, line.from_bus_id)
         j = Map.fetch!(bus_index, line.to_bus_id)
-        x = effective_reactance(line.x_pu)
+        x = YBus.effective_reactance(line.x_pu)
         theta_i = :array.get(i, theta_arr)
         theta_j = :array.get(j, theta_arr)
         flow_pu = (theta_i - theta_j) / x
         flow_mw = flow_pu * base_mva
 
-        rating = line.rating_a_mva
+        rating = Map.get(line, :rating_a_mva)
         rated? = is_number(rating) and rating > 0
 
         {{:line, line.id},
@@ -437,13 +460,17 @@ defmodule PowerModel.Solver.DCPowerFlow do
       Enum.map(transformers, fn xfmr ->
         i = Map.fetch!(bus_index, xfmr.from_bus_id)
         j = Map.fetch!(bus_index, xfmr.to_bus_id)
-        x = (xfmr.tap_ratio || 1.0) * effective_reactance(xfmr.x_pu)
+
+        x =
+          effective_tap_ratio(Map.get(xfmr, :tap_ratio)) *
+            YBus.effective_reactance(xfmr.x_pu)
+
         theta_i = :array.get(i, theta_arr)
         theta_j = :array.get(j, theta_arr)
         flow_pu = (theta_i - theta_j) / x
         flow_mw = flow_pu * base_mva
 
-        rating = xfmr.rated_mva
+        rating = Map.get(xfmr, :rated_mva)
         rated? = is_number(rating) and rating > 0
 
         {{:transformer, xfmr.id},
@@ -464,6 +491,9 @@ defmodule PowerModel.Solver.DCPowerFlow do
     {before, after_} = Enum.split(list, idx)
     before ++ [val] ++ after_
   end
+
+  defp effective_tap_ratio(t) when is_number(t) and t > 0.0, do: t
+  defp effective_tap_ratio(_), do: 1.0
 
   defp array_add(arr, idx, val) do
     :array.set(idx, :array.get(idx, arr) + val, arr)

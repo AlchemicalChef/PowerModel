@@ -156,7 +156,7 @@ defmodule PowerModel.Solver.YBus do
 
     r = xfmr.r_pu || 0.0
     x = effective_reactance(xfmr.x_pu)
-    t = xfmr.tap_ratio || 1.0
+    t = effective_tap_ratio(xfmr.tap_ratio)
 
     denom = r * r + x * x
     g = r / denom
@@ -170,13 +170,17 @@ defmodule PowerModel.Solver.YBus do
     ]
   end
 
-  # Same floor as DCPowerFlow.effective_reactance/1: guards division by zero
+  # Shared with the DC and AC flow-reporting paths: guards division by zero
   # for zero-impedance branches while preserving the sign of legitimate
   # negative reactances (3-winding transformer star-point branches).
   @x_floor 1.0e-3
-  defp effective_reactance(x) when is_number(x) and (x >= @x_floor or x <= -@x_floor), do: x
-  defp effective_reactance(x) when is_number(x) and x < 0.0, do: -@x_floor
-  defp effective_reactance(_), do: @x_floor
+  @doc false
+  def effective_reactance(x) when is_number(x) and (x >= @x_floor or x <= -@x_floor), do: x
+  def effective_reactance(x) when is_number(x) and x < 0.0, do: -@x_floor
+  def effective_reactance(_), do: @x_floor
+
+  defp effective_tap_ratio(t) when is_number(t) and t > 0.0, do: t
+  defp effective_tap_ratio(_), do: 1.0
 
   defp consolidate_triplets(triplets, _n) do
     triplets

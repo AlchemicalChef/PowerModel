@@ -19,7 +19,15 @@ defmodule PowerModel.Solver.Solution do
     :slack_bus_id,
     :slack_injection_mw,
     :mismatch_mw,
-    :mismatch_abs_mw
+    :mismatch_abs_mw,
+    # Number of islands whose solutions were merged into this one. A direct
+    # (single-island) solve is 1; an empty merge (nothing solvable) is 0.
+    :n_islands_solved,
+    # Load and bus count in dead (unsolvable, blacked-out) islands that were
+    # excluded from the solve. Populated by `solve_islands` from the Partition
+    # dead set so callers can account for unserved load.
+    :dead_load_mw,
+    :dead_bus_count
   ]
 
   def new(bus_ids, vm_pu, va_rad, line_flows, base_mva, extra \\ []) do
@@ -40,7 +48,10 @@ defmodule PowerModel.Solver.Solution do
         slack_bus_id: nil,
         slack_injection_mw: 0.0,
         mismatch_mw: nil,
-        mismatch_abs_mw: nil
+        mismatch_abs_mw: nil,
+        n_islands_solved: 1,
+        dead_load_mw: 0.0,
+        dead_bus_count: 0
       },
       extra
     )
@@ -94,10 +105,34 @@ defmodule PowerModel.Solver.Solution do
 
   @doc """
   Check the power-balance invariant: generation − load − losses ≈ 0.
+
+  The internal identity alone is tautological for any genuine solve (DC sets
+  gen = load by construction; converged AC defines gen = load + loss), so an
+  optional `expected_load_mw` — the snapshot's demand — can be supplied as a
+  third argument. When given, the served load plus the dead-island load
+  (`total_load_mw + dead_load_mw`) must also match it within tolerance,
+  which catches load that silently vanished from the solve.
   """
-  def energy_balance(%__MODULE__{} = s, tol_mw \\ 1.0) do
+  def energy_balance(%__MODULE__{} = s, tol_mw \\ 1.0, expected_load_mw \\ nil) do
     residual = (s.total_gen_mw || 0.0) - (s.total_load_mw || 0.0) - (s.total_loss_mw || 0.0)
-    %{residual_mw: residual, ok: abs(residual) <= tol_mw}
+    internal_ok = abs(residual) <= tol_mw
+
+    case expected_load_mw do
+      nil ->
+        %{residual_mw: residual, ok: internal_ok}
+
+      expected when is_number(expected) ->
+        accounted = (s.total_load_mw || 0.0) + (s.dead_load_mw || 0.0)
+        load_residual = accounted - expected
+
+        %{
+          residual_mw: residual,
+          load_residual_mw: load_residual,
+          expected_load_mw: expected,
+          accounted_load_mw: accounted,
+          ok: internal_ok and abs(load_residual) <= tol_mw
+        }
+    end
   end
 
   defp flow_magnitude(flow) do
