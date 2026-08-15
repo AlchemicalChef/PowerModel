@@ -94,9 +94,35 @@ defmodule PowerModel.Failure.ProtectionTest do
     test "retains the canonical UFLS first stage" do
       assert Protection.ufls_schedule(59.0) == [stage: 1, shed_fraction: 0.075]
     end
+  end
 
-    test "retains the steady-state frequency estimate" do
-      assert_in_delta Protection.estimate_frequency(90.0, 100.0), 59.7, 1.0e-12
+  describe "estimate_frequency/3 static fallback (ENE-7)" do
+    test "is the damping-consistent steady state f0*(1 - deficit/(D*load))" do
+      # 0.5% deficit with D = 1.0 -> 60 * (1 - 0.005) = 59.7 Hz
+      assert_in_delta Protection.estimate_frequency(99.5, 100.0), 59.7, 1.0e-9
+      # 1% deficit -> 59.4 Hz (old droop estimate said 59.97)
+      assert_in_delta Protection.estimate_frequency(99.0, 100.0), 59.4, 1.0e-9
+    end
+
+    test "clamps to the simulator's [55, 65] Hz band" do
+      # 10% deficit -> 54 Hz unclamped -> floor 55
+      assert Protection.estimate_frequency(90.0, 100.0) == 55.0
+      # Large surplus -> ceiling 65
+      assert Protection.estimate_frequency(200.0, 100.0) == 65.0
+    end
+
+    test "returns base frequency when there is no load" do
+      assert Protection.estimate_frequency(50.0, 0.0) == 60.0
+      assert Protection.estimate_frequency(50.0, 0.0, 59.5) == 59.5
+    end
+
+    test "total generation loss drives the full UFLS schedule" do
+      freq = Protection.estimate_frequency(0.0, 100.0)
+      assert freq == 55.0
+
+      schedule = Protection.ufls_schedule(freq)
+      assert schedule[:stage] == 4
+      assert_in_delta schedule[:shed_fraction], 0.30, 1.0e-9
     end
   end
 end

@@ -1,6 +1,8 @@
 defmodule PowerModel.DemandTest do
   use PowerModel.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
   @moduletag :db
 
   alias PowerModel.Demand
@@ -218,6 +220,129 @@ defmodule PowerModel.DemandTest do
     assert dc.p_mw == 50.0
     assert_in_delta other.p_mw, 200.0, 1.0e-6
     assert_in_delta Enum.sum(Enum.map(scaled, & &1.p_mw)), 250.0, 1.0e-6
+  end
+
+  test "latest_demand_hour/0 returns the most recent hour with demand rows", %{ciso: ciso} do
+    later = ~U[2024-07-16 05:00:00Z]
+
+    Repo.insert!(%BADemandHour{
+      balancing_authority_id: ciso.id,
+      timestamp_utc: later,
+      demand_mw: 10.0
+    })
+
+    assert DateTime.compare(Demand.latest_demand_hour(), later) == :eq
+  end
+
+  test "latest_demand_hour/0 is nil when no demand data exists" do
+    Repo.delete_all(BADemandHour)
+    assert Demand.latest_demand_hour() == nil
+  end
+
+  test "regional snapshot with no BA-scalable loads keeps baseline (ENE-2)" do
+    # All buses in ONE interconnection, none BA-mapped: scaling the region to
+    # NATIONAL demand would inflate it severalfold. Must stay at baseline.
+    buses = [
+      %{id: 1, balancing_authority_id: nil, interconnection_id: 55},
+      %{id: 2, balancing_authority_id: nil, interconnection_id: 55}
+    ]
+
+    loads = [
+      %{id: 1, bus_id: 1, p_mw: 60.0, q_mvar: 18.0},
+      %{id: 2, bus_id: 2, p_mw: 40.0, q_mvar: 12.0}
+    ]
+
+    log =
+      capture_log(fn ->
+        assert Demand.scale_loads(loads, buses, @hour) == loads
+      end)
+
+    assert log =~ "regional snapshot"
+    assert log =~ "100.0 MW"
+  end
+
+  test "multi-interconnection snapshot without BAs still gets the national fallback (ENE-2)" do
+    buses = [
+      %{id: 1, balancing_authority_id: nil, interconnection_id: 1},
+      %{id: 2, balancing_authority_id: nil, interconnection_id: 2}
+    ]
+
+    loads = [
+      %{id: 1, bus_id: 1, p_mw: 60.0, q_mvar: 18.0},
+      %{id: 2, bus_id: 2, p_mw: 40.0, q_mvar: 12.0}
+    ]
+
+    scaled = Demand.scale_loads(loads, buses, @hour)
+
+    assert_in_delta Enum.sum(Enum.map(scaled, & &1.p_mw)), 250.0, 1.0e-6
+  end
+
+  test "partial demand coverage logs the unmatched MW and BA codes (ENE-8)", %{ciso: ciso} do
+    miso = Repo.insert!(%BalancingAuthority{code: "MISO", name: "Midcontinent ISO"})
+
+    buses = [
+      %{id: 1, balancing_authority_id: ciso.id},
+      %{id: 2, balancing_authority_id: ciso.id},
+      %{id: 4, balancing_authority_id: nil},
+      %{id: 5, balancing_authority_id: miso.id}
+    ]
+
+    loads = [
+      %{id: 1, bus_id: 1, p_mw: 60.0, q_mvar: 18.0},
+      %{id: 2, bus_id: 2, p_mw: 40.0, q_mvar: 12.0},
+      %{id: 4, bus_id: 4, p_mw: 25.0, q_mvar: 7.5},
+      %{id: 5, bus_id: 5, p_mw: 30.0, q_mvar: 9.0}
+    ]
+
+    log =
+      capture_log(fn ->
+        scaled = Demand.scale_loads(loads, buses, @hour)
+
+        # CISO scaled by 2.0; MISO (no demand rows) and unmapped kept baseline
+        assert Enum.find(scaled, &(&1.id == 1)).p_mw == 120.0
+        assert Enum.find(scaled, &(&1.id == 4)).p_mw == 25.0
+        assert Enum.find(scaled, &(&1.id == 5)).p_mw == 30.0
+      end)
+
+    assert log =~ "55.0 MW kept synthetic baseline"
+    assert log =~ "25.0 MW on buses without a BA"
+    assert log =~ "MISO (30.0 MW)"
+  end
+
+  test "zero-demand row keeps that BA at baseline instead of zeroing it (ENE-9)",
+       %{ciso: ciso} do
+    zero_ba = Repo.insert!(%BalancingAuthority{code: "ZERO", name: "Zero Demand BA"})
+
+    Repo.insert!(%BADemandHour{
+      balancing_authority_id: zero_ba.id,
+      timestamp_utc: @hour,
+      demand_mw: 0.0
+    })
+
+    buses = [
+      %{id: 1, balancing_authority_id: ciso.id},
+      %{id: 2, balancing_authority_id: ciso.id},
+      %{id: 10, balancing_authority_id: zero_ba.id}
+    ]
+
+    loads = [
+      %{id: 1, bus_id: 1, p_mw: 60.0, q_mvar: 18.0},
+      %{id: 2, bus_id: 2, p_mw: 40.0, q_mvar: 12.0},
+      %{id: 10, bus_id: 10, p_mw: 40.0, q_mvar: 12.0}
+    ]
+
+    log =
+      capture_log(fn ->
+        factors = Demand.ba_scale_factors(loads, buses, @hour)
+        refute Map.has_key?(factors, zero_ba.id)
+
+        scaled = Demand.scale_loads(loads, buses, @hour)
+        zero_load = Enum.find(scaled, &(&1.id == 10))
+        assert zero_load.p_mw == 40.0
+        assert zero_load.q_mvar == 12.0
+      end)
+
+    assert log =~ "non-positive"
   end
 
   test "snapshot with no BA-mappable loads falls back to uniform national scaling" do

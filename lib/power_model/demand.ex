@@ -30,7 +30,7 @@ defmodule PowerModel.Demand do
 
   alias PowerModel.Repo
   alias PowerModel.Demand.BADemandHour
-  alias PowerModel.Grid.{Bus, Generator}
+  alias PowerModel.Grid.{BalancingAuthority, Bus, Generator}
 
   # Per-BA scale factors outside this range usually indicate bad demand data
   # or a badly skewed baseline; they are applied but logged.
@@ -49,6 +49,15 @@ defmodule PowerModel.Demand do
       {_, nil} -> nil
       {min_ts, max_ts} -> {min_ts, max_ts}
     end
+  end
+
+  @doc """
+  The most recent UTC hour with ingested EIA-930 demand rows, or nil when no
+  demand data is loaded. Used as the default simulation hour so that
+  simulations run against real demand rather than the ~2x synthetic baseline.
+  """
+  def latest_demand_hour do
+    Repo.one(from d in BADemandHour, select: max(d.timestamp_utc))
   end
 
   @doc """
@@ -97,7 +106,8 @@ defmodule PowerModel.Demand do
     baseline_by_ba
     |> Enum.flat_map(fn {ba_id, baseline_mw} ->
       with true <- baseline_mw > 0.0,
-           demand_mw when is_number(demand_mw) <- Map.get(demand, ba_id) do
+           demand_mw when is_number(demand_mw) <- Map.get(demand, ba_id),
+           true <- positive_demand_or_warn(ba_id, demand_mw, baseline_mw) do
         dc_mw = Map.get(dc_by_ba, ba_id, 0.0)
         target_mw = demand_mw - dc_mw
 
@@ -128,6 +138,20 @@ defmodule PowerModel.Demand do
     |> Map.new()
   end
 
+  # ENE-9: a zero/negative demand row would produce factor 0.0 and black out
+  # the whole BA. Keep those loads at baseline instead, loudly.
+  defp positive_demand_or_warn(_ba_id, demand_mw, _baseline_mw) when demand_mw > 0.0, do: true
+
+  defp positive_demand_or_warn(ba_id, demand_mw, baseline_mw) do
+    Logger.warning(
+      "EIA-930 demand row for BA #{ba_id} is non-positive " <>
+        "(#{round1(demand_mw)} MW) -- keeping #{round1(baseline_mw)} MW of baseline load " <>
+        "instead of scaling to zero; check demand ingestion"
+    )
+
+    false
+  end
+
   @doc """
   Scale snapshot loads to the actual demand of the given hour.
 
@@ -135,27 +159,26 @@ defmodule PowerModel.Demand do
   factor (q scales identically, preserving power factor). Loads without an
   applicable factor are returned unchanged.
 
-  When NO load in the snapshot can be matched to a BA (e.g. synthetic
-  MATPOWER networks whose buses carry no geographic metadata), all loads are
-  scaled uniformly so the snapshot total matches actual NATIONAL demand for
-  the hour (the sum over all reporting BAs) -- coarser, but the system-level
-  consumption still reflects reality.
+  When NO load in the snapshot can be matched to a BA, the uniform NATIONAL
+  fallback (snapshot total -> sum of all reporting BAs) is applied ONLY when
+  the snapshot is national in scope: its buses either carry no
+  interconnection metadata at all (synthetic MATPOWER networks) or span
+  multiple interconnections. A REGIONAL snapshot (all buses in one
+  interconnection, e.g. an un-BA-mapped ERCOT snapshot) is left at baseline
+  with a warning -- scaling one interconnection to national demand would
+  inflate it severalfold (ENE-2).
   """
   def scale_loads(loads, buses, %DateTime{} = timestamp) do
     factors = ba_scale_factors(loads, buses, timestamp)
+    bus_to_ba = Map.new(buses, &{&1.id, Map.get(&1, :balancing_authority_id)})
 
     if map_size(factors) == 0 do
-      scale_loads_to_national(loads, timestamp)
+      national_fallback_or_baseline(loads, buses, bus_to_ba, timestamp)
     else
-      bus_to_ba = Map.new(buses, &{&1.id, Map.get(&1, :balancing_authority_id)})
-
-      {scaled_loads, unscaled} =
-        Enum.map_reduce(loads, 0, fn load, unscaled ->
-          factor =
-            case Map.get(bus_to_ba, load.bus_id) do
-              nil -> nil
-              ba_id -> Map.get(factors, ba_id)
-            end
+      {scaled_loads, unscaled_by_ba} =
+        Enum.map_reduce(loads, %{}, fn load, unscaled ->
+          ba_id = Map.get(bus_to_ba, load.bus_id)
+          factor = if ba_id, do: Map.get(factors, ba_id)
 
           cond do
             # Datacenters run flat -- never shaped by the hourly curve
@@ -163,7 +186,7 @@ defmodule PowerModel.Demand do
               {load, unscaled}
 
             factor == nil ->
-              {load, unscaled + 1}
+              {load, Map.update(unscaled, ba_id, load.p_mw, &(&1 + load.p_mw))}
 
             true ->
               f = factor
@@ -171,14 +194,89 @@ defmodule PowerModel.Demand do
           end
         end)
 
-      if unscaled > 0 do
-        Logger.info(
-          "EIA-930 scaling: #{length(loads) - unscaled}/#{length(loads)} loads scaled " <>
-            "(#{unscaled} kept baseline: unmapped BA or no demand data)"
-        )
-      end
+      if map_size(unscaled_by_ba) > 0, do: log_unscaled(unscaled_by_ba)
 
       scaled_loads
+    end
+  end
+
+  # ENE-8: partial EIA-930 coverage silently mixes real demand with the
+  # (~2x) synthetic baseline. Report the MW involved and the BA codes so the
+  # gap is visible, not just a load count.
+  defp log_unscaled(unscaled_by_ba) do
+    {unmapped_mw, by_ba} = Map.pop(unscaled_by_ba, nil, 0.0)
+    total_mw = unmapped_mw + Enum.sum(Map.values(by_ba))
+    codes = ba_codes(Map.keys(by_ba))
+
+    ba_desc =
+      by_ba
+      |> Enum.map(fn {ba_id, mw} ->
+        "#{Map.get(codes, ba_id) || "BA #{ba_id}"} (#{round1(mw)} MW)"
+      end)
+      |> Enum.sort()
+      |> Enum.join(", ")
+
+    Logger.warning(
+      "EIA-930 scaling: #{round1(total_mw)} MW kept synthetic baseline, mixed with " <>
+        "real demand -- #{round1(unmapped_mw)} MW on buses without a BA" <>
+        if(ba_desc == "", do: "", else: "; BAs without applicable demand: #{ba_desc}")
+    )
+  end
+
+  defp ba_codes([]), do: %{}
+
+  defp ba_codes(ba_ids) do
+    from(ba in BalancingAuthority, where: ba.id in ^ba_ids, select: {ba.id, ba.code})
+    |> Repo.all()
+    |> Map.new()
+  end
+
+  defp round1(value), do: Float.round(value * 1.0, 1)
+
+  # ENE-2: the national fallback is only valid when the snapshot really is
+  # national in scope (no interconnection filter) AND no load carries a BA.
+  # A single-interconnection snapshot left un-BA-mapped stays at baseline.
+  defp national_fallback_or_baseline(loads, buses, bus_to_ba, timestamp) do
+    interconnections =
+      buses
+      |> Enum.map(&Map.get(&1, :interconnection_id))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    ba_mapped_mw =
+      loads
+      |> Enum.filter(&(Map.get(bus_to_ba, &1.bus_id) != nil))
+      |> Enum.map(& &1.p_mw)
+      |> Enum.sum()
+
+    regional? = match?([_], interconnections)
+
+    cond do
+      regional? ->
+        total_mw = Enum.sum(Enum.map(loads, & &1.p_mw))
+
+        Logger.warning(
+          "EIA-930 scaling: regional snapshot (interconnection #{hd(interconnections)}) " <>
+            "has no BA-scalable loads; leaving #{round1(total_mw)} MW at synthetic " <>
+            "baseline instead of scaling to national demand -- " <>
+            "run `mix power_model.ingest map_bas` / `demand`"
+        )
+
+        loads
+
+      ba_mapped_mw > 0.0 ->
+        total_mw = Enum.sum(Enum.map(loads, & &1.p_mw))
+
+        Logger.warning(
+          "EIA-930 scaling: #{round1(ba_mapped_mw)} MW of loads carry a BA but none " <>
+            "matched demand data for this hour; leaving all #{round1(total_mw)} MW at " <>
+            "synthetic baseline (national fallback suppressed)"
+        )
+
+        loads
+
+      true ->
+        scale_loads_to_national(loads, timestamp)
     end
   end
 

@@ -73,14 +73,18 @@ defmodule PowerModel.Failure.LoadShedding do
 
   Accepts optional keyword metadata (e.g., frequency_nadir, gov_response_mw)
   that will be included in the shed event details.
+
+  Loads with zero remaining demand (e.g. already blacked out) are left
+  untouched and emit NO shed event; an empty or all-zero load list returns
+  `{loads, []}` (no divide-by-zero on the shed fraction).
   """
   def apply_proportional_shedding(loads, shed_fraction, gen_mw, load_mw, opts \\ []) do
     deficit = load_mw - gen_mw
+    total_load = Enum.sum(Enum.map(loads, & &1.p_mw))
 
-    if deficit <= 0 do
+    if deficit <= 0 or total_load <= 0 do
       {loads, []}
     else
-      total_load = Enum.sum(Enum.map(loads, & &1.p_mw))
       actual_shed_fraction = min(shed_fraction, deficit / total_load)
 
       extra_details =
@@ -92,25 +96,32 @@ defmodule PowerModel.Failure.LoadShedding do
         Enum.map_reduce(loads, [], fn load, events ->
           shed_mw = load.p_mw * actual_shed_fraction
 
-          updated = %{
-            load
-            | p_mw: load.p_mw - shed_mw,
-              q_mvar: (load.q_mvar || 0.0) * (1.0 - actual_shed_fraction)
-          }
+          if shed_mw <= 0.0 do
+            # Zero-MW shed on an already-dark (or zero-demand) load: emitting
+            # an event per such load floods national-scale cascades with tens
+            # of thousands of meaningless events.
+            {load, events}
+          else
+            updated = %{
+              load
+              | p_mw: load.p_mw - shed_mw,
+                q_mvar: (load.q_mvar || 0.0) * (1.0 - actual_shed_fraction)
+            }
 
-          event = %{
-            component_type: "load",
-            component_id: load.id,
-            failure_cause: "ufls_shed",
-            details:
-              Map.merge(extra_details, %{
-                shed_mw: shed_mw,
-                shed_fraction: actual_shed_fraction,
-                remaining_mw: updated.p_mw
-              })
-          }
+            event = %{
+              component_type: "load",
+              component_id: load.id,
+              failure_cause: "ufls_shed",
+              details:
+                Map.merge(extra_details, %{
+                  shed_mw: shed_mw,
+                  shed_fraction: actual_shed_fraction,
+                  remaining_mw: updated.p_mw
+                })
+            }
 
-          {updated, [event | events]}
+            {updated, [event | events]}
+          end
         end)
 
       {updated_loads, Enum.reverse(shed_events)}

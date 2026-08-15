@@ -195,8 +195,18 @@ defmodule PowerModel.Failure.Protection do
 
   When called with generator and load structs, delegates to the swing-equation
   frequency simulator (`PowerModel.Solver.Frequency`) and returns the nadir
-  (minimum) frequency.  When called with simple MW values (backward-compatible
-  2-arity form), uses a quick steady-state droop estimate.
+  (minimum) frequency.
+
+  The 2/3-arity MW-only form is the STRUCT-LESS FALLBACK for callers that only
+  know island totals: the damping-consistent steady state of the swing model
+  with no governor response,
+
+      f = f0 * (1 - deficit / (D * load)),   deficit = load - gen
+
+  clamped to the same [55, 65] Hz band the dynamic simulator uses. This is
+  the `dfStar` equilibrium of `proofs/Proofs/Swing.lean` with gov = shed = 0,
+  so a total generation loss bottoms out at 55 Hz and drives the full UFLS
+  schedule (the old 5%-droop estimate could never fall below 57 Hz).
   """
   def estimate_frequency(generators, loads, gen_mw, load_mw)
       when is_list(generators) and is_list(loads) do
@@ -213,9 +223,14 @@ defmodule PowerModel.Failure.Protection do
     if load_mw <= 0.0 do
       base_freq
     else
-      imbalance_fraction = (gen_mw - load_mw) / load_mw
-      # Steady-state frequency droop: 5% droop characteristic
-      base_freq * (1.0 + imbalance_fraction * 0.05)
+      d = PowerModel.Solver.Frequency.load_damping()
+      deficit = load_mw - gen_mw
+
+      # Steady-state frequency with load damping as the only restoring force
+      # (no governor), clamped to the simulator's physical band.
+      (base_freq * (1.0 - deficit / (d * load_mw)))
+      |> max(55.0)
+      |> min(65.0)
     end
   end
 

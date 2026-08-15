@@ -51,7 +51,7 @@ defmodule PowerModel.Failure.Cascade do
     :original_load_mw,
     :shed_load_mw,
     :blackout_load_mw,
-    relay_elapsed: %{}
+    relay_duty: %{}
   ]
 
   @doc """
@@ -101,7 +101,7 @@ defmodule PowerModel.Failure.Cascade do
       stable: false,
       solution: nil,
       simulated_time: 0.0,
-      relay_elapsed: %{},
+      relay_duty: %{},
       dispatch: dispatch,
       bus_ba: Map.new(snapshot.buses, &{&1.id, Map.get(&1, :balancing_authority_id)}),
       original_load_mw: Enum.sum(Enum.map(snapshot.loads, & &1.p_mw)),
@@ -220,95 +220,138 @@ defmodule PowerModel.Failure.Cascade do
   @doc """
   Trip a transmission line and run cascade.
   Returns {final_state, all_step_results} for streaming.
+
+  Re-tripping an already-tripped line is a no-op (returns `{state, []}`).
+  Each accepted manual trip starts a NEW cascade event: the per-cascade step
+  budget, simulated relay clock, and relay duty accumulators are reset.
   """
   def trip_line(%__MODULE__{} = state, line_id) do
-    state = %{
-      state
-      | tripped_lines: MapSet.put(state.tripped_lines, line_id),
-        events: [
-          %{
-            step: 0,
-            component_type: "transmission_line",
-            component_id: line_id,
-            failure_cause: "manual_trip",
-            details: %{}
-          }
-          | state.events
-        ]
-    }
+    if MapSet.member?(state.tripped_lines, line_id) do
+      Logger.info("trip_line: line #{line_id} is already tripped; ignoring re-trip")
+      {state, []}
+    else
+      state = begin_cascade_event(state)
 
-    run_cascade(state)
+      state = %{
+        state
+        | tripped_lines: MapSet.put(state.tripped_lines, line_id),
+          events: [
+            %{
+              step: 0,
+              component_type: "transmission_line",
+              component_id: line_id,
+              failure_cause: "manual_trip",
+              details: %{}
+            }
+            | state.events
+          ]
+      }
+
+      # The trip may have split islands: raise reserves in deficit halves and
+      # curtail surplus halves BEFORE the cascade loop, so no island carries a
+      # phantom slack injection into the first re-solve.
+      state = maybe_redispatch_after_trip(state)
+
+      run_cascade(state)
+    end
   end
 
   @doc """
   Trip a transformer and run cascade.
   Returns {final_state, all_step_results} for streaming.
+
+  Re-tripping an already-tripped transformer is a no-op (returns
+  `{state, []}`). Each accepted manual trip starts a NEW cascade event (step
+  budget, simulated relay clock, and relay duty accumulators reset).
   """
   def trip_transformer(%__MODULE__{} = state, xfmr_id) do
-    state = %{
-      state
-      | tripped_transformers: MapSet.put(state.tripped_transformers, xfmr_id),
-        events: [
-          %{
-            step: 0,
-            component_type: "transformer",
-            component_id: xfmr_id,
-            failure_cause: "manual_trip",
-            details: %{}
-          }
-          | state.events
-        ]
-    }
+    if MapSet.member?(state.tripped_transformers, xfmr_id) do
+      Logger.info("trip_transformer: transformer #{xfmr_id} is already tripped; ignoring re-trip")
 
-    run_cascade(state)
+      {state, []}
+    else
+      state = begin_cascade_event(state)
+
+      state = %{
+        state
+        | tripped_transformers: MapSet.put(state.tripped_transformers, xfmr_id),
+          events: [
+            %{
+              step: 0,
+              component_type: "transformer",
+              component_id: xfmr_id,
+              failure_cause: "manual_trip",
+              details: %{}
+            }
+            | state.events
+          ]
+      }
+
+      state = maybe_redispatch_after_trip(state)
+
+      run_cascade(state)
+    end
   end
 
   @doc """
   Trip a generator and run cascade.
   Performs redispatch to cover the lost generation before running the cascade loop.
+
+  Re-tripping an already-tripped generator is a no-op (returns `{state, []}`).
+  Each accepted manual trip starts a NEW cascade event (step budget, simulated
+  relay clock, and relay duty accumulators reset).
   """
   def trip_generator(%__MODULE__{} = state, gen_id) do
-    # MW lost from this generator. Its dispatch entry is zeroed immediately so
-    # a repeated trip (or any later read) cannot double-count the loss.
-    lost_mw =
-      if MapSet.member?(state.tripped_generators, gen_id) do
-        0.0
-      else
-        Map.get(state.dispatch, gen_id, 0.0)
-      end
+    if MapSet.member?(state.tripped_generators, gen_id) do
+      Logger.info("trip_generator: generator #{gen_id} is already tripped; ignoring re-trip")
+      {state, []}
+    else
+      # MW lost from this generator. Its dispatch entry is zeroed immediately
+      # so any later read cannot double-count the loss.
+      lost_mw = Map.get(state.dispatch, gen_id, 0.0)
+      gen = Enum.find(state.generators, &(&1.id == gen_id))
 
-    gen = Enum.find(state.generators, &(&1.id == gen_id))
+      state = begin_cascade_event(state)
 
-    state = %{
-      state
-      | tripped_generators: MapSet.put(state.tripped_generators, gen_id),
-        dispatch: Map.put(state.dispatch, gen_id, 0.0),
-        events: [
-          %{
-            step: 0,
-            component_type: "generator",
-            component_id: gen_id,
-            failure_cause: "manual_trip",
-            details: %{}
-          }
-          | state.events
-        ]
-    }
+      state = %{
+        state
+        | tripped_generators: MapSet.put(state.tripped_generators, gen_id),
+          dispatch: Map.put(state.dispatch, gen_id, 0.0),
+          events: [
+            %{
+              step: 0,
+              component_type: "generator",
+              component_id: gen_id,
+              failure_cause: "manual_trip",
+              details: %{}
+            }
+            | state.events
+          ]
+      }
 
-    # Redispatch within the tripped generator's OWN island only -- and within
-    # that island, the unit's own balancing authority responds first (its
-    # contingency reserves), with the rest of the island as emergency backup.
-    state =
-      case gen && island_containing(state, gen.bus_id) do
-        nil ->
-          state
+      # Redispatch within the tripped generator's OWN island only -- and within
+      # that island, the unit's own balancing authority responds first (its
+      # contingency reserves), with the rest of the island as emergency backup.
+      state =
+        case gen && island_containing(state, gen.bus_id) do
+          nil ->
+            state
 
-        island ->
-          origin_ba = Map.get(state.bus_ba || %{}, gen.bus_id)
-          redispatch(state, lost_mw, island, origin_ba)
-      end
+          island ->
+            origin_ba = Map.get(state.bus_ba || %{}, gen.bus_id)
+            redispatch(state, lost_mw, island, origin_ba)
+        end
 
-    run_cascade(state)
+      run_cascade(state)
+    end
+  end
+
+  # Every accepted manual trip starts a NEW cascade event: the step budget,
+  # the simulated relay wall-clock, and the relay duty accumulators are
+  # per-cascade quantities, never per-session. Session-cumulative state
+  # (tripped sets, events, load accounting) is deliberately retained.
+  defp begin_cascade_event(state) do
+    %{state | step: 0, simulated_time: 0.0, relay_duty: %{}, stable: false}
   end
 
   @doc """
@@ -451,8 +494,10 @@ defmodule PowerModel.Failure.Cascade do
       )
 
     # If UFLS didn't shed enough (e.g. frequency still above threshold),
-    # force-shed ONLY the remaining gap against the post-UFLS loads. Both
-    # rounds' events are kept so the conservation accounting stays exact.
+    # force-shed ONLY the remaining gap against the post-UFLS loads. This tier
+    # intentionally permits total deficit coverage beyond the canonical UFLS
+    # program's roughly 30% cumulative shed so the remaining physical gap is
+    # actually closed. Both rounds' events are kept for exact conservation.
     ufls_shed_mw =
       Enum.sum(Enum.map(ufls_events, fn e -> Map.get(e.details, :shed_mw, 0.0) end))
 
@@ -498,7 +543,24 @@ defmodule PowerModel.Failure.Cascade do
   # ---------------------------------------------------------------------------
 
   defp do_cascade(%{step: step} = state, step_results, _callback) when step >= @max_steps do
-    {%{state | stable: false}, Enum.reverse(step_results)}
+    # The per-cascade step budget ran out with trips still pending. This is a
+    # truncated, NOT settled, cascade: mark it loudly so callers never present
+    # the final state as a stable equilibrium.
+    Logger.warning(
+      "cascade step budget exhausted at step #{state.step} (max #{@max_steps}); " <>
+        "terminating cascade as unstable"
+    )
+
+    exhausted_event = %{
+      step: state.step,
+      component_type: "cascade",
+      component_id: 0,
+      failure_cause: "max_steps_exhausted",
+      details: %{max_steps: @max_steps, simulated_time: state.simulated_time}
+    }
+
+    {%{state | stable: false, events: [exhausted_event | state.events]},
+     Enum.reverse(step_results)}
   end
 
   defp do_cascade(state, step_results, callback) do
@@ -569,7 +631,7 @@ defmodule PowerModel.Failure.Cascade do
           loads: updated_loads,
           shed_load_mw: state.shed_load_mw + step_shed_mw,
           blackout_load_mw: state.blackout_load_mw + step_blackout_mw,
-          relay_elapsed: %{},
+          relay_duty: %{},
           affected_water_facilities:
             MapSet.union(state.affected_water_facilities, newly_affected),
           affected_datacenters: MapSet.union(state.affected_datacenters, newly_affected_dcs)
@@ -600,12 +662,35 @@ defmodule PowerModel.Failure.Cascade do
           blackout_load_mw: state.blackout_load_mw + step_blackout_mw
       }
 
-      # For thermal/zone3 overloads: trip ONLY the first relay to finish timing.
-      # Every currently overloaded branch accrues the same wall-clock advance.
-      {tripped_component, time_advance_s, relay_elapsed} =
-        advance_relay_timers(timed_overloads, state.relay_elapsed)
+      island_solve_failed? =
+        Enum.any?(non_thermal_trips, &(&1.failure_cause == "island_solve_failed"))
 
-      state = %{state | relay_elapsed: relay_elapsed}
+      # Non-thermal trips (island blackouts, UFLS sheds, voltage trips) change
+      # the generation-load balance of the surviving islands: rebalance them
+      # NOW, before this step's balance is emitted, so dispatched generation
+      # tracks served load (e.g. a blacked-out single-bus island must have its
+      # still-online generator curtailed). A failed island solve is terminal
+      # for this run and its incomplete state is never redispatched from.
+      state =
+        if non_thermal_trips != [] and not island_solve_failed? do
+          maybe_redispatch_after_trip(state)
+        else
+          state
+        end
+
+      # For thermal/zone3 overloads: trip ONLY the first relay to finish timing.
+      # Every asserted relay integrates its own fraction of operating progress
+      # over the common wall-clock advance.
+      {tripped_component, time_advance_s, relay_duty} =
+        if island_solve_failed? do
+          # A failed numerical solve is terminal for this run; do not advance
+          # protection from the incomplete set of island solutions.
+          {nil, 0.0, %{}}
+        else
+          advance_relay_timers(timed_overloads, state.relay_duty)
+        end
+
+      state = %{state | relay_duty: relay_duty}
 
       {thermal_trips, state} =
         if tripped_component do
@@ -637,16 +722,21 @@ defmodule PowerModel.Failure.Cascade do
       if callback, do: callback.(step_result)
       step_results = [step_result | step_results]
 
-      if Enum.empty?(thermal_trips) and Enum.empty?(non_thermal_trips) do
-        {%{state | stable: true}, Enum.reverse(step_results)}
-      else
-        # Apply thermal trip
-        state = apply_trips(state, thermal_trips)
+      cond do
+        island_solve_failed? ->
+          {%{state | stable: false}, Enum.reverse(step_results)}
 
-        # Redispatch after trip (cover any generation/load imbalance)
-        state = maybe_redispatch_after_trip(state)
+        Enum.empty?(thermal_trips) and Enum.empty?(non_thermal_trips) ->
+          {%{state | stable: true}, Enum.reverse(step_results)}
 
-        do_cascade(state, step_results, callback)
+        true ->
+          # Apply thermal trip
+          state = apply_trips(state, thermal_trips)
+
+          # Redispatch after trip (cover any generation/load imbalance)
+          state = maybe_redispatch_after_trip(state)
+
+          do_cascade(state, step_results, callback)
       end
     end
   end
@@ -798,6 +888,38 @@ defmodule PowerModel.Failure.Cascade do
             {shed_loads, shed_events} =
               LoadShedding.apply_ufls(island_loads, island_gens, gen_mw, load_mw)
 
+            # Residual force-shed round (mirrors trigger_ufls_for_deficit):
+            # UFLS under-sheds when the frequency nadir stays above the first
+            # stage (small deficits) or when the deficit exceeds the ~30%
+            # cumulative schedule cap. The remaining physical gap MUST still
+            # be closed, otherwise the island is silently unbalanced and the
+            # DC slack absorbs unserved load that no event accounts for.
+            deficit_mw = load_mw - gen_mw
+
+            ufls_shed_mw =
+              Enum.sum(Enum.map(shed_events, fn e -> Map.get(e.details, :shed_mw, 0.0) end))
+
+            remaining_mw = deficit_mw - ufls_shed_mw
+            current_total = load_mw - ufls_shed_mw
+
+            {shed_loads, force_events} =
+              if remaining_mw > 0.5 and current_total > 0 do
+                fraction = min(remaining_mw / current_total, 1.0)
+
+                # gen/load args express exactly the remaining gap so the
+                # internal cap cannot re-shed what round 1 already removed
+                LoadShedding.apply_proportional_shedding(
+                  shed_loads,
+                  fraction,
+                  current_total - remaining_mw,
+                  current_total
+                )
+              else
+                {shed_loads, []}
+              end
+
+            shed_events = shed_events ++ force_events
+
             shed_map = Map.new(shed_loads, &{&1.id, &1})
             lds = Enum.map(lds, fn l -> Map.get(shed_map, l.id, l) end)
             island_loads = Enum.map(island_loads, fn l -> Map.get(shed_map, l.id, l) end)
@@ -848,7 +970,9 @@ defmodule PowerModel.Failure.Cascade do
               bus_index
             )
 
-          # Zone 3 trips are treated like fast thermal trips (trip time ~0.5s)
+          # Zone 3 trips integrate duty while continuously asserted using their
+          # own fixed 0.5 s timer. The cause-specific relay key keeps this duty
+          # completely separate from thermal exposure on the same branch.
           zone3_timed =
             Enum.map(zone3_trips, fn t ->
               Map.put(t, :trip_time_s, 0.5)
@@ -859,18 +983,27 @@ defmodule PowerModel.Failure.Cascade do
            dispatch_updates}
         rescue
           e ->
-            Logger.warning(
+            error = Exception.message(e)
+
+            Logger.error(
               "island solve raised #{Exception.message(e)}; island dropped from this step"
             )
 
-            {trips ++ shed_events, results, lds, overloads, shed_mw + event_shed_mw, blackout_mw,
-             dispatch_updates}
+            # A numerical failure is not evidence that a live island lost load,
+            # so its loads remain served. The explicit event plus error log is
+            # the honesty mechanism, while consumption conservation is unchanged.
+            failure_event = island_solve_failure_event(island_buses, island_loads, error)
+
+            {trips ++ shed_events ++ [failure_event], results, lds, overloads,
+             shed_mw + event_shed_mw, blackout_mw, dispatch_updates}
         catch
           thrown ->
-            Logger.warning("island solve threw #{inspect(thrown)}; island dropped from this step")
+            error = inspect(thrown)
+            Logger.error("island solve threw #{error}; island dropped from this step")
+            failure_event = island_solve_failure_event(island_buses, island_loads, error)
 
-            {trips ++ shed_events, results, lds, overloads, shed_mw + event_shed_mw, blackout_mw,
-             dispatch_updates}
+            {trips ++ shed_events ++ [failure_event], results, lds, overloads,
+             shed_mw + event_shed_mw, blackout_mw, dispatch_updates}
         end
       end
     end)
@@ -946,53 +1079,84 @@ defmodule PowerModel.Failure.Cascade do
     end)
   end
 
-  # Advance all concurrently overloaded relays by the remaining time of the
-  # first relay to finish. A branch that is absent from `timed_overloads` has
-  # fallen back to 100% loading or below and is dropped here: this model uses
-  # an instantaneous thermal reset rather than retaining cooling memory.
-  defp advance_relay_timers([], _relay_elapsed), do: {nil, 0.0, %{}}
+  defp island_solve_failure_event(island_buses, island_loads, error) do
+    %{
+      component_type: "island",
+      component_id: island_buses |> Enum.map(& &1.id) |> Enum.min(),
+      failure_cause: "island_solve_failed",
+      details: %{
+        bus_count: length(island_buses),
+        load_mw: Enum.sum(Enum.map(island_loads, & &1.p_mw)),
+        error: error
+      }
+    }
+  end
 
-  defp advance_relay_timers(timed_overloads, relay_elapsed) do
+  # Advance all concurrently asserted relays by the remaining wall-clock time
+  # of the first finite relay to finish. Each relay stores operating duty
+  # (integral of dt / current curve time), not elapsed seconds. A branch absent
+  # from `timed_overloads` is dropped here: thermal overload and Zone 3 both use
+  # an instantaneous reset when their respective condition clears.
+  defp advance_relay_timers([], _relay_duty), do: {nil, 0.0, %{}}
+
+  defp advance_relay_timers(timed_overloads, relay_duty) do
     overloads_with_remaining =
       Enum.map(timed_overloads, fn trip ->
         key = relay_key(trip)
-        elapsed = Map.get(relay_elapsed, key, 0.0)
-        {trip, remaining_trip_time(trip.trip_time_s, elapsed)}
+        duty = Map.get(relay_duty, key, 0.0)
+        {trip, remaining_trip_time(trip.trip_time_s, duty)}
       end)
 
-    {fastest, remaining} =
-      Enum.min_by(overloads_with_remaining, fn {_trip, remaining} ->
-        trip_time_sort_value(remaining)
-      end)
+    finite_overloads =
+      Enum.reject(overloads_with_remaining, fn {_trip, remaining} -> remaining == :infinity end)
 
-    case remaining do
-      :infinity ->
-        retained_elapsed =
+    case finite_overloads do
+      [] ->
+        retained_duty =
           Map.new(overloads_with_remaining, fn {trip, _remaining} ->
             key = relay_key(trip)
-            {key, Map.get(relay_elapsed, key, 0.0)}
+            {key, Map.get(relay_duty, key, 0.0)}
           end)
 
-        {nil, 0.0, retained_elapsed}
+        {nil, 0.0, retained_duty}
 
-      time_advance_s ->
-        advanced_elapsed =
+      _ ->
+        {fastest, time_advance_s} =
+          Enum.min_by(finite_overloads, fn {_trip, remaining} -> remaining end)
+
+        advanced_duty =
           Map.new(overloads_with_remaining, fn {trip, _remaining} ->
             key = relay_key(trip)
-            {key, Map.get(relay_elapsed, key, 0.0) + time_advance_s}
+            current_duty = Map.get(relay_duty, key, 0.0)
+            {key, accrue_relay_duty(current_duty, time_advance_s, trip.trip_time_s)}
           end)
 
-        {Map.delete(fastest, :trip_time_s), time_advance_s, advanced_elapsed}
+        fastest_key = relay_key(fastest)
+
+        if Map.fetch!(advanced_duty, fastest_key) >= 1.0 - 1.0e-9 do
+          retained_duty = drop_tripped_relay_duty(advanced_duty, fastest)
+          {Map.delete(fastest, :trip_time_s), time_advance_s, retained_duty}
+        else
+          {nil, time_advance_s, advanced_duty}
+        end
     end
   end
 
-  defp relay_key(trip), do: {trip.component_type, trip.component_id}
+  @doc false
+  def relay_key(trip), do: {trip.failure_cause, trip.component_type, trip.component_id}
 
-  defp remaining_trip_time(:infinity, _elapsed), do: :infinity
-  defp remaining_trip_time(trip_time_s, elapsed), do: max(trip_time_s - elapsed, 0.0)
+  defp accrue_relay_duty(duty, _delta_s, :infinity), do: duty
+  defp accrue_relay_duty(duty, delta_s, trip_time_s), do: min(duty + delta_s / trip_time_s, 1.0)
 
-  defp trip_time_sort_value(:infinity), do: 1.0e30
-  defp trip_time_sort_value(seconds), do: seconds
+  defp drop_tripped_relay_duty(relay_duty, tripped) do
+    Map.reject(relay_duty, fn
+      {{_cause, type, id}, _duty} ->
+        type == tripped.component_type and id == tripped.component_id
+    end)
+  end
+
+  defp remaining_trip_time(:infinity, _duty), do: :infinity
+  defp remaining_trip_time(trip_time_s, duty), do: max(trip_time_s * (1.0 - duty), 0.0)
 
   # ---------------------------------------------------------------------------
   # Dispatch helpers
