@@ -4,6 +4,10 @@ defmodule PowerModel.Grid.Generator do
 
   schema "generators" do
     field :eia_plant_id, :string
+    # EIA-860 "Generator ID" — unique per unit within a plant. Together with
+    # eia_plant_id it forms the natural key of a unit (see the partial unique
+    # index generators_eia_plant_id_generator_id_index).
+    field :generator_id, :string
     field :fuel_type, :string
     field :prime_mover, :string
     field :p_max_mw, :float
@@ -23,6 +27,7 @@ defmodule PowerModel.Grid.Generator do
     generator
     |> cast(attrs, [
       :eia_plant_id,
+      :generator_id,
       :fuel_type,
       :prime_mover,
       :p_max_mw,

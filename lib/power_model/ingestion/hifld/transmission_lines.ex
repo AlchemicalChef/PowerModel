@@ -84,7 +84,7 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLines do
 
           {source_id,
            %{
-             line_type: attrs["TYPE"],
+             line_type: line_type_from(attrs["VOLT_CLASS"], attrs["TYPE"]),
              owner: attrs["OWNER"],
              sub_1: attrs["SUB_1"],
              sub_2: attrs["SUB_2"],
@@ -124,48 +124,35 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLines do
 
   # API parsing
 
-  defp parse_api_feature(%{"attributes" => attrs, "geometry" => geom}) do
+  @doc false
+  # Public for tests. Parses one ArcGIS feature into an insertable attrs map.
+  def parse_api_feature(%{"attributes" => attrs, "geometry" => geom}) do
     try do
       voltage = parse_voltage(attrs["VOLTAGE"], attrs["VOLT_CLASS"])
       source_id = to_string(attrs["ID"] || attrs["OBJECTID_1"])
 
-      paths = geom["paths"] || []
-
-      coords =
-        paths
-        |> List.flatten()
-        |> Enum.chunk_every(2)
-        |> Enum.map(fn
-          [lon, lat] -> {lon, lat}
-          _ -> nil
-        end)
-        |> Enum.reject(&is_nil/1)
-
-      # Paths come as nested arrays [[lon,lat], [lon,lat]...]
-      coords =
-        if coords == [] do
-          paths
-          |> Enum.flat_map(fn path ->
-            Enum.map(path, fn
-              [lon, lat | _] -> {lon, lat}
-              _ -> nil
-            end)
-          end)
-          |> Enum.reject(&is_nil/1)
-        else
-          coords
-        end
+      # ArcGIS paths are nested per PART: [[[lon, lat(, z)], ...], ...].
+      # Parse each part on its own (dropping any Z) so a multi-part geometry
+      # never contributes phantom "bridge" segments between parts.
+      parts = parse_paths(geom["paths"] || [])
+      coords = Enum.concat(parts)
 
       if voltage && voltage > 0 && length(coords) >= 2 do
+        # Geometry is stored as a single LineString (downstream endpoint
+        # snapping and export expect one), which preserves the true line
+        # endpoints (first point of first part / last point of last part).
+        # The electrical length is computed per part BEFORE concatenation, so
+        # the gap between parts never feeds impedance estimation.
         geometry = %Geo.LineString{coordinates: coords, srid: 4326}
 
         %{
           voltage_kv: voltage,
           geometry: geometry,
+          length_km: parts_length_km(parts),
           source: "hifld",
           source_id: source_id,
           status: parse_status(attrs["STATUS"]),
-          line_type: attrs["TYPE"],
+          line_type: line_type_from(attrs["VOLT_CLASS"], attrs["TYPE"]),
           owner: attrs["OWNER"],
           sub_1: attrs["SUB_1"],
           sub_2: attrs["SUB_2"],
@@ -180,7 +167,67 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLines do
     end
   end
 
-  defp parse_api_feature(_), do: nil
+  def parse_api_feature(_), do: nil
+
+  @doc """
+  Parse ArcGIS `paths` (nested arrays, one per part) into a list of parts,
+  each a list of `{lon, lat}` tuples. Z (and any further) coordinates are
+  dropped explicitly; malformed points and degenerate parts (< 2 points)
+  are discarded.
+  """
+  def parse_paths(paths) when is_list(paths) do
+    paths
+    |> Enum.map(fn
+      part when is_list(part) ->
+        part
+        |> Enum.map(fn
+          [lon, lat | _] when is_number(lon) and is_number(lat) -> {lon, lat}
+          _ -> nil
+        end)
+        |> Enum.reject(&is_nil/1)
+
+      _ ->
+        []
+    end)
+    |> Enum.filter(fn part -> length(part) >= 2 end)
+  end
+
+  def parse_paths(_), do: []
+
+  @doc """
+  Sum geodesic length (km) over parts, each part a list of `{lon, lat}`.
+  Lengths are summed WITHIN each part only -- no segment is counted between
+  the end of one part and the start of the next.
+  """
+  def parts_length_km([]), do: nil
+
+  def parts_length_km(parts) when is_list(parts) do
+    parts
+    |> Enum.map(&part_length_km/1)
+    |> Enum.sum()
+    |> max(0.1)
+  end
+
+  defp part_length_km(part) do
+    part
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.map(fn [{lon1, lat1}, {lon2, lat2}] -> haversine_km(lat1, lon1, lat2, lon2) end)
+    |> Enum.sum()
+  end
+
+  @doc """
+  Determine `line_type` from HIFLD attributes: HVDC lines (VOLT_CLASS `"DC"`,
+  or a TYPE beginning with `"DC"` such as `"DC; OVERHEAD"`) get the canonical
+  `"dc"` marker, which AC snapshot queries exclude. Everything else keeps the
+  raw TYPE value.
+  """
+  def line_type_from(volt_class, type) do
+    cond do
+      is_binary(volt_class) and String.upcase(String.trim(volt_class)) == "DC" -> "dc"
+      is_binary(type) and String.starts_with?(String.upcase(String.trim(type)), "DC") -> "dc"
+      true -> type
+    end
+  end
 
   # Batch insert using Repo.insert_all for speed
 
@@ -207,7 +254,7 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLines do
           x_pu: nil,
           b_pu: nil,
           rating_a_mva: nil,
-          length_km: nil,
+          length_km: attrs[:length_km],
           inserted_at: now,
           updated_at: now
         }
@@ -247,18 +294,22 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLines do
 
   defp parse_shapefile_feature({shape, dbf_row}) do
     try do
-      geometry = extract_linestring(shape)
+      parts = extract_parts(shape)
+      coords = Enum.concat(parts)
       voltage = parse_voltage(get_field(dbf_row, "VOLTAGE"), get_field(dbf_row, "VOLT_CLASS"))
       source_id = to_string(get_field(dbf_row, "ID") || get_field(dbf_row, "OBJECTID"))
 
-      if geometry && voltage && voltage > 0 do
+      if voltage && voltage > 0 && length(coords) >= 2 do
         %{
           voltage_kv: voltage,
-          geometry: geometry,
+          # Concatenated for storage; length computed per part (see
+          # parse_api_feature for rationale).
+          geometry: %Geo.LineString{coordinates: coords, srid: 4326},
+          length_km: parts_length_km(parts),
           source: "hifld",
           source_id: source_id,
           status: parse_status(get_field(dbf_row, "STATUS")),
-          line_type: get_field(dbf_row, "TYPE"),
+          line_type: line_type_from(get_field(dbf_row, "VOLT_CLASS"), get_field(dbf_row, "TYPE")),
           owner: get_field(dbf_row, "OWNER"),
           sub_1: get_field(dbf_row, "SUB_1"),
           sub_2: get_field(dbf_row, "SUB_2"),
@@ -273,22 +324,38 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLines do
     end
   end
 
-  defp extract_linestring(%Exshape.Shp.Polyline{points: points}) when is_list(points) do
-    coords =
-      points
-      |> List.flatten()
+  # Shapefile polylines carry parts as nested point lists; keep parts separate
+  # (like parse_paths/1) and drop Z by matching only x/y. A flat list of
+  # points (single-part polyline) is treated as one part.
+  defp extract_parts(%Exshape.Shp.Polyline{points: points}) when is_list(points) do
+    points
+    |> Enum.map(fn
+      part when is_list(part) -> part
+      point -> [point]
+    end)
+    |> Enum.map(fn part ->
+      part
       |> Enum.map(fn
-        %Exshape.Shp.Point{x: lon, y: lat} -> {lon, lat}
+        %{x: lon, y: lat} when is_number(lon) and is_number(lat) -> {lon, lat}
         _ -> nil
       end)
       |> Enum.reject(&is_nil/1)
-
-    if length(coords) >= 2 do
-      %Geo.LineString{coordinates: coords, srid: 4326}
-    end
+    end)
+    |> merge_singleton_parts()
+    |> Enum.filter(fn part -> length(part) >= 2 end)
   end
 
-  defp extract_linestring(_), do: nil
+  defp extract_parts(_), do: []
+
+  # A flat (non-nested) point list becomes many 1-point "parts"; merge them
+  # back into a single part. Genuinely nested inputs keep their parts.
+  defp merge_singleton_parts(parts) do
+    if Enum.all?(parts, fn part -> length(part) <= 1 end) do
+      [Enum.concat(parts)]
+    else
+      parts
+    end
+  end
 
   defp get_field(row, field_name) when is_map(row) do
     Map.get(row, field_name) || Map.get(row, String.downcase(field_name))
@@ -330,13 +397,47 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLines do
 
   defp parse_volt_class(_), do: nil
 
-  defp parse_status(nil), do: "in_service"
+  # Status codes that explicitly mark a line as not energized. Anything else
+  # -- nil, "NOT AVAILABLE", unknown codes -- is treated as in service:
+  # HIFLD's STATUS field is sparsely populated (only a few dozen records are
+  # genuinely inactive), and mapping unknowns to out_of_service discards
+  # ~20% of the real network.
+  @out_of_service_statuses [
+    "INACTIVE",
+    "RETIRED",
+    "UNDER CONSTRUCTION",
+    "PROPOSED",
+    "DECOMMISSIONED"
+  ]
 
-  defp parse_status(status) when is_binary(status) do
-    if String.upcase(String.trim(status)) in ["IN SERVICE", "ACTIVE", "OPERATIONAL"],
-      do: "in_service",
-      else: "out_of_service"
+  @doc """
+  Map a HIFLD STATUS value to `"in_service"` / `"out_of_service"`.
+
+  Only explicit outage codes (#{Enum.join(@out_of_service_statuses, ", ")})
+  are out of service; unknown or missing statuses (incl. "NOT AVAILABLE")
+  are in service.
+  """
+  def parse_status(status) when is_binary(status) do
+    if String.upcase(String.trim(status)) in @out_of_service_statuses,
+      do: "out_of_service",
+      else: "in_service"
   end
 
-  defp parse_status(_), do: "in_service"
+  def parse_status(_), do: "in_service"
+
+  defp haversine_km(lat1, lon1, lat2, lon2) do
+    r = 6371.0
+    dlat = (lat2 - lat1) * :math.pi() / 180.0
+    dlon = (lon2 - lon1) * :math.pi() / 180.0
+    lat1_r = lat1 * :math.pi() / 180.0
+    lat2_r = lat2 * :math.pi() / 180.0
+
+    a =
+      :math.sin(dlat / 2) * :math.sin(dlat / 2) +
+        :math.cos(lat1_r) * :math.cos(lat2_r) *
+          :math.sin(dlon / 2) * :math.sin(dlon / 2)
+
+    c = 2 * :math.atan2(:math.sqrt(a), :math.sqrt(1 - a))
+    r * c
+  end
 end

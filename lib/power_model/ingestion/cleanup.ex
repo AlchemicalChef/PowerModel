@@ -11,7 +11,16 @@ defmodule PowerModel.Ingestion.Cleanup do
   import Ecto.Query
   require Logger
   alias PowerModel.Repo
-  alias PowerModel.Grid.{Bus, Generator, TransmissionLine, Transformer}
+
+  alias PowerModel.Grid.{
+    Bus,
+    Datacenter,
+    Generator,
+    Load,
+    TransmissionLine,
+    Transformer,
+    WaterFacility
+  }
 
   # Wide search for generators (100km should cover any plant near a transmission corridor)
   @gen_remap_radius_m 100_000
@@ -33,6 +42,11 @@ defmodule PowerModel.Ingestion.Cleanup do
 
   @doc """
   Move generators from synthetic buses to nearest real substation bus.
+
+  PLT-7: when the generator's current bus carries an interconnection, only
+  substation buses in the SAME interconnection are candidates — a 100 km
+  search radius can otherwise relocate a plant across an asynchronous seam
+  (e.g. from ERCOT into the Eastern interconnection).
   """
   def remap_generators do
     # Find all generators on synthetic buses
@@ -52,7 +66,7 @@ defmodule PowerModel.Ingestion.Cleanup do
         point = gen.bus.coordinates || gen.coordinates
 
         if point do
-          case find_nearest_substation_bus(point, @gen_remap_radius_m) do
+          case find_nearest_substation_bus(point, @gen_remap_radius_m, gen.bus.interconnection_id) do
             nil ->
               {ok, skip + 1}
 
@@ -176,7 +190,13 @@ defmodule PowerModel.Ingestion.Cleanup do
 
     connected =
       Enum.reduce(synth_buses, 0, fn bus, count ->
-        case find_nearest_substation_bus(bus.coordinates, @gen_remap_radius_m) do
+        # Same-interconnection restriction as remap_generators (PLT-7): a
+        # synthetic tie must not weld two asynchronous systems together.
+        case find_nearest_substation_bus(
+               bus.coordinates,
+               @gen_remap_radius_m,
+               bus.interconnection_id
+             ) do
           nil ->
             count
 
@@ -210,7 +230,12 @@ defmodule PowerModel.Ingestion.Cleanup do
   end
 
   @doc """
-  Delete synthetic buses that have no generators, no lines, and no loads.
+  Delete synthetic buses that nothing references.
+
+  DAT-3: "orphaned" must mean unreferenced by EVERY table that points at
+  buses — generators, lines, transformers, loads, water facilities, and
+  datacenters. Missing the last three either crashed the delete on the
+  loads FK mid-task or silently stranded water/datacenter records.
   """
   def cleanup_orphaned_buses do
     # Find synthetic buses with no references
@@ -227,10 +252,17 @@ defmodule PowerModel.Ingestion.Cleanup do
           on: t1.from_bus_id == b.id,
           left_join: t2 in Transformer,
           on: t2.to_bus_id == b.id,
+          left_join: ld in Load,
+          on: ld.bus_id == b.id,
+          left_join: w in WaterFacility,
+          on: w.bus_id == b.id,
+          left_join: d in Datacenter,
+          on: d.bus_id == b.id,
           where:
             b.source == "synthetic" and
               is_nil(g.id) and is_nil(l1.id) and is_nil(l2.id) and
-              is_nil(t1.id) and is_nil(t2.id),
+              is_nil(t1.id) and is_nil(t2.id) and
+              is_nil(ld.id) and is_nil(w.id) and is_nil(d.id),
           select: b.id
       )
 
@@ -242,23 +274,33 @@ defmodule PowerModel.Ingestion.Cleanup do
     end
   end
 
-  # Find nearest bus from a real substation (not synthetic)
-  defp find_nearest_substation_bus(nil, _radius), do: nil
+  # Find nearest bus from a real substation (not synthetic). When an
+  # interconnection id is given, only buses in that interconnection are
+  # candidates (PLT-7); nil means the source interconnection is unknown and
+  # no restriction applies.
+  defp find_nearest_substation_bus(nil, _radius, _interconnection_id), do: nil
 
-  defp find_nearest_substation_bus(point, radius_m) do
-    Repo.one(
-      from b in Bus,
-        where:
-          b.source == "substation" and
-            fragment(
-              "ST_DWithin(?::geography, ?::geography, ?)",
-              b.coordinates,
-              ^point,
-              ^radius_m
-            ),
-        order_by: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
-        limit: 1
+  defp find_nearest_substation_bus(point, radius_m, interconnection_id) do
+    from(b in Bus,
+      where:
+        b.source == "substation" and
+          fragment(
+            "ST_DWithin(?::geography, ?::geography, ?)",
+            b.coordinates,
+            ^point,
+            ^radius_m
+          ),
+      order_by: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point),
+      limit: 1
     )
+    |> then(fn query ->
+      if interconnection_id do
+        from b in query, where: b.interconnection_id == ^interconnection_id
+      else
+        query
+      end
+    end)
+    |> Repo.one()
   end
 
   # Find nearest bus for a line endpoint: try voltage-matched first, then any

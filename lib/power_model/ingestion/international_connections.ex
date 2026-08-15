@@ -29,21 +29,20 @@ defmodule PowerModel.Ingestion.InternationalConnections do
 
   @us_canada_ties [
     # ── Quebec ↔ New England / New York ──────────────────────────────
+    # PLT-10: the Quebec-New England multiterminal HVDC is ONE link, listed
+    # once. Phase I (1986) ran Des Cantons(QC)-Comerford(NH) at 690 MW;
+    # Phase II (1990-92) extended it Radisson-Nicolet-Sandy Pond (Ayer, MA)
+    # at 2,000 MW, and the Phase I converters were retired from scheduled
+    # service. A previous second entry ("Châteauguay-Sandy Pond") duplicated
+    # this same physical link with its US terminal misplaced in upstate NY;
+    # Châteauguay's real interconnection is the separate back-to-back tie to
+    # NYISO at Massena, already listed below as QC-NY 765kV.
     %{
-      name: "HQ Phase II HVDC (Des Cantons–Comerford)",
-      us_coords: {-71.96, 44.46},
-      foreign_coords: {-71.96, 45.01},
-      voltage_kv: 450.0,
-      rating_mva: 2000.0,
-      country: "CA",
-      region: "Quebec",
-      interconnection: "Eastern",
-      x_pu: 0.005
-    },
-    %{
-      name: "HQ HVDC Châteauguay–Sandy Pond",
-      us_coords: {-73.75, 42.08},
-      foreign_coords: {-73.75, 45.35},
+      name: "HQ Phase II HVDC (Radisson–Nicolet–Sandy Pond)",
+      # Sandy Pond converter station, Ayer MA
+      us_coords: {-71.58, 42.56},
+      # Nicolet converter station, QC
+      foreign_coords: {-72.62, 46.22},
       voltage_kv: 450.0,
       rating_mva: 2000.0,
       country: "CA",

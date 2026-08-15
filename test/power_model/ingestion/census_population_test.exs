@@ -40,4 +40,21 @@ defmodule PowerModel.Ingestion.Census.PopulationTest do
 
     assert Repo.aggregate(CountyPopulation, :count) == 3
   end
+
+  test "counties absent from the ingested file are deleted (DAT-6)" do
+    # A county from a previous vintage (e.g. a pre-2022 Connecticut county
+    # that has since been replaced by a planning region).
+    Repo.insert!(%CountyPopulation{
+      fips: "09001",
+      name: "Fairfield County",
+      state: "Connecticut",
+      population: 957_419,
+      coordinates: %Geo.Point{coordinates: {-73.36, 41.27}, srid: 4326}
+    })
+
+    {:ok, 3} = ingest!()
+
+    refute Repo.get_by(CountyPopulation, fips: "09001")
+    assert Repo.aggregate(CountyPopulation, :count) == 3
+  end
 end

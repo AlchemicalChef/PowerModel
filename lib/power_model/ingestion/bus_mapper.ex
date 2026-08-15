@@ -57,7 +57,10 @@ defmodule PowerModel.Ingestion.BusMapper do
           va_rad: 0.0,
           coordinates: sub.coordinates,
           source: "substation",
-          source_id: "#{sub.id}_#{round(kv)}kV",
+          # LIN-10: one-decimal kv keeps distinct near-integer levels
+          # (138.0 vs 138.4) from colliding into one source_id the way
+          # round/1 did.
+          source_id: "#{sub.id}_#{format_kv(kv)}kV",
           interconnection_id: determine_interconnection(sub.coordinates)
         }
 
@@ -178,16 +181,23 @@ defmodule PowerModel.Ingestion.BusMapper do
         |> Enum.each(fn [high, low] ->
           rated_mva = estimate_transformer_rating(high.base_kv)
 
+          # LIN-3: a typical bank has ~10% reactance / 0.3% resistance on its
+          # OWN MVA base. Stored impedances are on the 100 MVA system base, so
+          # rebase by 100/rated_mva — otherwise a 1000 MVA bank is 10x too
+          # impedant and sits at its steady-state stability limit at nameplate.
           %Transformer{}
           |> Transformer.changeset(%{
             from_bus_id: high.id,
             to_bus_id: low.id,
             rated_mva: rated_mva,
-            r_pu: 0.003,
-            x_pu: 0.1,
+            r_pu: 0.003 * (100.0 / rated_mva),
+            x_pu: 0.1 * (100.0 / rated_mva),
             tap_ratio: 1.0
           })
-          |> Repo.insert(on_conflict: :nothing)
+          # LIN-4/DAT-1: real conflict target so map_buses re-runs cannot
+          # duplicate a bank between the same two buses (unique index on
+          # (from_bus_id, to_bus_id)).
+          |> Repo.insert(on_conflict: :nothing, conflict_target: [:from_bus_id, :to_bus_id])
         end)
       end
     end)
@@ -348,6 +358,9 @@ defmodule PowerModel.Ingestion.BusMapper do
         end
     end
   end
+
+  # One-decimal kv string for bus source_ids ("138.0", "138.4"). See LIN-10.
+  defp format_kv(kv), do: :erlang.float_to_binary(kv * 1.0, decimals: 1)
 
   defp estimate_transformer_rating(high_kv) do
     cond do

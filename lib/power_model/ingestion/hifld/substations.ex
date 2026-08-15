@@ -6,6 +6,27 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
   1. From shapefile (if available)
   2. Derived from transmission line endpoint data via the API
      (using SUB_1/SUB_2 fields and line endpoint coordinates)
+
+  ## Substation identity (API-derived mode)
+
+  HIFLD substation names are NOT unique nationally (e.g. "MIDWAY" names
+  endpoints thousands of km apart), so identity is `name + geographic
+  cluster`: endpoints sharing a name are grouped with a ~5 km union-find
+  clustering pass, and each cluster becomes its own substation with
+  `hifld_id = "NAME@lat,lon"` (cluster centroid, 2 decimals).
+
+  Sentinel names ("NOT AVAILABLE", "NONE", "DEADHEAD", and UNKNOWN*/TAP*
+  prefixes) carry no identity at all, so they are never merged by name;
+  each such endpoint gets a per-endpoint coordinate-derived id
+  (`"NAME@lat,lon"` at 3 decimals, ~110 m).
+
+  > #### Re-ingest note {: .warning}
+  > The `hifld_id` format changed from the bare name to `NAME@lat,lon`.
+  > Re-ingesting into an existing database creates the corrected clustered
+  > substations ALONGSIDE previously ingested name-keyed rows (the upsert
+  > key no longer matches). A cleanup pass for the old rows is out of scope
+  > here — re-ingest into a fresh database, or delete substations whose
+  > `hifld_id` does not contain `"@"` before re-deriving.
   """
 
   alias PowerModel.Repo
@@ -14,53 +35,44 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
 
   @service "Electric_Power_Transmission_Lines"
 
+  # Endpoints with the same name within this distance are one substation.
+  @cluster_radius_km 5.0
+
+  # Voltage levels within this relative tolerance are one physical level
+  # (e.g. 115 kV and 120 kV records of the same yard).
+  @voltage_cluster_tolerance 0.05
+
+  # Names that carry no identity: merging them would fuse unrelated endpoints.
+  @sentinel_names ["NOT AVAILABLE", "NONE", "DEADHEAD"]
+
   @doc """
   Derive substations from transmission line API data.
-  Groups lines by SUB_1/SUB_2 name and uses endpoint coordinates.
+
+  Groups lines by SUB_1/SUB_2 name, clusters same-name endpoints
+  geographically (~#{@cluster_radius_km} km), and uses per-cluster centroid
+  coordinates. See the moduledoc for the identity scheme.
   """
   def derive_from_api do
     IO.puts("Deriving substations from transmission line endpoints...")
 
-    # Collect substation name -> {coordinates, voltages} mapping
-    sub_data =
+    endpoints =
       @service
       |> API.stream_features(fields: "SUB_1,SUB_2,VOLTAGE,VOLT_CLASS")
       |> Stream.flat_map(&extract_sub_refs/1)
-      |> Enum.reduce(%{}, fn {name, lon, lat, voltage}, acc ->
-        existing = Map.get(acc, name, %{lons: [], lats: [], voltages: []})
+      |> Enum.to_list()
 
-        Map.put(acc, name, %{
-          lons: [lon | existing.lons],
-          lats: [lat | existing.lats],
-          voltages: if(voltage, do: [voltage | existing.voltages], else: existing.voltages)
-        })
-      end)
+    IO.puts("Found #{length(endpoints)} substation endpoint references.")
 
-    IO.puts("Found #{map_size(sub_data)} unique substation references.")
+    entries = build_entries(endpoints)
 
-    # Filter out UNKNOWN/TAP substations with no real name
-    sub_data =
-      sub_data
-      |> Enum.reject(fn {name, _} ->
-        is_nil(name) or name == "" or
-          String.starts_with?(String.upcase(name), "UNKNOWN") or
-          String.starts_with?(String.upcase(name), "TAP")
-      end)
-      |> Map.new()
-
-    IO.puts("After filtering unknowns: #{map_size(sub_data)} substations.")
+    IO.puts("Clustered into #{length(entries)} substations.")
 
     counter = :counters.new(1, [:atomics])
 
-    sub_data
+    entries
     |> Enum.chunk_every(500)
     |> Enum.each(fn batch ->
-      entries =
-        Enum.map(batch, fn {name, data} ->
-          build_substation(name, data)
-        end)
-
-      insert_batch(entries)
+      insert_batch(batch)
       :counters.add(counter, 1, length(batch))
       count = :counters.get(counter, 1)
       if rem(count, 2000) < 500, do: IO.puts("  #{count} substations inserted...")
@@ -69,6 +81,108 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
     final = :counters.get(counter, 1)
     IO.puts("Inserted #{final} substations.")
     {:ok, final}
+  end
+
+  @doc """
+  Build substation insert entries from a list of endpoint references
+  `{name, lon, lat, voltage_kv_or_nil}`.
+
+  Named endpoints are grouped by name and clustered within
+  ~#{@cluster_radius_km} km; sentinel-named endpoints get per-endpoint
+  coordinate-derived identities instead of merging.
+  """
+  def build_entries(endpoints) do
+    endpoints =
+      Enum.map(endpoints, fn {name, lon, lat, voltage} ->
+        {String.trim(name), lon, lat, voltage}
+      end)
+
+    {sentinels, named} =
+      Enum.split_with(endpoints, fn {name, _, _, _} -> sentinel_name?(name) end)
+
+    named_entries =
+      named
+      |> Enum.group_by(fn {name, _, _, _} -> name end)
+      |> Enum.flat_map(fn {name, eps} ->
+        eps
+        |> Enum.map(fn {_, lon, lat, voltage} -> {lon, lat, voltage} end)
+        |> cluster_endpoints(@cluster_radius_km)
+        |> Enum.map(&build_cluster_substation(name, &1, 2))
+      end)
+
+    # Sentinel names carry no identity: one substation per (rounded) endpoint
+    # coordinate, never merged across locations.
+    sentinel_entries =
+      sentinels
+      |> Enum.group_by(fn {name, lon, lat, _} ->
+        {name, Float.round(lat * 1.0, 3), Float.round(lon * 1.0, 3)}
+      end)
+      |> Enum.map(fn {{name, _, _}, eps} ->
+        cluster = Enum.map(eps, fn {_, lon, lat, voltage} -> {lon, lat, voltage} end)
+        build_cluster_substation(name, cluster, 3)
+      end)
+
+    named_entries ++ sentinel_entries
+  end
+
+  @doc """
+  True for names that do not identify a real substation and therefore must
+  not be merged by name: #{inspect(@sentinel_names)} and the UNKNOWN*/TAP*
+  prefixes.
+  """
+  def sentinel_name?(name) when is_binary(name) do
+    up = name |> String.trim() |> String.upcase()
+
+    up == "" or up in @sentinel_names or
+      String.starts_with?(up, "UNKNOWN") or
+      String.starts_with?(up, "TAP")
+  end
+
+  @doc """
+  Cluster endpoints `{lon, lat, voltage_or_nil}` with union-find: any two
+  endpoints within `radius_km` are in the same cluster (transitively).
+  Returns a list of clusters (each a list of the input tuples).
+  """
+  def cluster_endpoints(endpoints, radius_km) do
+    indexed = Enum.with_index(endpoints)
+    parents = Map.new(indexed, fn {_, i} -> {i, i} end)
+
+    parents =
+      for {{lon1, lat1, _}, i} <- indexed,
+          {{lon2, lat2, _}, j} <- indexed,
+          i < j,
+          reduce: parents do
+        acc ->
+          if haversine_km(lat1, lon1, lat2, lon2) <= radius_km do
+            union(acc, i, j)
+          else
+            acc
+          end
+      end
+
+    indexed
+    |> Enum.group_by(fn {_, i} -> find_root(parents, i) end)
+    |> Map.values()
+    |> Enum.map(fn members -> Enum.map(members, &elem(&1, 0)) end)
+  end
+
+  @doc """
+  Merge voltage levels within #{trunc(@voltage_cluster_tolerance * 100)}% of
+  each other into one level (e.g. `[115.0, 120.0] -> [120.0]`), returning
+  representative levels sorted descending. The representative is the highest
+  level of each group.
+  """
+  def cluster_voltage_levels(voltages) do
+    voltages
+    |> Enum.uniq()
+    |> Enum.sort(:desc)
+    |> Enum.reduce([], fn v, acc ->
+      case acc do
+        [rep | _] when (rep - v) / rep <= @voltage_cluster_tolerance -> acc
+        _ -> [v | acc]
+      end
+    end)
+    |> Enum.reverse()
   end
 
   @doc """
@@ -141,17 +255,23 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
 
   defp last_point(_), do: nil
 
-  defp build_substation(name, data) do
-    # Average coordinates across all references
-    avg_lon = Enum.sum(data.lons) / length(data.lons)
-    avg_lat = Enum.sum(data.lats) / length(data.lats)
+  # cluster: [{lon, lat, voltage_or_nil}]; id_decimals controls hifld_id
+  # coordinate precision (2 for named clusters, 3 for per-endpoint sentinels).
+  defp build_cluster_substation(name, cluster, id_decimals) do
+    n = length(cluster)
+    avg_lon = (cluster |> Enum.map(&elem(&1, 0)) |> Enum.sum()) / n
+    avg_lat = (cluster |> Enum.map(&elem(&1, 1)) |> Enum.sum()) / n
 
-    voltages = Enum.uniq(data.voltages) |> Enum.sort(:desc)
+    voltages =
+      cluster
+      |> Enum.map(&elem(&1, 2))
+      |> Enum.reject(&is_nil/1)
+      |> cluster_voltage_levels()
+
     max_kv = List.first(voltages)
     min_kv = List.last(voltages)
 
-    # Use name as hifld_id since we don't have real HIFLD IDs
-    hifld_id = name
+    hifld_id = "#{name}@#{fmt_coord(avg_lat, id_decimals)},#{fmt_coord(avg_lon, id_decimals)}"
 
     now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
 
@@ -165,6 +285,21 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
       inserted_at: now,
       updated_at: now
     }
+  end
+
+  defp fmt_coord(value, decimals), do: :erlang.float_to_binary(value * 1.0, decimals: decimals)
+
+  # Union-find (no path compression -- per-name groups are small)
+
+  defp find_root(parents, i) do
+    parent = Map.fetch!(parents, i)
+    if parent == i, do: i, else: find_root(parents, parent)
+  end
+
+  defp union(parents, i, j) do
+    ri = find_root(parents, i)
+    rj = find_root(parents, j)
+    if ri == rj, do: parents, else: Map.put(parents, ri, rj)
   end
 
   defp insert_batch(entries) do
@@ -270,15 +405,46 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
 
   defp parse_volt_class(_), do: nil
 
-  defp parse_status(nil), do: "in_service"
+  # Status codes that explicitly mark a substation as not energized. Anything
+  # else -- including nil, "NOT AVAILABLE", and unknown codes -- is treated as
+  # in service: HIFLD's status field is sparsely populated, and discarding
+  # unknowns removes large swaths of the real network.
+  @out_of_service_statuses [
+    "INACTIVE",
+    "RETIRED",
+    "UNDER CONSTRUCTION",
+    "PROPOSED",
+    "DECOMMISSIONED"
+  ]
 
-  defp parse_status(status) when is_binary(status) do
-    normalized = status |> String.upcase() |> String.trim()
+  @doc """
+  Map a HIFLD STATUS value to `"in_service"` / `"out_of_service"`.
 
-    if normalized in ["IN SERVICE", "ACTIVE", "OPERATIONAL"],
-      do: "in_service",
-      else: "out_of_service"
+  Only explicit outage codes (#{Enum.join(@out_of_service_statuses, ", ")})
+  are out of service; unknown or missing statuses (incl. "NOT AVAILABLE")
+  are in service.
+  """
+  def parse_status(status) when is_binary(status) do
+    if String.upcase(String.trim(status)) in @out_of_service_statuses,
+      do: "out_of_service",
+      else: "in_service"
   end
 
-  defp parse_status(_), do: "in_service"
+  def parse_status(_), do: "in_service"
+
+  defp haversine_km(lat1, lon1, lat2, lon2) do
+    r = 6371.0
+    dlat = (lat2 - lat1) * :math.pi() / 180.0
+    dlon = (lon2 - lon1) * :math.pi() / 180.0
+    lat1_r = lat1 * :math.pi() / 180.0
+    lat2_r = lat2 * :math.pi() / 180.0
+
+    a =
+      :math.sin(dlat / 2) * :math.sin(dlat / 2) +
+        :math.cos(lat1_r) * :math.cos(lat2_r) *
+          :math.sin(dlon / 2) * :math.sin(dlon / 2)
+
+    c = 2 * :math.atan2(:math.sqrt(a), :math.sqrt(1 - a))
+    r * c
+  end
 end

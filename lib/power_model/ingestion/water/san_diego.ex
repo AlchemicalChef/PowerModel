@@ -356,12 +356,12 @@ defmodule PowerModel.Ingestion.Water.SanDiego do
     IO.puts("=== Ingesting San Diego County Water Infrastructure ===\n")
 
     IO.puts("Step 1: Carlsbad facilities...")
-    carlsbad = insert_facilities(@carlsbad_facilities)
-    IO.puts("  Inserted: #{carlsbad}")
+    carlsbad = upsert_facilities(@carlsbad_facilities)
+    IO.puts("  Upserted: #{carlsbad}")
 
     IO.puts("Step 2: SDCWA & regional facilities...")
-    sdcwa = insert_facilities(@sdcwa_facilities)
-    IO.puts("  Inserted: #{sdcwa}")
+    sdcwa = upsert_facilities(@sdcwa_facilities)
+    IO.puts("  Upserted: #{sdcwa}")
 
     IO.puts("Step 3: EPA wastewater plants from API...")
     epa = ingest_epa_wastewater()
@@ -372,7 +372,14 @@ defmodule PowerModel.Ingestion.Water.SanDiego do
     {:ok, total}
   end
 
-  defp insert_facilities(facilities) do
+  # DAT-8: upsert with {:replace, ...} (like the datacenter ingest) so
+  # corrections to the curated capacity/power/coordinate values actually land
+  # on re-ingest; `on_conflict: :nothing` froze whatever was first inserted.
+  # `status` and `bus_id` are deliberately NOT replaced: re-ingesting must not
+  # reactivate a deliberately-deactivated facility or unmap a mapped one.
+  # Public so focused tests can exercise the upsert without the EPA API call.
+  @doc false
+  def upsert_facilities(facilities) do
     now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
 
     facilities
@@ -399,7 +406,21 @@ defmodule PowerModel.Ingestion.Water.SanDiego do
       }
 
       case Repo.insert_all(WaterFacility, [entry],
-             on_conflict: :nothing,
+             on_conflict:
+               {:replace,
+                [
+                  :name,
+                  :facility_type,
+                  :coordinates,
+                  :city,
+                  :county,
+                  :state,
+                  :owner,
+                  :capacity_mgd,
+                  :storage_acre_feet,
+                  :power_consumption_mw,
+                  :updated_at
+                ]},
              conflict_target: [:source, :source_id]
            ) do
         {1, _} -> count + 1
@@ -458,8 +479,10 @@ defmodule PowerModel.Ingestion.Water.SanDiego do
               updated_at: now
             }
 
+            # DAT-8: refresh EPA-sourced fields on re-ingest too.
             case Repo.insert_all(WaterFacility, [entry],
-                   on_conflict: :nothing,
+                   on_conflict:
+                     {:replace, [:name, :facility_type, :coordinates, :city, :updated_at]},
                    conflict_target: [:source, :source_id]
                  ) do
               {1, _} -> count + 1

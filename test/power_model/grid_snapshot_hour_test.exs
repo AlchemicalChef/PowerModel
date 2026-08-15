@@ -5,7 +5,15 @@ defmodule PowerModel.GridSnapshotHourTest do
 
   alias PowerModel.Demand.BADemandHour
   alias PowerModel.Grid
-  alias PowerModel.Grid.{BalancingAuthority, Bus, Generator, Load, TransmissionLine}
+
+  alias PowerModel.Grid.{
+    BalancingAuthority,
+    Bus,
+    Generator,
+    Load,
+    Transformer,
+    TransmissionLine
+  }
 
   @hour ~U[2024-07-15 20:00:00Z]
 
@@ -34,14 +42,19 @@ defmodule PowerModel.GridSnapshotHourTest do
         coordinates: %Geo.Point{coordinates: {-117.0, 32.8}, srid: 4326}
       })
 
-    Repo.insert!(%TransmissionLine{
-      voltage_kv: 138.0,
-      from_bus_id: bus1.id,
-      to_bus_id: bus2.id,
-      x_pu: 0.1,
-      rating_a_mva: 200.0,
-      status: "in_service"
-    })
+    line =
+      Repo.insert!(%TransmissionLine{
+        voltage_kv: 138.0,
+        from_bus_id: bus1.id,
+        to_bus_id: bus2.id,
+        x_pu: 0.1,
+        rating_a_mva: 200.0,
+        geometry: %Geo.LineString{
+          coordinates: [{-117.1, 32.7}, {-117.0, 32.8}],
+          srid: 4326
+        },
+        status: "in_service"
+      })
 
     Repo.insert!(%Generator{p_max_mw: 100.0, bus_id: bus1.id, status: "in_service"})
 
@@ -54,7 +67,7 @@ defmodule PowerModel.GridSnapshotHourTest do
       demand_mw: 160.0
     })
 
-    %{ba: ba, bus2: bus2}
+    %{ba: ba, bus1: bus1, bus2: bus2, normal_line: line}
   end
 
   test "snapshot without hour keeps baseline loads" do
@@ -107,5 +120,144 @@ defmodule PowerModel.GridSnapshotHourTest do
     assert Enum.all?(snapshot.buses, & &1.coordinates)
     assert [load] = snapshot.loads
     assert load.p_mw == 80.0
+  end
+
+  test "AC snapshots exclude DC lines (LIN-6)", %{
+    bus1: bus1,
+    bus2: bus2,
+    normal_line: normal_line
+  } do
+    dc_line =
+      Repo.insert!(%TransmissionLine{
+        voltage_kv: 500.0,
+        from_bus_id: bus1.id,
+        to_bus_id: bus2.id,
+        x_pu: 0.01,
+        rating_a_mva: 3100.0,
+        line_type: "dc",
+        geometry: %Geo.LineString{
+          coordinates: [{-117.1, 32.7}, {-117.0, 32.8}],
+          srid: 4326
+        },
+        status: "in_service"
+      })
+
+    ic = Repo.get_by!(PowerModel.Grid.Interconnection, name: "TestIC")
+
+    for lines <- [
+          Grid.in_service_lines(ic.id),
+          Grid.get_full_grid_snapshot().lines,
+          Grid.get_regional_grid_snapshot({-117.2, 32.6, -116.9, 32.9}).lines
+        ] do
+      ids = Enum.map(lines, & &1.id)
+      assert normal_line.id in ids
+      refute dc_line.id in ids
+    end
+  end
+
+  test "regional snapshot carries the :datacenters key and scales loads by hour (DAT-11)" do
+    bounds = {-117.2, 32.6, -116.9, 32.9}
+
+    snapshot = Grid.get_regional_grid_snapshot(bounds)
+    assert Map.has_key?(snapshot, :datacenters)
+    assert [load] = snapshot.loads
+    assert load.p_mw == 80.0
+
+    scaled = Grid.get_regional_grid_snapshot(bounds, hour: @hour)
+    assert [scaled_load] = scaled.loads
+    assert_in_delta scaled_load.p_mw, 160.0, 1.0e-6
+  end
+
+  test "regional snapshot excludes lines with unmapped or interconnection-less endpoints (DAT-11)",
+       %{bus1: bus1, normal_line: normal_line} do
+    no_ic_bus =
+      Repo.insert!(%Bus{
+        bus_type: 1,
+        base_kv: 138.0,
+        coordinates: %Geo.Point{coordinates: {-117.05, 32.75}, srid: 4326}
+      })
+
+    bad_line =
+      Repo.insert!(%TransmissionLine{
+        voltage_kv: 138.0,
+        from_bus_id: bus1.id,
+        to_bus_id: no_ic_bus.id,
+        x_pu: 0.1,
+        geometry: %Geo.LineString{
+          coordinates: [{-117.1, 32.7}, {-117.05, 32.75}],
+          srid: 4326
+        },
+        status: "in_service"
+      })
+
+    unmapped_line =
+      Repo.insert!(%TransmissionLine{
+        voltage_kv: 138.0,
+        from_bus_id: bus1.id,
+        to_bus_id: nil,
+        x_pu: 0.1,
+        geometry: %Geo.LineString{
+          coordinates: [{-117.1, 32.7}, {-117.06, 32.74}],
+          srid: 4326
+        },
+        status: "in_service"
+      })
+
+    snapshot = Grid.get_regional_grid_snapshot({-117.2, 32.6, -116.9, 32.9})
+    ids = Enum.map(snapshot.lines, & &1.id)
+
+    assert normal_line.id in ids
+    refute bad_line.id in ids
+    refute unmapped_line.id in ids
+  end
+
+  test "regional and full snapshots exclude self-loop branches", %{
+    bus1: bus1,
+    bus2: bus2,
+    normal_line: normal_line
+  } do
+    normal_transformer =
+      Repo.insert!(%Transformer{
+        rated_mva: 150.0,
+        x_pu: 0.08,
+        from_bus_id: bus1.id,
+        to_bus_id: bus2.id,
+        status: "in_service"
+      })
+
+    self_loop_line =
+      Repo.insert!(%TransmissionLine{
+        voltage_kv: 138.0,
+        from_bus_id: bus1.id,
+        to_bus_id: bus1.id,
+        x_pu: 0.1,
+        b_pu: 0.04,
+        rating_a_mva: 200.0,
+        geometry: %Geo.LineString{
+          coordinates: [{-117.1, 32.7}, {-117.05, 32.75}],
+          srid: 4326
+        },
+        status: "in_service"
+      })
+
+    self_loop_transformer =
+      Repo.insert!(%Transformer{
+        rated_mva: 150.0,
+        x_pu: 0.08,
+        from_bus_id: bus1.id,
+        to_bus_id: bus1.id,
+        status: "in_service"
+      })
+
+    for snapshot <- [
+          Grid.get_regional_grid_snapshot({-117.2, 32.6, -116.9, 32.9}),
+          Grid.get_full_grid_snapshot()
+        ] do
+      assert Enum.any?(snapshot.lines, &(&1.id == normal_line.id))
+      refute Enum.any?(snapshot.lines, &(&1.id == self_loop_line.id))
+
+      assert Enum.any?(snapshot.transformers, &(&1.id == normal_transformer.id))
+      refute Enum.any?(snapshot.transformers, &(&1.id == self_loop_transformer.id))
+    end
   end
 end

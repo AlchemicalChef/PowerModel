@@ -12,6 +12,8 @@ defmodule PowerModel.Ingestion.Datacenters do
   by `PowerModel.Demand` hourly scaling.
   """
 
+  import Ecto.Query
+
   alias PowerModel.Repo
   alias PowerModel.Grid.Datacenter
 
@@ -134,9 +136,34 @@ defmodule PowerModel.Ingestion.Datacenters do
       Repo.insert_all(Datacenter, entries,
         on_conflict:
           {:replace,
-           [:operator, :facility_type, :coordinates, :city, :state, :power_mw, :updated_at]},
+           [
+             :operator,
+             :facility_type,
+             :coordinates,
+             :city,
+             :state,
+             :power_mw,
+             :status,
+             :updated_at
+           ]},
         conflict_target: [:source, :source_id]
       )
+
+    # DAT-6: campuses removed from the curated list must stop drawing load —
+    # deactivate any curated row whose source_id is no longer produced.
+    # (Their "datacenter" load rows disappear on the next
+    # Grid.map_datacenters_to_grid/1 rebuild, which only sums active rows.)
+    current_ids = Enum.map(entries, & &1.source_id)
+
+    {stale, _} =
+      from(d in Datacenter,
+        where: d.source == "curated" and d.status == "active" and d.source_id not in ^current_ids
+      )
+      |> Repo.update_all(set: [status: "inactive"])
+
+    if stale > 0 do
+      IO.puts("  Datacenters deactivated (absent from curated list): #{stale}")
+    end
 
     total_mw = entries |> Enum.map(& &1.power_mw) |> Enum.sum()
 

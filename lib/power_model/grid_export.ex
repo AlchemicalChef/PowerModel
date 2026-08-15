@@ -10,25 +10,37 @@ defmodule PowerModel.GridExport do
   require Logger
 
   @doc """
-  Regenerate the map data files at application boot when they are missing.
+  Regenerate the map data files at application boot when they are missing
+  or empty.
 
   Fly machines get a fresh image filesystem on every cold start, so the
   DB-derived exports must be rebuilt; locally and on warm restarts the files
-  exist and this is a no-op. Never crashes the supervision tree.
+  exist and this is a no-op. DAT-7: an export produced before ingestion ran
+  (0 records) is treated the same as a missing one, so a stale empty file
+  can never permanently blank the map. Never crashes the supervision tree.
   """
-  def ensure_exported do
-    dir = Application.app_dir(:power_model, "priv/static/grid_data")
+  def ensure_exported(dir \\ nil) do
+    dir = dir || Application.app_dir(:power_model, "priv/static/grid_data")
 
-    if File.exists?(Path.join(dir, "transmission.bin")) do
+    if usable_export?(Path.join(dir, "transmission.bin")) do
       :ok
     else
-      Logger.info("grid_data exports missing; regenerating from database")
+      Logger.info("grid_data exports missing or empty; regenerating from database")
       run(dir)
     end
   rescue
     e -> Logger.warning("grid_data export at boot failed: #{Exception.message(e)}")
   catch
     kind, reason -> Logger.warning("grid_data export at boot failed: #{kind} #{inspect(reason)}")
+  end
+
+  # A usable export exists and holds at least one record (the leading u32 is
+  # the record count).
+  defp usable_export?(path) do
+    case File.read(path) do
+      {:ok, <<count::unsigned-little-32, _rest::binary>>} -> count > 0
+      _ -> false
+    end
   end
 
   @doc "Export all map data files into `output_dir`."
@@ -186,7 +198,8 @@ defmodule PowerModel.GridExport do
               id: f.id,
               lon: lon,
               lat: lat,
-              name: f.name,
+              # UI-L12: TextLayer crashes on a null label
+              name: f.name || "",
               facilityType: water_facility_type_code(f.facility_type),
               capacityMgd: f.capacity_mgd || 0.0,
               powerMw: f.power_consumption_mw || 0.0,
@@ -216,8 +229,9 @@ defmodule PowerModel.GridExport do
               id: d.id,
               lon: lon,
               lat: lat,
-              name: d.name,
-              operator: d.operator,
+              # UI-L12: TextLayer crashes on a null label
+              name: d.name || "",
+              operator: d.operator || "",
               facilityType: datacenter_type_code(d.facility_type),
               powerMw: d.power_mw || 0.0,
               busId: d.bus_id,

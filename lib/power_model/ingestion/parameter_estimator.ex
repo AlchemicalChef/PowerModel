@@ -186,23 +186,61 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
     end
   end
 
-  # Estimate length from line geometry.  Returns nil when geometry is missing
-  # so the caller can fall back to bus-to-bus distance.
-  defp estimate_length(nil), do: nil
+  @doc """
+  Estimate geodesic length (km) from line geometry. Returns nil when geometry
+  is missing or degenerate so the caller can fall back to bus-to-bus distance.
 
-  defp estimate_length(%Geo.LineString{coordinates: coords}) when length(coords) >= 2 do
-    # Approximate geodesic length from coordinates
-    coords
-    |> Enum.chunk_every(2, 1, :discard)
-    |> Enum.map(fn [{lon1, lat1} | [_ | _] = rest] ->
-      {lon2, lat2} = hd(rest)
-      haversine_km(lat1, lon1, lat2, lon2)
-    end)
-    |> Enum.sum()
-    |> max(0.1)
+  Accepts both 2-tuple `{lon, lat}` and 3-tuple `{lon, lat, z}` coordinates
+  (Z is dropped). MultiLineString parts are summed independently -- no
+  segment is counted between parts.
+  """
+  def estimate_length(nil), do: nil
+
+  def estimate_length(%Geo.LineString{coordinates: coords}) do
+    case part_length_km(coords) do
+      nil -> nil
+      km -> max(km, 0.1)
+    end
   end
 
-  defp estimate_length(_), do: nil
+  def estimate_length(%Geo.MultiLineString{coordinates: parts}) when is_list(parts) do
+    lengths =
+      parts
+      |> Enum.map(&part_length_km/1)
+      |> Enum.reject(&is_nil/1)
+
+    case lengths do
+      [] -> nil
+      _ -> max(Enum.sum(lengths), 0.1)
+    end
+  end
+
+  def estimate_length(_), do: nil
+
+  # Length within a single part; nil when fewer than 2 valid points.
+  defp part_length_km(coords) when is_list(coords) do
+    points =
+      coords
+      |> Enum.map(fn
+        {lon, lat} -> {lon, lat}
+        {lon, lat, _z} -> {lon, lat}
+        _ -> nil
+      end)
+      |> Enum.reject(&is_nil/1)
+
+    case points do
+      [_, _ | _] ->
+        points
+        |> Enum.chunk_every(2, 1, :discard)
+        |> Enum.map(fn [{lon1, lat1}, {lon2, lat2}] -> haversine_km(lat1, lon1, lat2, lon2) end)
+        |> Enum.sum()
+
+      _ ->
+        nil
+    end
+  end
+
+  defp part_length_km(_), do: nil
 
   # Estimate line length from the coordinates of the from_bus and to_bus.
   # Falls back to a conservative 10.0 km default when coordinates are unavailable.

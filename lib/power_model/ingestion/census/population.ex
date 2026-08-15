@@ -10,12 +10,17 @@ defmodule PowerModel.Ingestion.Census.Population do
       (https://www2.census.gov/geo/docs/maps-data/data/gazetteer/),
       tab-delimited GEOID/INTPTLAT/INTPTLONG.
 
-  Joined on 5-digit county FIPS. Rows are upserted on `fips`, so re-ingesting
-  a newer vintage refreshes populations without duplicates.
+  Joined on 5-digit county FIPS. Rows are upserted on `fips`, and rows whose
+  FIPS is absent from the ingested file are DELETED afterwards (DAT-6):
+  county definitions change between vintages (e.g. Connecticut's 2022 switch
+  from 8 counties to 9 planning regions), and keeping stale FIPS alongside
+  their replacements double-counts population in the load weights.
   """
 
   NimbleCSV.define(CensusPopParser, separator: ",", escape: "\"")
   NimbleCSV.define(CensusGazParser, separator: "\t", escape: "\"")
+
+  import Ecto.Query
 
   alias PowerModel.Repo
   alias PowerModel.Demographics.CountyPopulation
@@ -76,6 +81,20 @@ defmodule PowerModel.Ingestion.Census.Population do
 
     total_pop = rows |> Enum.map(& &1.population) |> Enum.sum()
     IO.puts("  #{length(rows)} counties upserted, total population #{total_pop}.")
+
+    # DAT-6: drop counties from prior vintages that this file no longer
+    # defines, so mixed vintages cannot double-count. (Skipped for an empty
+    # ingest — that would wipe the table rather than refresh it.)
+    ingested_fips = Enum.map(rows, & &1.fips)
+
+    if ingested_fips != [] do
+      {stale, _} =
+        Repo.delete_all(from cp in CountyPopulation, where: cp.fips not in ^ingested_fips)
+
+      if stale > 0 do
+        IO.puts("  #{stale} stale counties deleted (FIPS not present in ingested file).")
+      end
+    end
 
     if missing != [] do
       IO.puts(

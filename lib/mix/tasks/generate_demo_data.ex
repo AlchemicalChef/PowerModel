@@ -4,16 +4,23 @@ defmodule Mix.Tasks.PowerModel.GenerateDemoData do
   Creates binary files matching the format expected by DataStore.js
   without requiring a database or real data ingestion.
 
+  DAT-7: demo output goes to `priv/static/grid_data_demo/` by default so it
+  can never clobber the real DB-derived exports in `priv/static/grid_data/`
+  (which the boot-time `GridExport.ensure_exported/1` guard would then treat
+  as legitimate). Pass `--force` to intentionally overwrite the real path.
+
   ## Usage
 
-      mix power_model.generate_demo_data
+      mix power_model.generate_demo_data           # writes grid_data_demo/
+      mix power_model.generate_demo_data --force   # overwrites grid_data/
   """
 
   use Mix.Task
 
   @shortdoc "Generate synthetic demo binary grid data"
 
-  @output_dir "priv/static/grid_data"
+  @demo_output_dir "priv/static/grid_data_demo"
+  @real_output_dir "priv/static/grid_data"
 
   # Major US power plant locations (approximate lon, lat)
   # Organized by interconnection region
@@ -174,20 +181,36 @@ defmodule Mix.Tasks.PowerModel.GenerateDemoData do
     {-96.35, 30.65, 138.0}
   ]
 
+  @doc """
+  Resolve the output directory from task args: the demo directory unless
+  `--force` explicitly targets the real export path.
+  """
+  def output_dir(args) do
+    if "--force" in args, do: @real_output_dir, else: @demo_output_dir
+  end
+
   @impl Mix.Task
-  def run(_args) do
-    File.mkdir_p!(@output_dir)
+  def run(args) do
+    output_dir = output_dir(args)
+
+    if output_dir == @real_output_dir do
+      Mix.shell().info(
+        "--force given: overwriting REAL grid exports in #{@real_output_dir}/ with demo data"
+      )
+    end
+
+    File.mkdir_p!(output_dir)
 
     generators = build_generators()
     substations = build_substations()
     lines = build_transmission_lines(substations)
 
-    write_generators(generators)
-    write_transmission_lines(lines)
-    write_substations(substations)
+    write_generators(generators, output_dir)
+    write_transmission_lines(lines, output_dir)
+    write_substations(substations, output_dir)
 
     Mix.shell().info("""
-    Demo data generated in #{@output_dir}/:
+    Demo data generated in #{output_dir}/:
       generators.bin:   #{length(generators)} generators
       transmission.bin: #{length(lines)} lines
       substations.bin:  #{length(substations)} substations
@@ -263,7 +286,7 @@ defmodule Mix.Tasks.PowerModel.GenerateDemoData do
     end)
   end
 
-  defp write_generators(generators) do
+  defp write_generators(generators, output_dir) do
     count = length(generators)
 
     binary =
@@ -280,12 +303,12 @@ defmodule Mix.Tasks.PowerModel.GenerateDemoData do
             >>
         end)
 
-    path = Path.join(@output_dir, "generators.bin")
+    path = Path.join(output_dir, "generators.bin")
     File.write!(path, binary)
     Mix.shell().info("  generators.bin: #{count} records, #{byte_size(binary)} bytes")
   end
 
-  defp write_transmission_lines(lines) do
+  defp write_transmission_lines(lines, output_dir) do
     count = length(lines)
 
     binary =
@@ -309,12 +332,12 @@ defmodule Mix.Tasks.PowerModel.GenerateDemoData do
           acc <> header <> point_data
         end)
 
-    path = Path.join(@output_dir, "transmission.bin")
+    path = Path.join(output_dir, "transmission.bin")
     File.write!(path, binary)
     Mix.shell().info("  transmission.bin: #{count} records, #{byte_size(binary)} bytes")
   end
 
-  defp write_substations(substations) do
+  defp write_substations(substations, output_dir) do
     count = length(substations)
 
     binary =
@@ -330,7 +353,7 @@ defmodule Mix.Tasks.PowerModel.GenerateDemoData do
             >>
         end)
 
-    path = Path.join(@output_dir, "substations.bin")
+    path = Path.join(output_dir, "substations.bin")
     File.write!(path, binary)
     Mix.shell().info("  substations.bin: #{count} records, #{byte_size(binary)} bytes")
   end

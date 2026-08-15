@@ -4,7 +4,16 @@ defmodule PowerModel.Ingestion.BusMapperTest do
   @moduletag :db
 
   alias PowerModel.Grid
-  alias PowerModel.Grid.{Bus, BalancingAuthority, Interconnection, TransmissionLine}
+
+  alias PowerModel.Grid.{
+    Bus,
+    BalancingAuthority,
+    Interconnection,
+    Substation,
+    Transformer,
+    TransmissionLine
+  }
+
   alias PowerModel.Ingestion.{BusMapper, Cleanup}
 
   defp point(lon, lat), do: %Geo.Point{coordinates: {lon, lat}, srid: 4326}
@@ -136,6 +145,66 @@ defmodule PowerModel.Ingestion.BusMapperTest do
 
       assert BusMapper.reconcile_interconnections_from_ba() == 1
       assert BusMapper.reconcile_interconnections_from_ba() == 0
+    end
+  end
+
+  describe "substation buses and transformers" do
+    test "transformer impedances are rebased to the system base from rated_mva (LIN-3)" do
+      sub =
+        Repo.insert!(%Substation{
+          name: "TEST 345/138",
+          max_voltage_kv: 345.0,
+          min_voltage_kv: 138.0,
+          coordinates: point(-90.0, 35.0)
+        })
+
+      BusMapper.run()
+
+      xfmr = Repo.one!(Transformer)
+      # 345 kV high side -> 600 MVA rating; 10% / 0.3% on the bank's own base
+      # rebased to the 100 MVA system base.
+      assert xfmr.rated_mva == 600.0
+      assert_in_delta xfmr.x_pu, 0.1 * (100.0 / 600.0), 1.0e-9
+      assert_in_delta xfmr.r_pu, 0.003 * (100.0 / 600.0), 1.0e-9
+
+      # Buses carry one-decimal kv source_ids (LIN-10).
+      source_ids =
+        Repo.all(from b in Bus, where: b.source == "substation", select: b.source_id)
+
+      assert Enum.sort(source_ids) == Enum.sort(["#{sub.id}_345.0kV", "#{sub.id}_138.0kV"])
+    end
+
+    test "re-running map_buses does not duplicate transformers (LIN-4/DAT-1)" do
+      Repo.insert!(%Substation{
+        name: "TEST 500/230",
+        max_voltage_kv: 500.0,
+        min_voltage_kv: 230.0,
+        coordinates: point(-91.0, 36.0)
+      })
+
+      BusMapper.run()
+      BusMapper.run()
+
+      assert Repo.aggregate(Transformer, :count) == 1
+    end
+
+    test "near-integer voltage levels get distinct buses (LIN-10)" do
+      # round/1 collapsed 138.0 and 138.4 into the same source_id, silently
+      # dropping one voltage level's bus.
+      sub =
+        Repo.insert!(%Substation{
+          name: "TEST 138.4/138.0",
+          max_voltage_kv: 138.4,
+          min_voltage_kv: 138.0,
+          coordinates: point(-92.0, 37.0)
+        })
+
+      BusMapper.run()
+
+      source_ids =
+        Repo.all(from b in Bus, where: b.source == "substation", select: b.source_id)
+
+      assert Enum.sort(source_ids) == Enum.sort(["#{sub.id}_138.4kV", "#{sub.id}_138.0kV"])
     end
   end
 

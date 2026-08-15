@@ -7,11 +7,20 @@ defmodule PowerModel.Ingestion.EPA.EGrid do
 
   eGRID provides generator-level capacity factors for ~25k generators,
   which is critical for realistic dispatch modeling.
+
+  The extracted sheets are parsed with NimbleCSV (RFC-4180), so plant names
+  containing commas ("General James M. Gavin, LLC") survive intact. Unit
+  CFACT values are clamped to [0, 1] BEFORE capacity-weighting (eGRID data
+  contains values up to ~3.4 and negatives); plants whose units all report
+  non-positive CFs store a true 0.0 rather than being skipped or floored.
   """
+
+  NimbleCSV.define(EGridGENParser, separator: ",", escape: "\"")
 
   import Ecto.Query
   alias PowerModel.Repo
   alias PowerModel.Grid.Generator
+  alias PowerModel.Ingestion.EIA.Form860
 
   def ingest(path) do
     xlsx_file =
@@ -31,86 +40,122 @@ defmodule PowerModel.Ingestion.EPA.EGrid do
 
     if xlsx_file do
       IO.puts("Reading eGRID from #{xlsx_file}...")
-      ingest_generator_capacity_factors(xlsx_file)
+      result = ingest_generator_capacity_factors(xlsx_file)
+
+      # eGRID is the last capacity-factor source in the pipeline: fill any
+      # generator still lacking a measured CF with its fuel-typical default
+      # so nothing dispatches at 100% of nameplate by accident.
+      Form860.backfill_missing_capacity_factors()
+
+      result
     else
       IO.puts("No eGRID XLSX file found at #{path}")
+      {:error, :no_egrid_file}
     end
   end
 
   @doc """
   Ingest generator-level capacity factors from the GEN sheet.
-  Matches on eia_plant_id (ORISPL) since we don't store generator sub-IDs.
-  When multiple generators exist at a plant, each gets the eGRID CF for that
-  specific generator if distinguishable, otherwise the plant average.
+  Matches on eia_plant_id (ORISPL) since we don't store eGRID unit sub-IDs;
+  each plant stores the capacity-weighted average CF of its units.
   """
   def ingest_generator_capacity_factors(xlsx_path) do
     # Convert XLSX to CSV via Python, then parse
     gen_csv = extract_sheet_to_csv(xlsx_path, "GEN")
 
     if gen_csv do
-      # Parse the CSV: field row is row 2, data starts row 3
-      lines = String.split(gen_csv, "\n", trim: true)
+      case parse_gen_sheet(gen_csv) do
+        {:ok, plant_cfs} ->
+          IO.puts("  eGRID plants with CF data: #{map_size(plant_cfs)}")
+          updated = apply_plant_capacity_factors(plant_cfs)
+          IO.puts("  Generators updated with capacity factors: #{updated}")
+          {:ok, updated}
 
-      if length(lines) >= 2 do
-        field_names = parse_csv_row(Enum.at(lines, 1))
+        {:error, reason} = error ->
+          IO.puts("  eGRID GEN sheet not ingested: #{inspect(reason)}")
+          error
+      end
+    else
+      IO.puts("  Could not extract GEN sheet from #{xlsx_path}")
+      {:error, :sheet_extraction_failed}
+    end
+  end
+
+  @doc """
+  Parse the GEN sheet CSV text (row 1 human-readable descriptions, row 2
+  field names, data from row 3) into `{:ok, %{orispl => capacity_factor}}`.
+
+  Each unit's CFACT is clamped to [0, 1] before capacity-weighting. Units
+  with a CFACT cell are counted even when non-positive, so an idle plant
+  yields 0.0 (not NULL, not a 0.01 floor); units without a CFACT are skipped.
+  """
+  def parse_gen_sheet(csv) when is_binary(csv) do
+    case EGridGENParser.parse_string(csv, skip_headers: false) do
+      [_descriptions, field_names | data] ->
         oris_idx = Enum.find_index(field_names, &(&1 == "ORISPL"))
         cfact_idx = Enum.find_index(field_names, &(&1 == "CFACT"))
         namepcap_idx = Enum.find_index(field_names, &(&1 == "NAMEPCAP"))
-        _fuel_idx = Enum.find_index(field_names, &(&1 == "FUELG1"))
 
         if oris_idx && cfact_idx do
-          # Group by plant ID, compute weighted average CF
-          plant_cfs =
-            lines
-            # skip header + field name rows
-            |> Enum.drop(2)
-            |> Enum.map(&parse_csv_row/1)
-            |> Enum.reduce(%{}, fn cols, acc ->
-              plant_id = Enum.at(cols, oris_idx)
-              cf = parse_float(Enum.at(cols, cfact_idx))
-              cap = parse_float(Enum.at(cols, namepcap_idx)) || 0.0
-
-              if plant_id && cf && cf > 0 do
-                existing = Map.get(acc, plant_id, {0.0, 0.0})
-                {weighted_sum, total_cap} = existing
-                Map.put(acc, plant_id, {weighted_sum + cf * cap, total_cap + cap})
-              else
-                acc
-              end
-            end)
-            |> Enum.map(fn {plant_id, {weighted_sum, total_cap}} ->
-              avg_cf = if total_cap > 0, do: weighted_sum / total_cap, else: 0.0
-              {plant_id, max(0.01, min(1.0, avg_cf))}
-            end)
-            |> Map.new()
-
-          IO.puts("  eGRID plants with CF data: #{map_size(plant_cfs)}")
-
-          # Batch update generators
-          updated =
-            plant_cfs
-            |> Enum.chunk_every(500)
-            |> Enum.reduce(0, fn batch, total ->
-              count =
-                Enum.reduce(batch, 0, fn {plant_id, cf}, cnt ->
-                  {n, _} =
-                    from(g in Generator,
-                      where: g.eia_plant_id == ^plant_id
-                    )
-                    |> Repo.update_all(set: [capacity_factor: cf])
-
-                  cnt + n
-                end)
-
-              total + count
-            end)
-
-          IO.puts("  Generators updated with capacity factors: #{updated}")
+          {:ok, aggregate_plant_cfs(data, oris_idx, cfact_idx, namepcap_idx)}
         else
-          IO.puts("  Could not find ORISPL/CFACT columns in GEN sheet")
+          {:error, {:columns_not_found, field_names}}
         end
-      end
+
+      _ ->
+        {:error, :gen_sheet_too_short}
     end
+  end
+
+  defp aggregate_plant_cfs(data, oris_idx, cfact_idx, namepcap_idx) do
+    data
+    |> Enum.reduce(%{}, fn cols, acc ->
+      plant_id = cols |> Enum.at(oris_idx, "") |> normalize_plant_id()
+      cf = parse_float(Enum.at(cols, cfact_idx))
+      cap = (namepcap_idx && parse_float(Enum.at(cols, namepcap_idx))) || 0.0
+
+      if plant_id != "" and cf != nil do
+        # Clamp per unit BEFORE weighting: eGRID CFACT contains values up to
+        # ~3.4 and negatives. A true-zero unit still participates so
+        # all-idle plants resolve to 0.0 instead of staying NULL.
+        clamped = cf |> max(0.0) |> min(1.0)
+
+        Map.update(acc, plant_id, {clamped * cap, cap, clamped, 1}, fn
+          {weighted, total_cap, cf_sum, n} ->
+            {weighted + clamped * cap, total_cap + cap, cf_sum + clamped, n + 1}
+        end)
+      else
+        acc
+      end
+    end)
+    |> Map.new(fn {plant_id, {weighted, total_cap, cf_sum, n}} ->
+      # Capacity-weighted average; simple mean when no unit reported capacity.
+      avg = if total_cap > 0, do: weighted / total_cap, else: cf_sum / n
+      {plant_id, avg |> max(0.0) |> min(1.0)}
+    end)
+  end
+
+  @doc """
+  Write plant-level capacity factors (`%{orispl => cf}`) to the generators
+  table. Returns the number of generator rows updated.
+  """
+  def apply_plant_capacity_factors(plant_cfs) do
+    plant_cfs
+    |> Enum.chunk_every(500)
+    |> Enum.reduce(0, fn batch, total ->
+      count =
+        Enum.reduce(batch, 0, fn {plant_id, cf}, cnt ->
+          {n, _} =
+            from(g in Generator,
+              where: g.eia_plant_id == ^plant_id
+            )
+            |> Repo.update_all(set: [capacity_factor: cf])
+
+          cnt + n
+        end)
+
+      total + count
+    end)
   end
 
   @doc """
@@ -143,13 +188,13 @@ defmodule PowerModel.Ingestion.EPA.EGrid do
     end
   end
 
-  defp parse_csv_row(line) do
-    # Simple CSV parsing (handles quoted fields)
-    line
+  # openpyxl renders integer cells as "613" but float cells as "613.0";
+  # eia_plant_id is stored as the integer string form.
+  defp normalize_plant_id(value) do
+    value
+    |> to_string()
     |> String.trim()
-    |> String.split(",")
-    |> Enum.map(&String.trim/1)
-    |> Enum.map(fn s -> String.trim(s, "\"") end)
+    |> String.replace_suffix(".0", "")
   end
 
   defp parse_float(nil), do: nil

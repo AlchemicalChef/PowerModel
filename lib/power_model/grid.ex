@@ -58,12 +58,18 @@ defmodule PowerModel.Grid do
 
   def get_generator!(id), do: Repo.get!(Generator, id)
 
+  # DAT-13: headline totals mirror the snapshot predicates (geolocated bus
+  # with an interconnection) so reported GW match what is actually simulated;
+  # coordinate-less imports and unmapped fleets are excluded exactly as
+  # get_grid_snapshot excludes them.
   def total_generation_capacity(interconnection_id \\ nil) do
     query =
       from g in Generator,
         join: b in Bus,
         on: g.bus_id == b.id,
-        where: g.status == "in_service",
+        where:
+          g.status == "in_service" and
+            not is_nil(b.coordinates) and not is_nil(b.interconnection_id),
         select: sum(g.p_max_mw)
 
     query
@@ -92,6 +98,14 @@ defmodule PowerModel.Grid do
   # joined only by DC ties, never by AC lines. Including such branches fuses
   # the interconnections into one fictitious electrical network where a trip
   # in Arizona ripples into Indiana.
+  #
+  # LIN-6: HVDC lines (line_type == "dc", written at HIFLD ingest from
+  # VOLT_CLASS) are excluded from all AC snapshots — a DC link carries a
+  # CONTROLLED flow, not one set by its series impedance, so modeling e.g.
+  # the Pacific DC Intertie as a giant AC line absorbs Western N-S flow that
+  # actually rides the AC paths. Proper treatment is a pair of fixed
+  # injections at the converter buses (future work); until then the ties are
+  # simply not part of the AC network.
   def in_service_lines(interconnection_id) do
     from(tl in TransmissionLine,
       join: fb in Bus,
@@ -101,6 +115,7 @@ defmodule PowerModel.Grid do
       where:
         tl.status == "in_service" and fb.interconnection_id == ^interconnection_id and
           tl.from_bus_id != tl.to_bus_id and
+          (is_nil(tl.line_type) or tl.line_type != "dc") and
           not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
           not is_nil(fb.interconnection_id) and
           fb.interconnection_id == tb.interconnection_id,
@@ -117,12 +132,15 @@ defmodule PowerModel.Grid do
     |> Repo.all()
   end
 
+  # DAT-13: same snapshot-aligned filters as total_generation_capacity/1.
   def total_load(interconnection_id \\ nil) do
     query =
       from l in Load,
         join: b in Bus,
         on: l.bus_id == b.id,
-        where: l.status == "in_service",
+        where:
+          l.status == "in_service" and
+            not is_nil(b.coordinates) and not is_nil(b.interconnection_id),
         select: %{p_mw: sum(l.p_mw), q_mvar: sum(l.q_mvar)}
 
     query
@@ -148,6 +166,7 @@ defmodule PowerModel.Grid do
       on: t.to_bus_id == tb.id,
       where:
         t.status == "in_service" and fb.interconnection_id == ^interconnection_id and
+          t.from_bus_id != t.to_bus_id and
           not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
           not is_nil(fb.interconnection_id) and
           fb.interconnection_id == tb.interconnection_id,
@@ -267,8 +286,8 @@ defmodule PowerModel.Grid do
   Accepts the same options as `get_grid_snapshot/2`.
   """
   def get_full_grid_snapshot(opts \\ []) do
-    # Geo-located endpoints only, no cross-interconnection branches --
-    # see in_service_lines/1 for rationale.
+    # Geo-located endpoints only, no cross-interconnection branches, no DC
+    # ties -- see in_service_lines/1 for rationale.
     lines =
       from(tl in TransmissionLine,
         join: fb in Bus,
@@ -278,6 +297,7 @@ defmodule PowerModel.Grid do
         where:
           tl.status == "in_service" and
             tl.from_bus_id != tl.to_bus_id and
+            (is_nil(tl.line_type) or tl.line_type != "dc") and
             not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
             not is_nil(fb.interconnection_id) and
             fb.interconnection_id == tb.interconnection_id,
@@ -293,6 +313,7 @@ defmodule PowerModel.Grid do
         on: t.to_bus_id == tb.id,
         where:
           t.status == "in_service" and
+            t.from_bus_id != t.to_bus_id and
             not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
             not is_nil(fb.interconnection_id) and
             fb.interconnection_id == tb.interconnection_id,
@@ -372,10 +393,23 @@ defmodule PowerModel.Grid do
   end
 
   # Export data for binary grid files
+  #
+  # DAT-2: the map export and the solver snapshot must describe the SAME
+  # network in both directions — a line the solver cannot simulate must not
+  # be clickable (it would answer :not_in_network), and a line the solver
+  # DOES simulate must be visible (synthetic ties had no geometry, so their
+  # trips were invisible). Export filters therefore mirror the snapshot
+  # predicates of in_service_lines/1 / in_service_transformers/1, and
+  # geometry-less lines are drawn as a 2-point segment between their
+  # endpoint buses.
 
   def export_generators do
     from(g in Generator,
-      where: g.status == "in_service" and not is_nil(g.coordinates),
+      join: b in Bus,
+      on: g.bus_id == b.id,
+      where:
+        g.status == "in_service" and not is_nil(g.coordinates) and
+          not is_nil(b.coordinates) and not is_nil(b.interconnection_id),
       select: %{
         id: g.id,
         coordinates: g.coordinates,
@@ -389,22 +423,58 @@ defmodule PowerModel.Grid do
 
   def export_transmission_lines do
     from(tl in TransmissionLine,
-      where: tl.status == "in_service",
+      join: fb in Bus,
+      on: tl.from_bus_id == fb.id,
+      join: tb in Bus,
+      on: tl.to_bus_id == tb.id,
+      where:
+        tl.status == "in_service" and
+          tl.from_bus_id != tl.to_bus_id and
+          (is_nil(tl.line_type) or tl.line_type != "dc") and
+          not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
+          not is_nil(fb.interconnection_id) and
+          fb.interconnection_id == tb.interconnection_id,
       select: %{
         id: tl.id,
         geometry: tl.geometry,
         voltage_kv: tl.voltage_kv,
         rating_a_mva: tl.rating_a_mva,
         from_bus_id: tl.from_bus_id,
-        to_bus_id: tl.to_bus_id
+        to_bus_id: tl.to_bus_id,
+        from_bus_coordinates: fb.coordinates,
+        to_bus_coordinates: tb.coordinates
       }
     )
     |> Repo.all()
+    |> Enum.map(&with_endpoint_geometry/1)
+  end
+
+  # Synthetic ties (and any other geometry-less line) get a straight 2-point
+  # geometry between their endpoint buses so the map can draw and repaint
+  # them during cascades.
+  defp with_endpoint_geometry(%{geometry: %Geo.LineString{coordinates: [_ | _]}} = line) do
+    Map.drop(line, [:from_bus_coordinates, :to_bus_coordinates])
+  end
+
+  defp with_endpoint_geometry(line) do
+    geometry =
+      case {line.from_bus_coordinates, line.to_bus_coordinates} do
+        {%Geo.Point{coordinates: from}, %Geo.Point{coordinates: to}} ->
+          %Geo.LineString{coordinates: [from, to], srid: 4326}
+
+        _ ->
+          line.geometry
+      end
+
+    line
+    |> Map.put(:geometry, geometry)
+    |> Map.drop([:from_bus_coordinates, :to_bus_coordinates])
   end
 
   def export_substations do
+    # DAT-12: substations without coordinates would render at Null Island.
     from(s in Substation,
-      where: s.status == "in_service",
+      where: s.status == "in_service" and not is_nil(s.coordinates),
       select: %{
         id: s.id,
         coordinates: s.coordinates,
@@ -463,11 +533,19 @@ defmodule PowerModel.Grid do
 
   def export_transformers do
     # Positioned at their from-bus (transformers join two voltage levels at
-    # the same physical substation).
+    # the same physical substation). Filters mirror in_service_transformers/1
+    # (DAT-2) so every exported transformer is simulatable.
     from(t in Transformer,
       join: fb in Bus,
       on: t.from_bus_id == fb.id,
-      where: t.status == "in_service" and not is_nil(fb.coordinates),
+      join: tb in Bus,
+      on: t.to_bus_id == tb.id,
+      where:
+        t.status == "in_service" and
+          t.from_bus_id != t.to_bus_id and
+          not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
+          not is_nil(fb.interconnection_id) and
+          fb.interconnection_id == tb.interconnection_id,
       select: %{
         id: t.id,
         coordinates: fb.coordinates,
@@ -882,9 +960,15 @@ defmodule PowerModel.Grid do
   end
 
   @doc """
-  Get grid snapshot including water facilities for a geographic region.
+  Get grid snapshot including water facilities and datacenters for a
+  geographic region.
+
+  DAT-11: branch predicates match `get_full_grid_snapshot/1` (mapped,
+  geolocated endpoints in one interconnection, no self-loops, no DC ties) so
+  the regional network is a subset of what the solver simulates. Accepts the
+  same `:hour` option as the other snapshots.
   """
-  def get_regional_grid_snapshot(bounds) do
+  def get_regional_grid_snapshot(bounds, opts \\ []) do
     {west, south, east, north} = bounds
 
     buses =
@@ -906,8 +990,16 @@ defmodule PowerModel.Grid do
 
     lines =
       from(tl in TransmissionLine,
+        join: fb in Bus,
+        on: tl.from_bus_id == fb.id,
+        join: tb in Bus,
+        on: tl.to_bus_id == tb.id,
         where:
-          tl.status == "in_service" and not is_nil(tl.from_bus_id) and not is_nil(tl.to_bus_id),
+          tl.status == "in_service" and tl.from_bus_id != tl.to_bus_id and
+            (is_nil(tl.line_type) or tl.line_type != "dc") and
+            not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
+            not is_nil(fb.interconnection_id) and
+            fb.interconnection_id == tb.interconnection_id,
         where:
           fragment(
             "ST_Intersects(?, ST_MakeEnvelope(?, ?, ?, ?, 4326))",
@@ -916,11 +1008,14 @@ defmodule PowerModel.Grid do
             ^south,
             ^east,
             ^north
-          )
+          ),
+        select: tl
       )
       |> Repo.all()
 
-    # Include buses referenced by lines but outside the bbox
+    # Include buses referenced by lines but outside the bbox (the join
+    # predicates above guarantee they are geolocated and carry an
+    # interconnection).
     extra_bus_ids =
       lines
       |> Enum.flat_map(fn l -> [l.from_bus_id, l.to_bus_id] end)
@@ -935,32 +1030,45 @@ defmodule PowerModel.Grid do
       end
 
     all_buses = buses ++ extra_buses
-    all_bus_ids = MapSet.new(all_buses, & &1.id)
+    all_bus_id_list = MapSet.to_list(MapSet.new(all_buses, & &1.id))
 
     transformers =
       from(t in Transformer,
-        where: t.status == "in_service",
+        join: fb in Bus,
+        on: t.from_bus_id == fb.id,
+        join: tb in Bus,
+        on: t.to_bus_id == tb.id,
         where:
-          t.from_bus_id in ^MapSet.to_list(all_bus_ids) or
-            t.to_bus_id in ^MapSet.to_list(all_bus_ids)
+          t.status == "in_service" and t.from_bus_id != t.to_bus_id and
+            not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
+            not is_nil(fb.interconnection_id) and
+            fb.interconnection_id == tb.interconnection_id,
+        where: t.from_bus_id in ^all_bus_id_list or t.to_bus_id in ^all_bus_id_list,
+        select: t
       )
       |> Repo.all()
 
     generators =
       from(g in Generator,
-        where: g.status == "in_service" and g.bus_id in ^MapSet.to_list(all_bus_ids)
+        where: g.status == "in_service" and g.bus_id in ^all_bus_id_list
       )
       |> Repo.all()
 
     loads =
       from(l in Load,
-        where: l.status == "in_service" and l.bus_id in ^MapSet.to_list(all_bus_ids)
+        where: l.status == "in_service" and l.bus_id in ^all_bus_id_list
       )
       |> Repo.all()
 
     water_facilities =
       from(w in WaterFacility,
-        where: w.status == "active" and w.bus_id in ^MapSet.to_list(all_bus_ids)
+        where: w.status == "active" and w.bus_id in ^all_bus_id_list
+      )
+      |> Repo.all()
+
+    datacenters =
+      from(d in Datacenter,
+        where: d.status == "active" and d.bus_id in ^all_bus_id_list
       )
       |> Repo.all()
 
@@ -969,8 +1077,9 @@ defmodule PowerModel.Grid do
       lines: lines,
       transformers: transformers,
       generators: generators,
-      loads: loads,
-      water_facilities: water_facilities
+      loads: maybe_scale_loads(loads, all_buses, opts[:hour]),
+      water_facilities: water_facilities,
+      datacenters: datacenters
     }
   end
 end

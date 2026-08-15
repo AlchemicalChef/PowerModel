@@ -19,6 +19,7 @@ defmodule PowerModel.Grid.Transformer do
     transformer
     |> cast(attrs, [:rated_mva, :r_pu, :x_pu, :tap_ratio, :status, :from_bus_id, :to_bus_id])
     |> validate_required([:rated_mva, :x_pu, :from_bus_id, :to_bus_id])
+    |> validate_number(:tap_ratio, greater_than: 0.0)
     |> foreign_key_constraint(:from_bus_id)
     |> foreign_key_constraint(:to_bus_id)
   end

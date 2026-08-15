@@ -13,6 +13,16 @@ defmodule PowerModel.Ingestion.BAMapper do
 
   Buses without coordinates stay unassigned and are simply never scaled by
   the EIA-930 demand profiles (they keep their baseline load).
+
+  ## Re-run stickiness (DAT-5, known limitation)
+
+  Only the plant-vote pass REWRITES an existing assignment. The
+  nearest-neighbor and topology fills only target buses whose
+  `balancing_authority_id` is NULL, so an assignment made by an earlier fill
+  survives later re-runs even when better donor data (new plants, corrected
+  interconnections) has arrived. Correcting a bad fill currently requires
+  nulling the affected `balancing_authority_id`s and re-running. A re-vote
+  strategy is deferred until BA boundary geometries are available.
   """
 
   NimbleCSV.define(EGridPLNTParser, separator: ",", escape: "\"")
@@ -171,37 +181,50 @@ defmodule PowerModel.Ingestion.BAMapper do
 
   # One pass of nearest-neighbor fill using the buses_coordinates_gist index.
   # Prefers a donor bus in the same interconnection when known.
+  #
+  # DAT-10: the donor subquery runs in a derived table and rows without a
+  # donor are filtered out (`d.ba IS NOT NULL`) BEFORE the update, so no NULL
+  # is ever written over a NULL and `num_rows` is the number of buses that
+  # actually received an assignment — not the number scanned.
   defp assign_buses_by_nearest_neighbor do
     {:ok, %{num_rows: n}} =
       Repo.query("""
-      UPDATE buses b SET balancing_authority_id = (
-        SELECT b2.balancing_authority_id FROM buses b2
-        WHERE b2.balancing_authority_id IS NOT NULL
-          AND b2.coordinates IS NOT NULL
-          AND (b.interconnection_id IS NULL
-               OR b2.interconnection_id = b.interconnection_id)
-        ORDER BY b2.coordinates <-> b.coordinates
-        LIMIT 1
-      )
-      WHERE b.balancing_authority_id IS NULL AND b.coordinates IS NOT NULL
+      UPDATE buses b SET balancing_authority_id = d.ba
+      FROM (
+        SELECT b1.id,
+               (SELECT b2.balancing_authority_id FROM buses b2
+                WHERE b2.balancing_authority_id IS NOT NULL
+                  AND b2.coordinates IS NOT NULL
+                  AND (b1.interconnection_id IS NULL
+                       OR b2.interconnection_id = b1.interconnection_id)
+                ORDER BY b2.coordinates <-> b1.coordinates
+                LIMIT 1) AS ba
+        FROM buses b1
+        WHERE b1.balancing_authority_id IS NULL AND b1.coordinates IS NOT NULL
+      ) d
+      WHERE b.id = d.id AND d.ba IS NOT NULL
       """)
 
     n
   end
 
   # Propagate BA assignments across the network graph: an unassigned bus takes
-  # the BA of any bus it shares a transmission line or transformer with.
+  # the BA of buses it shares a transmission line or transformer with.
   # Iterates to a fixpoint so chains of coordinate-less buses are reached.
+  #
+  # DAT-4: each bus takes the MAJORITY BA among all of its already-assigned
+  # neighbors (lines + transformers, both directions, counted together). Ties
+  # break deterministically on the smallest BA code string, so re-running the
+  # pipeline on the same data always yields the same assignment. The previous
+  # max(ba_id) pick depended on BA insert order, which silently changed which
+  # side of a seam a straddling bus landed on (and therefore which of its
+  # branches got dropped as cross-interconnection artifacts).
   defp assign_buses_by_topology(total \\ 0, iteration \\ 0)
 
   defp assign_buses_by_topology(total, iteration) when iteration >= 50, do: total
 
   defp assign_buses_by_topology(total, iteration) do
-    n =
-      Enum.reduce(topology_fill_statements(), 0, fn sql, acc ->
-        {:ok, %{num_rows: n}} = Repo.query(sql)
-        acc + n
-      end)
+    {:ok, %{num_rows: n}} = Repo.query(topology_fill_statement())
 
     if n == 0 do
       total
@@ -210,25 +233,38 @@ defmodule PowerModel.Ingestion.BAMapper do
     end
   end
 
-  defp topology_fill_statements do
-    for {table, a, b} <- [
-          {"transmission_lines", "from_bus_id", "to_bus_id"},
-          {"transmission_lines", "to_bus_id", "from_bus_id"},
-          {"transformers", "from_bus_id", "to_bus_id"},
-          {"transformers", "to_bus_id", "from_bus_id"}
-        ] do
-      """
-      UPDATE buses b SET balancing_authority_id = nb.ba
-      FROM (
-        SELECT t.#{a} AS bus_id, max(b2.balancing_authority_id) AS ba
-        FROM #{table} t
-        JOIN buses b2 ON b2.id = t.#{b}
-        WHERE b2.balancing_authority_id IS NOT NULL
-        GROUP BY t.#{a}
-      ) nb
-      WHERE b.id = nb.bus_id AND b.balancing_authority_id IS NULL
-      """
-    end
+  defp topology_fill_statement do
+    """
+    UPDATE buses b SET balancing_authority_id = v.ba
+    FROM (
+      SELECT bus_id, ba FROM (
+        SELECT nb.bus_id, nb.ba,
+               ROW_NUMBER() OVER (
+                 PARTITION BY nb.bus_id
+                 ORDER BY nb.votes DESC, ba.code ASC
+               ) AS rank
+        FROM (
+          SELECT e.bus_id, b2.balancing_authority_id AS ba, count(*) AS votes
+          FROM (
+            SELECT from_bus_id AS bus_id, to_bus_id AS neighbor_id FROM transmission_lines
+            UNION ALL
+            SELECT to_bus_id, from_bus_id FROM transmission_lines
+            UNION ALL
+            SELECT from_bus_id, to_bus_id FROM transformers
+            UNION ALL
+            SELECT to_bus_id, from_bus_id FROM transformers
+          ) e
+          JOIN buses b2 ON b2.id = e.neighbor_id
+          WHERE b2.balancing_authority_id IS NOT NULL
+            AND e.bus_id IS NOT NULL
+          GROUP BY e.bus_id, b2.balancing_authority_id
+        ) nb
+        JOIN balancing_authorities ba ON ba.id = nb.ba
+      ) ranked
+      WHERE rank = 1
+    ) v
+    WHERE b.id = v.bus_id AND b.balancing_authority_id IS NULL
+    """
   end
 
   defp report do
