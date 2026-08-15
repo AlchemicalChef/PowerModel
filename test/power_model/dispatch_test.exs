@@ -3,7 +3,9 @@ defmodule PowerModel.DispatchTest do
 
   alias PowerModel.Demand.{BADemandHour, BAFuelHour}
   alias PowerModel.Dispatch
+  alias PowerModel.Dispatch.Storage
   alias PowerModel.Grid.{BalancingAuthority, Bus, Generator}
+  alias PowerModel.Solver.{DCPowerFlow, Frequency}
 
   # July -> EIA summer capability season
   @hour ~U[2024-07-15 18:00:00Z]
@@ -196,8 +198,11 @@ defmodule PowerModel.DispatchTest do
       assert_in_delta coverage.by_ba[2].implied_interchange_mw, -180.0, 1.0e-9
     end
 
-    test "storage charging (negative measured MW) dispatches nothing" do
-      gens = [gen(1, bus_id: 1, fuel_type: "MWH", prime_mover: "BA", p_max_mw: 100.0)]
+    test "a negative measured fuel column still floors at zero for non-storage units" do
+      # Storage has its own schedule (see the "storage" describe block); every
+      # other fuel keeps the old behaviour, since nothing else in the pool can
+      # consume power.
+      gens = [gen(1, bus_id: 1, fuel_type: "GEO", prime_mover: "ST", p_max_mw: 100.0)]
 
       {:ok, %{dispatch: dispatch, coverage: coverage}} =
         Dispatch.for_hour(gens, @hour,
@@ -394,6 +399,524 @@ defmodule PowerModel.DispatchTest do
       # the coal unit's 100 MW expected output. Ignoring the onsite MW here
       # would ask the coal unit to serve 70 MW the array is already serving.
       assert_in_delta dispatch[3], 50.0, 1.0e-9
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Storage (ROADMAP item 17)
+  # ---------------------------------------------------------------------------
+
+  # CISO's measured net load (EIA-930 demand minus its utility-scale solar) and
+  # its "other" column, for the 24 hours beginning 2024-07-15 20:00 UTC. Every
+  # storage fact this fleet needs is visible in the two columns: net load
+  # troughs at midday under the solar (14.8 GW at 19:00 UTC, 12:00 PDT) and
+  # peaks on the evening ramp (36.7 GW at 04:00 UTC, 21:00 PDT), while "other"
+  # swings from -4,926 MW to +4,547 MW across the same hours — a battery fleet
+  # showing through a column EIA reports NET of it.
+  @ciso_day [
+    {15_904, -3_162},
+    {16_673, -1_769},
+    {18_738, -53},
+    {20_940, 49},
+    {22_703, -191},
+    {25_680, 727},
+    {30_604, 2_695},
+    {35_914, 4_547},
+    {36_653, 4_146},
+    {35_196, 4_061},
+    {32_901, 1_144},
+    {30_527, -381},
+    {28_625, 149},
+    {26_912, 283},
+    {25_844, -120},
+    {25_216, -53},
+    {24_995, 309},
+    {25_675, 910},
+    {24_764, 934},
+    {20_849, -2_410},
+    {18_310, -4_349},
+    {17_212, -4_926},
+    {15_803, -4_858},
+    {14_767, -4_078}
+  ]
+
+  @ciso_profile_start ~U[2024-07-14 20:00:00Z]
+
+  # The storage day is the UTC calendar day, which for CISO runs 17:00 PDT to
+  # 16:59 PDT and so holds a whole evening peak and a whole midday trough.
+  @ciso_window_start ~U[2024-07-16 00:00:00Z]
+  # 12:00 PDT: the day's lowest net load, and so its deepest charging hour.
+  @ciso_deepest_charge_utc ~U[2024-07-16 19:00:00Z]
+  # 18:00-21:00 PDT: the evening ramp, and the hours CISO's own "other" column
+  # is positive. 17:00 PDT is the crossover — the measured column is still
+  # slightly negative there (-191 MW), so it belongs to neither half.
+  @ciso_evening_ramp_utc 1..4 |> Enum.map(&DateTime.add(~U[2024-07-16 00:00:00Z], &1 * 3600))
+  @ciso_capability_mw 11_663.0
+
+  defp battery(id, opts) do
+    gen(id, Keyword.merge([fuel_type: "MWH", prime_mover: "BA", capacity_factor: 0.06], opts))
+  end
+
+  defp ciso_batteries do
+    [
+      battery(10, bus_id: 1, p_max_mw: 7_000.0),
+      battery(11, bus_id: 1, p_max_mw: 4_663.0)
+    ]
+  end
+
+  # `other_fun` rewrites the measured "other" column, so a test can ask what
+  # the schedule does with a column that never evidences charging, or one far
+  # deeper than the fleet could absorb.
+  defp ciso_profile(days \\ 3, other_fun \\ & &1) do
+    for day <- 0..(days - 1), {{net_load, other_mw}, index} <- Enum.with_index(@ciso_day) do
+      %{
+        hour: DateTime.add(@ciso_profile_start, (day * 24 + index) * 3600, :second),
+        net_load_mw: net_load * 1.0,
+        other_mw: other_fun.(other_mw * 1.0)
+      }
+    end
+  end
+
+  defp storage_mw(dispatch), do: Map.get(dispatch, 10, 0.0) + Map.get(dispatch, 11, 0.0)
+
+  # A column that neither evidences charging nor bounds discharge, so the duty
+  # cycle runs on its own terms.
+  defp unsigned_column, do: ciso_profile(3, fn _ -> 20_000.0 end)
+
+  @erco_capability_mw 7_849.6
+
+  # ERCOT's measured net load (EIA-930 demand minus utility-scale solar) and
+  # its "other" column for ten July 2024 days, exported from ba_demand_hour
+  # and ba_fuel_hour. Unlike CISO's, this column never goes negative across
+  # the week, which is what puts ERCOT on the uncalibrated duty cycle.
+  defp erco_profile do
+    Path.join(__DIR__, "../fixtures/eia930_erco_net_load_2024_07.csv")
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.drop(1)
+    |> Enum.map(fn line ->
+      [timestamp, net_load, other] = String.split(line, ",")
+      {:ok, hour, _} = DateTime.from_iso8601(timestamp)
+
+      %{
+        hour: hour,
+        net_load_mw: String.to_float(net_load),
+        other_mw: if(other == "", do: nil, else: String.to_float(other))
+      }
+    end)
+  end
+
+  # The fleet's MW for one hour, with storage the only thing on the system.
+  # The measured "other" for the hour comes from the same profile the schedule
+  # is built from, the way the database serves both.
+  defp ciso_storage_at(hour, opts \\ []) do
+    profile = Keyword.get(opts, :profile, ciso_profile())
+
+    {:ok, %{dispatch: dispatch, coverage: coverage}} =
+      Dispatch.for_hour(
+        Keyword.get(opts, :generators, ciso_batteries()),
+        hour,
+        bus_ba: bus_ba(),
+        fuel_totals:
+          Keyword.get_lazy(opts, :fuel_totals, fn -> measured_other(profile, hour) end),
+        storage_profile: %{1 => profile}
+      )
+
+    {storage_mw(dispatch), coverage}
+  end
+
+  defp measured_other(profile, hour) do
+    case Enum.find(profile, &(DateTime.compare(&1.hour, hour) == :eq)) do
+      nil -> %{1 => %{}}
+      record -> %{1 => %{"other" => record.other_mw || 0.0}}
+    end
+  end
+
+  defp ciso_day_hours do
+    Enum.map(0..23, &DateTime.add(@ciso_window_start, &1 * 3600, :second))
+  end
+
+  describe "storage duty cycle" do
+    test "a day of charging and discharging cancels to zero energy" do
+      day = Enum.map(ciso_day_hours(), fn hour -> elem(ciso_storage_at(hour), 0) end)
+
+      # Every hour is scheduled from the same day window, so the deviations
+      # that shape it sum to zero and the fleet ends the day where it started.
+      assert_in_delta Enum.sum(day), 0.0, 1.0e-6
+      # ... and it is genuinely cycling, not idling at zero.
+      assert Enum.count(day, &(&1 > 0.0)) >= 8
+      assert Enum.count(day, &(&1 < 0.0)) >= 8
+    end
+
+    test "discharges across the evening net-load peak and charges in the midday trough" do
+      for hour <- @ciso_evening_ramp_utc do
+        {mw, _} = ciso_storage_at(hour)
+        assert mw > 0.0, "expected discharge at #{hour}, got #{mw} MW"
+      end
+
+      # 08:00-12:00 PDT, the solar-driven bottom of the duck curve, where the
+      # measured column runs -2,410 to -4,926 MW.
+      for hour <- [~U[2024-07-16 15:00:00Z], ~U[2024-07-16 17:00:00Z], @ciso_deepest_charge_utc] do
+        {mw, _} = ciso_storage_at(hour)
+        assert mw < 0.0, "expected charging at #{hour}, got #{mw} MW"
+      end
+
+      # The deepest discharge of the day falls on the evening ramp.
+      peak =
+        ciso_day_hours()
+        |> Enum.max_by(fn hour -> elem(ciso_storage_at(hour), 0) end)
+
+      assert peak in @ciso_evening_ramp_utc
+    end
+
+    test "power respects nameplate in both directions" do
+      for hour <- ciso_day_hours() do
+        {mw, _} = ciso_storage_at(hour)
+        assert abs(mw) <= @ciso_capability_mw + 1.0e-9
+      end
+    end
+
+    test "the daily cycle fits the assumed 4-hour energy capacity" do
+      day = Enum.map(ciso_day_hours(), fn hour -> elem(ciso_storage_at(hour), 0) end)
+      capacity_mwh = Storage.duration_hours() * @ciso_capability_mw
+
+      discharge_mwh = day |> Enum.map(&max(&1, 0.0)) |> Enum.sum()
+      assert discharge_mwh <= capacity_mwh + 1.0e-9
+      assert discharge_mwh > 0.0
+
+      # SOC, tracked as the energy put in minus the energy taken back out.
+      soc =
+        Enum.scan(day, 0.0, fn mw, level -> level - mw end)
+
+      assert_in_delta List.last(soc), 0.0, 1.0e-6
+      assert Enum.max(soc) - Enum.min(soc) <= capacity_mwh + 1.0e-9
+    end
+
+    test "the schedule is stable across the hours of one day window" do
+      # Every hour of a window resolves the same anchor, mean and gain, so the
+      # 24 hourly calls describe one coherent cycle rather than 24 unrelated
+      # operating points.
+      gains =
+        ciso_day_hours()
+        |> Enum.map(fn hour ->
+          {_mw, coverage} = ciso_storage_at(hour)
+          stat = coverage.storage.by_ba[1]
+          {stat.gain, stat.window_start, stat.window_hours}
+        end)
+        |> Enum.uniq()
+
+      assert [{_gain, @ciso_window_start, 24}] = gains
+    end
+  end
+
+  describe "storage calibration" do
+    test "calibrates the fleet's deepest charging hour to the other column's negative" do
+      # -4,926 MW is the most negative CISO's "other" column reaches in the
+      # day, and it is a FLOOR on charging: geothermal and biomass generation
+      # in the same column mask the rest. It is a DAILY magnitude, so it binds
+      # the gain rather than any one hour.
+      {mw, coverage} = ciso_storage_at(@ciso_deepest_charge_utc)
+      {loose_mw, loose} = ciso_storage_at(@ciso_deepest_charge_utc, profile: unsigned_column())
+
+      stat = coverage.storage.by_ba[1]
+      assert stat.path == :calibrated
+      assert stat.observed_other_min_mw == -4_926.0
+      assert mw < 0.0
+
+      # The evidence pulls the fleet BELOW what the duty cycle alone proposed.
+      assert stat.gain < loose.storage.by_ba[1].gain
+      assert mw > loose_mw
+    end
+
+    test "runs the pure duty cycle where the column never evidences charging" do
+      {mw, coverage} = ciso_storage_at(@ciso_deepest_charge_utc, profile: unsigned_column())
+
+      stat = coverage.storage.by_ba[1]
+      assert stat.path == :duty_cycle
+      # Nothing binds but the 4-hour energy capacity: the day proposes 5.36
+      # nameplate-hours of discharge and is scaled to 4.
+      assert_in_delta stat.gain, 4.0 / 5.361, 0.01
+      assert_in_delta mw, -@ciso_capability_mw * stat.gain * 0.8222, 5.0
+      assert abs(mw) <= @ciso_capability_mw
+    end
+
+    test "calibration only ever reduces the gain" do
+      # An "other" column ten times as deep as measured — deeper than the
+      # fleet could absorb. The calibration stops binding rather than pushing
+      # the fleet past its nameplate.
+      deep = ciso_profile(3, &(&1 * 10))
+
+      {mw, coverage} = ciso_storage_at(@ciso_deepest_charge_utc, profile: deep)
+      {_, loose} = ciso_storage_at(@ciso_deepest_charge_utc, profile: unsigned_column())
+
+      assert coverage.storage.by_ba[1].path == :calibrated
+      assert coverage.storage.by_ba[1].gain == loose.storage.by_ba[1].gain
+      assert abs(mw) <= @ciso_capability_mw + 1.0e-9
+    end
+
+    test "storage with no profile for its BA sits idle instead of generating" do
+      {mw, coverage} =
+        ciso_storage_at(~U[2024-07-16 04:00:00Z],
+          profile: [],
+          fuel_totals: %{1 => %{"other" => 5_000.0}}
+        )
+
+      assert mw == 0.0
+      assert coverage.storage.by_ba[1].path == :no_profile
+      assert coverage.storage.net_mw == 0.0
+      # The phantom this replaces: without a schedule the batteries used to
+      # fill the "other" target in merit order and generate all day.
+      assert coverage.storage.units == 2
+    end
+
+    test "storage in a BA that reported no other column at all sits idle" do
+      # 1,380 MW of the fleet lives in BAs EIA publishes no "other" column
+      # for. There is nothing to place discharge into and nothing to bound it,
+      # and scheduling the charging half alone would be invented load.
+      {mw, coverage} =
+        ciso_storage_at(@ciso_deepest_charge_utc, fuel_totals: %{1 => %{"solar" => 100.0}})
+
+      assert mw == 0.0
+      assert coverage.storage.by_ba[1].path == :unreported
+    end
+  end
+
+  describe "storage and the fuel-anchored pool" do
+    test "the other target drops by the modeled storage, and the BA still totals what EIA reported" do
+      geothermal = gen(1, bus_id: 1, fuel_type: "GEO", prime_mover: "ST", p_max_mw: 3_000.0)
+      hour = ~U[2024-07-16 04:00:00Z]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour([geothermal | ciso_batteries()], hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"other" => 8_000.0}},
+          storage_profile: %{1 => ciso_profile()},
+          loads: [%{bus_id: 1, p_mw: 4_000.0}]
+        )
+
+      storage = storage_mw(dispatch)
+      assert storage > 0.0
+
+      other = coverage.by_ba[1].by_fuel["other"]
+      # The pool is asked for the measurement MINUS what the batteries did, so
+      # the same MW is never dispatched twice.
+      assert other.reported_mw == 8_000.0
+      assert_in_delta other.target_mw, 8_000.0 - storage, 1.0e-9
+      assert_in_delta dispatch[1], 8_000.0 - storage, 1.0e-9
+
+      # ... and the two halves still add back up to the measurement, so the
+      # interchange identity survives the carve-out.
+      assert_in_delta coverage.by_ba[1].dispatched_mw, 8_000.0, 1.0e-9
+      assert_in_delta coverage.by_ba[1].implied_interchange_mw, 4_000.0, 1.0e-9
+      assert_in_delta coverage.by_ba[1].storage_mw, storage, 1.0e-9
+    end
+
+    test "a charging fleet raises the pool target, because the column is measured net of it" do
+      geothermal = gen(1, bus_id: 1, fuel_type: "GEO", prime_mover: "ST", p_max_mw: 8_000.0)
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour([geothermal | ciso_batteries()], @ciso_deepest_charge_utc,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"other" => -1_000.0}},
+          storage_profile: %{1 => ciso_profile()},
+          loads: [%{bus_id: 1, p_mw: 1_000.0}]
+        )
+
+      storage = storage_mw(dispatch)
+      assert storage < 0.0
+
+      # -1,000 MW reported while the fleet absorbed ~2,800 MW means the
+      # non-storage plant in the column generated ~1,800 MW, not zero.
+      assert_in_delta coverage.by_ba[1].by_fuel["other"].target_mw, -1_000.0 - storage, 1.0e-9
+      assert dispatch[1] > 0.0
+      assert_in_delta coverage.by_ba[1].dispatched_mw, -1_000.0, 1.0e-9
+    end
+
+    test "the pool target floors at zero rather than going negative" do
+      geothermal = gen(1, bus_id: 1, fuel_type: "GEO", prime_mover: "ST", p_max_mw: 2_000.0)
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour([geothermal | ciso_batteries()], @ciso_deepest_charge_utc,
+          bus_ba: bus_ba(),
+          # A column MORE negative than the charging the model scheduled: the
+          # pool would have to generate negative MW to make up the difference.
+          fuel_totals: %{1 => %{"other" => -8_000.0}},
+          storage_profile: %{1 => ciso_profile()}
+        )
+
+      assert storage_mw(dispatch) > -8_000.0
+      assert coverage.by_ba[1].by_fuel["other"].target_mw == 0.0
+      assert dispatch[1] == 0.0
+    end
+
+    test "a BA whose only other plant is its batteries still appears in coverage" do
+      hour = ~U[2024-07-16 04:00:00Z]
+
+      {mw, coverage} =
+        ciso_storage_at(hour, fuel_totals: %{1 => %{"other" => 5_000.0}})
+
+      assert mw > 0.0
+      assert coverage.by_ba[1].storage_mw == mw
+      assert_in_delta coverage.by_ba[1].dispatched_mw, mw, 1.0e-9
+      # The measurement the batteries carried is not also reported missing.
+      assert coverage.unmatched == []
+    end
+
+    test "charging counts as placed generation, so the island fallback sees a deeper residual" do
+      # An unmeasured coal unit shares whatever load the measured fuels left.
+      # A battery pulling power off the island makes that residual LARGER, and
+      # ignoring the sign would have made it smaller.
+      coal = gen(1, bus_id: 1, fuel_type: "BIT", p_max_mw: 20_000.0, capacity_factor: 1.0)
+
+      {:ok, %{dispatch: dispatch}} =
+        Dispatch.for_hour([coal | ciso_batteries()], @ciso_deepest_charge_utc,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"solar" => 0.0, "other" => -1_000.0}},
+          storage_profile: %{1 => ciso_profile()},
+          loads: [%{bus_id: 1, p_mw: 10_000.0}],
+          islands: [MapSet.new([1])]
+        )
+
+      storage = storage_mw(dispatch)
+      assert storage < 0.0
+      assert_in_delta dispatch[1], 10_000.0 - storage, 1.0e-9
+    end
+  end
+
+  describe "storage in the consumption chain" do
+    test "a charging battery reaches the DC solve as a load at its bus" do
+      # The shape Cascade.apply_dispatch/2 hands the solver: p_max_mw is the
+      # dispatched MW and capacity_factor is 1.0, so a negative dispatch is a
+      # negative injection. Bus 2 generates, bus 3 charges; the line between
+      # them must carry the sum.
+      solve = fn battery_mw ->
+        DCPowerFlow.solve(%{
+          buses:
+            Enum.map([1, 2, 3], fn id ->
+              %{id: id, bus_type: if(id == 1, do: 3, else: 1), base_kv: 138.0}
+            end),
+          lines: [
+            %{
+              id: 1,
+              from_bus_id: 1,
+              to_bus_id: 2,
+              r_pu: 0.01,
+              x_pu: 0.1,
+              b_pu: 0.0,
+              rating_a_mva: 1_000.0
+            },
+            %{
+              id: 2,
+              from_bus_id: 2,
+              to_bus_id: 3,
+              r_pu: 0.01,
+              x_pu: 0.1,
+              b_pu: 0.0,
+              rating_a_mva: 1_000.0
+            }
+          ],
+          transformers: [],
+          generators: [
+            %{id: 1, bus_id: 1, p_max_mw: 300.0, capacity_factor: 1.0},
+            %{id: 2, bus_id: 3, p_max_mw: battery_mw, capacity_factor: 1.0}
+          ],
+          loads: [%{id: 1, bus_id: 2, p_mw: 200.0}]
+        })
+      end
+
+      charging = solve.(-100.0)
+      idle = solve.(0.0)
+
+      flow = fn solution, line_id -> Map.fetch!(solution.line_flows, {:line, line_id}) end
+
+      # Bus 3 draws 100 MW that has to arrive over line 2 from bus 2, on top of
+      # the 200 MW load there: the slack at bus 1 carries 300 MW, not 200.
+      assert_in_delta flow.(charging, 2).p_flow_mw, 100.0, 1.0e-6
+      assert_in_delta flow.(charging, 1).p_flow_mw, 300.0, 1.0e-6
+      assert_in_delta flow.(idle, 2).p_flow_mw, 0.0, 1.0e-6
+      assert_in_delta flow.(idle, 1).p_flow_mw, 200.0, 1.0e-6
+    end
+
+    test "a charging battery contributes no inertia and no governor response" do
+      # Frequency.simulate/5 keeps only units with p_max_mw > 0 online, and a
+      # charging battery is not spinning: the trajectory must be identical with
+      # and without it.
+      gas = %{p_max_mw: 1_000.0, capacity_factor: 1.0, fuel_type: "gas", prime_mover: "CC"}
+
+      charging = %{
+        p_max_mw: -400.0,
+        capacity_factor: 1.0,
+        fuel_type: "MWH",
+        prime_mover: "BA"
+      }
+
+      loads = [%{p_mw: 900.0}]
+
+      assert Frequency.simulate([gas, charging], loads, 100.0) ==
+               Frequency.simulate([gas], loads, 100.0)
+    end
+  end
+
+  describe "storage phantom-energy regression" do
+    test "a week of ERCOT storage nets to zero energy instead of 729 GWh of phantom" do
+      batteries = [
+        battery(10, bus_id: 1, p_max_mw: 5_000.0),
+        battery(11, bus_id: 1, p_max_mw: 2_849.6)
+      ]
+
+      profile = %{1 => erco_profile()}
+
+      week_at = fn hour ->
+        {:ok, %{dispatch: dispatch, coverage: coverage}} =
+          Dispatch.for_hour(batteries, hour,
+            bus_ba: bus_ba(),
+            fuel_totals: measured_other(erco_profile(), hour),
+            storage_profile: profile
+          )
+
+        {storage_mw(dispatch), coverage.storage.by_ba[1]}
+      end
+
+      # Start the week on a day boundary so it spans seven whole cycles.
+      {_mw, first} = week_at.(~U[2024-07-15 12:00:00Z])
+      start = first.window_start
+
+      week =
+        Enum.map(0..167, fn offset ->
+          {mw, _} = week_at.(DateTime.add(start, offset * 3600, :second))
+          mw
+        end)
+
+      discharge_gwh = week |> Enum.map(&max(&1, 0.0)) |> Enum.sum() |> Kernel./(1000.0)
+      charge_gwh = week |> Enum.map(&min(&1, 0.0)) |> Enum.sum() |> Kernel./(1000.0)
+
+      # The phantom: the legacy pro-rata rule ran this fleet at the ERCOT
+      # fleet-wide utilization all week, ~729 GWh of energy no battery made.
+      # Fuel-anchored merit order cut that to ~18 GWh; the duty cycle takes it
+      # to zero and supplies the charging half that never existed at all.
+      assert_in_delta discharge_gwh + charge_gwh, 0.0, 0.001
+      assert discharge_gwh > 20.0
+      assert discharge_gwh <= 7 * Storage.duration_hours() * @erco_capability_mw / 1000.0
+
+      # Seven complete cycles, each self-contained.
+      for day <- 0..6 do
+        assert_in_delta week |> Enum.slice(day * 24, 24) |> Enum.sum(), 0.0, 1.0e-6
+      end
+    end
+
+    test "ERCOT takes the duty-cycle path: its other column shows no charging that week" do
+      {:ok, %{coverage: coverage}} =
+        Dispatch.for_hour([battery(10, bus_id: 1, p_max_mw: 7_849.6)], ~U[2024-07-16 12:00:00Z],
+          bus_ba: bus_ba(),
+          fuel_totals: measured_other(erco_profile(), ~U[2024-07-16 12:00:00Z]),
+          storage_profile: %{1 => erco_profile()}
+        )
+
+      stat = coverage.storage.by_ba[1]
+      assert stat.path == :duty_cycle
+      # The signal a calibration would need: 5% of the fleet's capability.
+      assert stat.observed_other_min_mw > -0.05 * @erco_capability_mw
+      assert stat.gain > 0.0
     end
   end
 

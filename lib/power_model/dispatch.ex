@@ -49,6 +49,34 @@ defmodule PowerModel.Dispatch do
   Every other fuel is unaffected: sector plays no part in allocating gas,
   coal, nuclear, hydro, petroleum or other.
 
+  ## Storage (ROADMAP item 17)
+
+  Batteries sit outside the fuel-anchored pool the same way onsite VRE does,
+  and for a sharper reason: EIA-930's `"other"` column is a NET measurement
+  that goes negative when the fleet charges, and a fuel target floored at zero
+  can only ever make a battery generate. `PowerModel.Dispatch.Storage` gives
+  them an SOC-conserving daily duty cycle instead — charging in the BA's
+  net-load trough, discharging across its peak — and their MW are **negative
+  while charging**.
+
+  The `"other"` target the remaining pool is offered is `reported - storage`,
+  floored at zero, so no battery MW is counted twice and the BA's total
+  generation still adds up to what EIA reported (see
+  `PowerModel.Dispatch.Storage.adjust_fuel_totals/2`). The schedule is held
+  under that same column hour by hour, so a battery can never discharge MW the
+  measurement does not contain, and `by_fuel[fuel].reported_mw` carries the
+  raw measurement beside the `target_mw` the pool was actually offered.
+
+  A negative dispatch value travels the whole chain unchanged:
+  `Cascade.apply_dispatch/2` hands the solver `p_max_mw = the negative MW`,
+  `Solver.DCPowerFlow` injects `p_max_mw * capacity_factor` so a charging unit
+  is a load at its bus, and `Solver.Frequency.simulate/5` keeps only units with
+  `p_max_mw > 0` online — which correctly excludes a charging battery from
+  inertia and governor response, since it is not spinning and its inverter is
+  absorbing rather than supporting. `coverage.online_units` follows the same
+  `mw > 0.0` rule, so a charging unit counts as offline there;
+  `coverage.storage.charging_units` reports it explicitly.
+
   ## Minimum load and OFFLINE units
 
   A unit whose remaining allocation would fall below its `p_min_mw` is left
@@ -65,6 +93,47 @@ defmodule PowerModel.Dispatch do
   `capacity_factor > 0` and `p_max_mw > 0` as online, so a unit dispatched at
   0.0 contributes zero inertia and zero governor response — but a unit merely
   ABSENT from the map would silently come back online at its capacity factor.
+
+  ## Contingency reserve (REVIEW ENE-19)
+
+  A merit-order fill loads every unit it touches to its seasonal capability
+  and part-loads only the marginal one, so the operating point it produces
+  carries almost no headroom — and what headroom it does carry is wherever
+  the merit order happened to leave it, not on machines with governors. The
+  measured consequence: ERCOT's fuel-anchored operating point held ~1.27 GW of
+  governor-duty headroom against a 1,375 MW design contingency, so the island
+  shed customers for its own largest credible single loss.
+
+  Each interconnection therefore holds **primary-capable spinning reserve of at
+  least its design contingency** (`contingency_reserve_mw/1`), by backing
+  governor-duty units down proportionally inside their own fuel's allocation:
+  a hold-back fraction is applied to every governor-duty unit's capability
+  cap, so the same measured MW spread across MORE units, each carrying
+  headroom a governor can actually reach.
+
+  Three properties of that mechanism are worth stating because they are what
+  makes it safe:
+
+    * **The measurement always wins.** The hold-back is a CAP on the merit
+      fill, not a reduction of the target. When a fuel's measured MW cannot
+      fit under the cap, a second pass fills the remainder at full capability.
+      A (BA, fuel) group therefore places exactly the MW it placed before, and
+      the fuel-mix total-variation distance is unchanged by construction.
+    * **Only governor-duty fuels are touched** (`Frequency.governor_duty?/1`).
+      Nuclear, wind, solar and batteries fill exactly as they did: holding
+      them back would buy no frequency response at all.
+    * **Reserve is measured as `Frequency.primary_response_capability_mw/1`**
+      — delivery rate over the nadir window, capped by headroom — never as
+      `capability - dispatch`, which credits a nuclear unit's idle megawatts
+      as frequency response it will never provide.
+
+  The requirement per interconnection is the resource-loss contingency each
+  one sizes its frequency response against, and they are the same anchors the
+  BAL-003 acceptance work uses (`test/power_model/solver/frequency_beta_test.exs`):
+  Eastern and Western are two-unit nuclear plant losses (Western's is the Palo
+  Verde pair), ERCOT's is the South Texas Project pair. Override with
+
+      config :power_model, :contingency_reserve_mw, %{"ERCOT" => 1375.0}
 
   ## Fallback
 
@@ -90,6 +159,19 @@ defmodule PowerModel.Dispatch do
           fallback_capacity_mw: float,
           onsite_mw: float,          # MW placed on onsite solar/wind
           onsite_units: integer,     # in-service onsite solar/wind units
+          storage: %{               # ROADMAP item 17, negative = charging
+            net_mw: float, charge_mw: float, discharge_mw: float,
+            units: integer, charging_units: integer, capability_mw: float,
+            by_ba: %{ba_id => storage_stat}   # see Dispatch.Storage
+          },
+          reserve: %{               # REVIEW ENE-19, contingency reserve
+            requirement_mw: float, primary_reserve_mw: float, met?: boolean,
+            by_interconnection: %{name => %{
+              requirement_mw: float, primary_reserve_mw: float,
+              holdback_fraction: float, met?: boolean,
+              committed_units: integer, governor_duty_units: integer
+            }}
+          },
           units: integer,
           online_units: integer,
           offline_units: integer,
@@ -97,10 +179,12 @@ defmodule PowerModel.Dispatch do
           by_ba: %{ba_id => %{
             code: String.t() | nil,
             target_mw: float, dispatched_mw: float, unserved_mw: float,
+            storage_mw: float,
             load_mw: float | nil,
             implied_interchange_mw: float | nil,
             reported_interchange_mw: float | nil,
-            by_fuel: %{fuel => %{target_mw: float, dispatched_mw: float,
+            by_fuel: %{fuel => %{target_mw: float, reported_mw: float,
+                                 dispatched_mw: float,
                                  units: integer, online_units: integer,
                                  onsite_mw: float, onsite_units: integer}}
           }},
@@ -116,14 +200,23 @@ defmodule PowerModel.Dispatch do
 
   ## Options
 
+    * `:bus_interconnection` — `%{bus_id => interconnection_name}`, which is
+      what the contingency-reserve requirement is keyed by; queried from the
+      database when omitted, and simply absent (no requirement held) when the
+      caller supplies neither it nor a database
     * `:bus_ba` — `%{bus_id => ba_id}`; queried from the database when omitted
     * `:islands` — list of `MapSet` of bus ids; one island when omitted
     * `:loads` — snapshot loads, used for the island fallback residual and for
       the interchange identity in coverage
     * `:fuel_totals` — `%{ba_id => %{fuel => mw}}`. Supplying it declares the
-      caller as the source of truth for the hour and suppresses EVERY database
-      read (BA codes and reported interchange included), so the module runs
-      against fixtures with no repo at all.
+      caller as the source of truth for the measured MW and suppresses the
+      database reads that serve them (BA codes and reported interchange
+      included), so the module runs against fixtures with no repo at all.
+    * `:storage_profile` — the hourly net-load profile storage is scheduled
+      from, in the shape `PowerModel.Dispatch.Storage.profile/2` returns. It
+      is a DIFFERENT series from the measured MW, so `:fuel_totals` does not
+      cover it: this is queried whenever the snapshot holds a battery and the
+      option is absent. Pass `%{}` for a repo-free run with storage in it.
   """
 
   require Logger
@@ -131,8 +224,31 @@ defmodule PowerModel.Dispatch do
   import Ecto.Query
 
   alias PowerModel.Demand
-  alias PowerModel.Grid.{BalancingAuthority, Bus}
+  alias PowerModel.Dispatch.Storage
+  alias PowerModel.Grid.{BalancingAuthority, Bus, Interconnection}
   alias PowerModel.Repo
+  alias PowerModel.Solver.Frequency
+
+  # Design contingency per interconnection (MW): the resource loss each one
+  # sizes its frequency response against, and the floor on the primary-capable
+  # spinning reserve the dispatch holds (REVIEW ENE-19). Same anchors as
+  # `test/power_model/solver/frequency_beta_test.exs`.
+  @design_contingency_mw %{
+    "Eastern" => 2600.0,
+    "Western" => 2626.0,
+    "ERCOT" => 1375.0
+  }
+
+  # Hold-back search bounds. A governor-duty unit is never backed below this
+  # share of its capability: past it the "reserve" is a commitment decision
+  # (start another unit), not a loading decision, and the merit order is no
+  # longer recognisable.
+  @max_holdback_fraction 0.35
+
+  # Bisection steps for the hold-back. Reserve is monotone in the hold-back,
+  # so 16 halvings resolve it to ~5e-6 of capability — far finer than the
+  # megawatt the requirement is stated in.
+  @holdback_iterations 16
 
   # EIA energy-source code -> the EIA-930 fuel column that reports it.
   # Codes EIA-930 folds into "Other Fuel Sources" / "Other Energy Storage"
@@ -212,21 +328,45 @@ defmodule PowerModel.Dispatch do
         if opts[:db?], do: bus_ba_map(generators), else: %{}
       end)
 
+    bus_interconnection =
+      Keyword.get_lazy(opts, :bus_interconnection, fn ->
+        if opts[:db?], do: bus_interconnection_map(generators), else: %{}
+      end)
+
     loads = Keyword.get(opts, :loads, [])
     islands = Keyword.get(opts, :islands)
 
-    units = Enum.map(generators, &unit(&1, bus_ba, season))
+    units = Enum.map(generators, &unit(&1, bus_ba, bus_interconnection, season))
     {dispatchable, unavailable} = Enum.split_with(units, & &1.in_service?)
+
+    # Batteries run their own duty cycle rather than filling a fuel target
+    # that is measured NET of their charging (ROADMAP item 17), so they leave
+    # the pool first and the "other" target the pool is offered drops by what
+    # they were scheduled to do.
+    {storage, non_storage} = Enum.split_with(dispatchable, & &1.storage?)
+    {storage_alloc, storage_stats} = schedule_storage(storage, hour, fuel_totals, opts)
+
+    # Kept so coverage can report what EIA published next to what the pool was
+    # asked for once the batteries' MW came out of it.
+    reported_totals = fuel_totals
+    fuel_totals = Storage.adjust_fuel_totals(fuel_totals, storage_stats)
 
     # EIA-930 measures utility-scale solar and wind, so onsite units of those
     # fuels are held out of the pool and run on their own capacity factor.
-    {onsite, pooled} = Enum.split_with(dispatchable, &onsite_vre?/1)
+    {onsite, pooled} = Enum.split_with(non_storage, &onsite_vre?/1)
     {onsite_alloc, onsite_stats} = onsite_dispatch(onsite)
 
     # Grouped by the (BA, fuel) key the measurement is published at.
     by_group = Enum.group_by(pooled, &{&1.ba_id, &1.fuel})
 
-    {fuel_alloc, group_stats, missing} = allocate_groups(by_group, fuel_totals)
+    {fuel_alloc, group_stats, missing} = allocate_groups(by_group, fuel_totals, %{})
+
+    # REVIEW ENE-19: back governor-duty units down until each interconnection
+    # carries primary-capable spinning reserve for its design contingency.
+    # The measured MW are unchanged — only which units carry them, and how
+    # hard each one is pushed.
+    {fuel_alloc, group_stats, reserve_stats} =
+      hold_contingency_reserve(by_group, fuel_totals, fuel_alloc, group_stats)
 
     # A unit inside a measured group that lost the merit order stays offline —
     # the measurement placed every MW it had. Only units whose group was never
@@ -234,12 +374,13 @@ defmodule PowerModel.Dispatch do
     measured_keys = MapSet.new(Map.keys(group_stats))
     leftover = Enum.reject(pooled, &MapSet.member?(measured_keys, {&1.ba_id, &1.fuel}))
 
-    # Onsite MW count as generation already placed on the island, so the
-    # fallback's residual does not ask other units to serve that load again.
+    # Onsite and storage MW count as generation already placed on the island,
+    # so the fallback's residual does not ask other units to serve that load
+    # again — and a charging battery correctly DEEPENS the residual.
     {fallback_alloc, fallback_mw} =
       fallback_dispatch(
         leftover,
-        Map.merge(fuel_alloc, onsite_alloc),
+        fuel_alloc |> Map.merge(onsite_alloc) |> Map.merge(storage_alloc),
         dispatchable,
         loads,
         islands
@@ -250,6 +391,7 @@ defmodule PowerModel.Dispatch do
       |> Map.new(&{&1.id, 0.0})
       |> Map.merge(fuel_alloc)
       |> Map.merge(onsite_alloc)
+      |> Map.merge(storage_alloc)
       |> Map.merge(fallback_alloc)
 
     coverage =
@@ -260,13 +402,16 @@ defmodule PowerModel.Dispatch do
         dispatch,
         group_stats,
         onsite_stats,
+        storage_stats,
         missing,
-        unmatched(fuel_totals, by_group, dispatchable),
+        unmatched(fuel_totals, by_group, dispatchable, storage_stats),
         fallback_mw,
         leftover,
         onsite,
         loads,
         bus_ba,
+        reported_totals,
+        reserve_stats,
         opts
       )
 
@@ -279,7 +424,7 @@ defmodule PowerModel.Dispatch do
   # Unit view
   # ---------------------------------------------------------------------------
 
-  defp unit(generator, bus_ba, season) do
+  defp unit(generator, bus_ba, bus_interconnection, season) do
     capability = capability_mw(generator, season)
     bus_id = Map.get(generator, :bus_id)
 
@@ -287,6 +432,7 @@ defmodule PowerModel.Dispatch do
       id: generator.id,
       bus_id: bus_id,
       ba_id: Map.get(bus_ba, bus_id),
+      interconnection: Map.get(bus_interconnection, bus_id),
       fuel: fuel_for(generator),
       capability_mw: capability,
       # A minimum above the seasonal capability would make the unit
@@ -294,7 +440,18 @@ defmodule PowerModel.Dispatch do
       p_min_mw: min(Map.get(generator, :p_min_mw) || 0.0, capability),
       capacity_factor: Map.get(generator, :capacity_factor) || 0.0,
       in_service?: (Map.get(generator, :status) || "in_service") == "in_service",
-      utility_scale?: utility_scale?(generator)
+      utility_scale?: utility_scale?(generator),
+      storage?: Storage.storage?(generator),
+      # Frequency-response properties, read once from the swing model's own
+      # per-fuel table so the reserve this module holds is the reserve that
+      # model will credit (REVIEW ENE-19).
+      governor_duty?: Frequency.governor_duty?(generator),
+      # Delivery rate on the SEASONAL capability rather than nameplate: the
+      # dispatch cannot load a unit above capability, so crediting a rate
+      # against nameplate would hold less reserve than the fleet needs.
+      primary_rate_mw_per_s:
+        Frequency.machine_constants(generator).primary_response_rate_pct_per_s / 100.0 *
+          capability
     }
   end
 
@@ -370,7 +527,7 @@ defmodule PowerModel.Dispatch do
   # Measured allocation
   # ---------------------------------------------------------------------------
 
-  defp allocate_groups(by_group, fuel_totals) do
+  defp allocate_groups(by_group, fuel_totals, holdback) do
     Enum.reduce(by_group, {%{}, %{}, []}, fn {{ba_id, fuel}, group_units},
                                              {alloc, stats, missing} ->
       case measured_mw(fuel_totals, ba_id, fuel) do
@@ -387,7 +544,7 @@ defmodule PowerModel.Dispatch do
            ]}
 
         target_mw ->
-          {group_alloc, remaining} = fill(group_units, max(target_mw, 0.0))
+          {group_alloc, remaining} = fill(group_units, max(target_mw, 0.0), holdback)
 
           dispatched = target_mw |> max(0.0) |> Kernel.-(remaining)
 
@@ -406,13 +563,18 @@ defmodule PowerModel.Dispatch do
   # Measured MW the network cannot place at all: the BA is in this snapshot but
   # owns no in-service unit of that fuel, so the generation is simply missing
   # from the model. The other half of the coverage gap from `missing`.
-  defp unmatched(fuel_totals, by_group, dispatchable) do
+  #
+  # `fuel_totals` here is already net of storage, so what a BA's batteries
+  # carried is not reported as missing; a BA whose only "other" plant IS its
+  # batteries has no `by_group` entry for the fuel and is excluded explicitly.
+  defp unmatched(fuel_totals, by_group, dispatchable, storage_stats) do
     snapshot_bas = dispatchable |> Enum.map(& &1.ba_id) |> Enum.reject(&is_nil/1) |> MapSet.new()
 
     for {ba_id, fuels} <- fuel_totals,
         MapSet.member?(snapshot_bas, ba_id),
         {fuel, mw} <- fuels,
         not Map.has_key?(by_group, {ba_id, fuel}),
+        not (fuel == "other" and Map.has_key?(storage_stats, ba_id)),
         mw != 0.0 do
       %{ba_id: ba_id, fuel: fuel, mw: mw}
     end
@@ -431,20 +593,182 @@ defmodule PowerModel.Dispatch do
 
   # Merit order fill: highest capacity factor first, then largest unit, then id
   # so the order is stable across runs.
-  defp fill(units, target_mw) do
-    units
-    |> Enum.sort_by(&{-&1.capacity_factor, -&1.capability_mw, &1.id})
-    |> Enum.reduce({%{}, target_mw}, fn unit, {alloc, remaining} ->
-      take = min(unit.capability_mw, remaining)
+  #
+  # `holdback` is the contingency-reserve hold-back per interconnection
+  # (REVIEW ENE-19): governor-duty units are capped BELOW their capability so
+  # the same measured MW spread over more machines, each keeping headroom a
+  # governor can reach. It is a cap on the fill, never a cut to the target —
+  # if the capped fleet cannot absorb the measurement, a second pass places
+  # the remainder at full capability, because a reserve requirement may not
+  # make measured generation disappear.
+  defp fill(units, target_mw, holdback) do
+    sorted = Enum.sort_by(units, &{-&1.capacity_factor, -&1.capability_mw, &1.id})
+    {alloc, remaining} = fill_pass(sorted, target_mw, holdback, %{})
 
-      if take <= 0.0 or take < unit.p_min_mw do
-        # Below its minimum load this unit cannot run at all; leave it offline
-        # and offer the remaining MW to the next unit in merit order.
-        {Map.put(alloc, unit.id, 0.0), remaining}
-      else
-        {Map.put(alloc, unit.id, take), remaining - take}
+    if remaining > 1.0e-9 and map_size(holdback) > 0 do
+      fill_pass(sorted, remaining, %{}, alloc)
+    else
+      {alloc, remaining}
+    end
+  end
+
+  defp fill_pass(sorted_units, target_mw, holdback, alloc) do
+    Enum.reduce(sorted_units, {alloc, target_mw}, fn unit, {alloc, remaining} ->
+      already = Map.get(alloc, unit.id, 0.0)
+      take = min(capped_capability_mw(unit, holdback) - already, remaining)
+
+      cond do
+        take <= 0.0 ->
+          {Map.put_new(alloc, unit.id, 0.0), remaining}
+
+        already == 0.0 and take < unit.p_min_mw ->
+          # Below its minimum load this unit cannot run at all; leave it
+          # offline and offer the remaining MW to the next unit in merit order.
+          {Map.put(alloc, unit.id, 0.0), remaining}
+
+        true ->
+          {Map.put(alloc, unit.id, already + take), remaining - take}
       end
     end)
+  end
+
+  defp capped_capability_mw(unit, holdback) do
+    case unit.governor_duty? and Map.get(holdback, unit.interconnection) do
+      fraction when is_number(fraction) -> unit.capability_mw * (1.0 - fraction)
+      _ -> unit.capability_mw
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Contingency reserve (REVIEW ENE-19)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Design-contingency reserve requirement for an interconnection, in MW, or
+  `nil` for a system with no requirement configured.
+
+  Override the whole table with
+
+      config :power_model, :contingency_reserve_mw, %{"ERCOT" => 1375.0}
+  """
+  @spec contingency_reserve_mw(String.t() | nil) :: float() | nil
+  def contingency_reserve_mw(interconnection) do
+    Map.get(contingency_reserves(), interconnection)
+  end
+
+  @doc "The whole design-contingency table, config override included."
+  @spec contingency_reserves() :: %{optional(String.t()) => float()}
+  def contingency_reserves do
+    Application.get_env(:power_model, :contingency_reserve_mw, @design_contingency_mw)
+  end
+
+  @doc """
+  Primary-capable spinning reserve one dispatched unit carries, in MW.
+
+  `PowerModel.Solver.Frequency.primary_response_capability_mw/1` in the
+  dispatch's own terms: delivery rate over the nadir window, capped by the
+  headroom below seasonal capability, and zero for a unit with no governor
+  duty or one the merit order left offline (a governor on an unsynchronised
+  machine moves nothing).
+  """
+  @spec unit_primary_reserve_mw(map(), float()) :: float()
+  def unit_primary_reserve_mw(unit, dispatched_mw) do
+    if unit.governor_duty? and dispatched_mw > 0.0 do
+      min(
+        unit.primary_rate_mw_per_s * Frequency.nadir_window_seconds(),
+        max(unit.capability_mw - dispatched_mw, 0.0)
+      )
+    else
+      0.0
+    end
+  end
+
+  # Find, per interconnection, the smallest hold-back that meets the design
+  # contingency, and re-fill with it. Reserve is monotone non-decreasing in the
+  # hold-back, so a bisection is exact enough and cheap; the interconnections
+  # are resolved one at a time because a (BA, fuel) group whose units straddle
+  # a seam is rare and its coupling is second-order.
+  defp hold_contingency_reserve(by_group, fuel_totals, alloc, stats) do
+    requirements = contingency_reserves()
+    pooled = by_group |> Map.values() |> List.flatten()
+
+    present =
+      pooled
+      |> Enum.map(& &1.interconnection)
+      |> Enum.uniq()
+      |> Enum.filter(&Map.has_key?(requirements, &1))
+
+    {alloc, stats, _holdback, reserve} =
+      Enum.reduce(present, {alloc, stats, %{}, %{}}, fn name, {alloc, stats, holdback, reserve} ->
+        requirement = Map.fetch!(requirements, name)
+        units = Enum.filter(pooled, &(&1.interconnection == name))
+        held = reserve_mw(units, alloc)
+
+        {alloc, stats, holdback, fraction, held} =
+          if held >= requirement do
+            {alloc, stats, holdback, 0.0, held}
+          else
+            search_holdback(by_group, fuel_totals, units, name, requirement, holdback)
+          end
+
+        {alloc, stats, holdback,
+         Map.put(reserve, name, %{
+           requirement_mw: requirement,
+           primary_reserve_mw: held,
+           holdback_fraction: fraction,
+           met?: held >= requirement - 1.0e-6,
+           committed_units: Enum.count(units, &(Map.get(alloc, &1.id, 0.0) > 0.0)),
+           governor_duty_units: Enum.count(units, & &1.governor_duty?)
+         })}
+      end)
+
+    {alloc, stats, reserve}
+  end
+
+  # Bisect on this interconnection's hold-back fraction, keeping the fractions
+  # already resolved for its neighbours. The largest fraction is evaluated
+  # first, so a requirement the fleet cannot meet at all still leaves the best
+  # operating point available rather than the untouched one.
+  defp search_holdback(by_group, fuel_totals, units, name, requirement, holdback) do
+    {ceiling_alloc, ceiling_stats, ceiling_held} =
+      evaluate_holdback(by_group, fuel_totals, units, name, @max_holdback_fraction, holdback)
+
+    if ceiling_held < requirement do
+      {ceiling_alloc, ceiling_stats, Map.put(holdback, name, @max_holdback_fraction),
+       @max_holdback_fraction, ceiling_held}
+    else
+      {_low, _high, alloc, stats, fraction, held} =
+        Enum.reduce(
+          1..@holdback_iterations,
+          {0.0, @max_holdback_fraction, ceiling_alloc, ceiling_stats, @max_holdback_fraction,
+           ceiling_held},
+          fn _i, {low, high, alloc, stats, fraction, held} ->
+            mid = (low + high) / 2.0
+
+            {mid_alloc, mid_stats, mid_held} =
+              evaluate_holdback(by_group, fuel_totals, units, name, mid, holdback)
+
+            if mid_held >= requirement do
+              {low, mid, mid_alloc, mid_stats, mid, mid_held}
+            else
+              {mid, high, alloc, stats, fraction, held}
+            end
+          end
+        )
+
+      {alloc, stats, Map.put(holdback, name, fraction), fraction, held}
+    end
+  end
+
+  defp evaluate_holdback(by_group, fuel_totals, units, name, fraction, holdback) do
+    {alloc, stats, _missing} =
+      allocate_groups(by_group, fuel_totals, Map.put(holdback, name, fraction))
+
+    {alloc, stats, reserve_mw(units, alloc)}
+  end
+
+  defp reserve_mw(units, alloc) do
+    sum_by(units, &unit_primary_reserve_mw(&1, Map.get(alloc, &1.id, 0.0)))
   end
 
   # ---------------------------------------------------------------------------
@@ -470,6 +794,34 @@ defmodule PowerModel.Dispatch do
 
       {Map.put(alloc, unit.id, mw), Map.put(stats, {unit.ba_id, unit.fuel}, stat)}
     end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Storage
+  # ---------------------------------------------------------------------------
+
+  # The duty cycle needs the BA's hourly net-load profile: two queries covering
+  # the BAs that actually own storage, and none at all for a snapshot with no
+  # batteries in it.
+  #
+  # This read is deliberately NOT gated on `:fuel_totals`. That option means
+  # "these are the measured MW for the hour", and the profile is a different
+  # series entirely — gating it left every replayed hour with an idle fleet
+  # AND its share of the "other" column stranded as unserved. A caller with no
+  # repo passes `:storage_profile` (`%{}` for none).
+  defp schedule_storage([], _hour, _fuel_totals, _opts), do: {%{}, %{}}
+
+  defp schedule_storage(storage, hour, fuel_totals, opts) do
+    profile =
+      Keyword.get_lazy(opts, :storage_profile, fn ->
+        storage
+        |> Enum.map(& &1.ba_id)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq()
+        |> Storage.profile(hour)
+      end)
+
+    Storage.schedule(storage, hour, profile, fuel_totals)
   end
 
   # ---------------------------------------------------------------------------
@@ -544,6 +896,7 @@ defmodule PowerModel.Dispatch do
          dispatch,
          group_stats,
          onsite_stats,
+         storage_stats,
          missing,
          unmatched,
          fallback_mw,
@@ -551,6 +904,8 @@ defmodule PowerModel.Dispatch do
          onsite,
          loads,
          bus_ba,
+         reported_totals,
+         reserve_stats,
          opts
        ) do
     by_ba_fuel = Enum.group_by(group_stats, fn {{ba_id, _fuel}, _stat} -> ba_id end)
@@ -560,15 +915,22 @@ defmodule PowerModel.Dispatch do
 
     dispatch_by_ba = dispatch_by_ba(units, dispatch)
 
+    # A BA whose only "other" plant is its batteries has no measured group at
+    # all, and still has to appear: its storage is real MW on the network.
+    ba_ids = MapSet.union(MapSet.new(Map.keys(by_ba_fuel)), MapSet.new(Map.keys(storage_stats)))
+
     by_ba =
-      Map.new(by_ba_fuel, fn {ba_id, entries} ->
+      Map.new(ba_ids, fn ba_id ->
         fuels =
-          Map.new(entries, fn {{_ba, fuel}, stat} ->
+          by_ba_fuel
+          |> Map.get(ba_id, [])
+          |> Map.new(fn {{_ba, fuel}, stat} ->
             onsite = Map.get(onsite_stats, {ba_id, fuel}, %{onsite_mw: 0.0, onsite_units: 0})
 
             {fuel,
              stat
              |> Map.take([:target_mw, :dispatched_mw, :units, :online_units])
+             |> Map.put(:reported_mw, reported_mw(reported_totals, ba_id, fuel))
              |> Map.merge(onsite)}
           end)
 
@@ -582,6 +944,7 @@ defmodule PowerModel.Dispatch do
            target_mw: target,
            dispatched_mw: ba_dispatch,
            unserved_mw: max(target - (fuels |> Map.values() |> sum_by(& &1.dispatched_mw)), 0.0),
+           storage_mw: storage_stats |> Map.get(ba_id, %{}) |> Map.get(:net_mw, 0.0),
            load_mw: load_mw,
            implied_interchange_mw: load_mw && ba_dispatch - load_mw,
            reported_interchange_mw: Map.get(reported, ba_id),
@@ -604,6 +967,8 @@ defmodule PowerModel.Dispatch do
       fallback_capacity_mw: sum_by(leftover, & &1.capability_mw),
       onsite_mw: sum_by(onsite, &Map.get(dispatch, &1.id, 0.0)),
       onsite_units: length(onsite),
+      storage: storage_coverage(storage_stats),
+      reserve: reserve_coverage(reserve_stats),
       units: length(units),
       online_units: online,
       offline_units: length(units) - online,
@@ -612,6 +977,36 @@ defmodule PowerModel.Dispatch do
       missing: Enum.sort_by(missing, &(-&1.capacity_mw)),
       unmatched: unmatched,
       unmatched_mw: sum_by(unmatched, & &1.mw)
+    }
+  end
+
+  # What the BA reported for the fuel before storage was netted out of it.
+  defp reported_mw(reported_totals, ba_id, fuel) do
+    reported_totals |> Map.get(ba_id, %{}) |> Map.get(fuel, 0.0)
+  end
+
+  defp reserve_coverage(reserve_stats) do
+    stats = Map.values(reserve_stats)
+
+    %{
+      requirement_mw: sum_by(stats, & &1.requirement_mw),
+      primary_reserve_mw: sum_by(stats, & &1.primary_reserve_mw),
+      met?: Enum.all?(stats, & &1.met?),
+      by_interconnection: reserve_stats
+    }
+  end
+
+  defp storage_coverage(storage_stats) do
+    stats = Map.values(storage_stats)
+
+    %{
+      net_mw: sum_by(stats, & &1.net_mw),
+      charge_mw: sum_by(stats, & &1.charge_mw),
+      discharge_mw: sum_by(stats, & &1.discharge_mw),
+      capability_mw: sum_by(stats, & &1.capability_mw),
+      units: stats |> Enum.map(& &1.units) |> Enum.sum(),
+      charging_units: stats |> Enum.map(& &1.charging_units) |> Enum.sum(),
+      by_ba: storage_stats
     }
   end
 
@@ -654,8 +1049,22 @@ defmodule PowerModel.Dispatch do
         "island fallback #{gw(coverage.fallback_mw)} GW of " <>
         "#{gw(coverage.fallback_capacity_mw)} GW capacity, " <>
         "onsite solar/wind #{gw(coverage.onsite_mw)} GW on #{coverage.onsite_units} units, " <>
+        "storage #{gw(coverage.storage.net_mw)} GW net " <>
+        "(#{gw(coverage.storage.discharge_mw)} GW discharging, " <>
+        "#{gw(coverage.storage.charge_mw)} GW charging on " <>
+        "#{coverage.storage.charging_units}/#{coverage.storage.units} units), " <>
         "#{length(unavailable)} units out of service)"
     )
+
+    for {name, r} <- coverage.reserve.by_interconnection do
+      Logger.info(
+        "Dispatch reserve #{name}: #{Float.round(r.primary_reserve_mw, 0)} MW primary-capable " <>
+          "spinning against a #{Float.round(r.requirement_mw, 0)} MW design contingency " <>
+          "(#{if r.met?, do: "met", else: "SHORT"}; " <>
+          "#{Float.round(r.holdback_fraction * 100, 2)}% hold-back on " <>
+          "#{r.governor_duty_units} governor-duty units, #{r.committed_units} committed)"
+      )
+    end
 
     if coverage.missing != [] do
       top =
@@ -677,8 +1086,7 @@ defmodule PowerModel.Dispatch do
   defp sum_by(list, fun), do: list |> Enum.map(fun) |> Enum.sum()
 
   defp bus_ba_map(generators) do
-    bus_ids =
-      generators |> Enum.map(&Map.get(&1, :bus_id)) |> Enum.reject(&is_nil/1) |> Enum.uniq()
+    bus_ids = generator_bus_ids(generators)
 
     if bus_ids == [] do
       %{}
@@ -687,6 +1095,27 @@ defmodule PowerModel.Dispatch do
       |> Repo.all()
       |> Map.new()
     end
+  end
+
+  defp bus_interconnection_map(generators) do
+    bus_ids = generator_bus_ids(generators)
+
+    if bus_ids == [] do
+      %{}
+    else
+      from(b in Bus,
+        join: i in Interconnection,
+        on: i.id == b.interconnection_id,
+        where: b.id in ^bus_ids,
+        select: {b.id, i.name}
+      )
+      |> Repo.all()
+      |> Map.new()
+    end
+  end
+
+  defp generator_bus_ids(generators) do
+    generators |> Enum.map(&Map.get(&1, :bus_id)) |> Enum.reject(&is_nil/1) |> Enum.uniq()
   end
 
   defp truncate_to_hour(%DateTime{} = ts) do
