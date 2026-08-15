@@ -160,6 +160,27 @@ L ≈ multi-week.
     schedule; eliminates the phantom GWh and CISO's 15.6% always-on battery dispatch.
 
 ### Phase 4 — The voltage chain (M then L)
+
+> **Salvage note (2026-08-15):** the pre-reset GitHub remote (`origin/master`,
+> retrievable via `git show origin/master:<path>`) contains prior-architecture
+> modules worth mining, not resurrecting wholesale: a Rust cached-factorization
+> NIF (`sparse_factor`/`sparse_cached_solve`/`sparse_cached_solve_multi`,
+> ResourceArc LDLᵀ handle — handed to p4-sparse for item 18; items 19/21 build on
+> it), `solver/lodf.ex` (439 lines: correct LODF core — sensitivity solve, bridge
+> detection via 1−PTDF_self≈0, cumulative trips — but drift: non-sign-preserving
+> x floor, asymmetric tap entries that break B′ symmetry, single-factorization
+> compounding; reference seed for item 21), `failure/monte_carlo.ex` (N-2/N-k
+> LODF screening — item 21 stretch), `transient/machine/ibr.ex` (IEEE 1547 LVRT
+> voltage-trip envelopes — the voltage half of the Blue Cut mechanism, wire into
+> item 20's QSS-AC wave), `failure/scenarios.ex` (geographic heat-wave/ice/
+> wildfire/earthquake correlated failures — Phase 5 item 25 skeleton),
+> `controls/agc.ex` (ACE-based AGC, 161 lines — the "revisit after AGC" hook),
+> `controls/ras.ex` (latching SPS/RAS), `validation/{harness,scoring}.ex`
+> (weighted acceptance scoring — useful when acceptance gates formalize).
+> Judged not worth salvaging: `voltage_stability.ex`/`cpf.ex` (toy heuristics /
+> step-halving scanner, superseded by item 20), harmonics, OPF/UC/economic
+> dispatch (measured-anchored dispatch supersedes), OLTC/SVC/FACTS/HVDC
+> controllers (no data substrate).
 18. **Sparse DC assembly** (S–M, precondition): build B′ as triplets, never densify;
     delete the dense path. Turns OOM-at-Eastern into sub-second factorizations. Guard:
     negative-reactance branches break LDLᵀ SPD — detect and fall back loudly.
