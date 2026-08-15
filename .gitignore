@@ -45,3 +45,5 @@ npm-debug.log
 # Generated map exports (rebuild with: mix power_model.export_grid_data)
 /priv/static/grid_data/
 
+data/vendored/*
+!data/vendored/PROVENANCE.md
