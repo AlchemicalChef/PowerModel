@@ -439,6 +439,12 @@ class mismatches (115/161 kV, water pipeline, crypto) — align keys and rows. *
 R3-engine adds ids to elements it modifies). **UI-L10 (LOW) [DEFER]** No LiveView tests —
 R3-engine must add tests for what it changes. **UI-L11 (LOW) [DEFER]** daisyUI in scaffold
 chrome. **UI-L12 (LOW) [FIX:R3-data]** Export name nil-guard for TextLayer.
+**UI-M15 (MED) [DEFER→roadmap]** The N-1 screening result shown in the UI is a stub:
+`index.ex` (~:399-407 pre-R3) returns `length(tripped_lines) + length(tripped_generators)`
+— the count of components the user already tripped, presented as a violations count with no
+relationship to what it claims to measure. Found by the solver accuracy exploration
+(2026-08-15). Make it real via sparse PTDF/LODF screening (ROADMAP solver item 6) or remove
+the number until it is.
 **UI-L13 (LOW) [DEFER]** Three of four failure-logging paths untested (`map_manager.js:83`,
 `grid_map_hook.js:10`, `grid_map_hook.js:31`); the hook pair encodes the "map fails, UI
 still works" promise and nothing proves the hook survives either failure. Evidence the path
@@ -449,6 +455,30 @@ thenable whose `then` never settles, and the `.catch` at :31 can never fire (ben
 the plain-Node runner added in R3. Identified at R3-uijs sign-off.
 
 ---
+
+## Findings from the 2026-08-15 accuracy exploration (post-R3, measured)
+
+**ENE-13 (MED-HIGH, promotes DAT-15) [OPEN]** `Demand.latest_demand_hour/0` returns the
+file's boundary hour, where only 17 of 53 BAs report — so the ENE-1 default-hour fix is
+partially defeated: two-thirds of load silently falls back to the ~2× baseline in the
+default run. Fix: skip hours whose reporting-BA count is below modal−1 (ROADMAP item 3).
+**DAT-17 (MED) [OPEN]** Dev-DB schema drift: `rating_b_mva`/`rating_c_mva` columns exist
+in the live DB with no migration or schema behind them; fresh `mix ecto.setup` diverges.
+Close via ROADMAP item 9.
+**DAT-18 (HIGH) [OPEN→roadmap]** Parameter estimators are fill-NULL-only, so stored rows
+written by older code versions are permanently uncorrectable — measured: EHV impedances
+and ratings exactly 2× off the current table (a 500 kV line rated equal to a 345 kV).
+ROADMAP item 8.
+**CAS-15 (LOW-MED) [OPEN]** `island_dead?/2` still declares single-bus islands dead,
+contradicting SOL-3's `min_buses = 1` fix; `cascade_test.exs` pins the old behavior.
+**CAS-16 (MED) [OPEN→roadmap]** `simulated_time` advances 0 s on steps whose only trips
+are non-thermal — any future ramp/AGC modeling is unlimited until fixed (ROADMAP item 16).
+**ENE-14 (LOW) [OPEN]** `Frequency.normalize_fuel` has no case for OIL or biomass/waste
+codes (~15 GW geolocated falls to gas dynamics); the 268 GW `COL` case is entirely on
+coordinate-less MATPOWER buses and never simulated — worth a comment in the fuel table.
+**DAT-19 (DECISION) [OPEN]** Ingestion pulls HIFLD from an unofficial, unlicensed,
+unversioned ArcGIS mirror; HIFLD Open was shut down by DHS 2025-08-26. Vendor a pinned
+snapshot with recorded fetch date (ROADMAP "Decisions needed now").
 
 ## Cross-package contracts (all agents read this)
 
