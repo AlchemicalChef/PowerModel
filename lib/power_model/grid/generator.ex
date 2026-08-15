@@ -23,6 +23,15 @@ defmodule PowerModel.Grid.Generator do
     field :capacity_factor, :float
     field :coordinates, Geo.PostGIS.Geometry
     field :status, :string, default: "in_service"
+    # EIA-860 "Sector Name", stored raw: one of Electric Utility, IPP Non-CHP,
+    # IPP CHP, Commercial CHP, Commercial Non-CHP, Industrial CHP,
+    # Industrial Non-CHP.
+    field :sector, :string
+    # Derived from `sector`: utility and IPP plant is grid-scale, Commercial
+    # and Industrial plant sits at a host site. NULL means the unit never went
+    # through the EIA-860 ingest (MATPOWER imports, import pseudo-generators);
+    # consumers read NULL as utility-scale, which is what EIA-860 mostly is.
+    field :utility_scale, :boolean
 
     belongs_to :bus, PowerModel.Grid.Bus
 
@@ -45,6 +54,8 @@ defmodule PowerModel.Grid.Generator do
       :capacity_factor,
       :coordinates,
       :status,
+      :sector,
+      :utility_scale,
       :bus_id
     ])
     |> validate_required([:p_max_mw])

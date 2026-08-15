@@ -56,6 +56,23 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
   per-row warnings that size is silently truncated by the logger (measured:
   1,079 emitted, 114 printed), so the log alone undercounts by ~90%.
 
+  ## Sector
+
+  `Sector Name` separates grid-scale plant from generation sited at a host
+  facility. It is stored raw in `sector`, and `utility_scale` carries the
+  derived classification consumers read:
+
+    * `Electric Utility`, `IPP Non-CHP`, `IPP CHP` -> `utility_scale = true`
+    * `Commercial CHP`, `Commercial Non-CHP`, `Industrial CHP`,
+      `Industrial Non-CHP` -> `utility_scale = false`
+    * blank or unrecognized -> `true`, logged at debug. EIA-860 is
+      overwhelmingly utility-metered plant (25.5k of 26.9k rows on the 2024
+      file, versus 2 blanks), so utility-scale is the safe default; guessing
+      "onsite" would pull the unit out of the fuel-anchored dispatch pool.
+
+  The distinction matters because EIA-930's per-fuel solar and wind columns
+  report utility-scale generation only — see `PowerModel.Dispatch`.
+
   ## Capacity-factor defaults
 
   A generator with a NULL `capacity_factor` would dispatch at 100% of
@@ -128,6 +145,13 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
   # combined-cycle combustion-turbine part, NOT a simple-cycle turbine —
   # simple cycle is GT/IC).
   @combined_cycle_prime_movers ~w(CC CA CT CS)
+
+  # EIA-860 "Sector Name" values describing grid-scale plant. The other four
+  # published values name a host facility ("Commercial CHP",
+  # "Commercial Non-CHP", "Industrial CHP", "Industrial Non-CHP") and are
+  # matched by prefix so a renamed CHP suffix still classifies correctly.
+  @utility_scale_sectors ["ELECTRIC UTILITY", "IPP NON-CHP", "IPP CHP"]
+  @onsite_sector_prefixes ~w(COMMERCIAL INDUSTRIAL)
 
   # How far a reported seasonal capability may sit above nameplate before the
   # row is flagged (see the "Seasonal capability" moduledoc section).
@@ -236,6 +260,7 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
 
       if plant_id && nameplate && nameplate > 0 do
         generator_id = parse_generator_id(Map.get(row, "Generator ID"))
+        sector = parse_sector(Map.get(row, "Sector Name"))
 
         # Try coordinates from row first, then from plant lookup
         lat = parse_float(Map.get(row, "Latitude"))
@@ -265,6 +290,8 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
           winter_capacity_mw: winter_capacity(row, nameplate, seasonal_excess),
           coordinates: coords,
           status: parse_status(Map.get(row, "Status") || Map.get(row, "Operating Status")),
+          sector: sector,
+          utility_scale: utility_scale?(sector),
           # Set by BusMapper
           bus_id: nil
         }
@@ -356,6 +383,53 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
     Logger.warning(msg)
   end
 
+  @doc """
+  The EIA-860 `Sector Name` cell, trimmed, or `nil` when blank.
+
+  Stored raw rather than as a code so the seven published values survive the
+  ingest and can be re-derived if the `utility_scale` rule ever changes.
+  """
+  def parse_sector(nil), do: nil
+
+  def parse_sector(value) do
+    case value |> to_string() |> String.trim() do
+      "" -> nil
+      name -> name
+    end
+  end
+
+  @doc """
+  Whether an EIA-860 sector describes grid-scale, utility-metered plant.
+
+  `Electric Utility` and both IPP sectors are grid-scale; `Commercial *` and
+  `Industrial *` sit at a host facility and are metered behind it, so EIA-930
+  does not count them in its per-fuel generation columns.
+
+  A blank or unrecognized sector returns `true` and logs at debug: EIA-860 is
+  overwhelmingly utility-metered (2 blank rows on the 2024 national file), and
+  defaulting to onsite would silently pull those units out of the
+  fuel-anchored dispatch pool.
+  """
+  def utility_scale?(sector) do
+    normalized = sector |> to_string() |> String.trim() |> String.upcase()
+
+    cond do
+      normalized in @utility_scale_sectors ->
+        true
+
+      String.starts_with?(normalized, @onsite_sector_prefixes) ->
+        false
+
+      true ->
+        Logger.debug(
+          "EIA-860: blank or unrecognized Sector Name #{inspect(sector)}; " <>
+            "treating as utility-scale"
+        )
+
+        true
+    end
+  end
+
   defp parse_generator_id(nil), do: nil
 
   defp parse_generator_id(value) do
@@ -386,6 +460,8 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
            :p_min_mw,
            :summer_capacity_mw,
            :winter_capacity_mw,
+           :sector,
+           :utility_scale,
            :status,
            :coordinates,
            :updated_at

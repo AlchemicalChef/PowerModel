@@ -17,6 +17,38 @@ defmodule PowerModel.Dispatch do
   `implied_interchange_mw` alongside the interchange EIA reported, and the two
   should agree wherever the network's BA mapping is complete.
 
+  ## Utility-scale solar and wind, onsite solar and wind
+
+  EIA-930's per-fuel columns are a UTILITY-SCALE measurement: for solar and
+  wind they count grid-connected plant, not the arrays sitting behind a
+  commercial or industrial meter. The fuel-anchored pool for those two fuels
+  therefore contains only units EIA-860 tagged `utility_scale` (see
+  `PowerModel.Ingestion.EIA.Form860`), and the BA's measured MW are filled
+  into those units alone.
+
+  Onsite solar and wind units are dispatched OUTSIDE the pool, each at its own
+  capacity factor capped at seasonal capability, and their MW are never
+  subtracted from the BA's fuel target — the target measured other machines.
+  The accounting that follows from that:
+
+    * `by_ba[ba].by_fuel["solar"].target_mw` and `.dispatched_mw` describe the
+      utility-scale pool only; `.onsite_mw` and `.onsite_units` report what was
+      placed beside it, and the top-level `onsite_mw` totals it.
+    * `by_ba[ba].dispatched_mw` (and therefore `implied_interchange_mw`) DOES
+      include onsite MW: those are real injections at real buses, and the
+      network has to carry them.
+    * A BA reporting utility-scale solar whose only solar units are onsite now
+      shows that solar in `unmatched` rather than placing it on an onsite
+      unit — the measured plant is genuinely missing from the model.
+
+  The onsite operating point is a flat annual capacity factor, so it does not
+  fall to zero at night; ROADMAP item 30 replaces it with the BA's own hourly
+  utility-solar capacity factor. The magnitude is small (~0.75 GW of onsite PV
+  against 122 GW utility-scale) — this is a correctness fix, not a large one.
+
+  Every other fuel is unaffected: sector plays no part in allocating gas,
+  coal, nuclear, hydro, petroleum or other.
+
   ## Minimum load and OFFLINE units
 
   A unit whose remaining allocation would fall below its `p_min_mw` is left
@@ -56,6 +88,8 @@ defmodule PowerModel.Dispatch do
           unserved_mw: float,        # measured MW no unit could absorb
           fallback_mw: float,        # MW placed by the island fallback
           fallback_capacity_mw: float,
+          onsite_mw: float,          # MW placed on onsite solar/wind
+          onsite_units: integer,     # in-service onsite solar/wind units
           units: integer,
           online_units: integer,
           offline_units: integer,
@@ -67,7 +101,8 @@ defmodule PowerModel.Dispatch do
             implied_interchange_mw: float | nil,
             reported_interchange_mw: float | nil,
             by_fuel: %{fuel => %{target_mw: float, dispatched_mw: float,
-                                 units: integer, online_units: integer}}
+                                 units: integer, online_units: integer,
+                                 onsite_mw: float, onsite_units: integer}}
           }},
           missing: [%{ba_id: integer | nil, fuel: String.t(), capacity_mw: float,
                       units: integer}],       # units with no measurement
@@ -183,8 +218,13 @@ defmodule PowerModel.Dispatch do
     units = Enum.map(generators, &unit(&1, bus_ba, season))
     {dispatchable, unavailable} = Enum.split_with(units, & &1.in_service?)
 
+    # EIA-930 measures utility-scale solar and wind, so onsite units of those
+    # fuels are held out of the pool and run on their own capacity factor.
+    {onsite, pooled} = Enum.split_with(dispatchable, &onsite_vre?/1)
+    {onsite_alloc, onsite_stats} = onsite_dispatch(onsite)
+
     # Grouped by the (BA, fuel) key the measurement is published at.
-    by_group = Enum.group_by(dispatchable, &{&1.ba_id, &1.fuel})
+    by_group = Enum.group_by(pooled, &{&1.ba_id, &1.fuel})
 
     {fuel_alloc, group_stats, missing} = allocate_groups(by_group, fuel_totals)
 
@@ -192,15 +232,24 @@ defmodule PowerModel.Dispatch do
     # the measurement placed every MW it had. Only units whose group was never
     # measured at all are left for the fallback.
     measured_keys = MapSet.new(Map.keys(group_stats))
-    leftover = Enum.reject(dispatchable, &MapSet.member?(measured_keys, {&1.ba_id, &1.fuel}))
+    leftover = Enum.reject(pooled, &MapSet.member?(measured_keys, {&1.ba_id, &1.fuel}))
 
+    # Onsite MW count as generation already placed on the island, so the
+    # fallback's residual does not ask other units to serve that load again.
     {fallback_alloc, fallback_mw} =
-      fallback_dispatch(leftover, fuel_alloc, dispatchable, loads, islands)
+      fallback_dispatch(
+        leftover,
+        Map.merge(fuel_alloc, onsite_alloc),
+        dispatchable,
+        loads,
+        islands
+      )
 
     dispatch =
       units
       |> Map.new(&{&1.id, 0.0})
       |> Map.merge(fuel_alloc)
+      |> Map.merge(onsite_alloc)
       |> Map.merge(fallback_alloc)
 
     coverage =
@@ -210,10 +259,12 @@ defmodule PowerModel.Dispatch do
         units,
         dispatch,
         group_stats,
+        onsite_stats,
         missing,
         unmatched(fuel_totals, by_group, dispatchable),
         fallback_mw,
         leftover,
+        onsite,
         loads,
         bus_ba,
         opts
@@ -242,9 +293,20 @@ defmodule PowerModel.Dispatch do
       # undispatchable at any MW; clamp so it can still run at capability.
       p_min_mw: min(Map.get(generator, :p_min_mw) || 0.0, capability),
       capacity_factor: Map.get(generator, :capacity_factor) || 0.0,
-      in_service?: (Map.get(generator, :status) || "in_service") == "in_service"
+      in_service?: (Map.get(generator, :status) || "in_service") == "in_service",
+      utility_scale?: utility_scale?(generator)
     }
   end
+
+  # Read defensively: only EIA-860 sets this column, so a MATPOWER import, an
+  # import pseudo-generator, or a plain-map fixture has no value at all. Both
+  # "absent" and NULL mean utility-scale, which is what EIA-860 is
+  # overwhelmingly made of — see PowerModel.Ingestion.EIA.Form860.
+  defp utility_scale?(generator), do: Map.get(generator, :utility_scale, true) != false
+
+  # Onsite solar and wind: the two fuels whose EIA-930 columns exclude
+  # behind-the-meter plant. Every other fuel is measured whoever hosts it.
+  defp onsite_vre?(unit), do: not unit.utility_scale? and unit.fuel in ~w(solar wind)
 
   @doc """
   The EIA-930 fuel column a generator's output is reported in.
@@ -386,6 +448,31 @@ defmodule PowerModel.Dispatch do
   end
 
   # ---------------------------------------------------------------------------
+  # Onsite solar and wind
+  # ---------------------------------------------------------------------------
+
+  # Onsite units run at their own capacity factor against seasonal capability.
+  # There is no measured MW to fill them from — EIA-930 counted the utility
+  # fleet — so nothing here competes for, or consumes, a BA's fuel target.
+  # Stats come back keyed the way the measurement is, so coverage can report
+  # the onsite MW next to the utility-scale target it is NOT part of.
+  defp onsite_dispatch([]), do: {%{}, %{}}
+
+  defp onsite_dispatch(units) do
+    Enum.reduce(units, {%{}, %{}}, fn unit, {alloc, stats} ->
+      mw = min(unit.capability_mw * unit.capacity_factor, unit.capability_mw)
+      mw = if mw <= 0.0 or mw < unit.p_min_mw, do: 0.0, else: mw
+
+      stat =
+        stats
+        |> Map.get({unit.ba_id, unit.fuel}, %{onsite_mw: 0.0, onsite_units: 0})
+        |> then(&%{onsite_mw: &1.onsite_mw + mw, onsite_units: &1.onsite_units + 1})
+
+      {Map.put(alloc, unit.id, mw), Map.put(stats, {unit.ba_id, unit.fuel}, stat)}
+    end)
+  end
+
+  # ---------------------------------------------------------------------------
   # Island fallback
   # ---------------------------------------------------------------------------
 
@@ -456,10 +543,12 @@ defmodule PowerModel.Dispatch do
          units,
          dispatch,
          group_stats,
+         onsite_stats,
          missing,
          unmatched,
          fallback_mw,
          leftover,
+         onsite,
          loads,
          bus_ba,
          opts
@@ -475,7 +564,12 @@ defmodule PowerModel.Dispatch do
       Map.new(by_ba_fuel, fn {ba_id, entries} ->
         fuels =
           Map.new(entries, fn {{_ba, fuel}, stat} ->
-            {fuel, Map.take(stat, [:target_mw, :dispatched_mw, :units, :online_units])}
+            onsite = Map.get(onsite_stats, {ba_id, fuel}, %{onsite_mw: 0.0, onsite_units: 0})
+
+            {fuel,
+             stat
+             |> Map.take([:target_mw, :dispatched_mw, :units, :online_units])
+             |> Map.merge(onsite)}
           end)
 
         target = fuels |> Map.values() |> sum_by(& &1.target_mw)
@@ -508,6 +602,8 @@ defmodule PowerModel.Dispatch do
       unserved_mw: by_ba |> Map.values() |> sum_by(& &1.unserved_mw),
       fallback_mw: fallback_mw,
       fallback_capacity_mw: sum_by(leftover, & &1.capability_mw),
+      onsite_mw: sum_by(onsite, &Map.get(dispatch, &1.id, 0.0)),
+      onsite_units: length(onsite),
       units: length(units),
       online_units: online,
       offline_units: length(units) - online,
@@ -557,6 +653,7 @@ defmodule PowerModel.Dispatch do
         "(measured #{gw(coverage.target_mw)} GW, unserved #{gw(coverage.unserved_mw)} GW, " <>
         "island fallback #{gw(coverage.fallback_mw)} GW of " <>
         "#{gw(coverage.fallback_capacity_mw)} GW capacity, " <>
+        "onsite solar/wind #{gw(coverage.onsite_mw)} GW on #{coverage.onsite_units} units, " <>
         "#{length(unavailable)} units out of service)"
     )
 

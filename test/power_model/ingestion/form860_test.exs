@@ -30,6 +30,35 @@ defmodule PowerModel.Ingestion.EIA.Form860Test do
     """)
   end
 
+  # Same trimmed Schedule 3.1 shape, with the Sector Name column EIA publishes
+  # between Status and Energy Source 1.
+  defp write_sector_generators(dir, data_rows) do
+    File.write!(Path.join(dir, "generators.csv"), """
+    Plant Code,Generator ID,Energy Source 1,Prime Mover,Nameplate Capacity (MW),Summer Capacity (MW),Winter Capacity (MW),Minimum Load (MW),Status,Sector Name
+    #{data_rows}
+    """)
+
+    File.write!(Path.join(dir, "2___Plant_Y2024.csv"), """
+    Plant Code,Latitude,Longitude
+    100,35.0,-90.0
+    200,40.0,-100.0
+    """)
+  end
+
+  # `capture_log(level: :debug)` sets the capture handler's level but not the
+  # primary logger level, which the test env pins at :warning — a debug message
+  # is dropped before any handler sees it. Lower it for the duration.
+  defp capture_debug_log(fun) do
+    level = Logger.level()
+    Logger.configure(level: :debug)
+
+    try do
+      capture_log([level: :debug], fun)
+    after
+      Logger.configure(level: level)
+    end
+  end
+
   defp insert_gen!(attrs) do
     defaults = %{p_max_mw: 100.0, status: "in_service"}
     Repo.insert!(struct(Generator, Map.merge(defaults, attrs)))
@@ -155,6 +184,56 @@ defmodule PowerModel.Ingestion.EIA.Form860Test do
     end
   end
 
+  describe "utility_scale?/1 and parse_sector/1" do
+    test "every EIA-860 sector name classifies without a fallback log" do
+      # The seven values EIA publishes in Sector Name. Utility and IPP plant is
+      # grid-scale; Commercial and Industrial plant sits behind a host meter,
+      # where EIA-930's per-fuel columns do not count it.
+      log =
+        capture_debug_log(fn ->
+          assert Form860.utility_scale?("Electric Utility")
+          assert Form860.utility_scale?("IPP Non-CHP")
+          assert Form860.utility_scale?("IPP CHP")
+
+          refute Form860.utility_scale?("Commercial CHP")
+          refute Form860.utility_scale?("Commercial Non-CHP")
+          refute Form860.utility_scale?("Industrial CHP")
+          refute Form860.utility_scale?("Industrial Non-CHP")
+        end)
+
+      refute log =~ "unrecognized"
+    end
+
+    test "tolerates surrounding whitespace and case" do
+      assert Form860.utility_scale?("  electric utility  ")
+      refute Form860.utility_scale?(" INDUSTRIAL non-chp ")
+    end
+
+    test "blank or unrecognized sector defaults to utility-scale, logged at debug" do
+      # EIA-860 is overwhelmingly utility-metered (2 blank rows nationally), so
+      # the default is utility-scale: guessing "onsite" would silently pull the
+      # unit out of the fuel-anchored dispatch pool.
+      log =
+        capture_debug_log(fn ->
+          assert Form860.utility_scale?(nil)
+          assert Form860.utility_scale?("")
+          assert Form860.utility_scale?("   ")
+          assert Form860.utility_scale?("Cooperative")
+        end)
+
+      assert log =~ "unrecognized Sector Name"
+      assert log =~ "Cooperative"
+      assert log =~ "utility-scale"
+    end
+
+    test "parse_sector/1 keeps the raw name and blanks become nil" do
+      assert Form860.parse_sector(" IPP Non-CHP ") == "IPP Non-CHP"
+      assert Form860.parse_sector("") == nil
+      assert Form860.parse_sector("   ") == nil
+      assert Form860.parse_sector(nil) == nil
+    end
+  end
+
   describe "ingest/1 file requirements" do
     @tag :tmp_dir
     test "raises an actionable error when the Plant (coordinates) file is missing",
@@ -231,6 +310,95 @@ defmodule PowerModel.Ingestion.EIA.Form860Test do
       assert Repo.get_by!(Generator, generator_id: "GEN1").capacity_factor == 0.93
       assert Repo.get_by!(Generator, generator_id: "GEN2").capacity_factor == 0.55
       assert Repo.get_by!(Generator, eia_plant_id: "200").capacity_factor == 0.50
+    end
+  end
+
+  describe "ingest/1 sector (db)" do
+    @describetag :db
+
+    @tag :tmp_dir
+    test "stores the raw sector and the derived utility_scale flag", %{tmp_dir: tmp_dir} do
+      write_sector_generators(tmp_dir, """
+      100,UTIL,SUN,PV,100,100,100,0,OP,Electric Utility
+      100,IPP,SUN,PV,200,200,200,0,OP,IPP Non-CHP
+      100,IPPCHP,NG,CC,300,300,300,0,OP,IPP CHP
+      200,COMM,SUN,PV,5,5,5,0,OP,Commercial Non-CHP
+      200,COMMCHP,NG,GT,6,6,6,0,OP,Commercial CHP
+      200,IND,SUN,PV,7,7,7,0,OP,Industrial Non-CHP
+      200,INDCHP,NG,ST,8,8,8,0,OP,Industrial CHP
+      """)
+
+      capture_io(fn -> assert :ok = Form860.ingest(tmp_dir) end)
+
+      # Raw name survives the ingest so the classification can be re-derived.
+      assert Repo.get_by!(Generator, generator_id: "IPP").sector == "IPP Non-CHP"
+      assert Repo.get_by!(Generator, generator_id: "COMMCHP").sector == "Commercial CHP"
+
+      for id <- ~w(UTIL IPP IPPCHP) do
+        assert Repo.get_by!(Generator, generator_id: id).utility_scale == true,
+               "expected #{id} to be utility-scale"
+      end
+
+      for id <- ~w(COMM COMMCHP IND INDCHP) do
+        assert Repo.get_by!(Generator, generator_id: id).utility_scale == false,
+               "expected #{id} to be onsite"
+      end
+    end
+
+    @tag :tmp_dir
+    test "a blank sector stores NULL but still classifies as utility-scale",
+         %{tmp_dir: tmp_dir} do
+      write_sector_generators(tmp_dir, """
+      100,BLANK,SUN,PV,100,100,100,0,OP,
+      """)
+
+      capture_io(fn -> assert :ok = Form860.ingest(tmp_dir) end)
+
+      blank = Repo.get_by!(Generator, generator_id: "BLANK")
+      assert blank.sector == nil
+      assert blank.utility_scale == true
+    end
+
+    @tag :tmp_dir
+    test "a file with no Sector Name column leaves both fields unset", %{tmp_dir: tmp_dir} do
+      # Non-standard exports (and the trimmed fixtures the other tests use)
+      # have no sector at all; the ingest must not invent one.
+      write_generators(tmp_dir, """
+      100,NOSECTOR,NG,CT,100,100,100,0,OP
+      """)
+
+      capture_io(fn -> assert :ok = Form860.ingest(tmp_dir) end)
+
+      gen = Repo.get_by!(Generator, generator_id: "NOSECTOR")
+      assert gen.sector == nil
+      # Absent is not "onsite": consumers read it as utility-scale.
+      assert gen.utility_scale == true
+    end
+
+    @tag :tmp_dir
+    test "sector is EIA-sourced, so a re-ingest refreshes it", %{tmp_dir: tmp_dir} do
+      write_sector_generators(tmp_dir, """
+      100,MOVED,SUN,PV,100,100,100,0,OP,Commercial Non-CHP
+      """)
+
+      capture_io(fn -> assert :ok = Form860.ingest(tmp_dir) end)
+
+      moved = Repo.get_by!(Generator, generator_id: "MOVED")
+      assert moved.sector == "Commercial Non-CHP"
+      assert moved.utility_scale == false
+
+      # EIA reclassifies the unit; the re-ingest must carry both fields over
+      # rather than leaving a stale onsite tag behind.
+      write_sector_generators(tmp_dir, """
+      100,MOVED,SUN,PV,100,100,100,0,OP,IPP Non-CHP
+      """)
+
+      capture_io(fn -> assert :ok = Form860.ingest(tmp_dir) end)
+
+      assert Repo.aggregate(Generator, :count) == 1
+      moved = Repo.get_by!(Generator, generator_id: "MOVED")
+      assert moved.sector == "IPP Non-CHP"
+      assert moved.utility_scale == true
     end
   end
 

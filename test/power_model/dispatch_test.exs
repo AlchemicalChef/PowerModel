@@ -23,6 +23,8 @@ defmodule PowerModel.DispatchTest do
     })
   end
 
+  defp pv(id, opts), do: gen(id, Keyword.merge([fuel_type: "SUN", prime_mover: "PV"], opts))
+
   # Two-BA, two-bus world: BA 1 on bus 1, BA 2 on bus 2.
   defp bus_ba, do: %{1 => 1, 2 => 2}
 
@@ -205,6 +207,193 @@ defmodule PowerModel.DispatchTest do
 
       assert dispatch[1] == 0.0
       assert coverage.by_ba[1].by_fuel["other"].target_mw == -50.0
+    end
+  end
+
+  describe "utility-scale solar and wind" do
+    test "measured solar fills utility-scale units only; onsite runs on its own CF" do
+      gens = [
+        pv(1, bus_id: 1, p_max_mw: 100.0, capacity_factor: 0.3, utility_scale: true),
+        pv(2, bus_id: 1, p_max_mw: 200.0, capacity_factor: 0.25, utility_scale: true),
+        pv(3, bus_id: 1, p_max_mw: 40.0, capacity_factor: 0.2, utility_scale: false)
+      ]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"solar" => 150.0}}
+        )
+
+      # The 150 measured MW go to the two grid-scale units in merit order.
+      assert dispatch[1] == 100.0
+      assert dispatch[2] == 50.0
+      # The onsite array is not part of that measurement: it runs at its own
+      # capacity factor, 40 MW * 0.2.
+      assert_in_delta dispatch[3], 8.0, 1.0e-9
+
+      solar = coverage.by_ba[1].by_fuel["solar"]
+      # Every measured MW is still placed, and none of them went to the onsite
+      # unit: the pool's target and dispatched MW are untouched by it.
+      assert_in_delta solar.target_mw, 150.0, 1.0e-9
+      assert_in_delta solar.dispatched_mw, 150.0, 1.0e-9
+      assert solar.units == 2
+      assert solar.online_units == 2
+      assert_in_delta coverage.unserved_mw, 0.0, 1.0e-9
+
+      # The onsite MW are reported beside the target, never inside it.
+      assert_in_delta solar.onsite_mw, 8.0, 1.0e-9
+      assert solar.onsite_units == 1
+      assert_in_delta coverage.onsite_mw, 8.0, 1.0e-9
+      assert coverage.onsite_units == 1
+
+      # The BA total does include them — they are real injections at real
+      # buses, so 150 measured + 8 onsite reach the network.
+      assert_in_delta coverage.by_ba[1].dispatched_mw, 158.0, 1.0e-9
+    end
+
+    test "the same fleet tagged utility-scale puts the onsite unit in the pool instead" do
+      # Contrast with the test above: as a pool member the 0.2-CF unit is last
+      # in merit order and the 150 measured MW never reach it.
+      gens = [
+        pv(1, bus_id: 1, p_max_mw: 100.0, capacity_factor: 0.3, utility_scale: true),
+        pv(2, bus_id: 1, p_max_mw: 200.0, capacity_factor: 0.25, utility_scale: true),
+        pv(3, bus_id: 1, p_max_mw: 40.0, capacity_factor: 0.2, utility_scale: true)
+      ]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"solar" => 150.0}}
+        )
+
+      assert dispatch[3] == 0.0
+      assert coverage.onsite_mw == 0.0
+      assert coverage.by_ba[1].by_fuel["solar"].units == 3
+    end
+
+    test "onsite wind is held out of the measured wind column too" do
+      gens = [
+        gen(1,
+          bus_id: 1,
+          fuel_type: "WND",
+          prime_mover: "WT",
+          p_max_mw: 100.0,
+          utility_scale: true
+        ),
+        gen(2,
+          bus_id: 1,
+          fuel_type: "WND",
+          prime_mover: "WT",
+          p_max_mw: 20.0,
+          capacity_factor: 0.4,
+          utility_scale: false
+        )
+      ]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour, bus_ba: bus_ba(), fuel_totals: %{1 => %{"wind" => 60.0}})
+
+      assert dispatch[1] == 60.0
+      assert_in_delta dispatch[2], 8.0, 1.0e-9
+      assert_in_delta coverage.by_ba[1].by_fuel["wind"].target_mw, 60.0, 1.0e-9
+      assert_in_delta coverage.by_ba[1].by_fuel["wind"].onsite_mw, 8.0, 1.0e-9
+    end
+
+    test "the onsite operating point is capped at seasonal capability, not nameplate" do
+      gens = [
+        pv(1, bus_id: 1, p_max_mw: 100.0, capacity_factor: 0.5, utility_scale: true),
+        pv(2, bus_id: 1, p_max_mw: 100.0, capacity_factor: 0.5, utility_scale: false)
+        |> Map.put(:summer_capacity_mw, 40.0)
+      ]
+
+      {:ok, %{dispatch: dispatch}} =
+        Dispatch.for_hour(gens, @hour, bus_ba: bus_ba(), fuel_totals: %{1 => %{"solar" => 10.0}})
+
+      # 40 MW of summer capability at CF 0.5, not 100 MW of nameplate.
+      assert_in_delta dispatch[2], 20.0, 1.0e-9
+    end
+
+    test "measured solar with no utility-scale unit to carry it is reported unmatched" do
+      # Before sector tagging the onsite array absorbed the measurement and the
+      # gap disappeared. The BA's utility-scale solar is genuinely missing from
+      # the model, and coverage has to say so.
+      gens = [pv(1, bus_id: 1, p_max_mw: 40.0, capacity_factor: 0.2, utility_scale: false)]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"solar" => 300.0}}
+        )
+
+      assert_in_delta dispatch[1], 8.0, 1.0e-9
+      assert [%{ba_id: 1, fuel: "solar", mw: 300.0}] = coverage.unmatched
+      assert_in_delta coverage.unmatched_mw, 300.0, 1.0e-9
+    end
+
+    test "sector plays no part in any other fuel" do
+      # EIA-930's gas column counts industrial cogeneration; only solar and
+      # wind are utility-scale-only measurements.
+      gens = [
+        gen(1, bus_id: 1, fuel_type: "NG", capacity_factor: 0.4, utility_scale: true),
+        gen(2, bus_id: 1, fuel_type: "NG", capacity_factor: 0.9, utility_scale: false)
+      ]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"natural_gas" => 150.0}}
+        )
+
+      # The industrial unit wins the merit order like any other gas unit.
+      assert dispatch[2] == 100.0
+      assert dispatch[1] == 50.0
+      assert coverage.onsite_mw == 0.0
+      assert coverage.by_ba[1].by_fuel["natural_gas"].units == 2
+    end
+
+    test "a fixture without the field, or an unset column, dispatches as utility-scale" do
+      # Only the EIA-860 ingest sets utility_scale; plain-map fixtures and
+      # MATPOWER imports have no value at all, and NULL means "not derived",
+      # not "onsite".
+      gens = [
+        pv(1, bus_id: 1, p_max_mw: 100.0, capacity_factor: 0.3),
+        pv(2, bus_id: 1, p_max_mw: 100.0, capacity_factor: 0.2, utility_scale: nil)
+      ]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"solar" => 150.0}}
+        )
+
+      assert dispatch[1] == 100.0
+      assert dispatch[2] == 50.0
+      assert coverage.onsite_units == 0
+      assert coverage.by_ba[1].by_fuel["solar"].units == 2
+    end
+
+    test "onsite MW count as generation already placed on the island" do
+      gens = [
+        gen(1, bus_id: 1, fuel_type: "NG", p_max_mw: 100.0),
+        pv(2, bus_id: 1, p_max_mw: 40.0, capacity_factor: 0.5, utility_scale: false),
+        # No coal measurement exists for BA 1, so this one goes to the fallback
+        gen(3, bus_id: 1, fuel_type: "BIT", p_max_mw: 200.0, capacity_factor: 0.5)
+      ]
+
+      {:ok, %{dispatch: dispatch}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"natural_gas" => 30.0}},
+          loads: [%{bus_id: 1, p_mw: 100.0}],
+          islands: [MapSet.new([1])]
+        )
+
+      assert dispatch[1] == 30.0
+      assert_in_delta dispatch[2], 20.0, 1.0e-9
+      # 100 MW load - (30 measured + 20 onsite) = 50 MW residual, taken against
+      # the coal unit's 100 MW expected output. Ignoring the onsite MW here
+      # would ask the coal unit to serve 70 MW the array is already serving.
+      assert_in_delta dispatch[3], 50.0, 1.0e-9
     end
   end
 
