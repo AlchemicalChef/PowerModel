@@ -5,19 +5,46 @@ defmodule PowerModel.Demand do
   The synthetic loads created by `PowerModel.Ingestion.LoadEstimator` define
   WHERE demand sits (per-bus spatial weights); EIA-930 defines HOW MUCH each
   balancing authority actually consumed in a given hour. `scale_loads/3`
-  reconciles the two at snapshot-build time: within each BA, baseline loads
-  are rescaled so their sum equals that BA's actual demand for the selected
-  hour. The `loads` table is never rewritten, so concurrent simulations can
-  use different hours.
+  reconciles the two at snapshot-build time by rescaling each load with its
+  BA's factor. The `loads` table is never rewritten, so concurrent
+  simulations can use different hours.
+
+  ## The scaling rule (ENE-17)
+
+  A BA's factor is its actual demand divided by the BA's TOTAL baseline over
+  ALL its geolocated loads in the database — never by the baseline of
+  whatever slice of the BA a particular snapshot happens to hold:
+
+      factor(BA) = (actual_demand(BA, hour) − flat_datacenter_mw(BA))
+                   / total_geolocated_baseline(BA)
+
+  The denominator is a property of the BA, not of the snapshot, so a bus
+  carries the same MW whether or not its siblings made it into the snapshot,
+  and identical loads in a regional and a national run scale identically.
+
+  The consequence is deliberate: **a snapshot serves its genuine share of
+  real demand, not 100% of it.** A snapshot holding 30% of a BA's baseline
+  serves ~30% of that BA's demand. Scoped served load therefore drops
+  compared with the pre-ENE-17 behaviour, which concentrated a BA's whole
+  demand onto whatever buses survived (measured: MISO's 69 GW landing on
+  stray ERCOT-labelled buses at 17.2×, AECI at 191×). This aligns the load
+  universe with the generation universe — `PowerModel.Dispatch` likewise
+  places only the measured MW that found a mapped unit — so balance metrics
+  compare two populations covering the same fraction of the real network.
+  `baseline_coverage/2` reports each BA's scoped/total share, and
+  `scale_loads/3` logs it, so the share a run represents is always visible.
 
   Loads on buses without a BA assignment (run `mix power_model.ingest map_bas`)
-  or in BAs without demand data for the hour keep their baseline values.
+  or in BAs without demand data for the hour keep their baseline values. A BA
+  with no geolocated loads in the database (synthetic fixtures, an un-ingested
+  network) falls back to the snapshot's own baseline as the denominator.
 
   Datacenter loads (`load_type: "datacenter"`) are held FLAT: datacenters run
   near-constant 24/7 and do not follow the residential/commercial demand
-  shape. Their MW is subtracted from each BA's actual demand before computing
-  the scale factor for the remaining loads, so the BA total still matches
-  reality exactly.
+  shape. The BA's total datacenter MW is subtracted from its actual demand
+  before computing the scale factor for the remaining loads, so summing a
+  BA's served load over snapshots that partition its buses still reproduces
+  its actual demand exactly.
 
   Note: water-facility loads merged into bus loads are scaled along with
   everything else; the small distortion of nominally-fixed industrial load is
@@ -30,7 +57,7 @@ defmodule PowerModel.Demand do
 
   alias PowerModel.Repo
   alias PowerModel.Demand.{BADemandHour, BAFuelHour}
-  alias PowerModel.Grid.{BalancingAuthority, Bus, Generator}
+  alias PowerModel.Grid.{BalancingAuthority, Bus, Generator, Load}
 
   # Per-BA scale factors outside this range usually indicate bad demand data
   # or a badly skewed baseline; they are applied but logged.
@@ -162,44 +189,42 @@ defmodule PowerModel.Demand do
 
   @doc """
   Per-BA scale factors for the given hour, applied to NON-datacenter loads:
-  `(actual_BA_demand(hour) − flat_datacenter_mw) / baseline_BA_load_sum`.
+  `(actual_BA_demand(hour) − flat_datacenter_mw) / total_geolocated_baseline`.
 
-  BAs without demand data for the hour, or with a non-positive baseline,
-  are omitted (their loads stay at baseline).
+  The denominator is the BA's whole geolocated load baseline in the database,
+  NOT the part of it this snapshot contains (ENE-17) — see the moduledoc. It
+  falls back to the snapshot's own baseline only for BAs the database has no
+  geolocated loads for.
+
+  BAs with no non-datacenter load in the snapshot, without demand data for
+  the hour, or with a non-positive demand row are omitted (their loads stay
+  at baseline).
   """
   def ba_scale_factors(loads, buses, %DateTime{} = timestamp) do
-    bus_to_ba = Map.new(buses, &{&1.id, Map.get(&1, :balancing_authority_id)})
+    ba_scale_factors(loads, buses, timestamp, universe_baselines())
+  end
+
+  defp ba_scale_factors(loads, buses, timestamp, universe) do
+    bus_to_ba = bus_to_ba(buses)
     demand = demand_at(timestamp)
-
-    {baseline_by_ba, dc_by_ba} =
-      Enum.reduce(loads, {%{}, %{}}, fn load, {base, dc} ->
-        case Map.get(bus_to_ba, load.bus_id) do
-          nil ->
-            {base, dc}
-
-          ba_id ->
-            if datacenter_load?(load) do
-              {base, Map.update(dc, ba_id, load.p_mw, &(&1 + load.p_mw))}
-            else
-              {Map.update(base, ba_id, load.p_mw, &(&1 + load.p_mw)), dc}
-            end
-        end
-      end)
+    {scoped_baseline, scoped_dc} = scoped_sums(loads, bus_to_ba)
 
     {min_sane, max_sane} = @sane_factor_range
 
-    baseline_by_ba
-    |> Enum.flat_map(fn {ba_id, baseline_mw} ->
-      with true <- baseline_mw > 0.0,
+    scoped_baseline
+    |> Enum.flat_map(fn {ba_id, scoped_mw} ->
+      with true <- scoped_mw > 0.0,
            demand_mw when is_number(demand_mw) <- Map.get(demand, ba_id),
-           true <- positive_demand_or_warn(ba_id, demand_mw, baseline_mw) do
-        dc_mw = Map.get(dc_by_ba, ba_id, 0.0)
+           true <- positive_demand_or_warn(ba_id, demand_mw, scoped_mw) do
+        {baseline_mw, dc_mw} =
+          denominator(ba_id, scoped_mw, Map.get(scoped_dc, ba_id, 0.0), universe)
+
         target_mw = demand_mw - dc_mw
 
         if target_mw < 0.0 do
           Logger.warning(
-            "Flat datacenter load #{Float.round(dc_mw, 1)} MW exceeds BA #{ba_id} actual " <>
-              "demand #{Float.round(demand_mw, 1)} MW at this hour -- " <>
+            "Flat datacenter load #{round1(dc_mw)} MW exceeds BA #{ba_id} actual " <>
+              "demand #{round1(demand_mw)} MW at this hour -- " <>
               "datacenter estimates likely too high; scaling other loads to zero"
           )
         end
@@ -209,9 +234,9 @@ defmodule PowerModel.Demand do
         if factor < min_sane or factor > max_sane do
           Logger.warning(
             "EIA-930 scale factor #{Float.round(factor, 3)} for BA #{ba_id} is outside " <>
-              "[#{min_sane}, #{max_sane}] (demand #{Float.round(demand_mw, 1)} MW, " <>
-              "flat DC #{Float.round(dc_mw, 1)} MW, baseline #{Float.round(baseline_mw, 1)} MW) " <>
-              "-- check demand data / baseline"
+              "[#{min_sane}, #{max_sane}] (demand #{round1(demand_mw)} MW, " <>
+              "flat DC #{round1(dc_mw)} MW, total geolocated baseline " <>
+              "#{round1(baseline_mw)} MW) -- check demand data / baseline"
           )
         end
 
@@ -221,6 +246,98 @@ defmodule PowerModel.Demand do
       end
     end)
     |> Map.new()
+  end
+
+  defp bus_to_ba(buses), do: Map.new(buses, &{&1.id, Map.get(&1, :balancing_authority_id)})
+
+  # This snapshot's own per-BA sums: `{non_datacenter_mw, datacenter_mw}`.
+  defp scoped_sums(loads, bus_to_ba) do
+    Enum.reduce(loads, {%{}, %{}}, fn load, {base, dc} ->
+      case Map.get(bus_to_ba, load.bus_id) do
+        nil ->
+          {base, dc}
+
+        ba_id ->
+          if datacenter_load?(load) do
+            {base, Map.update(dc, ba_id, load.p_mw, &(&1 + load.p_mw))}
+          else
+            {Map.update(base, ba_id, load.p_mw, &(&1 + load.p_mw)), dc}
+          end
+      end
+    end)
+  end
+
+  # ENE-17: the denominator is the BA's TOTAL geolocated baseline, so a
+  # snapshot holding part of a BA gets its share of the BA's demand rather
+  # than all of it. A BA the database has no geolocated loads for (synthetic
+  # fixtures, un-ingested network) — or one whose in-snapshot baseline somehow
+  # exceeds the database total — keeps the snapshot-scoped denominator, which
+  # is the best available estimate of its universe.
+  defp denominator(ba_id, scoped_mw, scoped_dc_mw, universe) do
+    case Map.get(universe, ba_id) do
+      %{baseline_mw: total_mw, datacenter_mw: total_dc_mw} when total_mw >= scoped_mw ->
+        {total_mw, total_dc_mw}
+
+      _ ->
+        {scoped_mw, scoped_dc_mw}
+    end
+  end
+
+  # Every BA's whole load universe, in ONE query: in-service loads on
+  # geolocated, BA-assigned buses. That is the same population the replay
+  # harness measures bus coverage over, so the load and generation sides of a
+  # balance metric describe the same network.
+  defp universe_baselines do
+    from(l in Load,
+      join: b in Bus,
+      on: l.bus_id == b.id,
+      where:
+        l.status == "in_service" and not is_nil(b.coordinates) and
+          not is_nil(b.balancing_authority_id),
+      group_by: [b.balancing_authority_id, l.load_type],
+      select: {b.balancing_authority_id, l.load_type, sum(l.p_mw)}
+    )
+    |> Repo.all()
+    |> Enum.reduce(%{}, fn {ba_id, load_type, mw}, acc ->
+      mw = (mw || 0.0) * 1.0
+      entry = Map.get(acc, ba_id, %{baseline_mw: 0.0, datacenter_mw: 0.0})
+
+      entry =
+        if load_type == "datacenter" do
+          %{entry | datacenter_mw: entry.datacenter_mw + mw}
+        else
+          %{entry | baseline_mw: entry.baseline_mw + mw}
+        end
+
+      Map.put(acc, ba_id, entry)
+    end)
+  end
+
+  @doc """
+  What share of each BA's load universe a snapshot holds:
+  `%{ba_id => %{snapshot_baseline_mw:, total_baseline_mw:, share:}}`.
+
+  The share is the fraction of that BA's real demand the snapshot serves
+  under the ENE-17 rule (non-datacenter loads only; datacenters are flat and
+  carry their own absolute MW). BAs absent from the snapshot are omitted.
+  """
+  def baseline_coverage(loads, buses) do
+    baseline_coverage(loads, bus_to_ba(buses), universe_baselines())
+  end
+
+  defp baseline_coverage(loads, bus_to_ba, universe) do
+    {scoped_baseline, scoped_dc} = scoped_sums(loads, bus_to_ba)
+
+    Map.new(scoped_baseline, fn {ba_id, scoped_mw} ->
+      {total_mw, _dc_mw} = denominator(ba_id, scoped_mw, Map.get(scoped_dc, ba_id, 0.0), universe)
+
+      {ba_id,
+       %{
+         snapshot_baseline_mw: scoped_mw,
+         total_baseline_mw: total_mw,
+         share: if(total_mw > 0.0, do: scoped_mw / total_mw, else: 0.0)
+       }}
+    end)
   end
 
   # ENE-9: a zero/negative demand row would produce factor 0.0 and black out
@@ -244,6 +361,10 @@ defmodule PowerModel.Demand do
   factor (q scales identically, preserving power factor). Loads without an
   applicable factor are returned unchanged.
 
+  The snapshot serves its SHARE of each BA's demand, not the whole of it —
+  see the moduledoc (ENE-17). The share per BA is logged and available from
+  `baseline_coverage/2`.
+
   When NO load in the snapshot can be matched to a BA, the uniform NATIONAL
   fallback (snapshot total -> sum of all reporting BAs) is applied ONLY when
   the snapshot is national in scope: its buses either carry no
@@ -254,8 +375,9 @@ defmodule PowerModel.Demand do
   inflate it severalfold (ENE-2).
   """
   def scale_loads(loads, buses, %DateTime{} = timestamp) do
-    factors = ba_scale_factors(loads, buses, timestamp)
-    bus_to_ba = Map.new(buses, &{&1.id, Map.get(&1, :balancing_authority_id)})
+    universe = universe_baselines()
+    factors = ba_scale_factors(loads, buses, timestamp, universe)
+    bus_to_ba = bus_to_ba(buses)
 
     if map_size(factors) == 0 do
       national_fallback_or_baseline(loads, buses, bus_to_ba, timestamp)
@@ -281,9 +403,55 @@ defmodule PowerModel.Demand do
 
       if map_size(unscaled_by_ba) > 0, do: log_unscaled(unscaled_by_ba)
 
+      log_coverage(baseline_coverage(loads, bus_to_ba, universe), factors)
+
       scaled_loads
     end
   end
+
+  # ENE-17: served load is now the snapshot's SHARE of real demand. State the
+  # share so no consumer reads a scoped total as national demand. One line
+  # (DAT-20): per-BA detail is folded into it, not emitted per BA.
+  defp log_coverage(coverage, factors) do
+    scaled = Map.take(coverage, Map.keys(factors))
+
+    if map_size(scaled) > 0 do
+      snapshot_mw = scaled |> Map.values() |> Enum.map(& &1.snapshot_baseline_mw) |> Enum.sum()
+      total_mw = scaled |> Map.values() |> Enum.map(& &1.total_baseline_mw) |> Enum.sum()
+
+      partial =
+        scaled
+        |> Enum.filter(fn {_ba, c} -> c.share < 0.999 end)
+        |> Enum.sort_by(&elem(&1, 1).share)
+
+      codes = ba_codes(Enum.map(partial, &elem(&1, 0)))
+
+      lowest =
+        partial
+        |> Enum.take(8)
+        |> Enum.map_join(", ", fn {ba_id, c} ->
+          "#{Map.get(codes, ba_id) || "BA #{ba_id}"} #{pct(c.share)}"
+        end)
+
+      Logger.info(
+        "EIA-930 scaling: snapshot holds #{pct(safe_share(snapshot_mw, total_mw))} of the " <>
+          "geolocated load baseline of the #{map_size(scaled)} scaled BAs " <>
+          "(#{round1(snapshot_mw)} of #{round1(total_mw)} MW) and therefore serves that " <>
+          "share of their real demand (ENE-17)" <>
+          if(lowest == "",
+            do: "",
+            else:
+              "; #{length(partial)} BAs partially covered, lowest: #{lowest}" <>
+                if(length(partial) > 8, do: ", ...", else: "")
+          )
+      )
+    end
+  end
+
+  defp safe_share(_num, denom) when denom <= 0.0, do: 0.0
+  defp safe_share(num, denom), do: num / denom
+
+  defp pct(share), do: "#{Float.round(share * 100.0, 1)}%"
 
   # ENE-8: partial EIA-930 coverage silently mixes real demand with the
   # (~2x) synthetic baseline. Report the MW involved and the BA codes so the

@@ -1,6 +1,8 @@
 defmodule PowerModel.DemandTest do
   use PowerModel.DataCase, async: false
 
+  require Logger
+
   import ExUnit.CaptureLog
 
   @moduletag :db
@@ -402,6 +404,194 @@ defmodule PowerModel.DemandTest do
       end)
 
     assert log =~ "non-positive"
+  end
+
+  # ENE-17: a BA's scale factor divides by the BA's TOTAL geolocated baseline
+  # in the database, never by the slice of it a snapshot happens to hold. The
+  # fixtures here therefore live in the DATABASE (unlike the plain maps above,
+  # which exercise the documented no-database-loads fallback).
+  describe "total-baseline denominator (ENE-17)" do
+    alias PowerModel.Grid.{Bus, Interconnection, Load}
+
+    setup do
+      %{ic: Repo.insert!(%Interconnection{name: "ENE17 IC"})}
+    end
+
+    defp insert_ba_demand(code, demand_mw) do
+      ba = Repo.insert!(%BalancingAuthority{code: code, name: code})
+
+      Repo.insert!(%BADemandHour{
+        balancing_authority_id: ba.id,
+        timestamp_utc: @hour,
+        demand_mw: demand_mw
+      })
+
+      ba
+    end
+
+    # One geolocated bus + one in-service load per MW value, all in `ba`.
+    # Returns `{buses, loads}` as the structs a snapshot carries.
+    defp insert_loads(ba, ic, mws, load_type \\ "constant_power") do
+      mws
+      |> Enum.map(fn mw ->
+        n = System.unique_integer([:positive])
+
+        bus =
+          Repo.insert!(%Bus{
+            bus_type: 1,
+            base_kv: 138.0,
+            coordinates: %Geo.Point{coordinates: {-96.0 - n / 1000.0, 32.0}, srid: 4326},
+            interconnection_id: ic.id,
+            balancing_authority_id: ba.id
+          })
+
+        load =
+          Repo.insert!(%Load{
+            bus_id: bus.id,
+            p_mw: mw,
+            q_mvar: mw * 0.3,
+            load_type: load_type,
+            status: "in_service"
+          })
+
+        {bus, load}
+      end)
+      |> Enum.unzip()
+    end
+
+    test "a straddling BA's stray buses get their SHARE of demand, not all of it", %{ic: ic} do
+      # The measured ENE-17 case: a regionally-scoped snapshot holds a handful
+      # of a big BA's buses. Before the fix the factor was 69_000/200 = 345x
+      # and those two buses carried the ENTIRE 69 GW of MISO demand.
+      miso = insert_ba_demand("MISO", 69_000.0)
+      {stray_buses, stray_loads} = insert_loads(miso, ic, [120.0, 80.0])
+      {_rest_buses, _rest_loads} = insert_loads(miso, ic, [49_900.0, 49_900.0])
+
+      log =
+        capture_log(fn ->
+          factors = Demand.ba_scale_factors(stray_loads, stray_buses, @hour)
+
+          # 69_000 / 100_000 total geolocated baseline
+          assert_in_delta factors[miso.id], 0.69, 1.0e-9
+          # ... and nowhere near the 17.2x-345x blowup the old denominator gave
+          assert factors[miso.id] < 2.0
+
+          scaled = Demand.scale_loads(stray_loads, stray_buses, @hour)
+          served = scaled |> Enum.map(& &1.p_mw) |> Enum.sum()
+
+          # 0.2% of MISO's baseline is in this snapshot, so it serves 0.2% of
+          # MISO's demand (138 MW), not 69_000 MW.
+          assert_in_delta served, 138.0, 1.0e-6
+        end)
+
+      refute log =~ "outside [0.05, 2.0]"
+    end
+
+    test "a BA with half its baseline in the snapshot serves half its demand", %{ic: ic} do
+      # The national case: keeping only the largest connected component drops
+      # a BA to a fraction of its buses.
+      ba = insert_ba_demand("HALF", 1_000.0)
+      {buses, loads} = insert_loads(ba, ic, [100.0, 100.0])
+      insert_loads(ba, ic, [100.0, 100.0])
+
+      scaled = Demand.scale_loads(loads, buses, @hour)
+
+      assert_in_delta Enum.sum(Enum.map(scaled, & &1.p_mw)), 500.0, 1.0e-6
+    end
+
+    test "a fully-covered BA scales exactly as before", %{ic: ic} do
+      # When every one of a BA's loads is in the snapshot, scoped baseline ==
+      # total baseline: the factor is the old one and served == demand.
+      ba = insert_ba_demand("WHOLE", 300.0)
+      {buses, loads} = insert_loads(ba, ic, [60.0, 40.0])
+
+      factors = Demand.ba_scale_factors(loads, buses, @hour)
+      assert_in_delta factors[ba.id], 3.0, 1.0e-9
+
+      scaled = Demand.scale_loads(loads, buses, @hour)
+      assert_in_delta Enum.sum(Enum.map(scaled, & &1.p_mw)), 300.0, 1.0e-6
+    end
+
+    test "datacenter MW is subtracted over the whole BA, not the slice", %{ic: ic} do
+      # BA universe: 100 MW of shapeable load + 40 MW of flat datacenter,
+      # 200 MW of demand -> shapeable factor (200 - 40) / 100 = 1.6.
+      ba = insert_ba_demand("DCBA", 200.0)
+      {dc_buses, dc_loads} = insert_loads(ba, ic, [40.0], "datacenter")
+      {half_buses, half_loads} = insert_loads(ba, ic, [50.0])
+      {other_buses, other_loads} = insert_loads(ba, ic, [50.0])
+
+      factors = Demand.ba_scale_factors(half_loads, half_buses, @hour)
+      assert_in_delta factors[ba.id], 1.6, 1.0e-9
+
+      # Half the shapeable load and no datacenter: 80 MW.
+      scaled = Demand.scale_loads(half_loads, half_buses, @hour)
+      assert_in_delta Enum.sum(Enum.map(scaled, & &1.p_mw)), 80.0, 1.0e-6
+
+      # The whole BA still reproduces demand exactly, datacenter flat.
+      whole_buses = dc_buses ++ half_buses ++ other_buses
+      whole_loads = dc_loads ++ half_loads ++ other_loads
+      whole = Demand.scale_loads(whole_loads, whole_buses, @hour)
+
+      assert Enum.find(whole, &(&1.load_type == "datacenter")).p_mw == 40.0
+      assert_in_delta Enum.sum(Enum.map(whole, & &1.p_mw)), 200.0, 1.0e-6
+    end
+
+    test "served demand is conserved when scopes partition a BA's buses", %{ic: ic} do
+      # The property the single rule buys: scope the same BA any way you like
+      # and the served MW still add up to its real demand.
+      ba = insert_ba_demand("SPLIT", 900.0)
+      {a_buses, a_loads} = insert_loads(ba, ic, [30.0, 70.0])
+      {b_buses, b_loads} = insert_loads(ba, ic, [200.0])
+      {c_buses, c_loads} = insert_loads(ba, ic, [25.0], "datacenter")
+
+      served = fn loads, buses ->
+        loads |> Demand.scale_loads(buses, @hour) |> Enum.map(& &1.p_mw) |> Enum.sum()
+      end
+
+      total =
+        served.(a_loads, a_buses) + served.(b_loads, b_buses) + served.(c_loads, c_buses)
+
+      assert_in_delta total, 900.0, 1.0e-6
+    end
+
+    test "baseline_coverage/2 reports each BA's scoped share", %{ic: ic} do
+      ba = insert_ba_demand("COVER", 400.0)
+      {buses, loads} = insert_loads(ba, ic, [25.0])
+      insert_loads(ba, ic, [75.0])
+
+      coverage = Demand.baseline_coverage(loads, buses)
+
+      assert coverage[ba.id].snapshot_baseline_mw == 25.0
+      assert coverage[ba.id].total_baseline_mw == 100.0
+      assert_in_delta coverage[ba.id].share, 0.25, 1.0e-9
+    end
+
+    test "scale_loads/3 logs the share of real demand the snapshot serves", %{ic: ic} do
+      ba = insert_ba_demand("SHARE", 400.0)
+      {buses, loads} = insert_loads(ba, ic, [25.0])
+      insert_loads(ba, ic, [75.0])
+
+      # The coverage line is informational; the test env logs :warning and up.
+      Logger.put_module_level(Demand, :info)
+      on_exit(fn -> Logger.delete_module_level(Demand) end)
+
+      log = capture_log([level: :info], fn -> Demand.scale_loads(loads, buses, @hour) end)
+
+      assert log =~ "snapshot holds 25.0% of the geolocated load baseline"
+      assert log =~ "SHARE 25.0%"
+    end
+
+    test "a BA with no geolocated loads in the database keeps the scoped denominator" do
+      # Synthetic fixtures and un-ingested networks: there is no wider universe
+      # to divide by, so the snapshot's own baseline is the best estimate of it.
+      ba = insert_ba_demand("NODB", 300.0)
+      buses = [%{id: -1, balancing_authority_id: ba.id}]
+      loads = [%{id: -1, bus_id: -1, p_mw: 100.0, q_mvar: 30.0}]
+
+      factors = Demand.ba_scale_factors(loads, buses, @hour)
+
+      assert_in_delta factors[ba.id], 3.0, 1.0e-9
+    end
   end
 
   test "snapshot with no BA-mappable loads falls back to uniform national scaling" do
