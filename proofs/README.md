@@ -40,6 +40,99 @@ bound `beta_lt_two_iff` checked at simulation start remains the worst case.
 The constant-`Pload` transcription, however, no longer matches the code
 verbatim across a trajectory once shedding begins.
 
+**Known divergence — deliverable primary response (`Proofs/Swing.lean`)**:
+`Swing.lean` takes `gov` as a FREE real argument of `imbalance`/`stepDf`, so
+every per-step lemma holds for whatever governor megawatts the code computes
+for that step — and ROADMAP item 14 only changed how that number is computed
+(governor duty, a per-fuel duty share, a governor deadband, a sustained
+primary-response ceiling and a MW/s delivery rate limit). `stepDf_mono_shed`,
+`imbalance_anti_df` and `stepDf_shed_diff` therefore transcribe the code
+exactly, step by step, unchanged.
+
+What the change does touch is the two equilibrium results.
+`stepDf_fixed`/`stepDf_sub_dfStar` characterise `dfStar` and the exact
+`(1-β)` error recursion **at constant `gov`**. The implemented governor is a
+function of `df`, so in its linear region (deadband exceeded, no cap binding)
+the recursion is really
+
+    df' = (1 - β - γ)·df + const,   γ = dt·f0·k/(2HS),
+    k = Σᵢ dutyᵢ·P_ratedᵢ / (R·f0)   (MW per Hz),
+
+with the per-step `γ` further scaled down by the first-order governor lag
+(`min(dt/T_gov, 1)`) and clipped by the delivery rate limit. Two consequences,
+stated rather than proved:
+
+* The unique equilibrium is no longer `dfStar` at the step's `gov`; it is the
+  fixed point of the *closed loop*, which is exactly what makes β = ΔP/Δf a
+  meaningful interconnection-level number.
+* `beta_lt_two_iff` bounds `β` alone. Contraction of the closed loop needs
+  `0 < β + γ < 2`, so a large enough governor gain could in principle break
+  a step that the checked `β ≤ 1` accepts. Measured on the three ingested
+  interconnections at `dt = 0.1 s` (2026-08-15): `β` = 0.011–0.014 and `γ` =
+  0.056–0.098, falling to 0.009–0.013 once the governor lag is applied — two
+  orders below the bound, so `β ≤ 1` remains comfortable in practice.
+  Extending `beta_lt_two_iff` to `β + γ` is the natural next Lean step and is
+  the honest gap here.
+
+**Known divergence — persistent frequency state (`Proofs/Swing.lean`,
+`Proofs/Ufls.lean`)**: ROADMAP item 15 lets `Frequency.simulate_with_state/4`
+resume a segment from a previous one's final state. On the swing side this
+costs nothing: `lost`, `gov`, `shed` and `df` are all free parameters of
+`stepDf`, and resuming instantiates them from the carried state instead of
+from `(lost, 0, 0, 0)`. `Params.Pload` is instantiated as the segment's load
+base (currently connected + already shed), which can only shrink across
+segments, so `β = dt·D·Pload/(2HS)` is non-increasing and the bound checked at
+the first segment stays the worst case — the same argument as the UFLS
+linearization note above, extended across segments rather than across steps.
+Each resumed call re-checks `β` regardless.
+
+Two consequences of `cascade.ex` driving those segments (ROADMAP items 15–16)
+are worth recording beside it, neither of which touches a proved statement.
+First, the `lost` a resumed segment is handed is a SIGNED DELTA: the cascade
+computes the imbalance the island physically has and subtracts the one the
+carried state already implies, so a segment in which reserves replaced
+governor response, or in which the cascade's own force-shed tier closed part
+of the gap, is told a NEGATIVE new imbalance. `stepDf` takes `lost` as a free
+real parameter, so every step lemma applies unchanged; what is not formalized
+is the cascade's bookkeeping identity itself (that
+`lost_told − cumulative_shed = physical imbalance` at every segment
+boundary), which is pinned by tests only. Second, an island that splits hands
+BOTH halves the parent's state with the cumulative quantities apportioned by
+load share, so each child's `Params.Pload` is a fraction of the parent's — the
+monotonicity argument above still holds, in the direction it already needed.
+
+The conservation identity is UNCHANGED by these items. Generator
+under-frequency trips (item 15) can now take an island's whole fleet, but a
+tripped machine moves no load: the megawatts it was serving leave through the
+already-formalized shed and blackout transitions, so
+`served + shed + blackout = original + btm_tripped` holds in exactly the
+shape `Conservation.lean` and the BTM note below describe.
+
+`Ufls.lean` is a different matter. It formalizes the STATIC map from nadir to
+cumulative shed fraction (`protection.ex ufls_schedule/1`). With state
+threaded, `LoadShedding.remaining_schedule/2` returns only the stages still
+ARMED — a stage that opened at the first disturbance cannot open again at the
+second. So:
+
+* `schedule_le` (≤ 30%) and `schedule_eq_zero` (nothing above 59.3 Hz) still
+  bound the implemented function: a subset of the stages sums to no more than
+  all of them, and no stage arms above the first threshold.
+* `schedule_antitone` holds **within one segment** — at a fixed prior state,
+  a deeper nadir still selects a superset of stages — but NOT across segments.
+  A deeper nadir at the second disturbance can legitimately return a smaller
+  fraction than a shallower nadir did at the first, because the breakers the
+  first one opened are already open. That is the intended physics and the
+  reason the Lean statement no longer reads as a global property of the
+  system; formalizing it means giving `Ufls.lean` the armed/tripped state as
+  an argument and re-proving antitonicity pointwise in that state.
+
+**Not machine-checked — PRC-024 generator frequency envelopes**:
+`Protection.generator_frequency_trips/2` (item 15) is pure and has two
+properties worth a proof, currently pinned by tests only: time-in-band is
+monotone in both excursion depth and excursion duration, so a worse excursion
+never trips fewer units; and each unit appears at most once, reported against
+the most severe band it violated. Neither is stated in Lean.
+
 **Known divergence — behind-the-meter trip accounting (`Proofs/Conservation.lean`)**:
 `Conservation.lean` formalizes the PRE-BTM transition system, in which the
 only transitions move load between three buckets and `Trace.total_eq` proves

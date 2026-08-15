@@ -2,6 +2,14 @@ defmodule PowerModel.Failure.Protection do
   @moduledoc """
   Protection system models for cascade simulation.
   Implements overcurrent, undervoltage, underfrequency, and Zone 3 distance relays.
+
+  ## Generator frequency protection (ROADMAP item 15)
+
+  `generator_frequency_trips/2` is a PURE function: given a frequency
+  trajectory (or a flat-excursion summary) and a fleet, it returns the units
+  whose frequency protection has operated, with the band and the time-in-band
+  that did it. It reads no state and mutates nothing, so it can be evaluated
+  inside a cascade step, in a test, or against a recorded trajectory.
   """
 
   @doc """
@@ -242,6 +250,216 @@ defmodule PowerModel.Failure.Protection do
       |> max(55.0)
       |> min(65.0)
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Generator frequency protection — PRC-024-shaped envelopes (ROADMAP item 15)
+  # ---------------------------------------------------------------------------
+
+  # Under-frequency envelope: `{band_hz, allowance_seconds}`.
+  #
+  # A generator must ride through as long as the time it has spent AT OR BELOW
+  # a band stays within that band's allowance; the protection operates the
+  # moment any band's allowance is exhausted. Read bottom-up: a unit may not
+  # sit below 57.0 Hz at all, may sit below 58.0 Hz for half a minute, and may
+  # sit below 59.4 Hz for three minutes.
+  #
+  # Shaped after NERC PRC-024 Attachment 1 (Frequency Protection Settings —
+  # the "no trip zone" curve generator owners must set outside of). The exact
+  # breakpoints differ by interconnection and standard revision; these are the
+  # documented shape this model uses, not a verbatim transcription, and they
+  # are the only place the numbers live.
+  @underfrequency_envelope [
+    {57.0, 0.0},
+    {58.0, 30.0},
+    {59.4, 180.0}
+  ]
+
+  # Over-frequency envelope: `{band_hz, allowance_seconds}`, symmetric in
+  # spirit to the under-frequency side — read top-down: no time at all above
+  # 61.8 Hz, half a minute above 61.5 Hz, three minutes above 60.6 Hz.
+  @overfrequency_envelope [
+    {61.8, 0.0},
+    {61.5, 30.0},
+    {60.6, 180.0}
+  ]
+
+  @doc """
+  The under-frequency ride-through envelope as `[{band_hz, allowance_s}]`,
+  deepest band first. Single source of truth for the bands.
+  """
+  def underfrequency_envelope, do: @underfrequency_envelope
+
+  @doc """
+  The over-frequency ride-through envelope as `[{band_hz, allowance_s}]`,
+  highest band first.
+  """
+  def overfrequency_envelope, do: @overfrequency_envelope
+
+  @doc """
+  Generators whose frequency protection has operated over a frequency
+  excursion — PRC-024-shaped under- and over-frequency envelopes.
+
+  Pure: no database, no process state, no randomness. The cascade wires this
+  into a step (ROADMAP item 15 / wave 2); tests drive it from trajectories
+  directly.
+
+  ## Parameters
+
+  - `trajectory_or_summary` — either
+    * a `PowerModel.Solver.Frequency` trajectory (list of `%{time:,
+      frequency:, ...}` records), from which time-in-band is integrated, or
+    * a flat-excursion summary `%{frequency_hz: float, duration_s: float}` —
+      "the island held this frequency for this long". `duration_s` defaults
+      to `0.0`, in which case only the instantaneous bands (below 57.0 Hz,
+      above 61.8 Hz) can operate. This is the shape available to callers that
+      only have a nadir, e.g. `estimate_frequency/4`.
+  - `generators` — generator maps. Units that are offline contribute no trips:
+    a machine that is not synchronised has no breaker left to open. "Online"
+    is the same test `PowerModel.Solver.Frequency.simulate/3..6` uses to build
+    its inertia and governor sets — `capacity_factor > 0 and p_max_mw > 0` —
+    so a unit the dispatch left offline is consistently invisible to both.
+
+  ## Returns
+
+  A list of trip maps in the codebase's usual shape, most severe first:
+
+      %{
+        component_type: "generator",
+        component_id: term(),
+        failure_cause: "underfrequency_trip" | "overfrequency_trip",
+        details: %{
+          band_hz: float(),        # the envelope band whose allowance ran out
+          allowance_s: float(),    # how long that band permits
+          time_in_band_s: float(), # how long the excursion actually spent there
+          frequency_hz: float()    # worst frequency reached on that side
+        }
+      }
+
+  Each generator appears at most once, reported against the most severe band
+  it violated. A unit can trip on only one side of nominal per evaluation:
+  when an excursion crosses both (a deep sag answered by an over-correction),
+  the under-frequency side is reported, because it happened first.
+
+  ## Monotonicity
+
+  Deeper or longer is never gentler: time-in-band is non-decreasing in both
+  excursion depth and excursion duration for every band, so extending or
+  deepening an excursion can only trip the same units or more. The property
+  test in `test/power_model/failure/protection_test.exs` pins this.
+  """
+  @spec generator_frequency_trips(list(map()) | map(), list(map())) :: list(map())
+  def generator_frequency_trips(trajectory_or_summary, generators) do
+    {under_time, over_time, f_min, f_max} = frequency_exposure(trajectory_or_summary)
+
+    under_violation =
+      worst_violation(@underfrequency_envelope, under_time, fn band -> f_min <= band end)
+
+    over_violation =
+      worst_violation(@overfrequency_envelope, over_time, fn band -> f_max >= band end)
+
+    violation =
+      case {under_violation, over_violation} do
+        {nil, nil} -> nil
+        {nil, over} -> {"overfrequency_trip", over, f_max}
+        {under, _} -> {"underfrequency_trip", under, f_min}
+      end
+
+    case violation do
+      nil ->
+        []
+
+      {cause, {band_hz, allowance_s, time_in_band_s}, worst_hz} ->
+        generators
+        |> Enum.filter(&online?/1)
+        |> Enum.map(fn gen ->
+          %{
+            component_type: "generator",
+            component_id: Map.get(gen, :id),
+            failure_cause: cause,
+            details: %{
+              band_hz: band_hz,
+              allowance_s: allowance_s,
+              time_in_band_s: time_in_band_s,
+              frequency_hz: worst_hz
+            }
+          }
+        end)
+    end
+  end
+
+  # Time spent at or beyond each envelope band, plus the extremes reached.
+  # Trajectory form: integrate the dwell time of each sample interval. The
+  # interval a sample represents is the gap to the NEXT sample, so the final
+  # record contributes nothing — it is the end of the record, not a duration.
+  defp frequency_exposure(trajectory) when is_list(trajectory) do
+    frequencies = Enum.map(trajectory, & &1.frequency)
+    f_min = Enum.min(frequencies, fn -> 60.0 end)
+    f_max = Enum.max(frequencies, fn -> 60.0 end)
+
+    intervals =
+      trajectory
+      |> Enum.chunk_every(2, 1, :discard)
+      |> Enum.map(fn [a, b] -> {a.frequency, max(b.time - a.time, 0.0)} end)
+
+    under =
+      Map.new(@underfrequency_envelope, fn {band, _allowance} ->
+        {band, dwell(intervals, fn f -> f <= band end)}
+      end)
+
+    over =
+      Map.new(@overfrequency_envelope, fn {band, _allowance} ->
+        {band, dwell(intervals, fn f -> f >= band end)}
+      end)
+
+    {under, over, f_min, f_max}
+  end
+
+  defp frequency_exposure(%{} = summary) do
+    f = Map.get(summary, :frequency_hz) || Map.get(summary, :nadir_hz) || 60.0
+    duration = Map.get(summary, :duration_s, 0.0)
+
+    under =
+      Map.new(@underfrequency_envelope, fn {band, _} ->
+        {band, if(f <= band, do: duration, else: 0.0)}
+      end)
+
+    over =
+      Map.new(@overfrequency_envelope, fn {band, _} ->
+        {band, if(f >= band, do: duration, else: 0.0)}
+      end)
+
+    {under, over, min(f, 60.0), max(f, 60.0)}
+  end
+
+  defp dwell(intervals, in_band?) do
+    Enum.reduce(intervals, 0.0, fn {f, dt}, acc ->
+      if in_band?.(f), do: acc + dt, else: acc
+    end)
+  end
+
+  # The envelopes are listed most severe first, so the first band whose
+  # allowance is exhausted is the one to report.
+  #
+  # A zero allowance means "not for an instant": REACHING the band operates
+  # the protection, whether or not the excursion dwelt there long enough to
+  # register a measurable interval. That is what makes the instantaneous bands
+  # meaningful for a flat-excursion summary, which carries a frequency but not
+  # necessarily a duration.
+  defp worst_violation(envelope, time_in_band, reached?) do
+    Enum.find_value(envelope, fn {band, allowance} ->
+      t = Map.fetch!(time_in_band, band)
+
+      if (allowance == 0.0 and reached?.(band)) or t > allowance do
+        {band, allowance, t}
+      end
+    end)
+  end
+
+  # Same online test as the swing model's, so a unit the dispatch left offline
+  # is invisible to inertia, governors and protection alike.
+  defp online?(gen) do
+    (Map.get(gen, :capacity_factor) || 1.0) > 0.0 and (Map.get(gen, :p_max_mw) || 0.0) > 0.0
   end
 
   defp component_type_string(:line), do: "transmission_line"
