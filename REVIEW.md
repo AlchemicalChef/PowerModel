@@ -635,9 +635,11 @@ named 1,297 MW unanchored). The rejected alternative — share × (D+TI) for EVE
 reaches −2.2% but degrades Western fuel-mix TV 0.025 → 0.054 by re-weighting BPAT's
 hydro-heavy mix into capability limits, failing the TV regression gate. The correction is
 reported per BA as identity_correction_mw and retires itself if EIA revises the data.
-**LIN-12 (DATA DEFECT, LOW) [OPEN]** Western carries a 765 kV+ voltage class (1 line,
-3 transformers), all 100% overloaded at rest — WECC has no 765 kV; bad voltage data.
-Found by `mix grid.accuracy` 2026-08-15.
+**LIN-12 (FIXED 2026-08-16)** Root cause: the Pacific DC Intertie (HIFLD 200823,
+voltage_kv=1000) seeded phantom voltage levels via augment_voltage_levels_from_lines.
+Fixed by dc-line exclusion + 765 kV cap in the augment, and a predicate-based migration
+retiring the phantom levels/transformers (Western buses exactly −2, the 765kV+ class
+gone, CELILO/SYLMAR EAST corrected, dc_ties id=1 untouched). DR-3.
 **ENE-15 (MEASURED GAP) [OPEN→Phase 2]** With fuel-anchored dispatch live (2026-08-15),
 23.3 GW of measured nuclear cannot be placed on geolocated units: the BA-mapped fleet
 holds 84.2 GW of nuclear capability vs 97.4 GW measured (101 GW of nuclear nameplate is

@@ -95,6 +95,16 @@ L ≈ multi-week.
 8. **Recompute-not-fill-NULL pipeline** (M, gates everything here): params_version
    columns; estimators revisit stale rows; unordered-pair transformer key. Measured
    payoff of the EHV refresh alone: Western EHV overloads 22.6% → 10.3%.
+    LANDED AND RE-SCOPED (2026-08-16). The versioned recompute stands at
+    params_version 3. A blanket impedance recompute has NO TARGETS LEFT: stored x_pu
+    already equals the estimator recipe on every row it owns (deviations were the
+    write-time clamp) — item 8 cannot be what fixes LIN-13. What the recompute is FOR:
+    (a) rating tables (v3 sub-69 kV scaling, 4,091 rows), (b) the write floor aligned
+    to the solver's (951 rows), (c) the 8,814 restored circuits arriving at v0. It was
+    also a HAZARD: the predicate matched the 5,628 connectivity_repair rows, now
+    protected twice. Remaining work is a CENSUS GATE, not a rewrite: empty
+    `mix grid.census subtransmission` via DR-4 remaps + DR-5 caps with no x_pu row
+    edits; re-baseline after restoration+recompute (offenders tighten ~2.09x on v3).
 9. **Emergency ratings driving protection** (S): rate B/C as real schema+migration (the
    dev DB has drifted — columns exist with no migration), relay pickup at rate C instead
    of 100% of rate A; shrinks the trip-immune `base_overloaded` set.
@@ -329,6 +339,19 @@ L ≈ multi-week.
 24. **OSM circuits/voltage/substation polygons** (M–L): measured Ohio sample: 68% of
     lines carry `circuits`, 89% `voltage`; substation polygons anchor the 78% of
     endpoints with sentinel names. Requires local Overpass off the Geofabrik extract.
+    SCOPE BOUNDARY (measured 2026-08-16, DR-3/TOPO-7 — this item must not absorb work
+    already done or doable without OSM). Done without OSM this round: the 8,814
+    no-voltage HIFLD circuits ingested at yard-inferred voltage (DR-3); welds/endpoint
+    recovery (DR-4); load redistribution + connected-rating cap (DR-5); floor/LV
+    ratings/EHV reactors (DR-2); dispatch balance (DR-1). Genuinely needs OSM:
+    (1) real voltage for the 13,520 level-less substations — 5,117 of them are why
+    3,936 restorations sit at a 138 kV default; the in-repo evidence is EXHAUSTED,
+    not under-used (adding native MAX_VOLT/MIN_VOLT moves 19 of 8,814 circuits);
+    (2) the ~123 genuine HIFLD spurs whose underground meshes are absent from the
+    source entirely (count inherits an all-components basis; approximate). When OSM
+    voltage lands, write params_version 0 alongside any corrected voltage or the
+    estimator leaves impedance/rating on the inferred class. The restored set is
+    re-derivable any time from the pinned snapshot by source_ID.
     ODbL is ARCHITECTURAL: keep OSM-derived tables separable (§4.5), plan to satisfy
     share-alike by open-sourcing the extraction pipeline (§4.6). Internal-only use
     triggers nothing.
