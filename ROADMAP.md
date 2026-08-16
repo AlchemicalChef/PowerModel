@@ -39,6 +39,24 @@ reproduced here so the document stands alone.
 Ordering favors accuracy-per-effort and measured dependency; S ≈ days, M ≈ 1–2 wk,
 L ≈ multi-week.
 
+> **STATUS 2026-08-16: DATA-REPAIR + UI ROUND LANDED** (ultracode review → 5 DR + 4 UI
+> packages + the outcome feature, all adversarially planned and gate-measured):
+> - Eastern dispatch −65,100 → −175 MW (−0.07%); ERCOT +7.7% → +1.6%; the UI's first
+>   real N-1 (Eastern worst mw_at_risk 582 GW artifact → 10.8 GW real transformer).
+> - >90° census 15/1/3 → **0/1/0** (survivor = documented HIFLD source gap);
+>   Western FDPF α 0 (no solution) → **0.22**; ERCOT α 0.25 → **0.50**.
+> - 8,814 silently-dropped HIFLD circuits restored (94,619/94,619 features ingest);
+>   Eastern largest component 80.5 → 89.2%; bridges −5 to −7 pts; stranded nameplate
+>   546 → 98.1 GW; Grand Coulee on its 500 kV yard; PDCI phantom 765 kV+ class retired.
+> - Load: county-centroid KNN → capability-weighted polygon spread (594.8 GW moved,
+>   deg-1 load share T 31.5 → 4.9%); reactance floor 1e-3 → 1e-5 (bit-identical
+>   invariance); EHV line-end reactors synthesized (−65.1 GVAr).
+> - UI: crash fix (at-limit conductor), payload 2.2 MB → 22 KB client frames, real N-1
+>   panel, current+nadir frequency with AGC, H3 voltage-depth overlay with the bus-id
+>   channel it needed, collapse-vs-settled outcome through engine→seam→badge.
+> - Suite 1,248 → 1,415 tests, 0 failures. Open follow-ups: DAT-22/23/24, ENE-21/22,
+>   UI-M17/L14, ERCOT spur 72357 → OSM wave (item 24).
+>
 > **STATUS 2026-08-15 (later): Phase 2 LANDED** (items 8–13 + ENE-17) with a fresh
 > re-ingest from the vendored snapshots. Measured: buses carrying a branch 49.7% →
 > **91.7%**; largest components Eastern 27.2% → 80.5%, Western 16.6% → 89.7%, ERCOT

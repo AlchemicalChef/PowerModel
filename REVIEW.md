@@ -519,6 +519,16 @@ FURTHER CORRECTION (DR-2, 2026-08-16): synthesized EHV line-end reactors (−65.
 α ≤ 0.105 with overvoltage fully solved (5,151 → 18 buses >1.1 pu at α=0.08). The
 ceiling is pinned by LOW voltage in the 115 kV Pacific-Northwest corridor at every
 reactor constant swept — a topology gate for DR-4's remap, not reactive supply.
+WAVE-END (DR-1..DR-5, 2026-08-16): the >90° census is 0/1/0 balanced AND as-dispatched
+(from 15/1/3) — Eastern and Western CLEAN; the ERCOT survivor (72357, 95.3°, 522 MW of
+wind on a 69 kV radial) is a HIFLD source gap: exactly one circuit within 3 km of its
+yard, an OSM-wave item. Western FDPF α ceiling 0.10 → 0.22, ERCOT 0.25 → 0.50. The
+mechanism stack: dispatch balance (DR-1) + reactance floor/reactors (DR-2) + 8,814
+restored circuits (DR-3) + plant-level voltage-aware placement/welds (DR-4) +
+capability-weighted load spread (DR-5). Full-demand AC remains open (α=1.0 needs the
+OSM voltage backfill and the remaining ~100 GW of placement residuals) but the voltage
+chain's mid-cascade coverage and the reduced-demand envelope are now measured, not
+blocked.
 **SOL-12 (FIXED 2026-08-16)** Floor lowered 1.0e-3 → 1.0e-5 with the estimator write
 clamp aligned (whichever clamp is larger silently binds). x1000 invariance probe now
 bit-identical (Eastern sum|Δflow| 27,761 → 0.0 MW); the ACTIVSg2000 DC deviation was the
@@ -550,6 +560,24 @@ contingency at dispatch time. Found by the β acceptance work, 2026-08-15.
 **CAS-18 (VOLUME, LOW) [OPEN]** Large cascades now emit ~16.7k ufls_shed events on the
 ERCOT reference case (was 948) — per-load event granularity at collapse scale. Needs a
 DAT-20-style aggregation decision when payloads are next reshaped (UI-H6 territory).
+**DAT-22 (MED-HIGH) [OPEN]** `Grid.map_datacenters_to_grid/0` carries TOPO-2's defect:
+55 rows / 19.7 GW placed at the nearest bus with NO voltage or capability check — 11 on
+degree≤1 buses (3,800 MW), 3 below 60 kV (400 MW on a 13.8 kV bus). After DR-5 these
+rows are the ENTIRE residual of the load-placement census (flat_mw/flat_only sections
+attribute them). Reuse LoadEstimator.capability/1. Water-facility placement shares the
+gap at smaller scale. Found at DR-5, 2026-08-16.
+**DAT-23 (MED) [OPEN]** Pipeline ordering: `estimate_loads` runs BEFORE
+`repair_connectivity` in full_pipeline (ingest.ex ~:422 vs :432), so on a fresh ingest
+the capability cap sees the network without 10,000+ repair branches. One-line move.
+Also: 3,114 buses (2,701 restoration + 413 synthetic) carry no balancing authority —
+DR-5's known-BA guard excludes them from load, but BA assignment should re-run at
+ingest end; unguarded they absorbed 34 GW the scaler can never rescale and manufactured
+a new >90° branch. A "(none)" row in a per-BA load sum is the tell. Found at DR-5.
+**DAT-24 (MED) [OPEN]** `EIA.Form861.bus_shares/0` still carries a copy of the OLD
+KNN-25 allocation rule; its docstring claims BTM capacity "lands exactly where the load
+it offsets landed," which is no longer true after DR-5's spread. Align it with
+LoadEstimator or the BTM layer's bus placement drifts from the load it offsets. Found
+at DR-5, 2026-08-16.
 **CAS-19 (LOW) [OPEN]** Two Wave 3b bookkeeping refinements, deliberately not made
 mid-wave: (a) `Protection.gfl_derate/3` takes one fleet-wide p_set_pu, treating every
 inverter as fully loaded (knee 0.833 pu); deriving per-unit p_set from
