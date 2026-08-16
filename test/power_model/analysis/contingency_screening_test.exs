@@ -376,6 +376,43 @@ defmodule PowerModel.Analysis.ContingencyScreeningTest do
       assert e.category == :island_split
       assert_in_delta e.mw_at_risk, 40.0, 1.0e-9
     end
+
+    test "SOL-16: a crashed pair worker aborts the run instead of raising" do
+      # `sweep/3` has always had this clause and `screen_n2` did not, so a dead
+      # worker took a CaseClauseError out through the reduce rather than
+      # reaching the caller as an error. The clause is reached when the caller
+      # traps exits — which is the case that matters, because screening runs
+      # inside a supervised process, not a bare test process.
+      #
+      # The crash is forced by emptying the position-indexed base-flow tuple,
+      # which is read only inside the worker: `n2_seeds`, `seed_columns`,
+      # `scan_list/1` and `bridges/1` all read other fields, so the
+      # caller-side setup still succeeds and the failure lands where intended.
+      snap = meshed_with_ratings(14)
+      base = DCPowerFlow.solve(snap, base_mva: @base_mva)
+      {:ok, lodf} = PowerModel.Solver.LODF.init(snap, base, base_mva: @base_mva)
+
+      seeds = snap.lines |> Enum.take(4) |> Enum.map(&{:line, &1.id})
+      broken = %{lodf | base_flow_mw: {}}
+
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {:worker_exit, _reason}} =
+               ContingencyScreening.screen_n2(broken, seeds: seeds, base_mva: @base_mva)
+    end
+
+    test "SOL-16: an island-split pair is an answer, not an abort" do
+      # The other half of the contract. Aborting is for questions that could
+      # not be evaluated; a pair that genuinely disconnects the network HAS
+      # been evaluated and must stay in the ranked list.
+      base = DCPowerFlow.solve(dumbbell(), base_mva: @base_mva)
+      {:ok, lodf} = PowerModel.Solver.LODF.init(dumbbell(), base, base_mva: @base_mva)
+
+      assert {:ok, result} =
+               ContingencyScreening.screen_n2(lodf, seeds: [{:line, 1}, {:line, 7}], limit: 10)
+
+      assert length(result.ranked) == 1
+    end
   end
 
   describe "census agreement with full DC re-solves" do

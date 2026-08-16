@@ -63,16 +63,50 @@ defmodule PowerModel.Solver.FDPF do
   point here builds its own handles and drops them when the solve returns;
   nothing is cached across calls.
 
-  ## Fallback
+  ## Two cutoffs, two different questions (REVIEW SOL-14)
 
-  Dense Newton-Raphson stays authoritative for small islands (see
-  `@dense_nr_max_buses` — at that size its quadratic convergence beats FDPF's
-  linear one outright) and is the fallback when FDPF fails to converge on an
-  island small enough to afford it. Failures are logged once per island, never
-  once per bus: the OTP logger drops most of a warning burst under load.
+  `@dense_nr_max_buses` (25) is the PRIMARY handoff: at or below it, `solve/2`
+  never runs FDPF at all and dense Newton-Raphson is authoritative. Its
+  justification is that at that size the choice is free — both solvers are far
+  under a millisecond — so the more robust one wins, and the many tiny
+  fragments a cascade produces are exactly where the decoupling assumption is
+  least reliable.
+
+  `@dense_nr_fallback_max_buses` (300) is a DIFFERENT question with a
+  different answer: how large an island can we afford to *retry* densely after
+  FDPF has already failed on it. That retry is not free, and the cost is not
+  the converged cost — a fallback fires precisely on the islands that are hard,
+  so what gets paid is a full iteration budget on a dense (2n)x(2n) Jacobian
+  that usually ends in `converged: false`, the same answer refusing outright
+  would have given. It is O(n^3) and it was measured, on real ERCOT
+  sub-islands: 5.2 s at 306 buses, 120.4 s at 933, 340.8 s at 1,318 with a
+  1.4 GB peak, extrapolating to about an hour at the 3,000 this cutoff used to
+  sit at. The cascade engine's trip timeout is 120 s, so anything past a few
+  hundred buses spends the whole budget and then reports failure anyway.
+
+  300 keeps the affordable retry (a few seconds, worth it for the chance of a
+  converged answer) and refuses the rest in a quarter-second. Islands above it
+  get an unconverged `Solution` and a warning, not a stall. The two cutoffs are
+  independently settable — `:dense_nr_max_buses` per call, and the fallback
+  bound via `dense_nr_fallback_max_buses/0` — because they answer to different
+  evidence.
+
+  One consequence to be aware of: the same bound governs `hard_failure`, so an
+  island between 300 and 3,000 buses whose LINEAR SOLVE is rejected now throws
+  where it used to be retried densely. That is the intended reading and not
+  merely a side effect — above roughly 250 buses the Jacobian exceeds
+  `NewtonRaphson`'s own Gaussian cap (REVIEW SOL-15), so on precisely the
+  ill-conditioned islands that reach `hard_failure` the dense retry would burn
+  an LU attempt and then refuse anyway.
+
+  Whichever path ran is recorded on the `Solution`'s `:solver` field, so a
+  fallback is visible rather than inferred from a suspicious iteration count.
+
+  Failures are logged once per island, never once per bus: the OTP logger drops
+  most of a warning burst under load.
   """
 
-  alias PowerModel.Solver.{NewtonRaphson, Partition, Sparse, YBus}
+  alias PowerModel.Solver.{NewtonRaphson, Partition, Solution, Sparse, YBus}
 
   require Logger
 
@@ -110,9 +144,16 @@ defmodule PowerModel.Solver.FDPF do
   # otherwise spend its time in the NIF's degenerate 1x1 and 2x2 cases.
   @dense_nr_max_buses 25
 
-  # Above this an island cannot afford a dense NR fallback at all — its
-  # Jacobian would not fit — so a failed FDPF is reported, not retried.
-  @dense_nr_fallback_max_buses 3_000
+  # Above this a failed FDPF is REPORTED, not retried densely. See the
+  # moduledoc: this is not the same question @dense_nr_max_buses answers, and
+  # it does not have the same answer. A fallback pays a full dense iteration
+  # budget on an island already known to be hard, so the measured cost is the
+  # FAILED-solve cost, not the converged one — seconds at 300 buses, minutes
+  # at 900, hours at the 3,000 this used to be. LIN-13 makes non-convergence
+  # the normal case on real fragments, and the cascade engine's trip timeout
+  # is 120 s, so a retry that cannot finish inside a few seconds buys nothing
+  # the immediate refusal does not.
+  @dense_nr_fallback_max_buses 300
 
   @max_dtheta 0.5
   @max_dv 0.1
@@ -138,15 +179,20 @@ defmodule PowerModel.Solver.FDPF do
       |> Enum.filter(&MapSet.member?(dead_buses, &1.bus_id))
       |> Enum.reduce(0.0, fn load, acc -> acc + (load.p_mw || 0.0) end)
 
-    merged =
-      subs
-      |> Enum.map(fn sub ->
+    solutions =
+      Enum.map(subs, fn sub ->
         {:ok, solution} = solve(sub, opts)
         solution
       end)
-      |> Partition.merge_solutions(base_mva)
 
-    %{merged | dead_load_mw: dead_load_mw, dead_bus_count: MapSet.size(dead_buses)}
+    merged = Partition.merge_solutions(solutions, base_mva)
+
+    %{
+      merged
+      | dead_load_mw: dead_load_mw,
+        dead_bus_count: MapSet.size(dead_buses),
+        solver: Solution.merged_solver(solutions)
+    }
   end
 
   @doc """
@@ -183,7 +229,7 @@ defmodule PowerModel.Solver.FDPF do
     if non_slack == [] do
       # A single-bus island: the slack holds everything and there is nothing
       # to solve. Report it converged with a zero mismatch, as the DC path does.
-      {:ok, NewtonRaphson.build_solution(prep, vm, va, true, 0, 0.0, nil)}
+      {:ok, stamp(NewtonRaphson.build_solution(prep, vm, va, true, 0, 0.0, nil))}
     else
       case factor_b_prime(prep) do
         {:ok, bp} ->
@@ -205,7 +251,8 @@ defmodule PowerModel.Solver.FDPF do
 
     case outer_solve(prep, vm, va, bp, non_slack, state, tol, max_iter, 0, 0) do
       {:ok, vm, va, converged, iters, max_mis, p_calc} ->
-        solution = NewtonRaphson.build_solution(prep, vm, va, converged, iters, max_mis, p_calc)
+        solution =
+          stamp(NewtonRaphson.build_solution(prep, vm, va, converged, iters, max_mis, p_calc))
 
         if converged do
           {:ok, solution}
@@ -682,6 +729,12 @@ defmodule PowerModel.Solver.FDPF do
   # behaviour would make the fallback pointless. Newton-Raphson's own default
   # still caps it.
   defp dense_fallback_opts(opts), do: Keyword.delete(opts, :max_iterations)
+
+  # `build_solution` is NewtonRaphson's and stamps the dense path by default,
+  # so every solution this module assembles itself is re-stamped. Solutions
+  # that came back FROM a fallback are deliberately left alone: `:dense_nr` on
+  # an island above `@dense_nr_max_buses` is the record that FDPF failed there.
+  defp stamp(solution), do: %{solution | solver: :fdpf}
 
   defp effective_tap_ratio(t) when is_number(t) and t > 0.0, do: t
   defp effective_tap_ratio(_), do: 1.0

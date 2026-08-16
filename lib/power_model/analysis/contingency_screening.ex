@@ -333,6 +333,11 @@ defmodule PowerModel.Analysis.ContingencyScreening do
   shaped as in `screen/2`. A pair containing a bridge, or one whose two
   branches only disconnect the network together, is categorized
   `:island_split`.
+
+  The no-partial-results contract holds here exactly as in `screen/2`: a pair
+  whose rank-2 solve fails aborts the whole N-2 run with `{:error, reason}`.
+  It is not reported `:clean` — a pair nobody could evaluate is not a pair
+  known to be harmless (REVIEW SOL-16).
   """
   @spec screen_n2(%LODF{}, keyword()) :: {:ok, map()} | {:error, term()}
   def screen_n2(%LODF{} = lodf, opts \\ []) do
@@ -351,28 +356,59 @@ defmodule PowerModel.Analysis.ContingencyScreening do
       workers = max(concurrency, 1)
       slice = max(div(length(pairs) + workers - 1, workers), 1)
 
-      entries =
-        pairs
-        |> Enum.chunk_every(slice)
-        |> Task.async_stream(fn chunk -> Enum.map(chunk, &evaluate_pair(&1, ctx)) end,
-          max_concurrency: workers,
-          ordered: false,
-          timeout: :infinity
-        )
-        |> Enum.flat_map(fn {:ok, chunk} -> chunk end)
+      case pair_sweep(pairs, ctx, slice, workers) do
+        {:ok, entries} ->
+          elapsed = System.monotonic_time(:millisecond) - started
 
-      elapsed = System.monotonic_time(:millisecond) - started
+          {:ok,
+           %{
+             ranked: entries |> Enum.sort_by(& &1.mw_at_risk, :desc) |> Enum.take(limit),
+             base: base,
+             summary:
+               entries
+               |> summarize(lodf, base, elapsed)
+               |> Map.merge(%{seeds: length(seeds), pairs: length(pairs)})
+           }}
 
-      {:ok,
-       %{
-         ranked: entries |> Enum.sort_by(& &1.mw_at_risk, :desc) |> Enum.take(limit),
-         base: base,
-         summary:
-           entries
-           |> summarize(lodf, base, elapsed)
-           |> Map.merge(%{seeds: length(seeds), pairs: length(pairs)})
-       }}
+        {:error, reason} ->
+          Logger.warning(
+            "N-2 contingency screening aborted after " <>
+              "#{System.monotonic_time(:millisecond) - started} ms: " <>
+              "#{inspect(reason)} (no partial results returned)"
+          )
+
+          {:error, reason}
+      end
     end
+  end
+
+  # The N-2 twin of `sweep/3`, and it aborts the same way: a pair whose rank-2
+  # solve fails is not a `:clean` pair, it is an unanswered question, and this
+  # module's contract is no partial results (REVIEW SOL-16). The `{:exit, _}`
+  # clause is not decoration — without it a worker crash raises a CaseClauseError
+  # from inside the reduce instead of surfacing as an error to the caller.
+  defp pair_sweep(pairs, ctx, slice, workers) do
+    pairs
+    |> Enum.chunk_every(slice)
+    |> Task.async_stream(fn chunk -> pair_chunk(chunk, ctx) end,
+      max_concurrency: workers,
+      ordered: false,
+      timeout: :infinity
+    )
+    |> Enum.reduce_while({:ok, []}, fn
+      {:ok, {:ok, entries}}, {:ok, acc} -> {:cont, {:ok, entries ++ acc}}
+      {:ok, {:error, reason}}, _acc -> {:halt, {:error, reason}}
+      {:exit, reason}, _acc -> {:halt, {:error, {:worker_exit, reason}}}
+    end)
+  end
+
+  defp pair_chunk(chunk, ctx) do
+    Enum.reduce_while(chunk, {:ok, []}, fn pair, {:ok, acc} ->
+      case evaluate_pair(pair, ctx) do
+        {:ok, entry} -> {:cont, {:ok, [entry | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp n2_seeds(lodf, opts) do
@@ -405,6 +441,9 @@ defmodule PowerModel.Analysis.ContingencyScreening do
     end)
   end
 
+  # `{:ok, entry}` or `{:error, reason}`. An `:island_split` is an ANSWER — the
+  # pair disconnects the network and the entry says so — where an `:error` is
+  # the absence of one, and the two must not be conflated.
   defp evaluate_pair({p1, p2}, ctx) do
     keys = [LODF.branch_at(ctx.lodf, p1).key, LODF.branch_at(ctx.lodf, p2).key]
     base_flow = LODF.base_flow_at(ctx.lodf, p1) + LODF.base_flow_at(ctx.lodf, p2)
@@ -415,15 +454,18 @@ defmodule PowerModel.Analysis.ContingencyScreening do
       bridge != nil ->
         info = Map.fetch!(ctx.bridges, bridge)
 
-        ctx
-        |> pair_entry(keys, base_flow, :island_split)
-        |> Map.merge(%{
-          mw_at_risk: info.mw_at_risk,
-          max_loading_pct: nil,
-          islanded_load_mw: info.load_mw,
-          islanded_gen_mw: info.gen_mw,
-          islanded_bus_count: info.bus_count
-        })
+        entry =
+          ctx
+          |> pair_entry(keys, base_flow, :island_split)
+          |> Map.merge(%{
+            mw_at_risk: info.mw_at_risk,
+            max_loading_pct: nil,
+            islanded_load_mw: info.load_mw,
+            islanded_gen_mw: info.gen_mw,
+            islanded_bus_count: info.bus_count
+          })
+
+        {:ok, entry}
 
       true ->
         case LODF.outage_weights(ctx.lodf, [p1, p2], columns: ctx.columns) do
@@ -431,22 +473,25 @@ defmodule PowerModel.Analysis.ContingencyScreening do
             {best, nc, nmw, wc, wmw} =
               scan2(ctx.scan, p1, p2, x1, w1, x2, w2, {0.0, 0, 0.0, 0, 0.0})
 
-            ctx
-            |> pair_entry(keys, base_flow, if(nc > 0 or wc > 0, do: :thermal, else: :clean))
-            |> Map.merge(%{
-              mw_at_risk: nmw + wmw,
-              max_loading_pct: best * 100.0,
-              new_overloads: nc,
-              new_overload_mw: nmw,
-              worsened_overloads: wc,
-              worsened_overload_mw: wmw
-            })
+            entry =
+              ctx
+              |> pair_entry(keys, base_flow, if(nc > 0 or wc > 0, do: :thermal, else: :clean))
+              |> Map.merge(%{
+                mw_at_risk: nmw + wmw,
+                max_loading_pct: best * 100.0,
+                new_overloads: nc,
+                new_overload_mw: nmw,
+                worsened_overloads: wc,
+                worsened_overload_mw: wmw
+              })
+
+            {:ok, entry}
 
           {:island_split, _reason} ->
-            pair_entry(ctx, keys, base_flow, :island_split)
+            {:ok, pair_entry(ctx, keys, base_flow, :island_split)}
 
-          {:error, _reason} ->
-            pair_entry(ctx, keys, base_flow, :clean)
+          {:error, reason} ->
+            {:error, reason}
         end
     end
   end

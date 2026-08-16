@@ -65,8 +65,9 @@ defmodule PowerModel.Solver.LODF do
   ## Conventions are pinned to the DC solver, not re-derived
 
   LODF flows are only comparable to solved flows if B' is assembled the same
-  way. This module uses `YBus.effective_reactance/1` (sign-preserving +/-1e-3
-  floor) and the symmetric transformer entry `b = 1/(t * x)`, matching
+  way. This module uses `YBus.effective_reactance/1` (sign-preserving +/-1e-5
+  floor — `YBus.x_floor/0` is the single source of that number) and the
+  symmetric transformer entry `b = 1/(t * x)`, matching
   `DCPowerFlow.b_prime_triplets/3` exactly. Rather than trust that by
   inspection, `init/3` recomputes every branch flow from the base solution's
   own angles and refuses to build a state whose flows disagree with the
@@ -291,16 +292,24 @@ defmodule PowerModel.Solver.LODF do
 
   @doc """
   Current flows: the base case, or the post-outage flows if anything is tripped.
+
+  Same return shapes as `outage_flows/2`, and for the same reason: when the
+  accumulated outage set splits the island or its dense solve is rejected,
+  there are no post-outage flows to report. Returning the base flows instead —
+  which is what this used to do — hands back the pre-outage answer under a name
+  that promises the post-outage one, the one degradation this module's contract
+  says it will never do silently (REVIEW SOL-17).
   """
-  @spec flows(%__MODULE__{}) :: map()
+  @spec flows(%__MODULE__{}) :: {:ok, map()} | {:island_split, map()} | {:error, term()}
   def flows(%__MODULE__{outages: []} = state) do
-    build_flow_map(state, fn _pos -> 0.0 end, MapSet.new())
+    {:ok, build_flow_map(state, fn _pos -> 0.0 end, MapSet.new())}
   end
 
   def flows(%__MODULE__{} = state) do
     case solve_outage_set(state, state.outages) do
-      {:ok, delta} -> build_flow_map(state, delta, MapSet.new(state.outages))
-      _ -> build_flow_map(state, fn _pos -> 0.0 end, MapSet.new(state.outages))
+      {:ok, delta} -> {:ok, build_flow_map(state, delta, MapSet.new(state.outages))}
+      {:island_split, info} -> {:island_split, info}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -314,6 +323,13 @@ defmodule PowerModel.Solver.LODF do
 
   This answers the arithmetic question only. It cannot see a redispatch or a
   load shed, and those invalidate LODF immediately regardless of trip count.
+
+  Advisory, and deliberately so: nothing in this module consults it, because
+  `trip_line/2` already *enforces* the same horizon — past `:max_outages` it
+  refuses with `{:validity_horizon_exceeded, k, max}` rather than answering.
+  This predicate exists for a caller that wants to hand off to a fresh DC solve
+  BEFORE hitting that wall, at a moment of its own choosing. Its having no
+  caller today is a fact about the callers, not a wiring defect (REVIEW SOL-17).
   """
   @spec needs_refactorize?(%__MODULE__{}) :: boolean()
   def needs_refactorize?(%__MODULE__{} = state),

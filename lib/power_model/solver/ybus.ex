@@ -186,11 +186,22 @@ defmodule PowerModel.Solver.YBus do
   # same operating point with all reactances x1000 (lifting them clear of the
   # floor) and differencing the flows isolates the floor's error exactly.
   #
-  # The smallest reactance any real branch carries is 2.5e-5 pu, so 1.0e-5
-  # floors nothing physical while still keeping 1/x finite for a genuinely
-  # zero-impedance branch. `Ingestion.ParameterEstimator` clamps at the same
-  # value when it WRITES x: a larger write-time clamp silently becomes the
-  # binding floor no matter what this one says.
+  # At 1.0e-5 the floor is very nearly inert, but NOT literally inert, and the
+  # difference is worth naming (REVIEW SOL-20). Two in-service 765 kV jumpers
+  # sit exactly at it — line 36438 (100 m) and line 5701 (184 m) — because
+  # 765 kV has z_base 5,852 ohm, so 0.28 ohm/km over a sub-200 m span comes to
+  # 4.8e-6 and 8.8e-6 pu respectively and `ParameterEstimator` clamped both up
+  # when it wrote them. The floor therefore inflates 36438 by 2.1x and 5701 by
+  # 1.1x. Two branches out of 83,000, each a substation-internal jumper whose
+  # true impedance is negligible either way and whose flow is set by what it
+  # connects rather than by its own x, is the cost being accepted here — not
+  # zero, and not worth lowering the floor further to reclaim. Every other
+  # branch is clear: the smallest reactance the network carries above the
+  # floor is 1.2e-5 pu.
+  #
+  # `Ingestion.ParameterEstimator` clamps at the same value when it WRITES x:
+  # a larger write-time clamp silently becomes the binding floor no matter
+  # what this one says.
   @x_floor 1.0e-5
   @doc false
   def effective_reactance(x) when is_number(x) and (x >= @x_floor or x <= -@x_floor), do: x

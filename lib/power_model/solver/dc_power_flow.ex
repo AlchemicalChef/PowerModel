@@ -68,12 +68,15 @@ defmodule PowerModel.Solver.DCPowerFlow do
       |> Enum.filter(&MapSet.member?(dead_buses, &1.bus_id))
       |> Enum.reduce(0.0, fn load, acc -> acc + (load.p_mw || 0.0) end)
 
-    merged =
-      subs
-      |> Enum.map(&solve(&1, opts))
-      |> Partition.merge_solutions(base_mva)
+    solutions = Enum.map(subs, &solve(&1, opts))
+    merged = Partition.merge_solutions(solutions, base_mva)
 
-    %{merged | dead_load_mw: dead_load_mw, dead_bus_count: MapSet.size(dead_buses)}
+    %{
+      merged
+      | dead_load_mw: dead_load_mw,
+        dead_bus_count: MapSet.size(dead_buses),
+        solver: Solution.merged_solver(solutions)
+    }
   end
 
   @doc """
@@ -107,7 +110,10 @@ defmodule PowerModel.Solver.DCPowerFlow do
     # Find slack bus (type 3, or largest generator)
     slack_idx = find_slack_index(buses, generators, bus_index)
 
-    totals = compute_totals(generators, loads, dc_ties, bus_index, slack_idx, bus_ids)
+    totals =
+      generators
+      |> compute_totals(loads, dc_ties, bus_index, slack_idx, bus_ids)
+      |> Keyword.put(:solver, :dc)
 
     # Solve: theta = B'^-1 * P (excluding slack row/col)
     non_slack_size = n - 1

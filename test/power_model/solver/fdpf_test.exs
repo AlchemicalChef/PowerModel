@@ -168,6 +168,54 @@ defmodule PowerModel.Solver.FDPFTest do
   # which has a closed-form solution, so this case tests the solver against
   # arithmetic rather than against another solver.
 
+  # A plain ring of `n` buses, ids offset clear of IEEE-14's 1..14 so the two
+  # can be merged into one snapshot as separate islands. Deliberately easy to
+  # solve: the SOL-14 tests measure which SOLVER ran, not whether the network
+  # is hard, and they force non-convergence with an iteration cap instead.
+  defp ring(n) do
+    off = 1_000
+
+    %{
+      buses:
+        for i <- 1..n do
+          %{
+            id: off + i,
+            bus_type: if(i == 1, do: 3, else: 1),
+            base_kv: 230.0,
+            vm_pu: 1.0,
+            va_rad: 0.0
+          }
+        end,
+      lines:
+        for i <- 1..n do
+          j = if i == n, do: 1, else: i + 1
+
+          %{
+            id: off + i,
+            from_bus_id: off + i,
+            to_bus_id: off + j,
+            voltage_kv: 230.0,
+            r_pu: 0.005,
+            x_pu: 0.05,
+            b_pu: 0.01,
+            rating_a_mva: 400.0
+          }
+        end,
+      transformers: [],
+      generators: [
+        %{
+          id: off + 1,
+          bus_id: off + 1,
+          p_max_mw: n * 1.2,
+          capacity_factor: 1.0,
+          q_max_mvar: n * 1.0,
+          q_min_mvar: -n * 1.0
+        }
+      ],
+      loads: for(i <- 2..n, do: %{id: off + i, bus_id: off + i, p_mw: 1.0, q_mvar: 0.3})
+    }
+  end
+
   defp two_bus(p_mw, q_mvar) do
     %{
       buses: [
@@ -852,6 +900,84 @@ defmodule PowerModel.Solver.FDPFTest do
       assert sol.iterations > 1
       assert_in_delta sol.total_loss_mw, 13.393, 0.2
       assert FDPF.dense_nr_fallback_max_buses() >= 14
+      # SOL-14: the stamp is what makes the retry visible after the fact.
+      assert sol.solver == :dense_nr
+    end
+
+    test "SOL-14: an island past the fallback cutoff is refused, not retried" do
+      # Above `dense_nr_fallback_max_buses` a failed FDPF must report the
+      # unconverged solution immediately. Retrying densely there costs a full
+      # (2n)x(2n) iteration budget and lands on the same `converged: false`.
+      n = FDPF.dense_nr_fallback_max_buses() + 50
+      snapshot = ring(n)
+
+      {:ok, sol} = FDPF.solve(snapshot, fdpf_opts(max_iterations: 1))
+
+      refute sol.converged
+      assert sol.solver == :fdpf, "a dense retry would have stamped :dense_nr"
+      # One capped FDPF iteration, not a dense solve's worth of them.
+      assert sol.iterations <= 2
+    end
+
+    test "SOL-14: the two cutoffs answer different questions" do
+      # The primary handoff is where dense NR is free; the fallback bound is
+      # where a dense RETRY is affordable. They are ordered but unrelated, and
+      # the fallback bound sits far below the 3,000 it used to, because the
+      # cost that sets it is the failed-solve cost.
+      assert FDPF.dense_nr_max_buses() < FDPF.dense_nr_fallback_max_buses()
+      assert FDPF.dense_nr_fallback_max_buses() <= 500
+    end
+  end
+
+  describe "SOL-14: the :solver stamp" do
+    test "FDPF stamps its own solves" do
+      {:ok, sol} = FDPF.solve(ieee14(), fdpf_opts())
+
+      assert sol.converged
+      assert sol.solver == :fdpf
+    end
+
+    test "the primary handoff to dense NR is stamped :dense_nr, not :fdpf" do
+      {:ok, sol} = FDPF.solve(ieee14(), base_mva: @base_mva)
+
+      assert FDPF.dense_nr_max_buses() >= 14
+      assert sol.solver == :dense_nr
+    end
+
+    test "dense Newton-Raphson stamps itself" do
+      {:ok, sol} = NewtonRaphson.solve(ieee14(), base_mva: @base_mva)
+
+      assert sol.solver == :dense_nr
+    end
+
+    test "a merge whose islands took different paths is :mixed" do
+      # IEEE-14 is under the primary cutoff and goes dense; a 40-bus ring is
+      # over it and goes fast-decoupled. One merged solution, two solvers.
+      big = ring(40)
+
+      merged = %{
+        buses: ieee14().buses ++ big.buses,
+        lines: ieee14().lines ++ big.lines,
+        transformers: ieee14().transformers,
+        generators: ieee14().generators ++ big.generators,
+        loads: ieee14().loads ++ big.loads
+      }
+
+      solution = FDPF.solve_islands(merged, base_mva: @base_mva)
+
+      assert solution.n_islands_solved == 2
+      assert solution.solver == :mixed
+    end
+
+    test "a merge whose islands agree carries the shared stamp" do
+      solution = FDPF.solve_islands(ring(40), base_mva: @base_mva)
+
+      assert solution.n_islands_solved == 1
+      assert solution.solver == :fdpf
+    end
+
+    test "merged_solver/1 on an empty merge is nil, not a claim" do
+      assert Solution.merged_solver([]) == nil
     end
 
     test "an empty snapshot throws rather than returning an empty solution" do

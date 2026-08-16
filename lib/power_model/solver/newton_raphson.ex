@@ -328,6 +328,10 @@ defmodule PowerModel.Solver.NewtonRaphson do
   @doc """
   Assemble the `Solution` for a finished solve: branch flows at the solved
   voltages plus the energy-balance totals.
+
+  Stamps `solver: :dense_nr`. `FDPF` reuses this function for its own solves
+  and overwrites the stamp; the default is the dense path because every OTHER
+  caller of this function is the dense path.
   """
   def build_solution(%__MODULE__{} = prep, vm, va, converged, iterations, max_mismatch, p_calc) do
     line_flows =
@@ -384,7 +388,8 @@ defmodule PowerModel.Solver.NewtonRaphson do
       scheduled_gen_mw: scheduled_gen_mw,
       slack_bus_id: Enum.at(prep.bus_ids, prep.slack_idx),
       slack_injection_mw: totals.slack_injection_mw,
-      mismatch_mw: totals.mismatch_mw
+      mismatch_mw: totals.mismatch_mw,
+      solver: :dense_nr
     }
   end
 
@@ -403,11 +408,18 @@ defmodule PowerModel.Solver.NewtonRaphson do
     end)
   end
 
+  # Map.get with the documented default, not dot access, for the same reason
+  # `aggregate_q_limits` below gives: buses arrive both as `Grid.Bus` structs
+  # and as plain maps (tests, cascade fixtures), and a plain map need not carry
+  # the optional keys. The defaults are the schema's own: `bus_type` 1 (PQ) and
+  # `vm_pu` 1.0 (flat).
+  defp bus_type(bus), do: Map.get(bus, :bus_type) || 1
+
   defp classify_buses(buses, generators, bus_index) do
     gen_bus_ids = MapSet.new(Enum.map(generators, & &1.bus_id))
 
     slack_idx =
-      case Enum.find(buses, &(&1.bus_type == 3)) do
+      case Enum.find(buses, &(bus_type(&1) == 3)) do
         nil ->
           {max_id, _} =
             generators
@@ -427,7 +439,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
       buses
       |> Enum.with_index()
       |> Enum.filter(fn {bus, idx} ->
-        idx != slack_idx and (bus.bus_type == 2 or MapSet.member?(gen_bus_ids, bus.id))
+        idx != slack_idx and (bus_type(bus) == 2 or MapSet.member?(gen_bus_ids, bus.id))
       end)
       |> Enum.map(&elem(&1, 1))
 
@@ -473,8 +485,8 @@ defmodule PowerModel.Solver.NewtonRaphson do
 
     buses
     |> Enum.map(fn bus ->
-      if bus.bus_type == 3 or bus.bus_type == 2 or MapSet.member?(gen_bus_set, bus.id) do
-        bus.vm_pu || 1.0
+      if bus_type(bus) in [2, 3] or MapSet.member?(gen_bus_set, bus.id) do
+        Map.get(bus, :vm_pu) || 1.0
       else
         1.0
       end
@@ -548,7 +560,13 @@ defmodule PowerModel.Solver.NewtonRaphson do
   defp warm_start_index(_), do: %{}
 
   # Dense G/B for the Jacobian, expanded from the nonzero-only Y-bus. Only the
-  # dense NR path calls this, and only at sizes where n^2 is affordable.
+  # dense NR path calls this. "Affordable" is not a property of n^2 alone and
+  # the cutoffs that bound n say so: `FDPF.dense_nr_max_buses/0` (25) is where
+  # the dense path is chosen because it is free, and
+  # `FDPF.dense_nr_fallback_max_buses/0` (300) is the largest island a FAILED
+  # FDPF may retry here — set from measured failed-solve wall time, which runs
+  # seconds at 300 buses and minutes at 900 (REVIEW SOL-14). Above those this
+  # expansion is not reached, and that is the only reason it stays cheap.
   defp build_y_dense(%{n: n, gd: gd, bd: bd, nbrs: nbrs}) do
     g = :array.new(n * n, default: 0.0)
     b = :array.new(n * n, default: 0.0)
@@ -1044,7 +1062,33 @@ defmodule PowerModel.Solver.NewtonRaphson do
     end
   end
 
-  defp solve_jacobian_gauss(jacobian, mismatch, size) do
+  # Last-resort pure-Elixir O(n^3) elimination, reached only when the native LU
+  # has already failed — which is what the ill-conditioned islands an FDPF
+  # fallback sends here do. Capped for the same reason and at the same size as
+  # `DCPowerFlow.gaussian_solve/3` (REVIEW SOL-4/SOL-15): unbounded it is hours
+  # of in-GenServer arithmetic, and Newton calls it once PER ITERATION, so the
+  # caller's failure path has to surface instead of hanging.
+  #
+  # `j_size` is `(n - 1) + n_pq`, i.e. between `n - 1` and `2n - 2`, so 500
+  # covers an all-PV island of 500 buses but only an all-PQ one of ~250. That
+  # deliberately overlaps `FDPF.dense_nr_fallback_max_buses/0` (300) rather
+  # than sitting cleanly above or below it: a PQ-heavy island near 300 buses
+  # will be admitted to the dense fallback and then refused HERE. That is the
+  # right order of refusal, because reaching this function at all means the
+  # native factorization already declined the Jacobian, and grinding cubically
+  # through an ill-conditioned matrix in pure Elixir is the one case where the
+  # retry is guaranteed not to be worth its cost.
+  #
+  # Public with `@doc false` for the same reason `DCPowerFlow.gaussian_solve/3`
+  # is: a guard nothing can call is a guard nothing can test.
+  @gaussian_fallback_max 500
+
+  @doc false
+  def solve_jacobian_gauss(_jacobian, _mismatch, size) when size > @gaussian_fallback_max do
+    throw({:error, {:gaussian_fallback_too_large, size}})
+  end
+
+  def solve_jacobian_gauss(jacobian, mismatch, size) do
     aug =
       jacobian
       |> Enum.zip(mismatch)

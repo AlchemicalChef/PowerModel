@@ -28,9 +28,19 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   default length.
 
   That exclusion is load-bearing, not cosmetic: the predicate below matches on
-  `params_version < @params_version`, and every one of the 5,628
-  `connectivity_repair` rows sits at version 0. Drop the source from the list
-  and the next estimator run overwrites all of them.
+  `params_version < @params_version`, and 4,485 of the 10,113
+  `connectivity_repair` rows still sit at version 0, so the predicate matches
+  every one of them. Drop the source from the list and the next estimator run
+  replaces those measured joint impedances with a class-table guess against a
+  default length. (The other 5,628 have since been stamped at the current
+  version and would survive on the version test alone — which is exactly why
+  the list, not the version, is what this rests on.)
+
+  What the exclusion is NOT protecting against any more is the write-time
+  clamp. When this was first written the repair rows were the ones sitting
+  below it; today none is — the smallest reactance among them is 1.2e-5 pu,
+  above the 1.0e-5 clamp, so a recompute would not be *clamped*, it would
+  simply be wrong about the length (REVIEW SOL-18).
 
   ## How a rating is built
 
@@ -188,11 +198,10 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   #
   # `connectivity_repair` is on this list for a reason worth keeping: those
   # rows are written by `Ingestion.BusMapper` with the real (very short) joint
-  # distance, which puts 5,628 of them below this estimator's own write-time
-  # clamp (smallest 2.5e-5 pu). They are stamped params_version 0, so before
-  # they were listed here the recompute predicate below matched every one of
-  # them and a single estimator run would have silently replaced every repaired
-  # impedance with a class-table guess.
+  # distance, and 4,485 of the 10,113 are still stamped params_version 0, so
+  # the recompute predicate below matches every one of them. Without the
+  # exclusion a single estimator run would silently replace those measured
+  # impedances with a class-table guess against a default length.
   @externally_authored_sources ~w(matpower international connectivity_repair)
 
   # Default ambient temperature for summer derating (Celsius)

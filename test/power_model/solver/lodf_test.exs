@@ -460,7 +460,7 @@ defmodule PowerModel.Solver.LODFTest do
       [a | _] = LODF.branch_keys(lodf)
       {:ok, tripped, _} = LODF.trip_line(lodf, a)
 
-      base = tripped |> LODF.reset() |> LODF.flows()
+      {:ok, base} = tripped |> LODF.reset() |> LODF.flows()
 
       assert LODF.tripped_keys(LODF.reset(tripped)) == []
 
@@ -468,6 +468,63 @@ defmodule PowerModel.Solver.LODFTest do
         Enum.reduce(base, 0.0, fn {k, f}, acc ->
           ref = flow(solution.line_flows, k)
           max(acc, abs(f.p_flow_mw - ref))
+        end)
+
+      assert worst < 1.0e-9
+    end
+  end
+
+  describe "SOL-17: flows/1 return shape" do
+    test "a tripped state reports its post-outage flows as {:ok, flows}" do
+      snap = meshed(12)
+      {lodf, _} = init!(snap)
+      [a | _] = LODF.branch_keys(lodf)
+      {:ok, tripped, direct} = LODF.trip_line(lodf, a)
+
+      assert {:ok, flows} = LODF.flows(tripped)
+      assert map_size(flows) == map_size(direct)
+
+      worst =
+        Enum.reduce(flows, 0.0, fn {k, f}, acc ->
+          max(acc, abs(f.p_flow_mw - Map.fetch!(direct, k).p_flow_mw))
+        end)
+
+      assert worst < 1.0e-9
+    end
+
+    test "an outage set that splits the island says so rather than reporting base flows" do
+      # The bridge never gets into `outages` through `trip_line/2` — that
+      # refuses first — so the state is built directly. This is the shape a
+      # caller would hit if it assembled an outage set by hand.
+      {lodf, solution} = init!(dumbbell())
+      bridge_pos = lodf |> LODF.bridges() |> Map.keys() |> hd()
+
+      assert {:island_split, _info} = LODF.flows(%{lodf | outages: [bridge_pos]})
+
+      # And the old behaviour is what is being ruled out: base flows returned
+      # under a name that promises post-outage flows.
+      refute match?({:ok, _}, LODF.flows(%{lodf | outages: [bridge_pos]}))
+      assert map_size(solution.line_flows) > 0
+    end
+
+    test "a rejected linear solve is an error, not silent base flows" do
+      snap = meshed(12)
+      {lodf, _} = init!(snap)
+
+      broken = %{lodf | outages: [0], handle: :not_a_factorization}
+
+      assert {:error, _reason} = LODF.flows(broken)
+    end
+
+    test "an untripped state is still {:ok, base_flows}" do
+      snap = meshed(12)
+      {lodf, solution} = init!(snap)
+
+      assert {:ok, flows} = LODF.flows(lodf)
+
+      worst =
+        Enum.reduce(flows, 0.0, fn {k, f}, acc ->
+          max(acc, abs(f.p_flow_mw - flow(solution.line_flows, k)))
         end)
 
       assert worst < 1.0e-9

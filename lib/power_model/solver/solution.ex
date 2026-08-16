@@ -1,7 +1,27 @@
 defmodule PowerModel.Solver.Solution do
   @moduledoc """
   Represents the result of a power flow solution.
+
+  ## Which solver produced this (REVIEW SOL-14)
+
+  `:solver` names the code path that actually computed the voltages:
+
+    * `:dc` — `DCPowerFlow`, angles only, `vm_pu` flat at 1.0
+    * `:fdpf` — `FDPF`'s fast-decoupled iteration
+    * `:dense_nr` — the dense Newton-Raphson path, EITHER because the island
+      was small enough for `FDPF.solve/2` to hand it over up front or because
+      an FDPF failure fell back to it
+    * `:mixed` — a merge (`solve_islands/2`) whose islands were not all solved
+      the same way; the per-island solutions carry the unmerged stamps
+    * `nil` — an empty merge, where nothing produced anything
+
+  The point is that a fallback is *reported* rather than inferred from a
+  suspicious iteration count. `:dense_nr` on an island large enough to have
+  gone the FDPF route says FDPF failed there; the cost of the retry is on the
+  clock either way, and this is what makes it attributable after the fact.
   """
+
+  @type solver :: :dc | :fdpf | :dense_nr | :mixed | nil
 
   defstruct [
     :bus_ids,
@@ -27,7 +47,9 @@ defmodule PowerModel.Solver.Solution do
     # excluded from the solve. Populated by `solve_islands` from the Partition
     # dead set so callers can account for unserved load.
     :dead_load_mw,
-    :dead_bus_count
+    :dead_bus_count,
+    # Which solver produced these voltages. See the moduledoc.
+    :solver
   ]
 
   def new(bus_ids, vm_pu, va_rad, line_flows, base_mva, extra \\ []) do
@@ -51,10 +73,29 @@ defmodule PowerModel.Solver.Solution do
         mismatch_abs_mw: nil,
         n_islands_solved: 1,
         dead_load_mw: 0.0,
-        dead_bus_count: 0
+        dead_bus_count: 0,
+        solver: nil
       },
       extra
     )
+  end
+
+  @doc """
+  The `:solver` stamp for a merge of per-island solutions.
+
+  `nil` for an empty merge, the shared atom when every island took the same
+  path, `:mixed` otherwise. `:mixed` is the interesting one: it is how a
+  per-island fallback survives the merge, and it says to read the per-island
+  solutions if you want to know which island paid for it.
+  """
+  @spec merged_solver([%__MODULE__{}]) :: solver()
+  def merged_solver([]), do: nil
+
+  def merged_solver(solutions) do
+    case solutions |> Enum.map(& &1.solver) |> Enum.uniq() do
+      [one] -> one
+      _many -> :mixed
+    end
   end
 
   @doc """
