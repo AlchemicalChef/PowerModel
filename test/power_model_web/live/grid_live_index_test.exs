@@ -386,6 +386,26 @@ defmodule PowerModelWeb.GridLiveIndexTest do
       assert html =~ "Pipeline"
       assert html =~ "Crypto"
     end
+
+    # Rerouted is "flow moved here", not damage, and it is the most numerous
+    # class on a real disturbance — one Palo Verde unit trip repainted 995 of
+    # 22,152 Western branches while the engine reported settled/intact and
+    # 0 MW shed. Equal billing in the legend read as a catastrophe over a
+    # ride-through.
+    test "the failure legend names rerouted as informational and says it dims",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      html = render_change(view, "change_view_mode", %{"mode" => "failure_state"})
+
+      assert html =~ "Flow shifted (informational)"
+      refute html =~ "Rerouted Flow", "the legend must not give it equal billing"
+      assert html =~ "Shifted flow dims once the cascade settles"
+
+      # The classes that mean damage keep their plain, full-weight billing.
+      assert html =~ "Overloaded (&gt;100%)"
+      assert html =~ "Tripped / Dead"
+    end
   end
 
   describe "info panel names (UI-L5, UI-L6)" do

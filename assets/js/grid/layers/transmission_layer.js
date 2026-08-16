@@ -3,7 +3,39 @@ import { COLOR_SCALES, VOLTAGE_COLORS } from "../color_scales";
 
 // Dimmed ghost color for unaffected lines during cascade — dim, not gone:
 // the network must stay visible as context around the failure.
-const GHOST_COLOR = [90, 90, 110, 70];
+const GHOST_RGB = [90, 90, 110];
+const GHOST_COLOR = [...GHOST_RGB, 70];
+
+// Review weight for the REROUTED class (state 4).
+//
+// Rerouted is not damage. It is "flow moved here", and on a real system flow
+// moves a very long way: a single Palo Verde unit tripping — engine verdict
+// settled/intact, 0 MW shed, 59.80 Hz nadir — repainted 995 of 22,152
+// branches as rerouted across the whole West. At full impact weight that
+// reads as a catastrophe when what happened was a ride-through. So once the
+// run SETTLES, rerouted drops to a tint: still legible as the rerouted
+// colour, but clearly subordinate to the classes that mean damage.
+//
+// Three-step ladder, which is the property to preserve if these numbers are
+// ever retuned: ghost (unaffected context) < tint (flow moved) < full
+// (stressed / overloaded / tripped).
+//
+// It stays at FULL weight during the live cascade — watching redistribution
+// spread is the whole point of the streaming view.
+const REVIEW_TINT_MIX = 0.55;
+const REVIEW_TINT_ALPHA = 120;
+
+// Derived from STATE_COLORS rather than hardcoded, so retuning the rerouted
+// colour carries the legend swatch and this tint along with it.
+function reroutedTintColor() {
+  const base = COLOR_SCALES.getStateColor(4);
+  return [
+    ...base.map((c, i) =>
+      Math.round(c + (GHOST_RGB[i] - c) * REVIEW_TINT_MIX)
+    ),
+    REVIEW_TINT_ALPHA,
+  ];
+}
 
 // Legend voltage classes used for filtering — derived from VOLTAGE_COLORS so
 // the classes the legend paints and the classes the toggle filters can never
@@ -59,14 +91,23 @@ function filteredLines(dataStore, zoom, hiddenVoltages, stateVersion) {
   return lines;
 }
 
-export function createTransmissionLayer(dataStore, viewMode, zoom, onClick, selectedId, cascadeActive, hiddenVoltages, stateVersion) {
+// `impactView` is the impact picture being on at all (live cascade OR settled
+// review); `review` is specifically the settled half of it, and is what
+// demotes the rerouted class.
+export function createTransmissionLayer(dataStore, viewMode, zoom, onClick, selectedId, impactView, hiddenVoltages, stateVersion, review = false) {
   const lines = filteredLines(dataStore, zoom, hiddenVoltages, stateVersion);
 
   const layers = [];
 
-  if (cascadeActive) {
-    // Split into affected and unaffected for separate rendering
-    const affected = lines.filter((d) => d.state > 0);
+  if (impactView) {
+    // Split into affected and unaffected for separate rendering. Rerouted is
+    // pulled out into its own layer in BOTH states rather than only in
+    // review: a line that moved between layers at the settle boundary would
+    // leave one and appear in the other, and deck.gl can only interpolate an
+    // attribute for data that stays put. Keeping it in one layer is what lets
+    // the demotion animate rather than snap.
+    const rerouted = lines.filter((d) => d.state === 4);
+    const affected = lines.filter((d) => d.state > 0 && d.state !== 4);
     const unaffected = lines.filter((d) => d.state === 0);
 
     // Ghost layer — unaffected lines rendered nearly invisible
@@ -83,6 +124,39 @@ export function createTransmissionLayer(dataStore, viewMode, zoom, onClick, sele
           getColor: GHOST_COLOR,
           getWidth: 1,
           onClick,
+        })
+      );
+    }
+
+    // Rerouted — full weight while live, tint once settled. Pushed BEFORE the
+    // affected layer so damage always draws over flow redistribution.
+    if (rerouted.length > 0) {
+      layers.push(
+        new PathLayer({
+          id: "transmission-rerouted",
+          data: rerouted,
+          pickable: true,
+          widthScale: 1,
+          // A clamp, not an accessor, so it steps rather than eases. At these
+          // zooms the metre-denominated getWidth is sub-pixel and the clamp is
+          // what sets the drawn width, so the width change is a step and the
+          // colour is what carries the 600 ms fade.
+          widthMinPixels: review ? 1 : 2,
+          widthMaxPixels: review ? 2.5 : 7,
+          getPath: (d) => d.path,
+          getColor: review ? reroutedTintColor() : (d) => getCascadeLineColor(d),
+          getWidth: (d) => getCascadeLineWidth(d, zoom),
+          onClick,
+          updateTriggers: {
+            getColor: [stateVersion, review],
+            getWidth: [zoom],
+          },
+          transitions: {
+            // Same 600 ms as the vignette's settle transition, so the whole
+            // "the event is over, here is what mattered" beat reads as one
+            // movement.
+            getColor: 600,
+          },
         })
       );
     }

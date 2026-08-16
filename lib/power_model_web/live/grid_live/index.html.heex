@@ -452,9 +452,18 @@
             <span class="legend-dot" style="background: rgb(46, 204, 113);"></span>
             <span>Normal</span>
           </div>
+          <%!-- Rerouted is not damage: it is "flow moved here", and it is by
+                far the most numerous class on a real disturbance (a single
+                Palo Verde unit tripping repainted 995 of 22,152 Western
+                branches while the engine reported settled/intact and 0 MW
+                shed). Given equal billing it read as a catastrophe over a
+                ride-through, so it is labelled for what it is and drops to a
+                tint once the cascade settles. --%>
           <div class="legend-item">
+            <%!-- The swatch keeps the full rerouted colour: that is the class's
+                  identity, and it is what the live cascade actually paints. --%>
             <span class="legend-dot" style="background: rgb(255, 140, 0);"></span>
-            <span>Rerouted Flow</span>
+            <span>Flow shifted (informational)</span>
           </div>
           <div class="legend-item">
             <span class="legend-dot" style="background: rgb(245, 166, 35);"></span>
@@ -475,6 +484,9 @@
           <div class="legend-item">
             <span class="legend-dot" style="background: rgb(255, 50, 30);"></span>
             <span>Tripped / Dead</span>
+          </div>
+          <div class="legend-footnote">
+            Shifted flow dims once the cascade settles; damage classes stay at full weight.
           </div>
         </div>
         <%!-- UIW-4: the voltage overlay is PARTIAL by construction. It covers

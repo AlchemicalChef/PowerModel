@@ -229,6 +229,11 @@ export class MapManager {
     // ghosting, ghost-shrink, forced-visible impacted infrastructure. A
     // settled cascade is still a cascade to look at.
     const ca = this._impactView();
+    // The settled half of the impact view. The rerouted class is demoted to a
+    // tint here: flow redistribution is informational, and at collapse scale
+    // it is the overwhelming majority of what gets repainted, so at full
+    // weight a ride-through reads as a catastrophe.
+    const review = ca && !this.cascadeActive;
 
     // Demand-density hexbin overlay (drawn first = beneath the network) so
     // the line/generator geometry stays legible on top of it.
@@ -262,7 +267,7 @@ export class MapManager {
             });
           }
         }, selectedType === "transmission_line" ? selectedId : null, ca,
-        this.categoryFilters.voltage, this.stateVersion)
+        this.categoryFilters.voltage, this.stateVersion, review)
       );
     }
 

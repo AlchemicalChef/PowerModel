@@ -368,6 +368,90 @@ test("after settle the map still renders the ghost/affected split, not the flat 
   assert.ok(!ids().includes("transmission-ghost"));
 });
 
+// Rerouted is "flow moved here", not damage, and it is the most numerous
+// class on a real disturbance: one Palo Verde unit trip repainted 995 of
+// 22,152 Western branches rerouted while the engine reported settled/intact
+// and 0 MW shed. At full weight that reads as a catastrophe over a
+// ride-through. It keeps full weight while LIVE (watching redistribution
+// spread is the point) and drops to a tint once settled.
+test("rerouted drops to a tint at settle while damage classes keep full weight", () => {
+  // A fourth line stays unaffected so the ghost layer exists to compare
+  // against — the ladder is only meaningful with all three rungs present.
+  const m = bareManager();
+  m.dataStore.loadTransmissionLines(
+    buildLinesBuffer([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }])
+  );
+  let layers = [];
+  delete m._updateLayers;
+  m.map = {
+    getZoom: () => 9,
+    getBounds: () => ({
+      getWest: () => -180, getSouth: () => -90, getEast: () => 180, getNorth: () => 90,
+    }),
+  };
+  m.deckOverlay = { setProps: (p) => (layers = p.layers) };
+  const byId = (id) => layers.find((l) => l.id === id);
+
+  // Line 1 tripped, line 2 overloaded, line 3 rerouted.
+  m.applyCascadeStep({
+    step: 1,
+    tripped_line_ids: [1],
+    overloaded_line_ids: [2],
+    rerouted_line_ids: [3],
+  });
+
+  // LIVE: rerouted is its own layer but at full impact weight — same colour
+  // and same width clamps the affected layer uses.
+  const liveRerouted = byId("transmission-rerouted");
+  assert.ok(liveRerouted, "rerouted has its own layer so the demotion can animate");
+  assert.equal(liveRerouted.props.widthMinPixels, 2, "full weight while live");
+  assert.equal(liveRerouted.props.widthMaxPixels, 7);
+  assert.deepEqual(
+    liveRerouted.props.getColor({ state: 4 }),
+    [255, 140, 0, 240],
+    "full rerouted colour while live"
+  );
+  assert.equal(byId("transmission-affected").props.widthMinPixels, 2);
+
+  m.applyDCResults({ overloaded_line_ids: [2], rerouted_line_ids: [3] });
+  m.endCascade(true);
+
+  // REVIEW: rerouted demoted, damage untouched.
+  const tinted = byId("transmission-rerouted");
+  assert.ok(tinted, "rerouted is still drawn — subordinate, not gone");
+  assert.equal(tinted.props.widthMinPixels, 1, "thinner than the damage classes");
+  assert.equal(tinted.props.widthMaxPixels, 2.5);
+
+  const tint = tinted.props.getColor;
+  assert.deepEqual(tint, [164, 113, 61, 120], "low-saturation, low-alpha tint");
+
+  // The three-step ladder is the property worth pinning: ghost < tint < full.
+  assert.ok(
+    byId("transmission-ghost").props.widthMinPixels < tinted.props.widthMinPixels,
+    "tint must be visibly above the ghost layer"
+  );
+  assert.ok(
+    tinted.props.widthMinPixels < byId("transmission-affected").props.widthMinPixels,
+    "tint must be clearly below the damage classes"
+  );
+  assert.ok(tint[3] > 70 && tint[3] < 240, "alpha sits between ghost and full");
+
+  // Damage keeps full impact weight, and rerouted never gets a glow.
+  assert.equal(byId("transmission-affected").props.widthMinPixels, 2);
+  assert.deepEqual(
+    byId("transmission-affected").props.getColor({ state: 2 }),
+    [231, 76, 60, 240],
+    "overloaded still at full weight in review"
+  );
+  assert.ok(
+    byId("transmission-glow").props.data.every((d) => d.state !== 4),
+    "rerouted carries no glow"
+  );
+
+  // The demotion animates rather than snapping.
+  assert.equal(tinted.props.transitions.getColor, 600);
+});
+
 // UI-M21 composes with this: scrubbing a finished cascade stays OUT of the
 // live state but keeps the review dimming that makes the frame readable.
 test("scrubbing in review keeps the impact view and stays out of live", () => {
