@@ -364,6 +364,14 @@ Micro [DEFER]: num_points u16 clamp in grid_export.
 
 ## UI — LiveView / map / JS
 
+**UI-L14 (LOW) [OPEN]** Flow-classification id lists (rerouted/overloaded/stressed) are
+re-sent in full on every cascade step — 60% (134 KB) of a 50-step cascade's client
+payload. Delta-encoding them changes the map repaint/scrub contract and is deliberately
+NOT bought yet; the UIW-4 gate is restated as measured: per-frame < 100 KB (met at 34.2 KB
+worst, 65× under the original 2.2 MB defect) plus per-step-linear total (~4.4 KB/step
+measured). Post-DR-1, budget-exhausted 50-step cascades are the NORMAL case on physically
+rated anchors, not the exception. Found at UI-2 re-basing, 2026-08-16.
+
 **UI-C1 (CRIT) [FIX:R3-engine + R3-uijs]** Client never told the cascade ended — map stuck in
 cascade mode (ghosting, vignette, forced layers) until Reset. Fix contract: server pushes
 `push_event(socket, "cascade_done", %{stable: boolean})`; JS handles it, clears
@@ -497,7 +505,16 @@ real-demand ERCOT cascade, 93 of 170 island-solves DID carry a voltage layer —
 main island diverges every time, but every fragment that breaks off converges. LIN-13 is
 true of the whole island and false of the pieces; the voltage chain is live mid-cascade
 today, and the Phase 2 data repair raises coverage rather than enabling it.
-**SOL-12 (MED) [OPEN]** `YBus.effective_reactance/1` floors |x| at 1.0e-3 pu — far
+FURTHER CORRECTION (DR-2, 2026-08-16): synthesized EHV line-end reactors (−65.1 GVAr,
+48% of Western's charging) take Western from NO AC solution at any load level to
+α ≤ 0.105 with overvoltage fully solved (5,151 → 18 buses >1.1 pu at α=0.08). The
+ceiling is pinned by LOW voltage in the 115 kV Pacific-Northwest corridor at every
+reactor constant swept — a topology gate for DR-4's remap, not reactive supply.
+**SOL-12 (FIXED 2026-08-16)** Floor lowered 1.0e-3 → 1.0e-5 with the estimator write
+clamp aligned (whichever clamp is larger silently binds). x1000 invariance probe now
+bit-identical (Eastern sum|Δflow| 27,761 → 0.0 MW); the ACTIVSg2000 DC deviation was the
+floor alone — worst 8.7e-9 rad, the reference's own print quantization. 18 overload-flag
+flips at ≤230 kV, re-baselined. ORIGINAL: `YBus.effective_reactance/1` floors |x| at 1.0e-3 pu — far
 coarser than the divide-by-zero guard requires. Three real ACTIVSg2000 branches
 (true x 7.0e-4–8.8e-4) are inflated 14–43%, confirmed as the sole source of the case's
 DC deviation. Lower the floor (e.g. 1e-5) with the sign-preserving semantics intact.
@@ -561,7 +578,11 @@ broken-identity screen (catches BPAT alone; budget = share × (D+TI), see ENE-18
 Measured at 2025-01-01T04:00Z, as-dispatched: Eastern −65,100 → −174.9 MW (−0.07%); ERCOT
 +3,223 → +652 MW (+1.55%) — NOTE the prior claim "ERCOT/Western dispatch was validated in
 Phase 3" was mis-scoped: Phase 3 validated fuel-mix TV and the interchange identity, not
-absolute balance, and ERCOT ran +7.7% long; Western −2,355 MW gross (−3.0%), −1,058 MW
+absolute balance, and ERCOT ran +7.7% long — confirmed at three hours (+7.67% reference,
++6.72% at 2024-11-30T18:00Z, +2.70% at 2024-12-31T18:00Z). The pre-fix ERCOT reference
+cascade propagated on that surplus: neighbors of the tripped line carried fictitious
+slack-bound flow at 0.77× vs 0.25× balanced, so the same trip now settles with 0 MW shed —
+the controlled re-baseline of global gate 5, evidenced not assumed; Western −2,355 MW gross (−3.0%), −1,058 MW
 (−1.4%) net of 1,297 MW of named unanchored generation (fleet-mapping residual, ENE-15/
 DR-4/DR-5 territory). Eastern base overloads 4,444 → 778 (balanced control was 712);
 Eastern >90° branches 15 → 1, the survivor being a LIN13-B stranded-wind spur (DR-4), and
@@ -578,6 +599,13 @@ lists share ZERO entries. Likely interacts with ENE-17's cross-boundary BA scali
 ERCOT/Western dispatch was validated in Phase 3 and does not show this. Found by the
 LODF screening sweep 2026-08-15. Fix belongs in dispatch/balance_operating_point
 ownership; until then, Eastern screening results should use the balanced control.
+**ENE-21 (MED, NONDETERMINISM) [OPEN]** `Cascade.init` returns one of two dispatch
+states on identical snapshots — measured 76.3 MW spread across 1,107 Western generators
+on a snapshot agreeing to 1e-13; flips the Western overload census 585/586 between
+identical runs. The solver is exonerated (row-shuffled and repeated solves bit-identical;
+1e-9 MW injection swap moves flows 1.8e-9 MW). Dispatch-side map/order dependence is the
+suspect. Until fixed, census gates on Western must be stated ±1 or pinned to one dispatch
+draw. Found by DR-2's A/B harness, 2026-08-16.
 **ENE-18 (DATA CAVEAT) [RE-MEASURED 2026-08-16]** EIA-930's own identity NG − (D+TI)
 fails for BPAT alone in the current DB: 0 of 4,417 hours close at 5% tolerance, mean
 residual −4,317 MW (sd 725). The previously-recorded MISO and CISO are no longer broken
