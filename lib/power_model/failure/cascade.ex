@@ -57,30 +57,63 @@ defmodule PowerModel.Failure.Cascade do
   was never in `original_load_mw` — see that function for the extended
   conservation identity.
 
-  ## The step ordering (ROADMAP item 15)
+  ## The step ordering (ROADMAP items 15 and 20)
 
   Everything an island does inside one step happens in this order, and the
   order is the model:
 
-  1. **Reserves** — the ramp-limited tiers (`PowerModel.Failure.Reserves`)
-     raise the island's generation as far as the clock allows.
-  2. **Trajectory evaluation** — ONE swing-equation segment, resumed from the
+  1. **Voltage protection** — the island's AC solution from the END of the
+     previous segment is read by the grid-following derate, the IEEE 1547
+     rooftop voltage elements and PRC-024 generator ride-through. Rooftop that
+     trips is new LOAD, machines that trip are lost GENERATION, and both land
+     in this step's deficit before anything else looks at it.
+  2. **Reserves** — the ramp-limited tiers (`PowerModel.Failure.Reserves`)
+     raise the island's generation as far as the clock allows, with the
+     secondary tier fed by the island's own AGC controller.
+  3. **Trajectory evaluation** — ONE swing-equation segment, resumed from the
      island's persistent frequency state, for the deficit the reserves left.
-  3. **Protection reads that trajectory** — behind-the-meter inverters
-     (IEEE 1547) and generator frequency protection (PRC-024) are evaluated
-     against the SAME trajectory, so they cannot disagree about what the
-     island's frequency did.
-  4. **Recompute** — tripped rooftop is new load, tripped generators are lost
+  4. **Frequency protection reads that trajectory** — behind-the-meter
+     inverters (IEEE 1547) and generator frequency protection (PRC-024) are
+     evaluated against the SAME trajectory, so they cannot disagree about what
+     the island's frequency did.
+  5. **Recompute** — tripped rooftop is new load, tripped generators are lost
      generation; both land in the same step's deficit.
-  5. **Residual shed** — UFLS (authoritative, re-simulated on the deepened
-     gap) and then the force-shed tier close whatever is left.
-  6. **Solve** — DC power flow on the post-shed island, feeding thermal,
-     voltage and zone-3 protection.
+  6. **Residual shed** — UVLS first (its stage timers have already elapsed
+     against the voltage measurement), then UFLS (authoritative, re-simulated
+     on the changed gap), then the force-shed tier for whatever is left.
+  7. **Solve** — DC power flow on the post-shed island feeding thermal and
+     conductor protection, plus a QSS-AC attempt whose solution is this
+     segment's distance-relay measurement and the NEXT segment's voltage layer.
 
-  Step 3 is the positive feedback loop real blackouts run on: an island that
-  dips far enough loses generators, which deepens the same step's deficit,
-  which sheds more customers. Islands can therefore LOSE generation they did
-  not start losing.
+  Steps 1 and 4 are the positive feedback loop real blackouts run on: an island
+  that dips or sags far enough loses generators, which deepens the same step's
+  deficit, which sheds more customers. Islands can therefore LOSE generation
+  they did not start losing.
+
+  ## The voltage layer (ROADMAP item 20)
+
+  An island gets a voltage layer for a segment only if `PowerModel.Solver.FDPF`
+  converged on it at the end of the previous one. There is exactly one writer
+  of that field, and it takes a converged AC solution as its argument, so no
+  voltage-sensitive protection can be reading the DC solve's flat 1.0 pu —
+  which would make the whole layer silently inert and put every DC angle inside
+  the PRC-023 blinder wedge.
+
+  **`nil` is the common case at real demand.** REVIEW LIN-13 measured that no
+  interconnection has an AC solution there: wherever DC needs more than 90°
+  across a branch, no AC solution exists to find. An island without one runs
+  exactly as it did before this wave — DC plus the frequency chain — and is
+  counted in `voltage_layer` and in one summary log line per cascade.
+
+  ### Why the measurement is a segment old
+
+  A segment's own duration is not known until its trajectory settles, and a
+  protection cannot read a solution that has not been produced yet. So each
+  segment's voltage timers integrate the time that has ALREADY passed
+  (`now - evaluated_at_s`, which is the previous segment's clock advance)
+  against the voltage measured at its end. What the island holds now is what it
+  held then, until something in this step changes it — and everything that does
+  change it is downstream of the reading.
 
   ## Persistent island frequency state (ROADMAP item 15)
 
@@ -138,9 +171,10 @@ defmodule PowerModel.Failure.Cascade do
 
   require Logger
 
+  alias PowerModel.Controls.AGC
   alias PowerModel.Dispatch
   alias PowerModel.Grid.{BtmSolar, DcTie, Ratings}
-  alias PowerModel.Solver.{DCPowerFlow, Frequency}
+  alias PowerModel.Solver.{DCPowerFlow, FDPF, Frequency}
   alias PowerModel.Failure.{Protection, LoadShedding, Reserves}
   alias PowerModel.Simulation.Cascading.IslandDetector
 
@@ -169,15 +203,34 @@ defmodule PowerModel.Failure.Cascade do
   # with no new imbalance — while its frequency is this far off nominal.
   @excursion_epsilon_hz 1.0e-4
 
-  # IEEE 1547-2003 must-trip settings for the legacy behind-the-meter fleet.
-  # 1547-2018 units are required to ride through both of these, which is why
-  # only the legacy SHARE of each bus's rooftop output is ever at stake.
+  # IEEE 1547-2003 must-trip frequency for the legacy behind-the-meter fleet.
+  # 1547-2018 units are required to ride through it, which is why only the
+  # legacy SHARE of each bus's rooftop output is ever at stake here.
+  #
+  # The 0.88 pu VOLTAGE half of the same standard is NOT evaluated here: it
+  # belongs to `PowerModel.Grid.BtmSolar.voltage_trips/5`, which carries the
+  # real definite-time elements and the legacy/modern vintage split, and which
+  # the QSS-AC layer below feeds with measured bus voltages. Keeping a second,
+  # instantaneous 0.88 pu test on this path would trip the same megawatts
+  # twice — see `voltage_btm_trip/4` for the guard that keeps the two halves
+  # disjoint.
   @btm_trip_frequency_hz 59.3
-  @btm_trip_voltage_pu 0.88
 
   # Nominal frequency, used when an island carries no deficit and therefore no
   # under-frequency excursion to evaluate. Matches `Frequency`'s f0.
   @nominal_frequency_hz 60.0
+
+  # An island's AC solve is not retried while nothing about the island has
+  # changed enough to change the answer. Bus count and branch count are exact;
+  # load is compared relatively, because shedding a fraction of a percent does
+  # not move a case from infeasible to feasible.
+  @ac_retry_load_fraction 0.05
+
+  # Buses outside this band are counted into the island's one voltage-violation
+  # summary event. Matches `Protection.check_voltage_violations/3`'s defaults,
+  # which this supersedes on AC-solved islands.
+  @voltage_alarm_low_pu 0.85
+  @voltage_alarm_high_pu 1.15
 
   defstruct [
     :buses,
@@ -218,7 +271,32 @@ defmodule PowerModel.Failure.Cascade do
     # Transient governor MW inside `dispatch`, per generator (ROADMAP item 16).
     # `dispatch[id] - primary_reserve[id]` is the unit's SUSTAINED output, and
     # that is what the swing model is told about.
-    primary_reserve: %{}
+    primary_reserve: %{},
+    # `%{bus_id => %{legacy_mw:, modern_mw:}}` — the rooftop fleet split by
+    # inverter vintage, which is what the 1547 VOLTAGE protection needs.
+    # `btm_by_bus` above is the legacy-only view the 59.3 Hz frequency
+    # must-trip reads; the two are gated against each other, never summed.
+    btm_fleet_by_bus: %{},
+    # Cause-tagged refinement of `btm_tripped_mw`: `%{frequency_mw:,
+    # voltage_mw:, total_mw:}`, with `total_mw` equal to `btm_tripped_mw`.
+    # Strictly additive — the conservation identity's SHAPE is unchanged.
+    btm_trip_breakdown: %{frequency_mw: 0.0, voltage_mw: 0.0, total_mw: 0.0},
+    # Per-branch conductor temperature, `%{{type, id} => thermal state}`, and
+    # the cascade-clock time it was last advanced to. This is the SLOW
+    # timescale of ROADMAP item 20; the IEC 60255-151 duty integral is the
+    # fast one and they never feed each other.
+    conductor_state: %{},
+    conductor_at_s: 0.0,
+    # What the QSS-AC pass managed, cumulatively over the cascade:
+    # `%{islands_ac:, islands_dc_only:, ac_solves:, ac_diverged:, ac_skipped:}`.
+    # Reported once per cascade in the log and surfaced in every step result.
+    voltage_layer: %{
+      islands_ac: 0,
+      islands_dc_only: 0,
+      ac_solves: 0,
+      ac_diverged: 0,
+      ac_skipped: 0
+    }
   ]
 
   @doc """
@@ -311,11 +389,20 @@ defmodule PowerModel.Failure.Cascade do
       shed_load_mw: 0.0,
       blackout_load_mw: 0.0,
       btm_by_bus: aggregate_btm_solar(Map.get(snapshot, :btm_solar) || []),
+      btm_fleet_by_bus: BtmSolar.fleet_by_bus(Map.get(snapshot, :btm_solar) || []),
       btm_tripped_buses: MapSet.new(),
       btm_tripped_mw: 0.0,
+      btm_trip_breakdown: BtmSolar.fresh_trip_breakdown(),
       island_states: island_states,
-      primary_reserve: %{}
+      primary_reserve: %{},
+      conductor_state: %{},
+      conductor_at_s: 0.0,
+      voltage_layer: fresh_voltage_layer()
     }
+  end
+
+  defp fresh_voltage_layer do
+    %{islands_ac: 0, islands_dc_only: 0, ac_solves: 0, ac_diverged: 0, ac_skipped: 0}
   end
 
   # ---------------------------------------------------------------------------
@@ -331,12 +418,54 @@ defmodule PowerModel.Failure.Cascade do
   #   :deficit_since_s  cascade-clock time the island's SUSTAINED deficit
   #                     opened, or nil while it has none. The reserve tiers
   #                     ramp on `simulated_time - deficit_since_s`.
+  #
+  # The voltage half (ROADMAP item 20). Every one of these is written ONLY
+  # from a converged FDPF solution — see `record_ac_layer/3` — which is what
+  # makes it structurally impossible for a voltage-sensitive protection to be
+  # reading the DC solve's flat 1.0 pu:
+  #
+  #   :ac_voltage       `nil`, or `%{vm_by_bus:, at_s:, warm_start:}` from the
+  #                     END of the previous segment. `nil` IS the common case
+  #                     at real demand (REVIEW LIN-13) and every consumer
+  #                     below treats it as "no voltage layer this segment".
+  #   :ac_failed        the island fingerprint an AC attempt last failed on,
+  #                     so a provably infeasible island is not re-solved every
+  #                     step until something about it moves
+  #   :gen_voltage_state  PRC-024 ride-through timers, keyed by GENERATOR
+  #   :btm_voltage_state  IEEE 1547 rooftop timers, keyed by BUS
+  #   :uvls_state         UVLS stage timers, keyed by BUS
+  #
+  # All three timer states are INTENSIVE and split by plain key filter (see
+  # `inherit_record/4`); only the frequency state's cumulative megawatts are
+  # apportioned by load share.
+  #
+  #   :agc              `PowerModel.Controls.AGC` state — the island's
+  #                     closed-loop secondary controller
+  #   :mean_frequency_hz  the mean frequency of the LAST segment, which is
+  #                     what AGC measures (endpoint sampling over-commands)
+  #   :voltage_alarm    high-water mark `{undervoltage_buses, overvoltage_buses}`
+  #                     already reported, so a level alarm cannot re-fire every
+  #                     segment (see `voltage_alarm_event/3`)
+  #   :evaluated_at_s   cascade-clock time this island was last evaluated.
+  #                     Every "how long has this been true" question in the
+  #                     step — voltage timers, the AGC cycle — is answered by
+  #                     `now - evaluated_at_s`, which is exactly the previous
+  #                     segment's advance.
   defp fresh_island_record(buses, deficit_since_s \\ nil) do
     %{
       buses: buses,
       frequency_state: nil,
       exposure: [],
-      deficit_since_s: deficit_since_s
+      deficit_since_s: deficit_since_s,
+      ac_voltage: nil,
+      ac_failed: nil,
+      gen_voltage_state: Protection.fresh_voltage_state(),
+      btm_voltage_state: BtmSolar.fresh_voltage_state(),
+      uvls_state: LoadShedding.fresh_uvls_state(),
+      agc: nil,
+      mean_frequency_hz: nil,
+      evaluated_at_s: nil,
+      voltage_alarm: nil
     }
   end
 
@@ -403,9 +532,16 @@ defmodule PowerModel.Failure.Cascade do
   # contributed the plurality of its LOAD (bus count breaks ties; no overlap
   # at all means a fresh 60.0 Hz start). See the moduledoc for the rule and
   # its limits.
-  defp inherit_island_states(prior_records, islands, loads) do
+  #
+  # `generators` is needed for the two per-GENERATOR states (PRC-024 voltage
+  # timers, AGC): the frequency rule follows load, but a generator's ride-
+  # through timer follows the machine, so the split needs to know which units
+  # landed where.
+  defp inherit_island_states(prior_records, islands, loads, generators) do
     load_by_bus =
       Enum.reduce(loads, %{}, fn l, acc -> Map.update(acc, l.bus_id, l.p_mw, &(&1 + l.p_mw)) end)
+
+    gens_by_bus = Enum.group_by(generators, & &1.bus_id, & &1.id)
 
     owner =
       prior_records
@@ -439,12 +575,64 @@ defmodule PowerModel.Failure.Cascade do
           fresh_island_record(island)
 
         {index, {mw, _count}} ->
-          by_index
-          |> Map.fetch!(index)
-          |> Map.put(:buses, island)
-          |> apportion_state(mw / max(Map.get(prior_load, index, 0.0), 1.0e-9))
+          prior = Map.fetch!(by_index, index)
+          share = mw / max(Map.get(prior_load, index, 0.0), 1.0e-9)
+
+          inherit_record(prior, island, share, %{
+            load_by_bus: load_by_bus,
+            gens_by_bus: gens_by_bus
+          })
       end
     end)
+  end
+
+  # One island's inheritance from one prior record.
+  #
+  # An island whose bus set is UNCHANGED keeps every piece of state exactly as
+  # it was. That is not only the fast path, it is the correct one for AGC: the
+  # controller's integrator is a property of an AREA, and `AGC.apportion/2`
+  # rightly zeroes it because a split makes a new area. Re-apportioning an
+  # unchanged island every step would zero the integrator every step and leave
+  # the loop with proportional action only.
+  defp inherit_record(prior, island, share, ctx) do
+    if MapSet.equal?(prior.buses, island) do
+      prior
+    else
+      gen_ids =
+        Enum.flat_map(island, fn bus_id -> Map.get(ctx.gens_by_bus, bus_id, []) end)
+
+      island_load_mw =
+        island |> Enum.map(&Map.get(ctx.load_by_bus, &1, 0.0)) |> Enum.sum()
+
+      prior
+      |> Map.put(:buses, island)
+      |> apportion_state(share)
+      |> Map.put(
+        :gen_voltage_state,
+        Protection.split_voltage_state(prior.gen_voltage_state, gen_ids)
+      )
+      |> Map.put(
+        :btm_voltage_state,
+        BtmSolar.split_voltage_state(prior.btm_voltage_state, island)
+      )
+      |> Map.put(:uvls_state, LoadShedding.split_uvls_state(prior.uvls_state, island))
+      |> Map.put(:agc, split_agc(prior.agc, gen_ids, island_load_mw))
+      # The AC layer is a solution referenced to a slack bus that may have
+      # left with the other half, so it does not survive a re-partition. The
+      # TIMERS above do — they are per-bus and per-machine facts, and losing
+      # them would hand every relay back the exposure it had already spent.
+      |> Map.put(:ac_voltage, nil)
+    end
+  end
+
+  defp split_agc(nil, _gen_ids, _load_mw), do: nil
+
+  defp split_agc(agc, gen_ids, load_mw) do
+    # The cascade knows the island's REAL load, so AGC never has to fall back
+    # to estimating it from its own base-dispatch share.
+    agc
+    |> AGC.apportion([%{unit_ids: gen_ids, load_mw: load_mw}])
+    |> hd()
   end
 
   # When one island becomes two, both halves keep the frequency they were at
@@ -840,7 +1028,39 @@ defmodule PowerModel.Failure.Cascade do
   Yields each step result for streaming via callback.
   """
   def run_cascade(state, callback \\ nil) do
-    do_cascade(state, [], callback)
+    {state, step_results} = do_cascade(state, [], callback)
+    log_voltage_layer(state)
+    {state, step_results}
+  end
+
+  # ONE line per cascade, never one per island per step. A national snapshot
+  # runs thousands of island-solves in a single cascade and OTP's logger
+  # overload protection silently drops most of a burst that size (REVIEW
+  # DAT-20), so the count is tallied and reported once — which also makes
+  # "the voltage layer did nothing at all" a visible fact rather than an
+  # absence of log lines.
+  defp log_voltage_layer(%__MODULE__{voltage_layer: layer}) do
+    total = layer.islands_ac + layer.islands_dc_only
+
+    cond do
+      total == 0 ->
+        :ok
+
+      layer.islands_ac == 0 ->
+        Logger.info(
+          "QSS-AC: no island reached an AC solution in #{total} island-solves " <>
+            "(#{layer.ac_diverged} attempted and diverged, #{layer.ac_skipped} skipped as " <>
+            "unchanged since a prior failure) -- the voltage layer was inert this cascade " <>
+            "and every island ran DC plus the frequency chain (REVIEW LIN-13)"
+        )
+
+      true ->
+        Logger.info(
+          "QSS-AC: #{layer.islands_ac}/#{total} island-solves carried a voltage layer " <>
+            "(#{layer.ac_solves} AC solves, #{layer.ac_diverged} diverged, " <>
+            "#{layer.ac_skipped} skipped as unchanged since a prior failure)"
+        )
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -911,7 +1131,19 @@ defmodule PowerModel.Failure.Cascade do
 
   defp apply_sustained_reserves(state, deficit_mw, gens, elapsed_s) do
     units = Enum.map(gens, &sustained_unit_of(state, &1))
-    alloc = Reserves.allocate(units, deficit_mw, elapsed_s)
+
+    # TERTIARY ONLY. AGC owns the secondary tier island-wide, inside the step's
+    # own island evaluation where the frequency it regulates against lives, so
+    # this path must not draw secondary reserve as well: both tiers raise the
+    # SAME machines out of the SAME headroom, and the cascade re-derives each
+    # step's deficit from the raised dispatch, so running both would show a
+    # fleet delivering reserve it does not carry.
+    #
+    # An empty AGC increment map is how `Reserves.allocate/4` is told that:
+    # every unit's secondary capability is the MW AGC dispatched to it, which
+    # is zero, so the tier is saturated at zero and tertiary is reached
+    # immediately. The clock still bounds tertiary, unchanged.
+    alloc = Reserves.allocate(units, deficit_mw, elapsed_s, secondary: {:agc, %{}})
 
     dispatch =
       Enum.reduce(units, state.dispatch, fn unit, d ->
@@ -1021,7 +1253,7 @@ defmodule PowerModel.Failure.Cascade do
     # last trip did to the topology (see the moduledoc's inheritance rule).
     bus_ids = Enum.map(state.buses, & &1.id)
     islands = IslandDetector.detect(bus_ids, active_lines, active_xfmrs)
-    records = inherit_island_states(state.island_states, islands, state.loads)
+    records = inherit_island_states(state.island_states, islands, state.loads, active_gens)
 
     # Solve each island and collect ALL overloaded components with trip times
     island_step = solve_islands_timed(state, islands, records, active_lines, active_xfmrs)
@@ -1042,7 +1274,11 @@ defmodule PowerModel.Failure.Cascade do
         primary_reserve: island_step.primary_reserve,
         island_states: island_step.records,
         btm_tripped_buses: btm.tripped,
-        btm_tripped_mw: state.btm_tripped_mw + btm.tripped_mw
+        btm_tripped_mw: state.btm_tripped_mw + btm.tripped_mw,
+        btm_trip_breakdown: btm.breakdown,
+        conductor_state: island_step.conductor,
+        conductor_at_s: state.simulated_time,
+        voltage_layer: island_step.voltage_layer
     }
 
     # Facilities on dead-island buses lose power (water + datacenters)
@@ -1094,7 +1330,8 @@ defmodule PowerModel.Failure.Cascade do
         water_facility_ids: MapSet.to_list(state.affected_water_facilities),
         datacenter_ids: MapSet.to_list(state.affected_datacenters),
         solution: island_results,
-        balance: balance(state)
+        balance: balance(state),
+        voltage_layer: state.voltage_layer
       }
 
       if callback, do: callback.(step_result)
@@ -1136,7 +1373,7 @@ defmodule PowerModel.Failure.Cascade do
           # protection from the incomplete set of island solutions.
           {nil, 0.0, %{}}
         else
-          advance_relay_timers(timed_overloads, state.relay_duty)
+          advance_relay_timers(timed_overloads, reset_thermal_duty(state.relay_duty))
         end
 
       state = %{state | relay_duty: relay_duty}
@@ -1170,7 +1407,8 @@ defmodule PowerModel.Failure.Cascade do
         water_facility_ids: MapSet.to_list(state.affected_water_facilities),
         datacenter_ids: MapSet.to_list(state.affected_datacenters),
         solution: island_results,
-        balance: balance(state)
+        balance: balance(state),
+        voltage_layer: state.voltage_layer
       }
 
       if callback, do: callback.(step_result)
@@ -1249,7 +1487,10 @@ defmodule PowerModel.Failure.Cascade do
   # splitting the last trip did (see the moduledoc's inheritance rule).
   defp refresh_island_states(state) do
     islands = active_topology_islands(state)
-    records = inherit_island_states(state.island_states, islands, state.loads)
+
+    active_gens = Enum.reject(state.generators, &MapSet.member?(state.tripped_generators, &1.id))
+    records = inherit_island_states(state.island_states, islands, state.loads, active_gens)
+
     {%{state | island_states: records}, islands}
   end
 
@@ -1338,7 +1579,12 @@ defmodule PowerModel.Failure.Cascade do
       dc_ties: state.dc_ties,
       base_mva: state.base_mva,
       base_overloaded: state.base_overloaded,
-      now: state.simulated_time
+      base_line_loading: state.base_line_loading || %{},
+      now: state.simulated_time,
+      # Seconds since the conductor temperatures were last advanced — the
+      # PREVIOUS step's clock advance, which is the only interval whose
+      # duration is known when this step starts.
+      conductor_dt_s: max(state.simulated_time - (state.conductor_at_s || 0.0), 0.0)
     }
 
     active_gens = Enum.reject(state.generators, &MapSet.member?(state.tripped_generators, &1.id))
@@ -1354,7 +1600,9 @@ defmodule PowerModel.Failure.Cascade do
       primary_reserve: state.primary_reserve,
       btm: btm_context(state),
       records: [],
-      frequency_advance_s: 0.0
+      frequency_advance_s: 0.0,
+      conductor: state.conductor_state || %{},
+      voltage_layer: state.voltage_layer || fresh_voltage_layer()
     }
 
     islands
@@ -1444,23 +1692,56 @@ defmodule PowerModel.Failure.Cascade do
   defp put_record(acc, record), do: %{acc | records: [record | acc.records]}
 
   # One live island, start to finish. `env` carries the island's slice of the
-  # network; `record` its persistent frequency state.
+  # network; `record` its persistent frequency and voltage state.
   defp live_island(env, record, acc, ctx) do
+    # --- 0. The voltage layer, if this island has one ------------------------
+    # `nil` means the island ran DC-only last segment — the COMMON case at real
+    # demand (REVIEW LIN-13) — and every voltage-driven mechanism below is
+    # skipped rather than fed a flat 1.0 pu.
+    voltage = voltage_layer(record, ctx.now)
+
+    # --- 1. Voltage protection acts, ahead of anything frequency-driven ------
+    # The measurement is the AC solution from the END of the previous segment,
+    # integrated over the time that segment took. That ordering is forced: a
+    # segment's own duration is not known until its trajectory settles, and a
+    # protection cannot read a solution that has not been produced. What the
+    # island holds now IS what it held then, until something below changes it.
+    {env, acc, record, voltage_events, gfl} = voltage_protection(env, acc, record, ctx, voltage)
+
+    if island_dead?(env.buses, env.gens) do
+      # PRC-024 voltage protection took the last machine. Nothing to shed
+      # against and nothing to solve; the island is a blackout.
+      acc
+      |> black_out_island(env.loads)
+      |> add_trips(voltage_events)
+      |> put_record(fresh_island_record(env.island))
+    else
+      live_island_frequency(env, record, acc, ctx, voltage, gfl, voltage_events)
+    end
+  end
+
+  # --- 2. Reserves onwards: the frequency chain, unchanged in shape ---------
+  defp live_island_frequency(env, record, acc, ctx, voltage, gfl, voltage_events) do
     load_mw = sum_mw(env.loads, & &1.p_mw)
 
-    # --- 1. Reserves ---------------------------------------------------------
     units =
       Enum.map(env.gens, fn g ->
         sustained_unit(g, dispatch_of(acc, g), Map.get(acc.primary_reserve, g.id, 0.0))
       end)
 
-    sustained_mw = sum_mw(units, & &1.p_dispatch_mw)
+    sustained_mw = sum_mw(deliverable(units, gfl), & &1.p_dispatch_mw)
     deficit_mw = load_mw - sustained_mw - env.tie_mw
 
     record = update_deficit_clock(record, deficit_mw, ctx.now)
     elapsed_s = record_elapsed(record, ctx.now)
 
-    alloc = Reserves.allocate(units, max(deficit_mw, 0.0), elapsed_s)
+    # Closed-loop secondary control. AGC owns the secondary tier island-wide;
+    # `redispatch/4` keeps only the tertiary one, so the same headroom is never
+    # drawn against twice (see `apply_sustained_reserves/4`).
+    {record, agc_deltas} = step_agc(record, units, load_mw, ctx)
+
+    alloc =
+      Reserves.allocate(units, max(deficit_mw, 0.0), elapsed_s, secondary: {:agc, agc_deltas})
 
     raised =
       Enum.map(units, fn unit ->
@@ -1468,8 +1749,11 @@ defmodule PowerModel.Failure.Cascade do
         {unit, sustained, Map.get(alloc.primary_by_unit, unit.id, 0.0)}
       end)
 
-    sustained_gens = Enum.map(raised, fn {unit, sustained, _p} -> shape_at(unit, sustained) end)
-    available_sustained = sum_mw(sustained_gens, & &1.p_dispatch_mw) + env.tie_mw
+    sustained_gens =
+      raised |> Enum.map(fn {unit, sustained, _p} -> shape_at(unit, sustained) end)
+
+    available_sustained =
+      sum_mw(deliverable(sustained_gens, gfl), & &1.p_dispatch_mw) + env.tie_mw
 
     acc = %{
       acc
@@ -1477,23 +1761,37 @@ defmodule PowerModel.Failure.Cascade do
         primary_reserve: put_primary(acc.primary_reserve, raised)
     }
 
-    # --- 2. Trajectory evaluation -------------------------------------------
+    # --- 3. Trajectory evaluation -------------------------------------------
     # ONE segment of this island's frequency, resumed from where the last
     # disturbance left it. Everything below reads THIS trajectory, so the
     # rooftop inverters and the generator relays cannot disagree about what
     # the frequency did.
     {trajectory, eval_state} =
-      simulate_island(record, sustained_gens, env.loads, load_mw - available_sustained)
+      simulate_island(
+        record,
+        deliverable(sustained_gens, gfl),
+        env.loads,
+        load_mw - available_sustained
+      )
 
     nadir = if trajectory, do: Frequency.nadir(trajectory), else: @nominal_frequency_hz
 
-    # --- 3. Protection reads it ---------------------------------------------
+    # --- 4. Frequency protection reads it -----------------------------------
     # IEEE 1547 legacy inverters trip on the frequency the island reached with
     # its rooftop still on, and what they leave behind is LOAD — the vicious
     # pairing of item 31: the fleet is gone at 59.3 Hz while the first UFLS
     # stage only arms BELOW 59.3 Hz.
+    prior_tripped = acc.btm.tripped
+
     {loads, island_loads, load_mw, btm, btm_events} =
       evaluate_btm_trip(acc.btm, env.buses, env.loads, acc.loads, load_mw, nadir)
+
+    # The other half of the Blue Cut double-count guard: a bus whose legacy
+    # fleet just went at 59.3 Hz must not be tripped again by the 1547 VOLTAGE
+    # elements a segment later, so the frequency trip is written into the
+    # voltage timers it knows nothing about.
+    record =
+      mark_frequency_trips(record, btm_events, MapSet.difference(btm.tripped, prior_tripped))
 
     acc = %{acc | loads: loads, btm: btm}
     env = %{env | loads: island_loads}
@@ -1503,7 +1801,7 @@ defmodule PowerModel.Failure.Cascade do
     gen_trips =
       if trajectory, do: Protection.generator_frequency_trips(exposure, sustained_gens), else: []
 
-    # --- 4. Recompute --------------------------------------------------------
+    # --- 5. Recompute --------------------------------------------------------
     tripped_ids = MapSet.new(gen_trips, & &1.component_id)
 
     {survivors, acc} =
@@ -1528,7 +1826,7 @@ defmodule PowerModel.Failure.Cascade do
         do: [],
         else: gen_trips ++ [island_gen_trip_event(env, gen_trips, tripped_mw)]
 
-    events = btm_events ++ gen_events
+    events = voltage_events ++ btm_events ++ gen_events
 
     surviving_gens = Enum.map(survivors, fn {unit, _s, _p} -> unit end)
 
@@ -1537,7 +1835,7 @@ defmodule PowerModel.Failure.Cascade do
       # closing on itself. What is left is a blackout, not a deficit: there is
       # nothing to shed against and nothing to solve. The segment it died in
       # still happened, so it still moves the clock.
-      {advance_s, _state, _exposure} = settle_segment(trajectory, eval_state, [])
+      {advance_s, _state, _exposure, _mean} = settle_segment(trajectory, eval_state, [])
 
       acc
       |> black_out_island(env.loads)
@@ -1551,25 +1849,45 @@ defmodule PowerModel.Failure.Cascade do
         trajectory: trajectory,
         eval_state: eval_state,
         recompute?: MapSet.size(tripped_ids) > 0 or btm_events != [],
-        load_mw: load_mw
+        load_mw: load_mw,
+        voltage: voltage,
+        gfl: gfl
       })
     end
   end
 
-  # --- 5. Residual shed, and 6. solve ---------------------------------------
+  # --- 6. Residual shed, and 7. solve ---------------------------------------
   defp settle_island(env, record, acc, ctx, step) do
     sustained_gens = Enum.map(step.survivors, fn {u, s, _p} -> shape_at(u, s) end)
-    available_sustained = sum_mw(sustained_gens, & &1.p_dispatch_mw) + env.tie_mw
-    available_output = sum_mw(step.survivors, fn {_u, s, p} -> s + p end) + env.tie_mw
+    deliverable_gens = deliverable(sustained_gens, step.gfl)
+    available_sustained = sum_mw(deliverable_gens, & &1.p_dispatch_mw) + env.tie_mw
 
-    imbalance_mw = step.load_mw - available_sustained
+    available_output = deliverable_output_mw(step.survivors, step.gfl) + env.tie_mw
 
-    # The authoritative trajectory: when the rooftop or a generator left, the
-    # island is answering a DEEPER gap than the evaluation saw, so the segment
-    # is re-integrated from the same starting state rather than patched.
+    # UVLS runs FIRST of the two shedding programs, and only on an island that
+    # has an AC solution: voltage is not observable otherwise, and a stage
+    # armed against a flat 1.0 pu would never fire anyway. Its stage timers
+    # have already elapsed against the measurement, so what it sheds is not a
+    # response to this segment's deficit — it is the segment before's voltage
+    # finally running a definite-time relay out.
+    {uvls_loads, uvls_events, uvls_state} =
+      apply_uvls_layer(env.loads, record, step.voltage)
+
+    record = %{record | uvls_state: uvls_state}
+    uvls_shed_mw = sum_mw(uvls_events, &Map.get(&1.details, :shed_mw, 0.0))
+
+    env = %{env | loads: uvls_loads}
+    load_mw = step.load_mw - uvls_shed_mw
+
+    imbalance_mw = load_mw - available_sustained
+
+    # The authoritative trajectory: when the rooftop or a generator left, or
+    # UVLS took a block off, the island is answering a DIFFERENT gap than the
+    # evaluation saw, so the segment is re-integrated from the same starting
+    # state rather than patched.
     {trajectory, eval_state} =
-      if step.recompute? do
-        simulate_island(record, sustained_gens, env.loads, imbalance_mw)
+      if step.recompute? or uvls_shed_mw > 0.0 do
+        simulate_island(record, deliverable_gens, env.loads, imbalance_mw)
       else
         {step.trajectory, step.eval_state}
       end
@@ -1580,9 +1898,9 @@ defmodule PowerModel.Failure.Cascade do
       if lost_mw > 0.5 do
         LoadShedding.apply_ufls_with_state(
           env.loads,
-          sustained_gens,
-          step.load_mw - lost_mw,
-          step.load_mw,
+          deliverable_gens,
+          load_mw - lost_mw,
+          load_mw,
           frequency_state: record.frequency_state,
           duration_seconds: @frequency_window_s
         )
@@ -1591,6 +1909,8 @@ defmodule PowerModel.Failure.Cascade do
       end
 
     ufls_shed_mw = sum_mw(ufls_events, &Map.get(&1.details, :shed_mw, 0.0))
+
+    step = %{step | load_mw: load_mw}
 
     # Residual force-shed. UFLS under-sheds when the frequency nadir stays
     # above the first stage (small deficits) or when the deficit exceeds the
@@ -1617,9 +1937,24 @@ defmodule PowerModel.Failure.Cascade do
         {shed_loads, []}
       end
 
-    shed_events = ufls_events ++ force_events
-    shed_mw = sum_mw(shed_events, &Map.get(&1.details, :shed_mw, 0.0))
-    served_mw = step.load_mw - shed_mw
+    # Two shed totals, and the difference between them is load-bearing.
+    #
+    # `frequency_shed_mw` is what the SWING MODEL must be credited with. UVLS
+    # is deliberately not in it: its blocks came off before `imbalance_mw` was
+    # computed, so the simulator was already told about them once, and
+    # crediting them again would leave `lost_mw - cumulative_shed_mw` claiming
+    # an imbalance the island does not have — the exact breakage
+    # `credit_shed/3` exists to prevent.
+    #
+    # `shed_mw` is what the ACCOUNTING must record: UVLS and UFLS open real
+    # breakers on real feeders, and the conservation identity
+    # `served + shed + blackout == original + btm_tripped` has to see every one
+    # of those megawatts exactly once.
+    shed_events = uvls_events ++ ufls_events ++ force_events
+    force_shed_mw = sum_mw(force_events, &Map.get(&1.details, :shed_mw, 0.0))
+    frequency_shed_mw = ufls_shed_mw + force_shed_mw
+    shed_mw = uvls_shed_mw + frequency_shed_mw
+    served_mw = step.load_mw - frequency_shed_mw
 
     shed_map = Map.new(shed_loads, &{&1.id, &1})
     loads = Enum.map(acc.loads, fn l -> Map.get(shed_map, l.id, l) end)
@@ -1647,19 +1982,21 @@ defmodule PowerModel.Failure.Cascade do
       end
 
     solver_gens =
-      Enum.map(step.survivors, fn {unit, _s, _p} ->
-        shape_at(unit, Map.get(dispatch, unit.id, 0.0))
-      end)
+      step.survivors
+      |> Enum.map(fn {unit, _s, _p} -> shape_at(unit, Map.get(dispatch, unit.id, 0.0)) end)
+      |> deliverable(step.gfl)
 
-    frequency_state = credit_shed(frequency_state, record.frequency_state, shed_mw)
+    frequency_state = credit_shed(frequency_state, record.frequency_state, frequency_shed_mw)
 
-    {advance_s, frequency_state, exposure} =
+    {advance_s, frequency_state, exposure, mean_hz} =
       settle_segment(trajectory, frequency_state, record.exposure)
 
     record = %{
       record
       | frequency_state: frequency_state,
         exposure: exposure,
+        mean_frequency_hz: mean_hz || record.mean_frequency_hz,
+        evaluated_at_s: ctx.now,
         deficit_since_s:
           update_deficit_clock(record, served_mw - available_sustained, ctx.now).deficit_since_s
     }
@@ -1674,13 +2011,17 @@ defmodule PowerModel.Failure.Cascade do
           frequency_advance_s: max(acc.frequency_advance_s, advance_s)
       }
       |> add_trips(step.events ++ shed_events)
-      |> put_record(record)
 
-    solve_island_flows(%{env | loads: island_loads}, solver_gens, acc, ctx)
+    solve_island_flows(%{env | loads: island_loads}, solver_gens, record, acc, ctx)
   end
 
-  # --- 6. DC power flow, and the protection that reads it -------------------
-  defp solve_island_flows(env, solver_gens, acc, ctx) do
+  # --- 7. Power flow, and the protection that reads it ----------------------
+  #
+  # The DC solve is authoritative for FLOWS and always runs. The QSS-AC pass
+  # (ROADMAP item 20) then attempts the same island in AC, and where it
+  # converges the island gains a voltage layer for the NEXT segment plus a
+  # deterministic distance-relay evaluation for this one.
+  defp solve_island_flows(env, solver_gens, record, acc, ctx) do
     snapshot = %{
       buses: env.buses,
       lines: env.lines,
@@ -1697,41 +2038,142 @@ defmodule PowerModel.Failure.Cascade do
       # lines already overloaded in the base case (model artifacts).
       timed = compute_timed_overloads(solution.line_flows, ctx.base_overloaded)
 
-      voltage_trips = Protection.check_voltage_violations(solution.bus_ids, solution.vm_pu)
+      # The SLOW timescale. Conductor temperature integrates the same rate-A
+      # loading the operator display reports — NOT `trip_loading_pct/1`, whose
+      # rate-C basis would understate the temperature rise by 1.35².
+      {conductor, thermal_timed} =
+        advance_conductors(acc.conductor, solution.line_flows, ctx)
 
-      bus_index = solution.bus_ids |> Enum.with_index() |> Map.new()
+      {ac, acc, record} = attempt_ac(snapshot, env, record, %{acc | conductor: conductor}, ctx)
 
-      zone3_trips =
-        Protection.check_zone3_encroachment(
-          solution.line_flows,
-          env.lines ++ env.transformers,
-          env.buses,
-          solution.vm_pu,
-          solution.va_rad,
-          bus_index
-        )
+      {trips, distance_timed, record} =
+        voltage_dependent_protection(ac, solution, env, record, ctx)
 
-      # Zone 3 trips integrate duty while continuously asserted using their
-      # own fixed 0.5 s timer. The cause-specific relay key keeps this duty
-      # completely separate from thermal exposure on the same branch.
-      zone3_timed = Enum.map(zone3_trips, &Map.put(&1, :trip_time_s, 0.5))
-
-      %{
-        acc
-        | trips: acc.trips ++ voltage_trips,
-          results: [solution | acc.results],
-          overloads: acc.overloads ++ timed ++ zone3_timed
-      }
+      acc
+      |> put_record(record)
+      |> add_trips(trips)
+      |> Map.put(:results, [solution | acc.results])
+      |> Map.put(:overloads, acc.overloads ++ timed ++ thermal_timed ++ distance_timed)
     rescue
       e ->
         error = Exception.message(e)
         Logger.error("island solve raised #{error}; island dropped from this step")
-        island_solve_failed(acc, env, error)
+        acc |> put_record(record) |> island_solve_failed(env, error)
     catch
       thrown ->
         error = inspect(thrown)
         Logger.error("island solve threw #{error}; island dropped from this step")
-        island_solve_failed(acc, env, error)
+        acc |> put_record(record) |> island_solve_failed(env, error)
+    end
+  end
+
+  # Which set of branch protections gets to run, and on what.
+  #
+  # > #### The heuristic and the characteristic never both fire {: .warning}
+  # >
+  # > `Protection.check_zone3_encroachment/6` is a PROBABILISTIC screen that
+  # > needs no impedance; `Protection.distance_relay_trips/2` is the real mho
+  # > characteristic and needs one. On an AC-solved island the deterministic
+  # > path runs and the heuristic is skipped, because two models of the same
+  # > relay would double the zone-3 trip rate on exactly the branches the
+  # > phase exists to get right. A DC-only island keeps the heuristic: it is
+  # > the honest degradation, not a second opinion.
+  defp voltage_dependent_protection(nil, dc_solution, env, record, _ctx) do
+    bus_index = dc_solution.bus_ids |> Enum.with_index() |> Map.new()
+
+    zone3_timed =
+      dc_solution.line_flows
+      |> Protection.check_zone3_encroachment(
+        env.lines ++ env.transformers,
+        env.buses,
+        dc_solution.vm_pu,
+        dc_solution.va_rad,
+        bus_index
+      )
+      # Zone 3 trips integrate duty while continuously asserted using their
+      # own fixed 0.5 s timer. The cause-specific relay key keeps this duty
+      # completely separate from thermal exposure on the same branch.
+      |> Enum.map(&Map.put(&1, :trip_time_s, 0.5))
+
+    {[], zone3_timed, record}
+  end
+
+  defp voltage_dependent_protection(ac, _dc_solution, env, record, ctx) do
+    vm_by_bus = Map.new(Enum.zip(ac.bus_ids, ac.vm_pu))
+
+    distance_timed =
+      ac.line_flows
+      |> distance_relay_inputs(env, vm_by_bus, ctx)
+      |> Protection.distance_relay_trips(base_mva: ctx.base_mva)
+      |> Enum.map(fn trip -> Map.put(trip, :trip_time_s, trip.details.delay_s) end)
+
+    {alarm, record} = voltage_alarm_event(env, vm_by_bus, record)
+
+    {List.wrap(alarm), distance_timed, record_ac_layer(record, ac, ctx)}
+  end
+
+  # The ONLY writer of `record.ac_voltage`, and it takes a converged AC
+  # solution as its argument. That is what makes it structurally impossible
+  # for the voltage protections in `voltage_protection/5` to be reading a DC
+  # solve's flat 1.0 pu: there is no other path into the field.
+  defp record_ac_layer(record, ac, ctx) do
+    %{
+      record
+      | ac_voltage: %{
+          vm_by_bus: Map.new(Enum.zip(ac.bus_ids, ac.vm_pu)),
+          at_s: ctx.now,
+          warm_start: ac
+        },
+        ac_failed: nil
+    }
+  end
+
+  # ONE event per island for buses outside the alarm band, on a HIGH-WATER
+  # MARK: it fires the first time a count is reached and stays quiet until the
+  # island gets worse still.
+  #
+  # Two reasons, and the second is the load-bearing one:
+  #
+  #   * One per bus per step would bury every other cause in a national
+  #     snapshot's timeline, and OTP's logger and the UI both suffer for it
+  #     (the DAT-20 counter pattern).
+  #   * Every entry in `acc.trips` makes `non_thermal_trips` non-empty, and a
+  #     step with any non-thermal trip is by definition not settled. A level
+  #     alarm re-emitted each segment therefore makes an island parked below
+  #     0.85 pu run until the step budget stops it — measured at 1,050 steps
+  #     before this was edge-triggered. An alarm must not be able to keep a
+  #     cascade alive.
+  #
+  # This supersedes `Protection.check_voltage_violations/3` on the cascade
+  # path, which was reading the DC solve's flat 1.0 pu and could never fire.
+  defp voltage_alarm_event(env, vm_by_bus, record) do
+    {low, high, worst} =
+      Enum.reduce(vm_by_bus, {0, 0, 1.0}, fn {_id, vm}, {low, high, worst} ->
+        cond do
+          vm < @voltage_alarm_low_pu -> {low + 1, high, min(worst, vm)}
+          vm > @voltage_alarm_high_pu -> {low, high + 1, worst}
+          true -> {low, high, worst}
+        end
+      end)
+
+    {seen_low, seen_high} = record.voltage_alarm || {0, 0}
+
+    if low <= seen_low and high <= seen_high do
+      {nil, record}
+    else
+      event = %{
+        component_type: "island",
+        component_id: env.buses |> Enum.map(& &1.id) |> Enum.min(),
+        failure_cause: "voltage_violation",
+        details: %{
+          undervoltage_buses: low,
+          overvoltage_buses: high,
+          vm_pu_min: worst,
+          bus_count: map_size(vm_by_bus)
+        }
+      }
+
+      {event, %{record | voltage_alarm: {max(low, seen_low), max(high, seen_high)}}}
     end
   end
 
@@ -1892,15 +2334,22 @@ defmodule PowerModel.Failure.Cascade do
   # section). A trajectory that settles after 4 s of a 30 s window advances
   # the clock 4 s, and the island's own frequency clock is rewound with it so
   # the two never drift apart.
-  defp settle_segment(nil, state, exposure), do: {0.0, state, exposure}
+  # Returns `{advance_s, state, exposure, mean_hz}`. The mean is the segment's
+  # own average frequency over the interval it actually took, which is what the
+  # island's AGC measures on the next segment — BAL-003's "value B" reading,
+  # for the same reason: one sample of an oscillating trajectory is not the
+  # frequency the controller is answering.
+  defp settle_segment(nil, state, exposure), do: {0.0, state, exposure, nil}
 
   defp settle_segment(trajectory, state, exposure) do
     started_at = hd(trajectory).time
     settled_at = settle_time(trajectory)
 
     trimmed = Enum.filter(trajectory, &(&1.time <= settled_at))
+    mean_hz = Frequency.mean_frequency(trimmed, started_at, settled_at)
 
-    {settled_at - started_at, %{state | time: settled_at}, accumulate_exposure(exposure, trimmed)}
+    {settled_at - started_at, %{state | time: settled_at}, accumulate_exposure(exposure, trimmed),
+     mean_hz}
   end
 
   # The earliest time from which the trajectory never moves again: every later
@@ -1952,8 +2401,13 @@ defmodule PowerModel.Failure.Cascade do
   defp btm_context(%__MODULE__{} = state) do
     %{
       by_bus: state.btm_by_bus || %{},
+      # The vintage-split view the 1547 VOLTAGE elements read. `by_bus` above
+      # is the legacy-only view the 59.3 Hz frequency must-trip reads; the two
+      # are gated against each other in `island_btm_fleet/2`, never summed.
+      fleet: state.btm_fleet_by_bus || %{},
       tripped: state.btm_tripped_buses || MapSet.new(),
-      tripped_mw: 0.0
+      tripped_mw: 0.0,
+      breakdown: state.btm_trip_breakdown || BtmSolar.fresh_trip_breakdown()
     }
   end
 
@@ -1976,45 +2430,34 @@ defmodule PowerModel.Failure.Cascade do
         {all_loads, island_loads, island_load_mw, btm, []}
 
       candidates ->
-        # The voltage trigger is checked whatever the frequency did, since a
-        # bus can be depressed without the island being short of generation.
         tripping =
-          Enum.filter(candidates, fn {_bus_id, _legacy_mw, vm_pu} ->
-            legacy_btm_trips?(nadir, vm_pu)
-          end)
+          Enum.filter(candidates, fn {_bus_id, _legacy_mw} -> nadir <= @btm_trip_frequency_hz end)
 
         apply_btm_trip(btm, tripping, island_loads, all_loads, island_load_mw, nadir)
     end
   end
 
-  # Buses in this island that still have legacy rooftop to lose, with the
-  # voltage each currently holds.
+  # Buses in this island that still have legacy rooftop to lose to FREQUENCY.
+  #
+  # > #### Voltage is not evaluated here {: .info}
+  # >
+  # > This path used to carry the 1547-2003 0.88 pu term as well, reading
+  # > `bus.vm_pu` — a snapshot field the DC solve never writes back, so it sat
+  # > at a flat 1.0 pu and could not fire. Now that the QSS-AC pass produces
+  # > real magnitudes the voltage half belongs to
+  # > `PowerModel.Grid.BtmSolar.voltage_trips/5`, which carries the real
+  # > definite-time elements and the legacy/modern vintage split. Keeping an
+  # > instantaneous second copy here would trip the same megawatts twice.
   defp btm_candidates(btm, island_buses) do
     Enum.reduce(island_buses, [], fn bus, acc ->
       legacy_mw = Map.get(btm.by_bus, bus.id, 0.0)
 
       if legacy_mw > 0.0 and not MapSet.member?(btm.tripped, bus.id) do
-        [{bus.id, legacy_mw, Map.get(bus, :vm_pu) || 1.0} | acc]
+        [{bus.id, legacy_mw} | acc]
       else
         acc
       end
     end)
-  end
-
-  # IEEE 1547-2003 must-trip envelope. Frequency is an island-wide quantity, so
-  # every candidate bus sees the same nadir; voltage is local to the bus.
-  #
-  # > #### The voltage trigger is unreachable today {: .warning}
-  # >
-  # > `vm_pu` comes from the bus as the snapshot carries it, and the DC power
-  # > flow neither models voltage magnitude nor writes one back — every bus
-  # > sits at a flat 1.0 pu (the CAS-14 family of caveats). So the 0.88 pu term
-  # > below is correct and inert: it can only fire once the Q-V / QSS-AC work
-  # > gives buses real magnitudes. It is implemented rather than deferred so
-  # > that landing those voltages turns the mechanism on without anyone having
-  # > to remember this clause exists.
-  defp legacy_btm_trips?(nadir_hz, vm_pu) do
-    nadir_hz <= @btm_trip_frequency_hz or vm_pu <= @btm_trip_voltage_pu
   end
 
   defp apply_btm_trip(btm, [], island_loads, all_loads, island_load_mw, _nadir) do
@@ -2025,7 +2468,7 @@ defmodule PowerModel.Failure.Cascade do
     loads_by_bus = Enum.group_by(island_loads, & &1.bus_id)
 
     {additions, tripped_mw, tripped_bus_ids} =
-      Enum.reduce(tripping, {%{}, 0.0, []}, fn {bus_id, legacy_mw, _vm_pu},
+      Enum.reduce(tripping, {%{}, 0.0, []}, fn {bus_id, legacy_mw},
                                                {additions, tripped_mw, bus_ids} ->
         bus_loads = Map.get(loads_by_bus, bus_id, [])
         bus_load_mw = Enum.sum(Enum.map(bus_loads, & &1.p_mw))
@@ -2069,7 +2512,8 @@ defmodule PowerModel.Failure.Cascade do
       btm = %{
         btm
         | tripped: MapSet.union(btm.tripped, MapSet.new(tripped_bus_ids)),
-          tripped_mw: btm.tripped_mw + tripped_mw
+          tripped_mw: btm.tripped_mw + tripped_mw,
+          breakdown: BtmSolar.record_trip(btm.breakdown, :frequency, tripped_mw)
       }
 
       {gross_up_loads(all_loads, additions), gross_up_loads(island_loads, additions),
@@ -2090,6 +2534,533 @@ defmodule PowerModel.Failure.Cascade do
         added_mw -> %{load | p_mw: load.p_mw + added_mw}
       end
     end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # The voltage chain (ROADMAP item 20)
+  #
+  # Everything below reads ONE quantity: `record.ac_voltage`, written only by
+  # `record_ac_layer/3` from a converged FDPF solution. There is no other way
+  # into that field, which is how the hard rule — no voltage-sensitive
+  # protection ever reads a DC solve — is enforced structurally rather than by
+  # remembering to.
+  # ---------------------------------------------------------------------------
+
+  # The island's voltage measurement and how long it has been standing, or
+  # `nil` when the island has none. `nil` is the COMMON case at real demand:
+  # REVIEW LIN-13 measured that no interconnection has an AC solution there,
+  # so the whole chain below is a no-op until the Phase 2 network work lands.
+  defp voltage_layer(%{ac_voltage: %{vm_by_bus: vm, at_s: at}}, now) when map_size(vm) > 0 do
+    %{vm: vm, dt_s: max(now - at, 0.0)}
+  end
+
+  defp voltage_layer(_record, _now), do: nil
+
+  # Everything the voltage layer does to an island, before the frequency chain
+  # sees the island at all. Returns the island with its rooftop grossed up and
+  # its voltage-tripped machines removed, plus the GFL availability ceiling the
+  # rest of the step reasons about.
+  defp voltage_protection(env, acc, record, _ctx, nil), do: {env, acc, record, [], %{}}
+
+  defp voltage_protection(env, acc, record, _ctx, voltage) do
+    dispatched = apply_dispatch(env.gens, acc.dispatch)
+
+    # Grid-following inverters are current sources behind a ceiling: below the
+    # knee they cannot hold their dispatched P and the deliverable power
+    # follows the terminal voltage down. This is a quasi-steady AVAILABILITY
+    # ceiling, never written into `dispatch` — a schedule the derate had
+    # rewritten downward could not recover when the voltage did, and the next
+    # segment would recompute the derate against the already-derated number.
+    #
+    # Which pool: every inverter-coupled unit in the island, utility-scale or
+    # onsite. `PowerModel.Dispatch` places onsite solar and wind outside the
+    # EIA-930 fuel-anchored pool, so derating those changes the island's
+    # generation without changing any measured fuel target — physically right
+    # and invisible to fuel-mix TV distance. A cascade is not a TV measurement.
+    gfl = Protection.gfl_derate(dispatched, voltage.vm)
+
+    {env, acc, record, btm_events} = voltage_btm_trip(env, acc, record, voltage)
+
+    {env, acc, record, gen_events} =
+      voltage_gen_trips(env, acc, record, dispatched, voltage)
+
+    {env, acc, record, btm_events ++ gen_events, gfl}
+  end
+
+  # IEEE 1547 voltage trips on the behind-the-meter fleet — the actual Blue Cut
+  # mechanism, and a LOAD INCREASE exactly like the 59.3 Hz frequency trip.
+  defp voltage_btm_trip(env, acc, record, voltage) do
+    case island_btm_fleet(acc, env) do
+      fleet when map_size(fleet) == 0 ->
+        {env, acc, record, []}
+
+      fleet ->
+        {trips_by_bus, state} =
+          BtmSolar.voltage_trips(fleet, voltage.vm, record.btm_voltage_state, voltage.dt_s)
+
+        record = %{record | btm_voltage_state: state}
+
+        case BtmSolar.tripped_mw_by_bus(trips_by_bus) do
+          mw_by_bus when map_size(mw_by_bus) == 0 ->
+            {env, acc, record, []}
+
+          mw_by_bus ->
+            {all_loads, island_loads, tripped_mw} =
+              gross_up_by_bus(acc.loads, env.loads, mw_by_bus)
+
+            # Only a bus that lost LEGACY megawatts joins `btm_tripped_buses`:
+            # that set gates the 59.3 Hz frequency must-trip, which can only
+            # ever take legacy. A bus that lost only its modern (1547-2018)
+            # share still has legacy rooftop for the frequency side to find.
+            legacy_buses =
+              for {bus_id, detail} <- trips_by_bus,
+                  detail.by_vintage.legacy > 0.0,
+                  do: bus_id
+
+            btm = %{
+              acc.btm
+              | tripped: MapSet.union(acc.btm.tripped, MapSet.new(legacy_buses)),
+                tripped_mw: acc.btm.tripped_mw + tripped_mw,
+                breakdown: BtmSolar.record_trip(acc.btm.breakdown, :voltage, tripped_mw)
+            }
+
+            {%{env | loads: island_loads}, %{acc | loads: all_loads, btm: btm}, record,
+             [BtmSolar.voltage_trip_event(trips_by_bus)]}
+        end
+    end
+  end
+
+  # The rooftop fleet this island still has to lose to VOLTAGE, gated three
+  # ways so the two Blue Cut halves can never trip the same megawatts:
+  #
+  #   * a bus whose legacy fleet already went at 59.3 Hz contributes only its
+  #     modern share (`btm_tripped_buses`, the cascade's own set);
+  #   * a vintage the voltage timers already tripped is skipped inside
+  #     `BtmSolar.voltage_trips/5` itself;
+  #   * a bus with no energized load is omitted entirely rather than tripped
+  #     for zero — rooftop behind a de-energized feeder is already
+  #     disconnected, and omitting it HOLDS its timers instead of resetting
+  #     them, which is the same rule a missing measurement gets.
+  defp island_btm_fleet(acc, env) do
+    load_by_bus =
+      Enum.reduce(env.loads, %{}, fn l, m -> Map.update(m, l.bus_id, l.p_mw, &(&1 + l.p_mw)) end)
+
+    Enum.reduce(env.buses, %{}, fn bus, fleet ->
+      mw = Map.get(acc.btm.fleet, bus.id)
+
+      cond do
+        is_nil(mw) ->
+          fleet
+
+        Map.get(load_by_bus, bus.id, 0.0) <= 0.0 ->
+          fleet
+
+        true ->
+          mw =
+            if MapSet.member?(acc.btm.tripped, bus.id),
+              do: %{mw | legacy_mw: 0.0},
+              else: mw
+
+          if mw.legacy_mw > 0.0 or mw.modern_mw > 0.0, do: Map.put(fleet, bus.id, mw), else: fleet
+      end
+    end)
+  end
+
+  # Hand `mw_by_bus` back to the loads at each bus, split by each load's share
+  # of that bus's demand. Returns `{all_loads, island_loads, added_mw}`.
+  defp gross_up_by_bus(all_loads, island_loads, mw_by_bus) do
+    loads_by_bus = Enum.group_by(island_loads, & &1.bus_id)
+
+    {additions, added_mw} =
+      Enum.reduce(mw_by_bus, {%{}, 0.0}, fn {bus_id, mw}, {additions, total} ->
+        bus_loads = Map.get(loads_by_bus, bus_id, [])
+        bus_load_mw = sum_mw(bus_loads, & &1.p_mw)
+
+        if bus_load_mw <= 0.0 or mw <= 0.0 do
+          {additions, total}
+        else
+          additions =
+            Enum.reduce(bus_loads, additions, fn load, acc ->
+              Map.update(
+                acc,
+                load.id,
+                mw * load.p_mw / bus_load_mw,
+                &(&1 + mw * load.p_mw / bus_load_mw)
+              )
+            end)
+
+          {additions, total + mw}
+        end
+      end)
+
+    {gross_up_loads(all_loads, additions), gross_up_loads(island_loads, additions), added_mw}
+  end
+
+  # PRC-024 generator voltage ride-through. Cumulative band timers, so a
+  # machine that dips in and out of a band still exhausts its allowance —
+  # the opposite convention from UVLS's definite-time elements, and both are
+  # right for what they model.
+  defp voltage_gen_trips(env, acc, record, dispatched, voltage) do
+    {trips, state} =
+      Protection.generator_voltage_trips(
+        dispatched,
+        voltage.vm,
+        record.gen_voltage_state,
+        voltage.dt_s
+      )
+
+    record = %{record | gen_voltage_state: state}
+
+    if trips == [] do
+      {env, acc, record, []}
+    else
+      ids = MapSet.new(trips, & &1.component_id)
+      lost_mw = sum_mw(Enum.filter(dispatched, &MapSet.member?(ids, &1.id)), & &1.p_max_mw)
+
+      env = %{env | gens: Enum.reject(env.gens, &MapSet.member?(ids, &1.id))}
+
+      acc = %{
+        acc
+        | dispatch: Enum.reduce(ids, acc.dispatch, &Map.put(&2, &1, 0.0)),
+          primary_reserve: Enum.reduce(ids, acc.primary_reserve, &Map.delete(&2, &1))
+      }
+
+      {env, acc, record, trips ++ [island_voltage_trip_event(env, trips, lost_mw)]}
+    end
+  end
+
+  # One aggregated event per island per step beside the individual generator
+  # trips, for the same reason the frequency side has one: a national snapshot
+  # can lose thousands of machines in a segment and the timeline needs a single
+  # line that says so.
+  defp island_voltage_trip_event(env, trips, lost_mw) do
+    %{details: details, failure_cause: cause} = hd(trips)
+
+    %{
+      component_type: "island",
+      component_id: env.buses |> Enum.map(& &1.id) |> Enum.min(),
+      failure_cause: "generator_voltage_trips",
+      details: %{
+        unit_count: length(trips),
+        tripped_mw: lost_mw,
+        trip_cause: cause,
+        band_pu: Map.get(details, :band_pu),
+        vm_pu: Map.get(details, :vm_pu)
+      }
+    }
+  end
+
+  # The 59.3 Hz frequency must-trip written into the 1547 VOLTAGE timers it
+  # knows nothing about, so the voltage side cannot take the same legacy
+  # megawatts a segment later. The complementary gate — legacy zeroed for
+  # already-tripped buses — is in `island_btm_fleet/2`.
+  defp mark_frequency_trips(record, [], _newly), do: record
+
+  defp mark_frequency_trips(record, _events, newly) do
+    state =
+      Enum.reduce(newly, record.btm_voltage_state, fn bus_id, state ->
+        BtmSolar.mark_tripped(state, bus_id, [:legacy])
+      end)
+
+    %{record | btm_voltage_state: state}
+  end
+
+  # UVLS runs ONLY where there is a voltage to run it on. An island without an
+  # AC solution has no observable voltage, and shedding against an assumed one
+  # would be inventing the collapse rather than finding it.
+  defp apply_uvls_layer(loads, record, nil), do: {loads, [], record.uvls_state}
+
+  defp apply_uvls_layer(loads, record, voltage) do
+    LoadShedding.apply_uvls_with_state(loads, voltage.vm, voltage.dt_s,
+      uvls_state: record.uvls_state
+    )
+  end
+
+  # A unit's deliverable output under the GFL current ceiling. Applied at every
+  # point the island's DELIVERABLE generation is read — the balance, the swing
+  # model, the shed arithmetic, the solver injections — and nowhere else, so
+  # the dispatch schedule the derate is computed against never moves.
+  defp deliverable(gens, gfl) when map_size(gfl) == 0, do: gens
+
+  defp deliverable(gens, gfl) do
+    Enum.map(gens, fn g ->
+      case Map.get(gfl, g.id) do
+        nil -> g
+        fraction when fraction >= 1.0 -> g
+        fraction -> shape_at(g, (Map.get(g, :p_dispatch_mw) || g.p_max_mw) * fraction)
+      end
+    end)
+  end
+
+  # Total output the survivors can actually deliver, governor response
+  # included. Same ceiling, applied to the `{unit, sustained, primary}` shape
+  # the reserve tiers work in.
+  defp deliverable_output_mw(survivors, gfl) do
+    Enum.reduce(survivors, 0.0, fn {unit, sustained, primary}, total ->
+      total + (sustained + primary) * min(Map.get(gfl, unit.id, 1.0), 1.0)
+    end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Closed-loop secondary control (AGC)
+  # ---------------------------------------------------------------------------
+
+  # One AGC cycle for this island: it measures the MEAN frequency of the
+  # previous segment over the time that segment took, and returns the setpoint
+  # INCREMENT for this one.
+  #
+  # The mean, not the endpoint: sampling the trajectory's last value
+  # over-commands, because the endpoint of an arrested excursion is its
+  # deepest sustained point rather than its average error.
+  #
+  # The increment, never the cumulative position: the cascade adds the
+  # allocation to its dispatch and re-derives the next step's deficit from the
+  # raised dispatch, so a cumulative figure would be re-credited every step.
+  #
+  # `dt` is the CASCADE clock's advance, not the island's frequency-segment
+  # advance, and those differ whenever a slow relay decides the step — a
+  # branch a hair over pickup can carry a 990-second inverse-time curve while
+  # the swing model integrates 30 seconds and stops. The cascade clock is the
+  # right one: 990 seconds of wall time really did pass, and a controller that
+  # only ever credited the 30 seconds the swing model bothered to simulate
+  # would systematically under-deliver secondary control on exactly the steps
+  # where there was most time to deliver it. The integral is bounded either
+  # way — AGC back-calculates it to the command the fleet actually achieved.
+  defp step_agc(record, units, load_mw, ctx) do
+    agc = record.agc || AGC.init(units, load_mw: load_mw)
+    dt = max(ctx.now - (record.evaluated_at_s || ctx.now), 0.0)
+
+    if dt <= 0.0 do
+      {%{record | agc: agc}, %{}}
+    else
+      telemetry = %{frequency_hz: record.mean_frequency_hz || @nominal_frequency_hz}
+      {agc, deltas} = AGC.step(agc, telemetry, dt)
+      {%{record | agc: agc}, deltas}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # QSS-AC: the per-island FDPF attempt
+  # ---------------------------------------------------------------------------
+
+  # Attempt AC on this island, warm-started from the previous segment where the
+  # topology allows it. Returns `{solution | nil, acc, record}`; `nil` means the
+  # island runs exactly as it did before this wave — DC plus the frequency
+  # chain, with the voltage layer skipped.
+  defp attempt_ac(snapshot, env, record, acc, ctx) do
+    if ac_retry?(record.ac_failed, env) do
+      case run_fdpf(snapshot, record, ctx) do
+        {:ok, solution} ->
+          {solution, count_voltage(acc, :islands_ac, :ac_solves), record}
+
+        :error ->
+          {nil, count_voltage(acc, :islands_dc_only, :ac_diverged),
+           %{record | ac_failed: ac_fingerprint(env), ac_voltage: nil}}
+      end
+    else
+      # Nothing about this island has moved since AC last failed on it, so
+      # nothing about the answer would either. REVIEW LIN-13 makes this the
+      # steady state at real demand, and re-solving a provably infeasible
+      # 50,000-bus island every step for fifty steps is the difference between
+      # a cascade that runs and one that does not.
+      {nil, count_voltage(acc, :islands_dc_only, :ac_skipped), record}
+    end
+  end
+
+  defp ac_retry?(nil, _env), do: true
+
+  defp ac_retry?(%{buses: buses, branches: branches, load_mw: load_mw}, env) do
+    buses != length(env.buses) or branches != length(env.lines) + length(env.transformers) or
+      abs(sum_mw(env.loads, & &1.p_mw) - load_mw) > @ac_retry_load_fraction * max(load_mw, 1.0)
+  end
+
+  defp ac_fingerprint(env) do
+    %{
+      buses: length(env.buses),
+      branches: length(env.lines) + length(env.transformers),
+      load_mw: sum_mw(env.loads, & &1.p_mw)
+    }
+  end
+
+  defp run_fdpf(snapshot, record, ctx) do
+    opts = [base_mva: ctx.base_mva]
+
+    opts =
+      case record.ac_voltage do
+        %{warm_start: %{} = warm} -> Keyword.put(opts, :warm_start, warm)
+        _ -> opts
+      end
+
+    case FDPF.solve(snapshot, opts) do
+      {:ok, %{converged: true} = solution} -> {:ok, solution}
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  catch
+    _kind, _payload -> :error
+  end
+
+  defp count_voltage(acc, island_key, attempt_key) do
+    layer =
+      acc.voltage_layer
+      |> Map.update!(island_key, &(&1 + 1))
+      |> Map.update!(attempt_key, &(&1 + 1))
+
+    %{acc | voltage_layer: layer}
+  end
+
+  # Per-branch inputs for the mho characteristic, from the AC solution.
+  #
+  # `z_adjacent` is the LONGEST line leaving each branch's remote bus, which is
+  # what makes zone 3 a SETTING rather than a screen: without it the reach
+  # defaults to the protected line itself, which is not a remote-backup zone at
+  # all. `rating_mva` is the highest tier the branch carries (rate C where it
+  # has one), because PRC-023 states its blinder against the highest seasonal
+  # facility rating.
+  #
+  # Branches already past relay pickup in the base case are excluded, exactly
+  # as they are for overcurrent: their loading is a data defect, and the
+  # blinder that would otherwise hold them is computed from the same suspect
+  # ratings.
+  defp distance_relay_inputs(line_flows, env, vm_by_bus, ctx) do
+    branches = Map.new(env.lines, &{{:line, &1.id}, &1})
+    branches = Enum.reduce(env.transformers, branches, &Map.put(&2, {:transformer, &1.id}, &1))
+    adjacent = longest_adjacent_impedance(env)
+
+    for {{type, id} = key, flow} <- line_flows,
+        not MapSet.member?(ctx.base_overloaded, {type, id}),
+        branch = Map.get(branches, key),
+        branch != nil,
+        vm_pu = Map.get(vm_by_bus, flow.from_bus_id),
+        vm_pu != nil do
+      %{
+        component_type: type,
+        component_id: id,
+        z_line: {Map.get(branch, :r_pu) || 0.0, Map.get(branch, :x_pu) || 0.0},
+        vm_pu: vm_pu,
+        p_pu: flow.p_flow_mw / ctx.base_mva,
+        q_pu: (Map.get(flow, :q_flow_mvar) || 0.0) / ctx.base_mva,
+        z_adjacent: Map.get(adjacent, flow.to_bus_id),
+        rating_mva: highest_rating_mva(flow)
+      }
+    end
+  end
+
+  # The longest line leaving each bus, as `%{bus_id => {r_pu, x_pu}}`. A relay
+  # looking into a branch sees its own line plus this, which is the reach zone 3
+  # is set to back up.
+  defp longest_adjacent_impedance(env) do
+    Enum.reduce(env.lines ++ env.transformers, %{}, fn branch, acc ->
+      z = {Map.get(branch, :r_pu) || 0.0, Map.get(branch, :x_pu) || 0.0}
+      mag = Protection.impedance_magnitude(z)
+
+      acc
+      |> longest_at(branch.from_bus_id, z, mag)
+      |> longest_at(branch.to_bus_id, z, mag)
+    end)
+  end
+
+  defp longest_at(acc, bus_id, z, mag) do
+    case Map.get(acc, bus_id) do
+      nil ->
+        Map.put(acc, bus_id, z)
+
+      current ->
+        if mag > Protection.impedance_magnitude(current), do: Map.put(acc, bus_id, z), else: acc
+    end
+  end
+
+  defp highest_rating_mva(flow) do
+    [:rating_c_mva, :rating_b_mva, :rating_mva]
+    |> Enum.map(&Map.get(flow, &1))
+    |> Enum.filter(&(is_number(&1) and &1 > 0))
+    |> Enum.max(fn -> nil end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Conductor thermal: the SLOW timescale (ROADMAP item 20)
+  # ---------------------------------------------------------------------------
+
+  # Advance every branch's conductor temperature over the cascade clock and
+  # emit a trip candidate for any conductor now heading for its emergency
+  # limit. The candidate joins the same fastest-relay-wins selection the
+  # IEC 60255-151 elements use; the two answer different questions (does a
+  # relay operate in seconds / does the conductor anneal in tens of minutes)
+  # and neither is ever fed the other's output.
+  #
+  # `loading_pct` is the RATE A basis, which is the only anchor the curve has:
+  # rate A is by definition the current at which the conductor settles at its
+  # continuous design temperature. Feeding `trip_loading_pct/1`'s rate-C basis
+  # here would understate every temperature by 1.35².
+  #
+  # The DC solve's loading is P-only, so the model is conservative on
+  # reactive-heavy branches. It is used on every island rather than switching
+  # to the AC magnitude where one exists, because this state accumulates across
+  # steps and an island flipping between the two bases would integrate a
+  # discontinuity that is measurement, not physics.
+  defp advance_conductors(conductor, line_flows, ctx) do
+    Enum.reduce(line_flows, {conductor, []}, fn {{type, id} = key, flow}, {state, candidates} ->
+      loading = (Map.get(flow, :loading_pct) || 0.0) / 100.0
+
+      advanced =
+        Protection.advance_conductor_temperature(Map.get(state, key), loading, ctx.conductor_dt_s)
+
+      state = Map.put(state, key, advanced)
+
+      candidates =
+        with false <- base_case_cooking?(ctx, key),
+             trip_time when trip_time != :infinity <-
+               Protection.conductor_trip_time_s(advanced, loading) do
+          [conductor_candidate(type, id, flow, advanced, trip_time) | candidates]
+        else
+          _ -> candidates
+        end
+
+      {state, candidates}
+    end)
+  end
+
+  # The thermal model's own trip-immune set, and it is NOT `base_overloaded`.
+  #
+  # That set is on the rate-C basis: a branch joins it past 100% of rate C,
+  # which is 135% of rate A. The conductor curve cooks from about 131% of rate
+  # A (where a 35 °C rated rise first exceeds the 60 °C the emergency limit
+  # allows), so a branch sitting in the 131–135% band in the BASE case is a
+  # model artifact that the overcurrent exclusion lets through and the slow
+  # mechanism would then trip at t≈0 on impedance error alone — exactly what
+  # the exclusion exists to prevent, one basis lower down.
+  #
+  # So the test is asked in the thermal model's own terms: would this branch's
+  # BASE-CASE loading, held forever, reach the emergency temperature? If it
+  # would, the branch was already cooking before anything happened and nothing
+  # the cascade does to it is an event.
+  defp base_case_cooking?(ctx, key) do
+    MapSet.member?(ctx.base_overloaded, key) or
+      case Map.get(ctx.base_line_loading, key) do
+        pct when is_number(pct) ->
+          Protection.conductor_overtemperature?(%{
+            temp_c: Protection.conductor_steady_state_temp_c(pct / 100.0)
+          })
+
+        _ ->
+          false
+      end
+  end
+
+  defp conductor_candidate(type, id, flow, thermal, trip_time_s) do
+    %{
+      component_type: component_type_string(type),
+      component_id: id,
+      failure_cause: "conductor_thermal",
+      details: %{
+        loading_pct: Map.get(flow, :loading_pct),
+        temp_c: thermal.temp_c,
+        steady_state_c: thermal.steady_state_c,
+        trip_time_s: trip_time_s
+      },
+      trip_time_s: trip_time_s
+    }
   end
 
   @doc """
@@ -2206,6 +3177,16 @@ defmodule PowerModel.Failure.Cascade do
 
   @doc false
   def relay_key(trip), do: {trip.failure_cause, trip.component_type, trip.component_id}
+
+  # Conductor thermal carries its progress in the TEMPERATURE, not in the duty
+  # accumulator: `conductor_trip_time_s/3` is already the remaining time from
+  # the temperature the conductor has reached. Letting duty accumulate across
+  # steps on top of that would integrate the same progress twice, so the
+  # thermal keys start each step at zero and reach 1.0 exactly when the step's
+  # advance equals the remaining time.
+  defp reset_thermal_duty(relay_duty) do
+    Map.reject(relay_duty, fn {{cause, _type, _id}, _duty} -> cause == "conductor_thermal" end)
+  end
 
   defp accrue_relay_duty(duty, _delta_s, :infinity), do: duty
   defp accrue_relay_duty(duty, delta_s, trip_time_s), do: min(duty + delta_s / trip_time_s, 1.0)

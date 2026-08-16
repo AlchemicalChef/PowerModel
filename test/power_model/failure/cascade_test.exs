@@ -1190,85 +1190,92 @@ defmodule PowerModel.Failure.CascadeTest do
       assert Enum.filter(final_state.events, &(&1.failure_cause == "ufls_shed")) == []
     end
 
-    test "secondary reserve answers inside the origin BA first" do
-      # Ten minutes into a standing deficit, so the ramp-limited secondary
-      # tier has real megawatts to offer (`redispatch/4` reads the elapsed
-      # time from the island's deficit clock).
-      state = Cascade.init(two_ba_snapshot(gen2_max: 200.0))
-      island = MapSet.new([1, 2, 3])
-
-      state = %{
+    defp standing_deficit(state, island, now_s) do
+      %{
         state
-        | simulated_time: 600.0,
+        | simulated_time: now_s,
           island_states: [
             %{buses: island, frequency_state: nil, exposure: [], deficit_since_s: 0.0}
           ]
       }
+    end
+
+    defp ba_delta(raised, before) do
+      Map.fetch!(raised.dispatch, 1) - Map.fetch!(before, 1) +
+        (Map.fetch!(raised.dispatch, 2) - Map.fetch!(before, 2))
+    end
+
+    test "redispatch draws the TERTIARY tier only — secondary belongs to AGC" do
+      # ROADMAP Phase 4 wave 3b: AGC owns the secondary tier island-wide,
+      # inside the step's own island evaluation where the frequency it
+      # regulates against lives. `redispatch/4` keeps only tertiary, because
+      # both tiers raise the SAME machines out of the SAME headroom and the
+      # cascade re-derives each step's deficit from the raised dispatch.
+      #
+      # Ten minutes in is exactly the tier boundary: the secondary horizon has
+      # just closed and the tertiary start-up delay has just expired, so a
+      # fleet that would have had ten minutes of secondary ramp on offer now
+      # has zero seconds of tertiary ramp.
+      state = Cascade.init(two_ba_snapshot(gen2_max: 200.0))
+      island = MapSet.new([1, 2, 3])
+      state = standing_deficit(state, island, 600.0)
 
       before = state.dispatch
       raised = Cascade.redispatch(state, 40.0, island, 10)
 
-      # BA 10's own units (gens 1 and 2, both on bus 1) carried the whole
-      # 40 MW between them; BA 20's did not move at all.
-      ba_10_delta =
-        Map.fetch!(raised.dispatch, 1) - Map.fetch!(before, 1) +
-          (Map.fetch!(raised.dispatch, 2) - Map.fetch!(before, 2))
-
-      assert_in_delta ba_10_delta, 40.0, 1.0e-6
+      assert ba_delta(raised, before) == 0.0
       assert Map.fetch!(raised.dispatch, 3) == Map.fetch!(before, 3)
     end
 
-    test "the neighboring BA assists once the origin BA's ramp is exhausted" do
-      # BA 10 is a 20 MW machine and a 30 MW machine: even ten minutes of
-      # ramp cannot cover a 40 MW hole, so BA 20 is asked for the rest.
-      state = Cascade.init(two_ba_snapshot(gen2_max: 30.0))
+    test "the origin BA still answers first on the tertiary tier" do
+      # Half an hour in: twenty minutes past the tertiary start-up delay, so
+      # the tier has real megawatts. The BA ordering is unchanged — the
+      # balancing authority that lost the generation restores its own ACE
+      # before anyone assists it.
+      state = Cascade.init(two_ba_snapshot(gen2_max: 200.0))
       island = MapSet.new([1, 2, 3])
-
-      state = %{
-        state
-        | simulated_time: 600.0,
-          island_states: [
-            %{buses: island, frequency_state: nil, exposure: [], deficit_since_s: 0.0}
-          ]
-      }
+      state = standing_deficit(state, island, 1800.0)
 
       before = state.dispatch
       raised = Cascade.redispatch(state, 40.0, island, 10)
 
-      ba_10_delta =
-        Map.fetch!(raised.dispatch, 1) - Map.fetch!(before, 1) +
-          (Map.fetch!(raised.dispatch, 2) - Map.fetch!(before, 2))
+      assert_in_delta ba_delta(raised, before), 40.0, 1.0e-6
+      assert Map.fetch!(raised.dispatch, 3) == Map.fetch!(before, 3)
+    end
+
+    test "the neighboring BA assists once the origin BA's tertiary ramp is exhausted" do
+      # BA 10 is a 20 MW machine and a 30 MW machine: even twenty minutes past
+      # the start-up delay cannot cover a 40 MW hole out of that headroom, so
+      # BA 20 is asked for the rest.
+      state = Cascade.init(two_ba_snapshot(gen2_max: 30.0))
+      island = MapSet.new([1, 2, 3])
+      state = standing_deficit(state, island, 1800.0)
+
+      before = state.dispatch
+      raised = Cascade.redispatch(state, 40.0, island, 10)
 
       gen3_delta = Map.fetch!(raised.dispatch, 3) - Map.fetch!(before, 3)
 
-      assert ba_10_delta > 0.0
+      assert ba_delta(raised, before) > 0.0
       assert gen3_delta > 0.0
-      assert_in_delta ba_10_delta + gen3_delta, 40.0, 0.5
+      assert_in_delta ba_delta(raised, before) + gen3_delta, 40.0, 0.5
     end
 
-    test "a deficit seconds old gets seconds' worth of secondary reserve" do
-      # The same 40 MW hole in the same fleet, thirty seconds in instead of
-      # ten minutes: an 8%/min ramp over half a minute delivers 4% of BA 10's
-      # 220 MW of nameplate, and the rest waits for the clock.
+    test "a deficit seconds old gets nothing from redispatch at all" do
+      # Thirty seconds in, the only tier that answers is the governor's, and
+      # that one is allocated island-wide inside the step's own evaluation —
+      # never here. Before wave 3b this path handed over half a minute of
+      # secondary ramp; that megawatt now arrives through AGC or not at all,
+      # which is what stops the two tiers double-drawing the same headroom.
       state = Cascade.init(two_ba_snapshot(gen2_max: 200.0))
       island = MapSet.new([1, 2, 3])
-
-      state = %{
-        state
-        | simulated_time: 30.0,
-          island_states: [
-            %{buses: island, frequency_state: nil, exposure: [], deficit_since_s: 0.0}
-          ]
-      }
+      state = standing_deficit(state, island, 30.0)
 
       before = state.dispatch
       raised = Cascade.redispatch(state, 40.0, island, 10)
 
-      ba_10_delta =
-        Map.fetch!(raised.dispatch, 1) - Map.fetch!(before, 1) +
-          (Map.fetch!(raised.dispatch, 2) - Map.fetch!(before, 2))
-
-      assert_in_delta ba_10_delta, 8.8, 1.0e-6
+      assert ba_delta(raised, before) == 0.0
+      assert Map.fetch!(raised.dispatch, 3) == Map.fetch!(before, 3)
     end
   end
 

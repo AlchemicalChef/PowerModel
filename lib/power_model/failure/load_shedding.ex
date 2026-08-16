@@ -427,6 +427,47 @@ defmodule PowerModel.Failure.LoadShedding do
     {shed_loads, events}
   end
 
+  @doc """
+  Restrict a UVLS state to a set of bus ids — the SPLIT half of island-state
+  threading, and the exact counterpart of
+  `PowerModel.Failure.Protection.split_voltage_state/2` and
+  `PowerModel.Grid.BtmSolar.split_voltage_state/2`.
+
+  UVLS stage timers are keyed by BUS and are INTENSIVE: "this bus has been
+  below 0.89 pu for 3.2 s" is a property of the bus, not a quantity to share
+  out. So unlike the frequency state's cumulative megawatts (which
+  `PowerModel.Failure.Cascade` apportions by load share when an island splits),
+  these need no scaling — partitioning by key is the whole operation and every
+  timer is conserved exactly.
+
+  `cumulative_shed_mw` IS extensive, and it is apportioned by the surviving
+  buses' share of the state's own tally rather than carried whole into both
+  halves. It is a report, not a control input — nothing in
+  `apply_uvls_with_state/4` reads it back — so the apportionment only has to
+  keep the two halves summing to the parent.
+
+  Accepts a list, `MapSet` or map of bus ids.
+  """
+  @spec split_uvls_state(map() | nil, Enumerable.t()) :: map()
+  def split_uvls_state(nil, _bus_ids), do: fresh_uvls_state()
+
+  def split_uvls_state(state, bus_ids) do
+    keep = MapSet.new(bus_ids)
+    buses = Map.filter(state.buses, fn {id, _} -> MapSet.member?(keep, id) end)
+
+    share =
+      case map_size(state.buses) do
+        0 -> 0.0
+        n -> map_size(buses) / n
+      end
+
+    %{
+      state
+      | buses: buses,
+        cumulative_shed_mw: Map.get(state, :cumulative_shed_mw, 0.0) * share
+    }
+  end
+
   defp bus_voltage(voltages, _bus_id) when is_number(voltages), do: voltages * 1.0
   defp bus_voltage(voltages, bus_id) when is_map(voltages), do: Map.get(voltages, bus_id)
   defp bus_voltage(_voltages, _bus_id), do: nil
