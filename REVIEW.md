@@ -552,7 +552,23 @@ straddle interconnection boundaries — MISO's 69 GW lands on stray ERCOT-labell
 real ~45 GW. Regional and national runs are not comparable until per-interconnection
 scaling restricts a BA's demand to its in-snapshot share. Found by the replay harness
 2026-08-15 (`outsized scaling` flag: 16 BAs / 40.35 GW nationally).
-**ENE-20 (MEASURED, HIGH) [OPEN]** Eastern's as-dispatched operating point runs ~65 GW
+**ENE-20 (FIXED 2026-08-16)** Root cause: dispatch placed 100% of each BA's EIA-930 fuel
+MW while ENE-17 restricted load to the snapshot's share — 181.6 GW (23%) of Eastern's load
+baseline sits on off-main fragments. Fixed by share-scaling fuel targets at dispatch time
+(Demand.snapshot_load_shares/1; shares recomputed per run, so topology repair self-retires
+the correction), range-proportional re-load for p_min lumpiness, and a DYNAMIC
+broken-identity screen (catches BPAT alone; budget = share × (D+TI), see ENE-18).
+Measured at 2025-01-01T04:00Z, as-dispatched: Eastern −65,100 → −174.9 MW (−0.07%); ERCOT
++3,223 → +652 MW (+1.55%) — NOTE the prior claim "ERCOT/Western dispatch was validated in
+Phase 3" was mis-scoped: Phase 3 validated fuel-mix TV and the interchange identity, not
+absolute balance, and ERCOT ran +7.7% long; Western −2,355 MW gross (−3.0%), −1,058 MW
+(−1.4%) net of 1,297 MW of named unanchored generation (fleet-mapping residual, ENE-15/
+DR-4/DR-5 territory). Eastern base overloads 4,444 → 778 (balanced control was 712);
+Eastern >90° branches 15 → 1, the survivor being a LIN13-B stranded-wind spur (DR-4), and
+Western's >90° set shifted onto a 115 kV Pacific-Northwest data-defect corridor (lines
+61121–61147) now carrying redistributed power — DR-2/DR-4 own it. balance_operating_point
+closes deficits but not surpluses, so dispatch-balance claims must measure RAW dispatch vs
+connected load, never sol.mismatch_mw. ORIGINAL FINDING: Eastern's as-dispatched operating point ran ~65 GW
 long: dispatched generation 300.3 GW against 235.0 GW connected load, with the slack bus
 absorbing −60.6 GW (`mismatch_mw` −65,100). Every flow-derived number on Eastern is
 suspect at that operating point — the first N-1 census measured the dispatch imbalance,
@@ -562,10 +578,24 @@ lists share ZERO entries. Likely interacts with ENE-17's cross-boundary BA scali
 ERCOT/Western dispatch was validated in Phase 3 and does not show this. Found by the
 LODF screening sweep 2026-08-15. Fix belongs in dispatch/balance_operating_point
 ownership; until then, Eastern screening results should use the balanced control.
-**ENE-18 (DATA CAVEAT) [DOCUMENTED]** EIA-930's own generation identity (NG − TI = D)
-never closes for BPAT (0/4,417 hours), MISO (5/4,389), CISO (611/2,473) — those BAs are
-essentially unvalidatable against their own published totals. The harness's screened-hours
-logic excludes them from balance gates; expect their metrics to carry wider error bars.
+**ENE-18 (DATA CAVEAT) [RE-MEASURED 2026-08-16]** EIA-930's own identity NG − (D+TI)
+fails for BPAT alone in the current DB: 0 of 4,417 hours close at 5% tolerance, mean
+residual −4,317 MW (sd 725). The previously-recorded MISO and CISO are no longer broken
+after the ENE-16 re-ingest — MISO closes 4,389/4,389, CISO 2,090/2,473 (84.5%); next-worst
+IID at 60.9%. The screened set is therefore a MEASUREMENT (Demand.broken_identity_bas/0,
+≥24 h and closure <50%), never a stored list — a stale list would now mis-correct two
+healthy BAs.
+**ENE-20 anchoring decision (DECIDED 2026-08-16).** For a screened BA the dispatch budget
+is share × (demand + interchange) allocated in the BA's published fuel-mix proportions,
+not share × net_generation. Rationale: a BA whose identity never closes cannot have both
+its generation column and its demand/interchange pair be right, and this model is judged
+against the second pair — served load and implied interchange. Measured Western at the
+reference hour: +2.2% pre-fix (BPAT's −4.4 GW error accidentally cancelling the fragment
+surplus), −8.1% under share-scaling alone, −3.0% with the correction (−1.4% net of the
+named 1,297 MW unanchored). The rejected alternative — share × (D+TI) for EVERY BA —
+reaches −2.2% but degrades Western fuel-mix TV 0.025 → 0.054 by re-weighting BPAT's
+hydro-heavy mix into capability limits, failing the TV regression gate. The correction is
+reported per BA as identity_correction_mw and retires itself if EIA revises the data.
 **LIN-12 (DATA DEFECT, LOW) [OPEN]** Western carries a 765 kV+ voltage class (1 line,
 3 transformers), all 100% overloaded at rest — WECC has no 765 kV; bad voltage data.
 Found by `mix grid.accuracy` 2026-08-15.
