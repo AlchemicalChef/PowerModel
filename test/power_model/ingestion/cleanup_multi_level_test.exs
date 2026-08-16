@@ -10,6 +10,8 @@ defmodule PowerModel.Ingestion.CleanupMultiLevelTest do
 
   @moduletag :db
 
+  import Ecto.Query
+
   alias PowerModel.Grid.{Bus, Generator, Substation, TransmissionLine}
   alias PowerModel.Ingestion.{BusMapper, Cleanup}
 
@@ -97,7 +99,7 @@ defmodule PowerModel.Ingestion.CleanupMultiLevelTest do
   end
 
   describe "generator placement across levels" do
-    test "a generator takes the lowest level of the nearest yard, deterministically" do
+    test "a generator takes the lowest ADEQUATE level of the nearest yard" do
       sub = insert_substation("PLANT SWITCHYARD", -90.0, 35.0, [500.0, 345.0, 138.0])
 
       gen =
@@ -111,9 +113,48 @@ defmodule PowerModel.Ingestion.CleanupMultiLevelTest do
       BusMapper.run()
 
       # LIN-8 (no GSU model) is unchanged: the generator still lands directly
-      # on a transmission bus. What this pins is WHICH one, now that a yard
-      # offers several buses at one coordinate.
+      # on a transmission bus, and at 500 MW the LIN13-B floor is 115 kV, which
+      # 138 clears — so the yard's lowest level still wins.
       assert Repo.get!(Generator, gen.id).bus_id == bus_of(sub, "138.0").id
+    end
+  end
+
+  describe "cleanup's wide-radius generator remap (LIN13-B)" do
+    test "a GW-scale plant on a synthetic bus is not dragged down to a distant low level" do
+      # Cleanup's search radius is 100 km and its old tie-break took the lowest
+      # level of whatever yard it found — which would undo the placement rule
+      # for exactly the plants that rule exists for.
+      low = insert_substation("LOW YARD", -90.4, 35.0, [69.0])
+      high = insert_substation("EHV YARD", -90.6, 35.0, [500.0, 230.0])
+      BusMapper.create_substation_buses()
+
+      synthetic =
+        Repo.insert!(%Bus{
+          bus_type: 2,
+          base_kv: 13.8,
+          vm_pu: 1.0,
+          va_rad: 0.0,
+          coordinates: point(-90.0, 35.0),
+          source: "synthetic",
+          source_id: "gen_test",
+          interconnection_id: Repo.one!(from(b in Bus, limit: 1)).interconnection_id
+        })
+
+      gen =
+        Repo.insert!(%Generator{
+          p_max_mw: 1200.0,
+          fuel_type: "HYC",
+          status: "in_service",
+          bus_id: synthetic.id,
+          coordinates: point(-90.0, 35.0)
+        })
+
+      Cleanup.remap_generators()
+
+      placed = Repo.get!(Bus, Repo.get!(Generator, gen.id).bus_id)
+      assert placed.base_kv >= 230.0
+      assert placed.id in [bus_of(high, "230.0").id, bus_of(high, "500.0").id]
+      refute placed.id == bus_of(low, "69.0").id
     end
   end
 end

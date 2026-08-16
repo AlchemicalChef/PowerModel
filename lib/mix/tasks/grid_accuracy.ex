@@ -43,11 +43,29 @@ defmodule Mix.Tasks.Grid.Accuracy do
       scale_load=F                   every load x F
       scale_generation=F             every generator p_max_mw x F
 
+  ## Main-island census (TOPO-3)
+
+  The `SIMULATED-GRAPH CENSUS` block reports bridges, degree-1 buses, the load
+  behind them, un-welded co-located yards, and stranded generation — every one
+  of them measured on the graph `Grid.get_grid_snapshot/2` hands the solver,
+  which is every component of 200 buses or more with loads scaled to `--hour`
+  (Eastern's is two islands, not one). The block says so on every run, and
+  that is not decoration: the same census over ALL components gives materially
+  different fractions (Eastern 31.9% bridges against 27.8% on the simulated
+  graph), so a threshold set on one graph passes vacuously on the other.
+  Anything comparing these numbers to a benchmark has to compare against a
+  benchmark measured on the same graph.
+
+  Loading the snapshot a second time is what the block costs; `--no-census`
+  skips it.
+
   ## Options
 
       --interconnection NAME|ID  restrict to one interconnection (repeatable)
       --hour ISO8601             scale loads to an EIA-930 hour
       --format text|json         default text; json keys are stable for CI diffs
+      --census / --no-census     main-island bridge/deg-1/stranding census,
+                                 default on
       --base-mva F               solver base, default 100.0
       --max-solve-buses N        skip the base case above this island size
                                  (default 0 = no guard). Obsolete since sparse
@@ -69,8 +87,20 @@ defmodule Mix.Tasks.Grid.Accuracy do
     base_mva: :float,
     max_solve_buses: :integer,
     solve_timeout: :integer,
+    census: :boolean,
     ab: :keep
   ]
+
+  # The graph every number in the census block is measured on, printed with
+  # the block so a threshold can never be compared against a fraction from a
+  # different graph (TOPO-3).
+  #
+  # "Simulated" and not "main island": `Grid.get_grid_snapshot/2` keeps every
+  # component of 200 buses or more, not only the largest, so the graph a
+  # simulation runs on can be several islands (Eastern's is two — 59,817 buses
+  # and 287). The census reports `simulated islands` so the difference is
+  # visible rather than assumed away.
+  @census_graph "simulated (Grid.get_grid_snapshot/2: every component >= 200 buses), loads scaled to --hour"
 
   @impl Mix.Task
   def run(argv) do
@@ -110,10 +140,263 @@ defmodule Mix.Tasks.Grid.Accuracy do
         overrides: Enum.map(Keyword.get_values(opts, :ab), &parse_override/1)
       )
 
+    report = attach_census(report, opts)
+
     case format do
       "json" -> IO.puts(encode_json(report))
       "text" -> render_text(report)
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Main-island census (TOPO-3)
+  # ---------------------------------------------------------------------------
+
+  defp attach_census(report, opts) do
+    if Keyword.get(opts, :census, true) do
+      scopes =
+        Enum.map(report.scopes, fn scope ->
+          case scope[:interconnection_id] do
+            nil -> scope
+            id -> Map.put(scope, :main_island_census, main_island_census(id, opts[:hour]))
+          end
+        end)
+
+      Map.put(%{report | scopes: scopes}, :census_graph, @census_graph)
+    else
+      report
+    end
+  end
+
+  defp main_island_census(interconnection_id, hour) do
+    snapshot = PowerModel.Grid.get_grid_snapshot(interconnection_id, hour: hour)
+
+    branches =
+      Enum.map(snapshot.lines, &{:line, &1}) ++
+        Enum.map(snapshot.transformers, &{:transformer, &1})
+
+    bus_ids = Enum.map(snapshot.buses, & &1.id)
+    load_by_bus = load_by_bus(snapshot.loads)
+    island_load = load_by_bus |> Map.values() |> Enum.sum()
+
+    degree = degree_by_bus(branches)
+    deg1 = Enum.filter(bus_ids, &(Map.get(degree, &1, 0) <= 1))
+    deg1_load = Enum.sum(Enum.map(deg1, &Map.get(load_by_bus, &1, 0.0)))
+
+    bridge_edges = bridges(bus_ids, branches)
+    isolated_load = load_behind_bridges(bus_ids, branches, bridge_edges, load_by_bus)
+
+    stranding = Mix.Tasks.Grid.Census.Stranding.summarize(snapshot)
+
+    %{
+      graph: @census_graph,
+      buses: length(bus_ids),
+      branches: length(branches),
+      islands: islands(bus_ids, branches),
+      island_load_mw: island_load,
+      bridges: MapSet.size(bridge_edges),
+      bridge_share: share(MapSet.size(bridge_edges), length(branches)),
+      degree_1_buses: length(deg1),
+      degree_1_share: share(length(deg1), length(bus_ids)),
+      degree_1_load_mw: deg1_load,
+      degree_1_load_share: share(deg1_load, island_load),
+      load_behind_bridges_mw: isolated_load,
+      load_behind_bridges_share: share(isolated_load, island_load),
+      colocated_unwelded_pairs: colocated_unwelded_pairs(snapshot, branches),
+      stranded_generation_buses: stranding.generation.count,
+      stranded_generation_gw: stranding.generation.nameplate_gw,
+      radial_generation_buses: stranding.radial_generation.count,
+      undersized_bank_buses: stranding.transformer_fed_load.count
+    }
+  end
+
+  defp share(_numerator, 0), do: nil
+  defp share(_numerator, +0.0), do: nil
+  defp share(numerator, denominator), do: numerator / denominator
+
+  defp islands(bus_ids, branches) do
+    parent =
+      Enum.reduce(branches, Map.new(bus_ids, &{&1, &1}), fn {_kind, b}, acc ->
+        union(acc, b.from_bus_id, b.to_bus_id)
+      end)
+
+    bus_ids |> Enum.map(&find(parent, &1)) |> Enum.uniq() |> length()
+  end
+
+  defp load_by_bus(loads) do
+    Enum.reduce(loads, %{}, fn load, acc ->
+      Map.update(acc, load.bus_id, load.p_mw || 0.0, &(&1 + (load.p_mw || 0.0)))
+    end)
+  end
+
+  defp degree_by_bus(branches) do
+    Enum.reduce(branches, %{}, fn {_kind, b}, acc ->
+      acc
+      |> Map.update(b.from_bus_id, 1, &(&1 + 1))
+      |> Map.update(b.to_bus_id, 1, &(&1 + 1))
+    end)
+  end
+
+  # Adjacency keyed by bus, each entry {neighbour, edge_key}. The edge key
+  # distinguishes parallel circuits, which is what keeps a double circuit from
+  # being reported as a bridge.
+  defp adjacency(branches) do
+    branches
+    |> Enum.with_index()
+    |> Enum.reduce(%{}, fn {{_kind, b}, index}, acc ->
+      acc
+      |> Map.update(b.from_bus_id, [{b.to_bus_id, index}], &[{b.to_bus_id, index} | &1])
+      |> Map.update(b.to_bus_id, [{b.from_bus_id, index}], &[{b.from_bus_id, index} | &1])
+    end)
+  end
+
+  # Iterative Tarjan. Recursion would blow the stack on a 60,000-bus island,
+  # and the depth is exactly what a stringy bridge-heavy network maximises.
+  defp bridges(bus_ids, branches) do
+    adj = adjacency(branches)
+
+    {_disc, _low, _timer, found} =
+      Enum.reduce(bus_ids, {%{}, %{}, 0, MapSet.new()}, fn root, {disc, low, timer, found} ->
+        if Map.has_key?(disc, root) do
+          {disc, low, timer, found}
+        else
+          dfs(
+            [{root, nil, Map.get(adj, root, [])}],
+            adj,
+            Map.put(disc, root, timer),
+            Map.put(low, root, timer),
+            timer + 1,
+            found
+          )
+        end
+      end)
+
+    found
+  end
+
+  defp dfs([], _adj, disc, low, timer, found), do: {disc, low, timer, found}
+
+  defp dfs([{u, parent_edge, [{v, edge} | rest]} | tail], adj, disc, low, timer, found) do
+    cond do
+      edge == parent_edge ->
+        dfs([{u, parent_edge, rest} | tail], adj, disc, low, timer, found)
+
+      Map.has_key?(disc, v) ->
+        low = Map.update!(low, u, &min(&1, Map.fetch!(disc, v)))
+        dfs([{u, parent_edge, rest} | tail], adj, disc, low, timer, found)
+
+      true ->
+        frame = {v, edge, Map.get(adj, v, [])}
+
+        dfs(
+          [frame, {u, parent_edge, rest} | tail],
+          adj,
+          Map.put(disc, v, timer),
+          Map.put(low, v, timer),
+          timer + 1,
+          found
+        )
+    end
+  end
+
+  defp dfs([{u, parent_edge, []} | tail], adj, disc, low, timer, found) do
+    case tail do
+      [] ->
+        dfs([], adj, disc, low, timer, found)
+
+      [{p, _pe, _rest} | _] ->
+        low_u = Map.fetch!(low, u)
+        low = Map.update!(low, p, &min(&1, low_u))
+
+        found =
+          if low_u > Map.fetch!(disc, p), do: MapSet.put(found, parent_edge), else: found
+
+        dfs(tail, adj, disc, low, timer, found)
+    end
+  end
+
+  # Load that at least one bridge separates from the network core: union-find
+  # over the NON-bridge branches, then everything outside the largest
+  # 2-edge-connected component. Summing per bridge instead would count nested
+  # bridges several times over.
+  defp load_behind_bridges(bus_ids, branches, bridge_edges, load_by_bus) do
+    parent =
+      branches
+      |> Enum.with_index()
+      |> Enum.reject(fn {_branch, index} -> MapSet.member?(bridge_edges, index) end)
+      |> Enum.reduce(Map.new(bus_ids, &{&1, &1}), fn {{_kind, b}, _index}, acc ->
+        union(acc, b.from_bus_id, b.to_bus_id)
+      end)
+
+    groups = Enum.group_by(bus_ids, &find(parent, &1))
+
+    case groups do
+      empty when empty == %{} ->
+        0.0
+
+      groups ->
+        core = groups |> Enum.max_by(fn {_root, members} -> length(members) end) |> elem(0)
+
+        groups
+        |> Enum.reject(fn {root, _members} -> root == core end)
+        |> Enum.flat_map(fn {_root, members} -> members end)
+        |> Enum.map(&Map.get(load_by_bus, &1, 0.0))
+        |> Enum.sum()
+    end
+  end
+
+  defp find(parent, id) do
+    case Map.get(parent, id, id) do
+      ^id -> id
+      next -> find(parent, next)
+    end
+  end
+
+  defp union(parent, a, b) do
+    root_a = find(parent, a)
+    root_b = find(parent, b)
+    if root_a == root_b, do: parent, else: Map.put(parent, root_a, root_b)
+  end
+
+  # TOPO-4's metric, on the simulated graph: same-level bus pairs within 250 m
+  # with no branch directly between them.
+  defp colocated_unwelded_pairs(snapshot, branches) do
+    direct =
+      MapSet.new(branches, fn {_kind, b} ->
+        {min(b.from_bus_id, b.to_bus_id), max(b.from_bus_id, b.to_bus_id)}
+      end)
+
+    located =
+      snapshot.buses
+      |> Enum.flat_map(fn bus ->
+        case bus.coordinates do
+          %Geo.Point{coordinates: {lon, lat}} when is_number(bus.base_kv) ->
+            [{bus.id, round(bus.base_kv / 5.0), lon, lat}]
+
+          _ ->
+            []
+        end
+      end)
+
+    cells =
+      Enum.group_by(located, fn {_id, _lk, lon, lat} -> {floor(lon / 0.01), floor(lat / 0.01)} end)
+
+    Enum.reduce(located, 0, fn {id, lk, lon, lat}, count ->
+      {cx, cy} = {floor(lon / 0.01), floor(lat / 0.01)}
+
+      neighbours =
+        for dx <- -1..1,
+            dy <- -1..1,
+            other <- Map.get(cells, {cx + dx, cy + dy}, []),
+            do: other
+
+      count +
+        Enum.count(neighbours, fn {other_id, other_lk, olon, olat} ->
+          other_id > id and other_lk == lk and
+            not MapSet.member?(direct, {id, other_id}) and
+            PowerModel.Ingestion.HIFLD.EndpointMatcher.haversine_km(lat, lon, olat, olon) <= 0.25
+        end)
+    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -233,8 +516,47 @@ defmodule Mix.Tasks.Grid.Accuracy do
     render_topology(scope.topology)
     render_base_case(scope.base_case)
     render_census(scope.kv_census)
+    render_main_island_census(scope[:main_island_census])
 
     if scope[:diff], do: render_diff(scope.diff)
+  end
+
+  defp render_main_island_census(nil), do: :ok
+
+  defp render_main_island_census(c) do
+    Mix.shell().info("\n  SIMULATED-GRAPH CENSUS  graph: #{c.graph}")
+
+    row("buses / branches", "#{c.buses} / #{c.branches}", "")
+    row("simulated islands", "#{c.islands} component(s) of >= 200 buses", "")
+    row("bridges", "#{c.bridges} branches whose loss splits the island", pct(c.bridge_share))
+    row("degree <= 1 buses", "#{c.degree_1_buses}", pct(c.degree_1_share))
+
+    row(
+      "load on them",
+      "#{mw(c.degree_1_load_mw)} MW of #{mw(c.island_load_mw)} MW",
+      pct(c.degree_1_load_share)
+    )
+
+    row(
+      "load behind a bridge",
+      "#{mw(c.load_behind_bridges_mw)} MW outside the core",
+      pct(c.load_behind_bridges_share)
+    )
+
+    row(
+      "co-located unwelded",
+      "#{c.colocated_unwelded_pairs} same-level pairs <= 250 m apart",
+      ""
+    )
+
+    row(
+      "stranded generation",
+      "#{c.stranded_generation_buses} buses, #{c.stranded_generation_gw} GW " <>
+        "(#{c.radial_generation_buses} of them degree-1)",
+      ""
+    )
+
+    row("undersized banks", "#{c.undersized_bank_buses} transformer-fed buses over 0.8x", "")
   end
 
   defp render_topology(t) do

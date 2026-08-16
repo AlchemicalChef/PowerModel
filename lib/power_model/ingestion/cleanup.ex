@@ -22,6 +22,8 @@ defmodule PowerModel.Ingestion.Cleanup do
     WaterFacility
   }
 
+  alias PowerModel.Ingestion.BusMapper
+
   # Wide search for generators (100km should cover any plant near a transmission corridor)
   @gen_remap_radius_m 100_000
 
@@ -42,16 +44,45 @@ defmodule PowerModel.Ingestion.Cleanup do
     remap_unmapped_lines()
     connect_isolated_generators()
     cleanup_orphaned_buses()
+    resize_transformers()
     IO.puts("\n=== Cleanup complete ===")
   end
 
   @doc """
-  Move generators from synthetic buses to nearest real substation bus.
+  Re-rate substation banks against the load their low side now carries
+  (TOPO-6), delegating to `BusMapper.resize_transformers_to_through_load/0`.
+
+  It runs here, and not in `map_buses`, because of pipeline order:
+  `create_substation_transformers` fires long before `LoadEstimator` exists to
+  say what any low side will carry, and cleanup is the first BusMapper-owned
+  stage that runs after the loads are written.
+  """
+  def resize_transformers do
+    %{resized: resized, added_mva: added} = BusMapper.resize_transformers_to_through_load()
+
+    IO.puts(
+      "\nSubstation banks re-rated to their low-side load: #{resized} " <>
+        "(+#{Float.round(added, 1)} MVA)"
+    )
+
+    %{resized: resized, added_mva: added}
+  end
+
+  @doc """
+  Move generators from synthetic buses to the nearest real substation bus that
+  can evacuate them.
 
   PLT-7: when the generator's current bus carries an interconnection, only
   substation buses in the SAME interconnection are candidates — a 100 km
   search radius can otherwise relocate a plant across an asynchronous seam
   (e.g. from ERCOT into the Eastern interconnection).
+
+  LIN13-B: the candidate filter is the same voltage/size floor
+  `BusMapper.map_generators_to_buses/0` applies, for the same reason and with
+  the same LIN-8 reversal. Without it this pass undoes that one — its search
+  radius is ten times wider and its old tie-break took the LOWEST level of
+  whatever yard it found, so a GW-scale plant that `map_buses` had placed on
+  EHV could be dragged back down onto a 13.8 kV bus 90 km away.
   """
   def remap_generators do
     # Find all generators on synthetic buses
@@ -66,24 +97,35 @@ defmodule PowerModel.Ingestion.Cleanup do
 
     IO.puts("Generators on synthetic buses: #{length(gens_on_synth)}")
 
+    capacity = BusMapper.connected_branch_capacity()
+    plant_mw = plant_nameplate_index()
+
     {remapped, kept} =
       Enum.reduce(gens_on_synth, {0, 0}, fn gen, {ok, skip} ->
         point = gen.bus.coordinates || gen.coordinates
+        mw = Map.get(plant_mw, gen.eia_plant_id) || gen.p_max_mw || 0.0
 
-        if point do
-          case find_nearest_substation_bus(point, @gen_remap_radius_m, gen.bus.interconnection_id) do
-            nil ->
-              {ok, skip + 1}
+        target =
+          point &&
+            find_evacuating_bus(
+              point,
+              @gen_remap_radius_m,
+              gen.bus.interconnection_id,
+              BusMapper.plant_voltage_floor(mw),
+              mw,
+              capacity
+            )
 
-            bus ->
-              gen
-              |> Ecto.Changeset.change(%{bus_id: bus.id})
-              |> Repo.update!()
+        case target do
+          nil ->
+            {ok, skip + 1}
 
-              {ok + 1, skip}
-          end
-        else
-          {ok, skip + 1}
+          bus ->
+            gen
+            |> Ecto.Changeset.change(%{bus_id: bus.id})
+            |> Repo.update!()
+
+            {ok + 1, skip}
         end
       end)
 
@@ -310,6 +352,66 @@ defmodule PowerModel.Ingestion.Cleanup do
         unquote(point),
         ^unquote(radius_m)
       )
+    end
+  end
+
+  # Whole-plant nameplate by EIA plant id: the size test asks how much steel
+  # is behind the switchyard, not how big one machine of it is.
+  defp plant_nameplate_index do
+    from(g in Generator,
+      where: g.status == "in_service" and not is_nil(g.eia_plant_id) and g.eia_plant_id != "",
+      group_by: g.eia_plant_id,
+      select: {g.eia_plant_id, sum(g.p_max_mw)}
+    )
+    |> Repo.all()
+    |> Map.new(fn {plant, mw} -> {plant, (mw || 0.0) * 1.0} end)
+  end
+
+  # Nearest substation bus at or above `min_kv` that can carry `plant_mw`,
+  # ranked the way BusMapper ranks: capacity first, then distance, then the
+  # LOWEST qualifying level. Falls back to the unfiltered nearest bus when no
+  # candidate clears the floor, so the floor can never leave a plant stranded
+  # on its synthetic bus.
+  defp find_evacuating_bus(point, radius_m, interconnection_id, nil, _plant_mw, _capacity),
+    do: find_nearest_substation_bus(point, radius_m, interconnection_id)
+
+  defp find_evacuating_bus(point, radius_m, interconnection_id, min_kv, plant_mw, capacity) do
+    needed = BusMapper.stranding_headroom() * plant_mw
+
+    candidates =
+      from(b in Bus,
+        where:
+          b.source == "substation" and within(b.coordinates, ^point, radius_m) and
+            b.base_kv >= ^min_kv,
+        order_by: [
+          asc: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point)
+        ],
+        limit: 25,
+        select: %{
+          bus: b,
+          distance: fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^point)
+        }
+      )
+      |> then(fn query ->
+        if interconnection_id do
+          from b in query, where: b.interconnection_id == ^interconnection_id
+        else
+          query
+        end
+      end)
+      |> Repo.all()
+
+    case candidates do
+      [] ->
+        find_nearest_substation_bus(point, radius_m, interconnection_id)
+
+      candidates ->
+        candidates
+        |> Enum.min_by(fn %{bus: bus, distance: distance} ->
+          short = if Map.get(capacity, bus.id, 0.0) >= needed, do: 0, else: 1
+          {short, distance, bus.base_kv, bus.id}
+        end)
+        |> Map.fetch!(:bus)
     end
   end
 

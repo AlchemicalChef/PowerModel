@@ -27,6 +27,15 @@ defmodule Mix.Tasks.Grid.Census do
   Both sections print a TOTAL line, which is the number the repair rounds are
   gated on: it should reach 0.
 
+  ## stranding
+
+      mix grid.census stranding
+
+  Generation and load MW against the connected branch capacity of the bus they
+  sit on — the placement half of the same story. Documented in
+  `Mix.Tasks.Grid.Census.Stranding`, which this task delegates to; its
+  `--graph`, `--headroom` and `--limit` options are parsed here.
+
   ### Options
 
       --interconnection NAME     restrict to one interconnection (repeatable)
@@ -59,10 +68,15 @@ defmodule Mix.Tasks.Grid.Census do
     limit: :integer,
     balanced: :boolean,
     format: :string,
-    base_mva: :float
+    base_mva: :float,
+    # stranding only
+    graph: :string,
+    headroom: :float
   ]
 
-  @censuses ~w(subtransmission)
+  # `stranding` lives in Mix.Tasks.Grid.Census.Stranding (LIN13-B, DR-4); this
+  # task is the front door for both so the CLI reads as one census family.
+  @censuses ~w(subtransmission stranding)
 
   @default_threshold 1.25
   @default_max_kv 100.0
@@ -125,6 +139,8 @@ defmodule Mix.Tasks.Grid.Census do
   Build the census report without printing it. Exposed so tests and other
   tasks can assert on the numbers rather than on formatted output.
   """
+  def report("stranding", opts), do: Mix.Tasks.Grid.Census.Stranding.report(opts)
+
   def report("subtransmission", opts) do
     hour = parse_hour(opts[:hour]) || Demand.latest_demand_hour()
     threshold = Keyword.get(opts, :threshold, @default_threshold)
@@ -248,6 +264,9 @@ defmodule Mix.Tasks.Grid.Census do
   # ---------------------------------------------------------------------------
   # Rendering
   # ---------------------------------------------------------------------------
+
+  defp render_text(%{census: "stranding"} = report),
+    do: Mix.Tasks.Grid.Census.Stranding.render_text(report)
 
   defp render_text(report) do
     limit = @default_limit
