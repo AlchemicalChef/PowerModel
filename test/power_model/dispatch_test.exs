@@ -735,15 +735,22 @@ defmodule PowerModel.DispatchTest do
   defp ciso_storage_at(hour, opts \\ []) do
     profile = Keyword.get(opts, :profile, ciso_profile())
 
-    {:ok, %{dispatch: dispatch, coverage: coverage}} =
-      Dispatch.for_hour(
-        Keyword.get(opts, :generators, ciso_batteries()),
-        hour,
+    dispatch_opts =
+      [
         bus_ba: bus_ba(),
         fuel_totals:
           Keyword.get_lazy(opts, :fuel_totals, fn -> measured_other(profile, hour) end),
         storage_profile: %{1 => profile}
-      )
+      ]
+      |> then(fn o ->
+        case Keyword.fetch(opts, :share) do
+          {:ok, share} -> Keyword.put(o, :ba_snapshot_share, %{1 => share})
+          :error -> o
+        end
+      end)
+
+    {:ok, %{dispatch: dispatch, coverage: coverage}} =
+      Dispatch.for_hour(Keyword.get(opts, :generators, ciso_batteries()), hour, dispatch_opts)
 
     {storage_mw(dispatch), coverage}
   end
@@ -861,6 +868,66 @@ defmodule PowerModel.DispatchTest do
       assert_in_delta stat.gain, 4.0 / 5.361, 0.01
       assert_in_delta mw, -@ciso_capability_mw * stat.gain * 0.8222, 5.0
       assert abs(mw) <= @ciso_capability_mw
+    end
+
+    test "the whole profile window is share-scaled, not just the dispatched hour" do
+      # REVIEW ENE-24. The dispatched hour's "other" arrives through
+      # `fuel_totals`, which ENE-20 already share-scales; the other 23 hours of
+      # the same window came straight from the BA's published column. The
+      # charging floor the gain calibrates against is a DAILY minimum over all
+      # 24, so it was reading a BA-sized number against a snapshot-sized fleet,
+      # and the error grows with (1 - share).
+      {_full_mw, full} = ciso_storage_at(@ciso_deepest_charge_utc)
+      {_half_mw, half} = ciso_storage_at(@ciso_deepest_charge_utc, share: 0.5)
+
+      assert full.storage.by_ba[1].observed_other_min_mw == -4_926.0
+      assert half.storage.by_ba[1].observed_other_min_mw == -2_463.0
+      assert half.storage.by_ba[1].path == :calibrated
+    end
+
+    test "no hour discharges past the snapshot's share of the measured column" do
+      # The ceiling `cap_to_measurement` applies, stated in the units the
+      # schedule is actually in. Before ENE-24 this held on the dispatched hour
+      # alone and the other 23 were bounded by the whole BA's column.
+      share = 0.4
+      profile = ciso_profile()
+
+      for hour <- ciso_day_hours() do
+        {mw, _coverage} = ciso_storage_at(hour, share: share)
+        record = Enum.find(profile, &(DateTime.compare(&1.hour, hour) == :eq))
+        ceiling = share * max(record.other_mw, 0.0)
+
+        assert mw <= ceiling + 1.0e-6,
+               "hour #{hour} discharged #{mw} MW past the #{ceiling} MW share of the column"
+      end
+    end
+
+    test "a share-scaled day still cancels to zero energy" do
+      # The phantom-energy invariant is not bought back by the rescaling.
+      day = Enum.map(ciso_day_hours(), fn hour -> elem(ciso_storage_at(hour, share: 0.5), 0) end)
+
+      assert_in_delta Enum.sum(day), 0.0, 1.0e-6
+      assert Enum.count(day, &(&1 > 0.0)) >= 8
+    end
+
+    test "scale_profile/2 leaves a whole-BA snapshot and a missing share alone" do
+      records = [
+        %{hour: @ciso_window_start, net_load_mw: 100.0, other_mw: 40.0},
+        %{hour: @ciso_window_start, net_load_mw: 80.0, other_mw: nil}
+      ]
+
+      profile = %{1 => records, 2 => records}
+
+      assert PowerModel.Dispatch.Storage.scale_profile(profile, %{}) == profile
+      assert PowerModel.Dispatch.Storage.scale_profile(profile, %{1 => 1.0}) == profile
+
+      scaled = PowerModel.Dispatch.Storage.scale_profile(profile, %{1 => 0.25})
+
+      assert [%{net_load_mw: 25.0, other_mw: 10.0}, %{net_load_mw: 20.0, other_mw: nil}] =
+               scaled[1]
+
+      # An absent BA is 1.0, matching every other share reader in Dispatch.
+      assert scaled[2] == records
     end
 
     test "calibration only ever reduces the gain" do
@@ -1345,19 +1412,24 @@ defmodule PowerModel.DispatchTest do
           capacity_factor: 0.5
         })
 
-      Repo.insert!(%BAFuelHour{
-        ba_code: "BPAT",
-        timestamp_utc: @hour,
-        fuel: "hydro",
-        net_generation_mw: 1_000.0
-      })
-
-      # 4,417 hours of a broken identity: net generation 1,000 MW against a
-      # demand and interchange totalling 2,000.
+      # 4,417 hours of a broken identity: generation 1,000 MW against a demand
+      # and interchange totalling 2,000. The per-fuel row is written for every
+      # one of them, not just the dispatched hour — REVIEW ENE-23 moved the
+      # screen onto the fuel SUM, so an hour with no fuel series is an hour the
+      # screen has nothing to measure.
       for offset <- 0..29 do
+        hour = DateTime.add(@hour, offset * 3600, :second)
+
+        Repo.insert!(%BAFuelHour{
+          ba_code: "BPAT",
+          timestamp_utc: hour,
+          fuel: "hydro",
+          net_generation_mw: 1_000.0
+        })
+
         Repo.insert!(%BADemandHour{
           balancing_authority_id: ba.id,
-          timestamp_utc: DateTime.add(@hour, offset * 3600, :second),
+          timestamp_utc: hour,
           demand_mw: 1_200.0,
           net_generation_mw: 1_000.0,
           total_interchange_mw: 800.0

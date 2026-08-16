@@ -28,9 +28,12 @@ defmodule PowerModel.Ingestion.Validation do
     * `topology_census/1` — golden-file regression gate over the network:
       bus/line/generator/transformer counts, buses without a balancing
       authority, lines with unmapped endpoints, self-loops, generators without
-      a bus, and per-interconnection connectivity (share of geolocated buses
-      carrying a branch, and largest-component share). The first run writes
-      the baseline; later runs fail on regression beyond the configured
+      a bus, per-interconnection connectivity (share of geolocated buses
+      carrying a branch, and largest-component share), and — REVIEW DAT-28 —
+      whether the network can CARRY what is on it: stranded nameplate, buses
+      with generation and no branch rating, and radial load per
+      interconnection (`placement_census/0`). The first run writes the
+      baseline; later runs fail on regression beyond the configured
       tolerances.
 
     * `capacity_and_balance/1` — the two `ba_fuel_hour` gates: can the mapped
@@ -78,8 +81,10 @@ defmodule PowerModel.Ingestion.Validation do
   import Ecto.Query
   require Logger
 
+  alias PowerModel.Demand
   alias PowerModel.Demand.{BADemandHour, BAFuelHour}
   alias PowerModel.Dispatch
+  alias PowerModel.Ingestion.BusMapper
 
   alias PowerModel.Grid.{
     BalancingAuthority,
@@ -117,7 +122,10 @@ defmodule PowerModel.Ingestion.Validation do
     transformers_unmapped_endpoints: :down,
     self_loop_transformers: :down,
     generator_count: :up,
-    generators_without_bus: :down
+    generators_without_bus: :down,
+    # REVIEW DAT-28: what the network can CARRY, not just what it contains.
+    stranded_nameplate_mw: :down,
+    zero_capability_generator_buses: :down
   }
 
   @interconnection_metric_directions %{
@@ -126,10 +134,12 @@ defmodule PowerModel.Ingestion.Validation do
     connected_fraction: :up,
     component_count: :down,
     largest_component_bus_count: :up,
-    largest_component_fraction: :up
+    largest_component_fraction: :up,
+    degree_1_load_mw: :down,
+    degree_1_load_share: :down
   }
 
-  @fraction_metrics ~w(connected_fraction largest_component_fraction)
+  @fraction_metrics ~w(connected_fraction largest_component_fraction degree_1_load_share)
 
   @doc """
   Run every gate. Returns `{:ok, summary}` when no check failed,
@@ -524,7 +534,125 @@ defmodule PowerModel.Ingestion.Validation do
     |> Map.merge(line)
     |> Map.merge(transformer)
     |> Map.merge(generator)
-    |> Map.put(:interconnections, interconnection_connectivity())
+    |> Map.merge(placement_census())
+    |> Map.put(:interconnections, interconnection_metrics())
+  end
+
+  # Connectivity and radial-load exposure land in one per-interconnection map
+  # so the baseline diff walks them together.
+  defp interconnection_metrics do
+    deg1 = degree_1_load()
+    empty = %{degree_1_load_mw: 0, degree_1_load_share: 0.0}
+
+    Map.new(interconnection_connectivity(), fn {name, stats} ->
+      {name, Map.merge(stats, Map.get(deg1, name, empty))}
+    end)
+  end
+
+  @doc """
+  Whether the network can CARRY what has been placed on it, as three numbers
+  over the DB graph (every bus and every in-service branch, all components —
+  the graph DR-4's stranding census was measured on, not the main-island
+  snapshot):
+
+    * `stranded_nameplate_mw` — in-service nameplate sitting on buses whose
+      summed connected branch rating cannot carry
+      `PowerModel.Ingestion.BusMapper.stranding_headroom/0` times it. Grand
+      Coulee's 6,809 MW on a 115 kV bus with 537 MVA of branch is the shape of
+      it: the DC solution answers with an angle no AC solution reproduces.
+    * `zero_capability_generator_buses` — buses carrying in-service generation
+      with NO branch rating at all. Distinct from the above because a bus with
+      zero capability is invisible to a ratio test that never divides.
+    * `degree_1_load_mw` / `degree_1_load_share` — load behind a single branch,
+      per interconnection. A radial load is a load one trip disconnects.
+
+  REVIEW DAT-28: the census recorded counts and connectivity only, so DAT-26's
+  degradation — placement falling back to the pre-DR-4 rule because
+  `rating_a_mva` was still NULL when `map_buses` ran — moved 87.8% of the
+  capability at generator buses to zero and passed the pipeline's final gate
+  clean. These three are the metrics that would have caught it.
+  """
+  def placement_census do
+    %{rows: [[stranded_mw, zero_cap_buses]]} =
+      Repo.query!(
+        """
+        WITH cap AS (
+          SELECT bus_id, SUM(mva) AS mva FROM (
+            SELECT from_bus_id AS bus_id, COALESCE(rating_a_mva, 0.0) AS mva
+              FROM transmission_lines WHERE status = 'in_service'
+            UNION ALL
+            SELECT to_bus_id, COALESCE(rating_a_mva, 0.0)
+              FROM transmission_lines WHERE status = 'in_service'
+            UNION ALL
+            SELECT from_bus_id, COALESCE(rated_mva, 0.0)
+              FROM transformers WHERE status = 'in_service'
+            UNION ALL
+            SELECT to_bus_id, COALESCE(rated_mva, 0.0)
+              FROM transformers WHERE status = 'in_service'
+          ) branch WHERE bus_id IS NOT NULL GROUP BY bus_id
+        ),
+        gen AS (
+          SELECT bus_id, SUM(COALESCE(p_max_mw, 0.0)) AS mw
+            FROM generators WHERE status = 'in_service' AND bus_id IS NOT NULL
+            GROUP BY bus_id
+        )
+        SELECT
+          COALESCE(SUM(gen.mw) FILTER (WHERE gen.mw > $1 * COALESCE(cap.mva, 0.0)), 0.0),
+          COUNT(*) FILTER (WHERE COALESCE(cap.mva, 0.0) = 0.0)
+        FROM gen LEFT JOIN cap ON cap.bus_id = gen.bus_id
+        """,
+        [BusMapper.stranding_headroom()],
+        timeout: :infinity
+      )
+
+    %{
+      stranded_nameplate_mw: round(stranded_mw),
+      zero_capability_generator_buses: zero_cap_buses
+    }
+  end
+
+  # Load on buses carrying at most one in-service branch, per interconnection.
+  # Degree is counted over the same branch set `interconnection_connectivity/0`
+  # uses, so "degree 1" means the same thing in both.
+  defp degree_1_load do
+    %{rows: rows} =
+      Repo.query!(
+        """
+        WITH branch AS (
+          SELECT from_bus_id AS a, to_bus_id AS b FROM transmission_lines
+            WHERE status = 'in_service' AND from_bus_id IS NOT NULL
+              AND to_bus_id IS NOT NULL AND from_bus_id <> to_bus_id
+          UNION ALL
+          SELECT from_bus_id, to_bus_id FROM transformers
+            WHERE status = 'in_service' AND from_bus_id IS NOT NULL
+              AND to_bus_id IS NOT NULL AND from_bus_id <> to_bus_id
+        ),
+        degree AS (
+          SELECT bus_id, count(*) AS deg FROM (
+            SELECT a AS bus_id FROM branch UNION ALL SELECT b FROM branch
+          ) e GROUP BY bus_id
+        ),
+        bus_load AS (
+          SELECT bus_id, SUM(COALESCE(p_mw, 0.0)) AS mw FROM loads
+            WHERE status = 'in_service' AND bus_id IS NOT NULL GROUP BY bus_id
+        )
+        SELECT i.name,
+               COALESCE(SUM(bus_load.mw), 0.0),
+               COALESCE(SUM(bus_load.mw) FILTER (WHERE COALESCE(degree.deg, 0) <= 1), 0.0)
+        FROM bus_load
+        JOIN buses b ON b.id = bus_load.bus_id
+        JOIN interconnections i ON i.id = b.interconnection_id
+        LEFT JOIN degree ON degree.bus_id = bus_load.bus_id
+        GROUP BY i.name
+        """,
+        [],
+        timeout: :infinity
+      )
+
+    Map.new(rows, fn [name, total_mw, deg1_mw] ->
+      {name,
+       %{degree_1_load_mw: round(deg1_mw), degree_1_load_share: safe_fraction(deg1_mw, total_mw)}}
+    end)
   end
 
   @doc """
@@ -579,6 +707,7 @@ defmodule PowerModel.Ingestion.Validation do
   end
 
   defp safe_fraction(_num, 0), do: 0.0
+  defp safe_fraction(_num, +0.0), do: 0.0
   defp safe_fraction(num, den), do: Float.round(num / den, 4)
 
   # The branch set the solver actually sees: in-service, not a self-loop, not
@@ -669,7 +798,12 @@ defmodule PowerModel.Ingestion.Validation do
       "note" =>
         "Topology census baseline written by PowerModel.Ingestion.Validation. " <>
           "Regenerate with `mix power_model.ingest validate --update-baseline` and commit " <>
-          "the change together with the ingest change that caused it.",
+          "the change together with the ingest change that caused it. " <>
+          "buses_without_ba is a KNOWN-OPEN number, not a target: REVIEW DAT-23 owns it, " <>
+          "and its fix will move this figure down and need this file regenerated in the " <>
+          "same change. stranded_nameplate_mw / zero_capability_generator_buses / " <>
+          "<ic>.degree_1_load_* are DAT-28's placement gate — they move when generator " <>
+          "placement or load allocation degrades, which counts alone cannot see.",
       "metrics" => jsonable(metrics)
     }
 
@@ -831,46 +965,57 @@ defmodule PowerModel.Ingestion.Validation do
   short, 95 of them beyond 2x. No unit yet carries a seasonal capability, so
   today's bound is nameplate and the real shortfall is larger.
 
-  ## Balance at screened hours
+  ## Balance
 
-  On each BA-hour the identity is `generation - demand = total_interchange`.
-  Rows are SCREENED on EIA's own numbers first (`|net_generation -
-  (demand + interchange)| <= tolerance`), because EIA's published trio does
-  not close on every row — measured 4.0% of rows off by more than 1 GW — and
-  scoring our ingest against an hour EIA itself cannot balance measures
-  nothing. On the rows that survive, `Σ ba_fuel_hour - demand -
-  total_interchange` must stay inside the same tolerance; a systematic
-  residual means the per-fuel columns are being read wrong (the ENE-16 class
-  of bug), not that the grid failed to balance. Measured 2026-08-15: 94.5% of
-  rows screened in, 4.0% of those out of tolerance (mean residual 53.5 MW,
-  concentrated in PJM).
+  On each BA-hour the identity is `generation - demand = total_interchange`,
+  and the generation term is the SUM of the per-fuel columns — the series
+  `PowerModel.Dispatch` places. A BA-hour CLOSES when
+  `|Σ ba_fuel_hour − (demand + interchange)|` lands inside
+  `PowerModel.Demand.identity_tolerance/0`; everything else is a finding,
+  because those are the MW dispatch will place against an obligation they do
+  not match.
 
-  WHICH BAs fail EIA's own identity is a measurement, not a list. The ENE-16
-  re-ingest changed the answer: at a 5% tolerance MISO now closes 4,389 of
-  4,389 hours and CISO 2,090 of 2,473 (84.5%), while **BPAT still closes 0 of
-  4,417** (mean residual -4,317 MW, sd 725 — a systematic bias, not noise) and
-  is the one BA about which almost nothing can be validated. The next-worst is
-  IID at 60.9%. `PowerModel.Demand.broken_identity_bas/0` re-runs that screen
-  per call, and is what `PowerModel.Dispatch` anchors a broken BA's generation
-  budget on `demand + interchange` from (REVIEW ENE-20). Re-measured
-  2026-08-15 after ENE-16.
+  This module no longer carries a screen of its own. REVIEW ENE-22 recorded
+  the two disagreeing at runtime and suspected a sign or column divergence; it
+  was neither — the formula was the same and the TOLERANCE was not (1% here,
+  5% in `Demand`), which is why the same rows produced MISO 5/4,389 in one
+  report and 4,389/4,389 in the other. Both now read
+  `PowerModel.Demand.identity_closure_by_ba/0`.
+
+  REVIEW ENE-23 is why the identity is stated on the fuel sum rather than on
+  EIA's `net_generation` column: screening on `net_generation` threw away the
+  hours where the two disagree, which is exactly where the defect lives. WALC
+  closes `net_generation` on 99.5% of its 4,368 hours and its fuel sum on
+  31.3%, running +202 MW long on average — invisible to a net-generation
+  screen, and a fifth of its own demand at dispatch time. EIA's own column is
+  still reported per BA as `eia_closure_rate`, so the two can be told apart.
+
+  Measured 2026-08-16 nationally over 231,838 BA-hours: 95.1% close on the
+  fuel sum, 97.1% on `net_generation`. `broken_identity_bas/0` screens in BPAT
+  (0 of 4,417, mean residual −4,315 MW) and WALC; next-worst IID at 60.8%.
+  `PowerModel.Dispatch` anchors a screened BA's generation budget on
+  `demand + interchange` (REVIEW ENE-20).
 
   ## Options
 
   Merged over the defaults below, from `:capacity_and_balance` in the opts or
   in `config :power_model, PowerModel.Ingestion.Validation`:
 
-      #{inspect(%{capacity_slack: 0.05, capacity_min_mw: 100.0, capacity_fail_ratio: 2.0, capacity_fail_share: 0.35, balance_tolerance_mw: 50.0, balance_tolerance_rel: 0.01, screen_tolerance_mw: 50.0, screen_tolerance_rel: 0.01, balance_fail_share: 0.1}, pretty: true)}
+      #{inspect(%{capacity_slack: 0.05, capacity_min_mw: 100.0, capacity_fail_ratio: 2.0, capacity_fail_share: 0.35, balance_fail_share: 0.1}, pretty: true)}
+
+  The balance tolerance is NOT among them: it belongs to the one identity
+  implementation in `PowerModel.Demand`, and a second knob here is how the two
+  drifted apart in the first place.
   """
   def capacity_and_balance(opts \\ []) do
     settings = fuel_gate_settings(opts)
 
     if Repo.exists?(from(f in BAFuelHour)) do
       capacity = capacity_feasibility(settings)
-      balance = balance_at_screened_hours(settings)
+      balance = balance_by_ba()
 
       report(:capacity_and_balance, %{capacity: capacity, balance: balance, settings: settings},
-        warnings: capacity_warnings(capacity, settings) ++ balance_warnings(balance, settings),
+        warnings: capacity_warnings(capacity, settings) ++ balance_warnings(balance),
         failures: capacity_failures(capacity, settings) ++ balance_failures(balance, settings)
       )
     else
@@ -895,11 +1040,10 @@ defmodule PowerModel.Ingestion.Validation do
     capacity_fail_ratio: 2.0,
     # Aggregate shortfall share that fails the gate (measured 0.200).
     capacity_fail_share: 0.35,
-    balance_tolerance_mw: 50.0,
-    balance_tolerance_rel: 0.01,
-    screen_tolerance_mw: 50.0,
-    screen_tolerance_rel: 0.01,
-    # Share of screened rows out of tolerance that fails (measured 0.039).
+    # Share of BA-hours whose fuel-sum identity does not close that fails the
+    # gate (measured 0.049 nationally on 2026-08-16). The tolerance itself is
+    # `PowerModel.Demand.identity_tolerance/0` — see the moduledoc for why
+    # there is no second copy of it here.
     balance_fail_share: 0.10
   }
 
@@ -1060,57 +1204,35 @@ defmodule PowerModel.Ingestion.Validation do
     end)
   end
 
-  # --- balance at screened hours --------------------------------------------
+  # --- balance ---------------------------------------------------------------
 
-  # One pass in SQL: 1.2M per-fuel rows summed per BA-hour and joined to the
-  # demand row, aggregated per BA so only a few dozen rows come back.
-  @balance_sql """
-  WITH fuel AS (
-    SELECT ba_code, timestamp_utc, sum(net_generation_mw) AS gen_mw
-    FROM ba_fuel_hour GROUP BY 1, 2
-  ),
-  joined AS (
-    SELECT ba.code AS code, d.timestamp_utc AS hour, d.demand_mw, d.net_generation_mw AS ng,
-           d.total_interchange_mw AS ti, fuel.gen_mw,
-           abs(d.net_generation_mw - (d.demand_mw + d.total_interchange_mw)) AS eia_residual,
-           abs(fuel.gen_mw - d.demand_mw - d.total_interchange_mw) AS residual,
-           greatest($1, $2 * abs(d.net_generation_mw)) AS tolerance,
-           greatest($3, $4 * abs(d.demand_mw)) AS screen
-    FROM ba_demand_hourly d
-    JOIN balancing_authorities ba ON ba.id = d.balancing_authority_id
-    JOIN fuel ON fuel.ba_code = ba.code AND fuel.timestamp_utc = d.timestamp_utc
-    WHERE d.net_generation_mw IS NOT NULL AND d.total_interchange_mw IS NOT NULL
-      AND d.demand_mw IS NOT NULL
-  )
-  SELECT code,
-         count(*),
-         count(*) FILTER (WHERE eia_residual <= screen),
-         count(*) FILTER (WHERE eia_residual <= screen AND residual > tolerance),
-         coalesce(sum(residual) FILTER (WHERE eia_residual <= screen), 0),
-         coalesce(max(residual) FILTER (WHERE eia_residual <= screen), 0)
-  FROM joined GROUP BY code ORDER BY code
-  """
-
-  defp balance_at_screened_hours(settings) do
-    {:ok, %{rows: rows}} =
-      Repo.query(@balance_sql, [
-        settings.balance_tolerance_mw,
-        settings.balance_tolerance_rel,
-        settings.screen_tolerance_mw,
-        settings.screen_tolerance_rel
-      ])
+  # Everything here is a projection of the ONE identity measurement in
+  # `PowerModel.Demand` (ENE-22/ENE-23). `screened_rows` are the BA-hours whose
+  # fuel-sum identity closes, `out_of_tolerance` the ones that do not; there is
+  # no second tier, because with one identity a hour is either reproduced or
+  # it is a finding.
+  defp balance_by_ba do
+    closure = Demand.identity_closure_by_ba()
+    screened_ids = closure |> Demand.broken_identity_bas() |> Map.keys() |> MapSet.new()
 
     by_ba =
-      Enum.map(rows, fn [code, rows_n, screened, out, residual_sum, residual_max] ->
+      closure
+      |> Enum.map(fn {ba_id, s} ->
         %{
-          ba_code: code,
-          rows: rows_n,
-          screened: screened,
-          out_of_tolerance: out,
-          mean_residual_mw: safe_fraction(to_float(residual_sum), screened),
-          max_residual_mw: to_float(residual_max)
+          ba_id: ba_id,
+          ba_code: s.ba_code,
+          rows: s.hours,
+          screened: s.closed,
+          screened_share: s.closure_rate,
+          out_of_tolerance: s.hours - s.closed,
+          mean_residual_mw: s.mean_abs_residual_mw,
+          max_residual_mw: s.max_residual_mw,
+          mean_error_mw: s.mean_error_mw,
+          eia_screened: s.eia_closed,
+          eia_screened_share: s.eia_closure_rate
         }
       end)
+      |> Enum.sort_by(& &1.ba_code)
 
     rows_total = sum_by(by_ba, & &1.rows)
     screened = sum_by(by_ba, & &1.screened)
@@ -1122,21 +1244,22 @@ defmodule PowerModel.Ingestion.Validation do
       rows: rows_total,
       screened_rows: screened,
       screened_share: safe_fraction(screened, rows_total),
+      eia_screened_rows: sum_by(by_ba, & &1.eia_screened),
+      eia_screened_share: safe_fraction(sum_by(by_ba, & &1.eia_screened), rows_total),
       out_of_tolerance: out,
-      out_of_tolerance_share: safe_fraction(out, screened),
+      out_of_tolerance_share: safe_fraction(out, rows_total),
       mean_residual_mw:
-        safe_fraction(sum_by(by_ba, &((&1.mean_residual_mw || 0.0) * &1.screened)), screened),
-      # BAs whose own EIA trio rarely closes: nothing downstream can be
-      # validated against them, so the screen throws most of their hours away.
+        safe_fraction(sum_by(by_ba, &(&1.mean_residual_mw * &1.out_of_tolerance)), out),
+      # Exactly the set `PowerModel.Dispatch` anchor-corrects: the identity
+      # screen's own output, not a second threshold that happens to resemble it.
       barely_screened:
         by_ba
-        |> Enum.filter(&(&1.rows > 100 and safe_fraction(&1.screened, &1.rows) < 0.5))
-        |> Enum.sort_by(&safe_fraction(&1.screened, &1.rows))
-        |> Enum.map(&Map.put(&1, :screened_share, safe_fraction(&1.screened, &1.rows))),
+        |> Enum.filter(&MapSet.member?(screened_ids, &1.ba_id))
+        |> Enum.sort_by(& &1.screened_share),
       worst:
         by_ba
         |> Enum.filter(&(&1.out_of_tolerance > 0))
-        |> Enum.sort_by(&(-(&1.mean_residual_mw || 0.0)))
+        |> Enum.sort_by(&(-&1.mean_residual_mw))
         |> Enum.take(10)
     }
   end
@@ -1156,7 +1279,7 @@ defmodule PowerModel.Ingestion.Validation do
     )
   end
 
-  defp balance_warnings(balance, settings) do
+  defp balance_warnings(balance) do
     []
     |> maybe_warn(
       balance.bas_without_fuel_rows != [],
@@ -1165,36 +1288,43 @@ defmodule PowerModel.Ingestion.Validation do
         "Their generation cannot be anchored to a fuel and falls to the island fallback."
     )
     |> maybe_warn(
-      is_number(balance.screened_share) and balance.screened_share < 0.8,
-      "Only #{percent(balance.screened_share)} of BA-hours pass the EIA identity screen " <>
-        "(|net_generation - demand - interchange| <= " <>
-        "max(#{settings.screen_tolerance_mw} MW, #{percent(settings.screen_tolerance_rel)})). " <>
-        "EIA's own trio is that inconsistent, or the demand ingest is misaligned."
+      is_number(balance.eia_screened_share) and
+        balance.eia_screened_share - balance.screened_share > 0.01,
+      "EIA's own net_generation column closes on #{percent(balance.eia_screened_share)} of " <>
+        "BA-hours but the per-fuel SUM closes on only #{percent(balance.screened_share)}. " <>
+        "The gap is the part of the data a net_generation screen cannot see, and the " <>
+        "per-fuel columns are the ones dispatch places (REVIEW ENE-23)."
     )
     |> maybe_warn(
       balance.barely_screened != [],
-      "#{length(balance.barely_screened)} BA(s) fail EIA's OWN generation identity on more " <>
-        "than half their hours, so most of their data cannot be validated at all: " <>
+      "#{length(balance.barely_screened)} BA(s) fail the generation identity on more than " <>
+        "half their hours, so most of their data cannot be validated at all and dispatch " <>
+        "anchors them on demand + interchange instead (REVIEW ENE-20): " <>
         Enum.map_join(Enum.take(balance.barely_screened, 6), ", ", fn b ->
-          "#{b.ba_code} #{b.screened}/#{b.rows} (#{percent(b.screened_share)})"
+          "#{b.ba_code} #{b.screened}/#{b.rows} (#{percent(b.screened_share)}, EIA's own " <>
+            "column #{percent(b.eia_screened_share)})"
         end)
     )
     |> maybe_warn(
       balance.out_of_tolerance > 0,
-      "#{balance.out_of_tolerance} of #{balance.screened_rows} screened BA-hours " <>
+      "#{balance.out_of_tolerance} of #{balance.rows} BA-hours " <>
         "(#{percent(balance.out_of_tolerance_share)}) do not balance: summed per-fuel " <>
-        "generation minus demand minus interchange exceeds tolerance, mean residual " <>
+        "generation minus demand minus interchange exceeds " <>
+        "max(#{tolerance_mw()} MW, #{percent(tolerance_rel())}), mean residual " <>
         "#{round1(balance.mean_residual_mw || 0.0)} MW. Worst: " <>
         describe_balance(balance.worst)
     )
     |> Enum.reverse()
   end
 
+  defp tolerance_mw, do: Demand.identity_tolerance() |> elem(0)
+  defp tolerance_rel, do: Demand.identity_tolerance() |> elem(1)
+
   defp balance_failures(balance, settings) do
     if is_number(balance.out_of_tolerance_share) and
          balance.out_of_tolerance_share > settings.balance_fail_share do
       [
-        "Per-BA balance: #{percent(balance.out_of_tolerance_share)} of screened BA-hours do " <>
+        "Per-BA balance: #{percent(balance.out_of_tolerance_share)} of BA-hours do " <>
           "not close, past the #{percent(settings.balance_fail_share)} gate. The per-fuel " <>
           "columns of EIA-930 are being read wrong (see REVIEW ENE-16 for the last time " <>
           "this happened) — re-check the Form 930 field resolver."
@@ -1206,16 +1336,12 @@ defmodule PowerModel.Ingestion.Validation do
 
   defp describe_balance(worst) do
     Enum.map_join(Enum.take(worst, 6), ", ", fn b ->
-      "#{b.ba_code} #{b.out_of_tolerance}/#{b.screened} rows, mean " <>
+      "#{b.ba_code} #{b.out_of_tolerance}/#{b.rows} rows, mean " <>
         "#{round1(b.mean_residual_mw || 0.0)} MW"
     end)
   end
 
   defp sum_by(list, fun), do: list |> Enum.map(fun) |> Enum.sum()
-
-  defp to_float(%Decimal{} = value), do: Decimal.to_float(value)
-  defp to_float(value) when is_integer(value), do: value * 1.0
-  defp to_float(value), do: value
 
   defp fmt_gw(mw), do: Float.round(mw / 1000.0, 1)
 
@@ -1327,8 +1453,8 @@ defmodule PowerModel.Ingestion.Validation do
   defp headline(%{check: :capacity_and_balance, metrics: m}) do
     "#{m.capacity.short}/#{m.capacity.ba_fuels} BA-fuels short " <>
       "(#{percent(m.capacity.shortfall_share)} of peaks); " <>
-      "#{percent(m.balance.out_of_tolerance_share)} of #{m.balance.screened_rows} " <>
-      "screened BA-hours unbalanced"
+      "#{percent(m.balance.out_of_tolerance_share)} of #{m.balance.rows} " <>
+      "BA-hours unbalanced on the fuel sum"
   end
 
   defp headline(%{check: check}), do: to_string(check)

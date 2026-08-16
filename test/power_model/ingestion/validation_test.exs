@@ -9,7 +9,16 @@ defmodule PowerModel.Ingestion.ValidationTest do
   import ExUnit.CaptureLog
 
   alias PowerModel.Demand.{BADemandHour, BAFuelHour}
-  alias PowerModel.Grid.{BalancingAuthority, Bus, Generator, Interconnection, TransmissionLine}
+
+  alias PowerModel.Grid.{
+    BalancingAuthority,
+    Bus,
+    Generator,
+    Interconnection,
+    Load,
+    TransmissionLine
+  }
+
   alias PowerModel.Ingestion.Validation
 
   setup do
@@ -86,6 +95,7 @@ defmodule PowerModel.Ingestion.ValidationTest do
       x_pu: 0.01,
       status: Keyword.get(opts, :status, "in_service"),
       line_type: opts[:line_type],
+      rating_a_mva: opts[:rating_a_mva],
       from_bus_id: from && from.id,
       to_bus_id: to && to.id,
       source: "hifld",
@@ -307,6 +317,62 @@ defmodule PowerModel.Ingestion.ValidationTest do
 
       assert western.largest_component_fraction == 1.0
       assert western.component_count == 1
+    end
+
+    # REVIEW DAT-28: the census recorded what the network CONTAINS and nothing
+    # about whether it can carry it, so DAT-26 — placement falling back to the
+    # pre-DR-4 rule because rating_a_mva was still NULL when map_buses ran —
+    # went past the pipeline's final gate clean. These are the three metrics
+    # that move when placement degrades.
+    test "stranded nameplate counts plants their bus cannot evacuate" do
+      ic = Repo.insert!(%Interconnection{name: "Western"})
+      strong = insert_bus(ic)
+      weak = insert_bus(ic)
+      far = insert_bus(ic)
+
+      # 2,000 MVA of branch behind `strong`, 100 MVA behind `weak`.
+      insert_line(strong, far, rating_a_mva: 1000.0)
+      insert_line(far, strong, rating_a_mva: 1000.0)
+      insert_line(weak, far, rating_a_mva: 100.0)
+
+      insert_generator(strong, "NG", 800.0)
+      insert_generator(weak, "WAT", 600.0)
+
+      m = Validation.census_metrics()
+
+      # 800 MW against 2,000 MVA clears 1.2x; 600 MW against 100 MVA does not.
+      assert m.stranded_nameplate_mw == 600
+      assert m.zero_capability_generator_buses == 0
+    end
+
+    test "a generator bus with no branch at all is counted separately" do
+      ic = Repo.insert!(%Interconnection{name: "Western"})
+      orphan = insert_bus(ic)
+      insert_generator(orphan, "NG", 250.0)
+
+      m = Validation.census_metrics()
+
+      # A ratio test never divides here, which is why this is its own metric.
+      assert m.zero_capability_generator_buses == 1
+      assert m.stranded_nameplate_mw == 250
+    end
+
+    test "radial load share is reported per interconnection" do
+      east = Repo.insert!(%Interconnection{name: "Eastern"})
+      [a, b, spur] = for _ <- 1..3, do: insert_bus(east)
+
+      insert_line(a, b)
+      insert_line(b, spur)
+
+      Repo.insert!(%Load{bus_id: a.id, p_mw: 300.0, status: "in_service"})
+      Repo.insert!(%Load{bus_id: spur.id, p_mw: 100.0, status: "in_service"})
+
+      %{"Eastern" => eastern} = Validation.census_metrics().interconnections
+
+      # `spur` carries one branch; `a` carries one too (only the a-b line), so
+      # both are radial — 400 of 400 MW is behind a single branch.
+      assert eastern.degree_1_load_mw == 400
+      assert eastern.degree_1_load_share == 1.0
     end
   end
 
@@ -618,30 +684,40 @@ defmodule PowerModel.Ingestion.ValidationTest do
       end)
     end
 
-    test "hours where EIA's own identity does not close are screened out" do
+    test "an hour EIA's own column closes but the fuel sum misses is still a finding" do
       ba = insert_ba("AAA")
       insert_fleet(ba, "BIT", 600.0)
-      # EIA says 1500 MW generated against 1000 demand and 100 exported: its
-      # own trio is 400 MW from closing, so nothing can be validated here.
+      # EIA's own trio is 400 MW from closing AND the fuel columns account for
+      # only 500 of the 1,100 MW the demand/interchange pair implies. REVIEW
+      # ENE-23: the old screen threw this hour away on the first fact, which is
+      # how WALC over-dispatched a fifth of its demand for 69% of its hours
+      # without the report saying a word. Dispatch places the fuel columns, so
+      # the fuel columns are what has to reconcile.
       insert_demand(ba, @summer_hour, demand: 1000.0, net_generation: 1500.0, interchange: 100.0)
       insert_fuel("AAA", @summer_hour, "coal", 500.0)
 
       capture_log(fn ->
-        assert {:ok, report} = Validation.capacity_and_balance()
+        assert {:ok, report} =
+                 Validation.capacity_and_balance(capacity_and_balance: %{balance_fail_share: 1.0})
 
         balance = report.metrics.balance
         assert balance.rows == 1
         assert balance.screened_rows == 0
-        assert balance.out_of_tolerance == 0
         assert balance.screened_share == 0.0
+        assert balance.out_of_tolerance == 1
+        assert balance.mean_residual_mw == 600.0
+
+        # EIA's own column is reported alongside, so the two can be told apart.
+        assert balance.eia_screened_rows == 0
       end)
     end
 
-    test "a screened hour whose per-fuel sum misses the identity is a finding" do
+    test "the fuel sum missing the identity is a finding even where EIA's column closes" do
       ba = insert_ba("AAA")
       insert_fleet(ba, "BIT", 1000.0)
       insert_demand(ba, @summer_hour, demand: 1000.0, net_generation: 1100.0, interchange: 100.0)
-      # The per-fuel columns only account for 900 of the 1100 MW.
+      # The per-fuel columns only account for 900 of the 1100 MW. This is the
+      # WALC shape in miniature: EIA's own trio closes exactly.
       insert_fuel("AAA", @summer_hour, "coal", 900.0)
 
       capture_log(fn ->
@@ -651,11 +727,14 @@ defmodule PowerModel.Ingestion.ValidationTest do
                  Validation.capacity_and_balance(capacity_and_balance: %{balance_fail_share: 1.0})
 
         balance = report.metrics.balance
-        assert balance.screened_rows == 1
+        assert balance.rows == 1
+        assert balance.eia_screened_rows == 1
+        assert balance.screened_rows == 0
         assert balance.out_of_tolerance == 1
         assert balance.out_of_tolerance_share == 1.0
         assert balance.mean_residual_mw == 200.0
         assert Enum.any?(report.warnings, &(&1 =~ "do not balance"))
+        assert Enum.any?(report.warnings, &(&1 =~ "per-fuel SUM closes on only"))
       end)
     end
 
@@ -678,7 +757,7 @@ defmodule PowerModel.Ingestion.ValidationTest do
       ba = insert_ba("AAA")
       insert_fleet(ba, "BIT", 1200.0)
       insert_demand(ba, @summer_hour, demand: 1000.0, net_generation: 1100.0, interchange: 100.0)
-      # 20 MW off, inside max(50 MW, 1% of net generation).
+      # 20 MW off, inside Demand.identity_tolerance/0 = max(50 MW, 5% of demand).
       insert_fuel("AAA", @summer_hour, "coal", 1080.0)
 
       capture_log(fn ->
@@ -714,10 +793,17 @@ defmodule PowerModel.Ingestion.ValidationTest do
       end
 
       capture_log(fn ->
-        assert {:ok, report} = Validation.capacity_and_balance()
+        # Every hour in the fixture fails, which is 100% of rows and past the
+        # gate — the naming is what is under test, so the gate is opened.
+        assert {:ok, report} =
+                 Validation.capacity_and_balance(capacity_and_balance: %{balance_fail_share: 1.0})
 
         assert [%{ba_code: "AAA", screened: 0}] = report.metrics.balance.barely_screened
-        assert Enum.any?(report.warnings, &(&1 =~ "fail EIA's OWN generation identity"))
+        assert Enum.any?(report.warnings, &(&1 =~ "fail the generation identity"))
+
+        # The screened set is exactly what dispatch anchor-corrects, taken from
+        # the one identity implementation rather than a threshold of its own.
+        assert Map.keys(PowerModel.Demand.broken_identity_bas()) == [ba.id]
       end)
     end
   end

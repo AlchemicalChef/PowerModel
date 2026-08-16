@@ -611,4 +611,144 @@ defmodule PowerModel.DemandTest do
     assert_in_delta load1.p_mw, 150.0, 1.0e-6
     assert_in_delta load1.q_mvar, 45.0, 1.0e-6
   end
+
+  # REVIEW DAT-25. ENE20-E made `demand_mw` nullable so a generation-only BA
+  # (DEAA, GRID, HGMA, AVRN) keeps its net-generation and interchange cells
+  # instead of having the whole row dropped. Every reader of those rows has to
+  # survive the nil — the dashboard calls interconnection_demand_for_date/1
+  # unconditionally — and the BA has to keep contributing the series it DOES
+  # publish.
+  describe "generation-only BA rows (DAT-25)" do
+    alias PowerModel.Grid.{Bus, Interconnection}
+
+    setup %{ciso: ciso} do
+      western = Repo.insert!(%Interconnection{name: "DAT25 Western"})
+      genonly = Repo.insert!(%BalancingAuthority{code: "DEAA", name: "Arlington Valley"})
+
+      pt = %Geo.Point{coordinates: {-112.0, 33.0}, srid: 4326}
+
+      Repo.insert!(%Bus{
+        bus_type: 1,
+        base_kv: 230.0,
+        coordinates: pt,
+        interconnection_id: western.id,
+        balancing_authority_id: genonly.id
+      })
+
+      Repo.insert!(%Bus{
+        bus_type: 1,
+        base_kv: 230.0,
+        coordinates: %Geo.Point{coordinates: {-120.0, 37.0}, srid: 4326},
+        interconnection_id: western.id,
+        balancing_authority_id: ciso.id
+      })
+
+      # insert_all, not a changeset: this is the path EIA.Form930 writes
+      # through, and its changeset still lists demand_mw as required.
+      now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+
+      Repo.insert_all(BADemandHour, [
+        %{
+          balancing_authority_id: genonly.id,
+          timestamp_utc: @hour,
+          demand_mw: nil,
+          net_generation_mw: 620.0,
+          total_interchange_mw: 620.0,
+          inserted_at: now,
+          updated_at: now
+        }
+      ])
+
+      %{western: western, genonly: genonly}
+    end
+
+    test "demand_at/1 omits the BA rather than mapping it to nil", %{
+      ciso: ciso,
+      genonly: genonly
+    } do
+      demand = Demand.demand_at(@hour)
+
+      refute Map.has_key?(demand, genonly.id)
+      assert demand[ciso.id] == 200.0
+    end
+
+    test "the nil-tolerant readers cannot tell absence from a nil value", %{genonly: genonly} do
+      # The claim the fix rests on, asserted rather than assumed: an absent key
+      # and a nil value are the same input to every guard downstream.
+      assert Map.get(Demand.demand_at(@hour), genonly.id) == nil
+
+      buses = [%{id: -10, balancing_authority_id: genonly.id}]
+      loads = [%{id: -10, bus_id: -10, p_mw: 40.0, q_mvar: 12.0}]
+
+      # ba_scale_factors' is_number guard: no factor, so the BA's loads stay at
+      # baseline instead of being scaled by a nil.
+      refute Map.has_key?(Demand.ba_scale_factors(loads, buses, @hour), genonly.id)
+    end
+
+    test "interconnection_demand_for_date/1 survives and skips the row", %{
+      ciso: ciso,
+      western: western
+    } do
+      demand = Demand.interconnection_demand_for_date(~D[2024-07-15])
+
+      # CISO's 200 MW is the whole of Western's 20:00 figure; the generation-
+      # only BA contributes no demand rather than a nil that breaks the sum.
+      assert demand[western.id][20] == 200.0
+      assert Demand.demand_at(@hour)[ciso.id] == 200.0
+    end
+
+    test "a second demand row for the same interconnection-hour still sums", %{
+      western: western,
+      genonly: genonly
+    } do
+      # The nil only reaches arithmetic on the SECOND row of a BA-hour group,
+      # so the fix is only proven with another BA in the same interconnection.
+      other = Repo.insert!(%BalancingAuthority{code: "WALC", name: "WAPA Desert Southwest"})
+
+      Repo.insert!(%Bus{
+        bus_type: 1,
+        base_kv: 230.0,
+        coordinates: %Geo.Point{coordinates: {-111.0, 34.0}, srid: 4326},
+        interconnection_id: western.id,
+        balancing_authority_id: other.id
+      })
+
+      Repo.insert!(%BADemandHour{
+        balancing_authority_id: other.id,
+        timestamp_utc: @hour,
+        demand_mw: 300.0
+      })
+
+      demand = Demand.interconnection_demand_for_date(~D[2024-07-15])
+
+      assert demand[western.id][20] == 500.0
+      refute Map.has_key?(Demand.demand_at(@hour), genonly.id)
+    end
+
+    test "the national scale path ignores the nil demand", %{genonly: _genonly} do
+      # Buses without a BA and spanning no single interconnection: the national
+      # fallback, which sums demand_at/1's values.
+      buses = [
+        %{id: 1, balancing_authority_id: nil, interconnection_id: 1},
+        %{id: 2, balancing_authority_id: nil, interconnection_id: 2}
+      ]
+
+      loads = [
+        %{id: 1, bus_id: 1, p_mw: 60.0, q_mvar: 18.0},
+        %{id: 2, bus_id: 2, p_mw: 40.0, q_mvar: 12.0}
+      ]
+
+      # National target is CISO 200 + ERCO 50 = 250; the generation-only BA
+      # adds nothing to it (and does not crash the sum).
+      scaled = Demand.scale_loads(loads, buses, @hour)
+
+      assert_in_delta Enum.sum(Enum.map(scaled, & &1.p_mw)), 250.0, 1.0e-6
+    end
+
+    test "the BA still contributes its interchange", %{genonly: genonly} do
+      # The whole point of keeping the row: 620 MW of Western injection that
+      # ENE20-E's fix exists to preserve.
+      assert Demand.interchange_at(@hour)[genonly.id] == 620.0
+    end
+  end
 end

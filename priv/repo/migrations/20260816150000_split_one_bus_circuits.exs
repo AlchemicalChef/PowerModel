@@ -36,19 +36,82 @@ defmodule PowerModel.Repo.Migrations.SplitOneBusCircuits do
     IO.puts("In-service lines with a NULL endpoint: #{before} -> #{null_endpoint_lines()}")
   end
 
+  # The buses this created are keyed "line_<id>_<side>", and dropping one
+  # while anything still points at it is a foreign-key violation, so the
+  # reverse unmaps every referent first.
+  #
+  # REVIEW DAT-27: unmapping the LINE endpoints is not enough. Migration
+  # 150003 runs after this one and moves plants onto whichever bus can
+  # evacuate them, which put 102 generators on 413 of these buses; its own
+  # down/0 is `:ok`, so rolling this one back met `generators_bus_id_fkey`
+  # (23503) and left the database mid-rollback. Both referents are cleared
+  # here, and `mix power_model.ingest map_buses` — a fill pass, so it writes
+  # only the NULLs this leaves — rebuilds the mapping, exactly as 150002 and
+  # 150003 direct.
+  @synthetic_bus_where "source = 'synthetic' AND source_id LIKE 'line\\_%'"
+
   def down do
-    # The endpoints this filled were NULL and the buses it made are keyed
-    # "line_<id>_<side>"; dropping the buses would orphan the lines that now
-    # point at them, so the reverse is to unmap those endpoints first.
+    blocked = blocking_referents()
+
+    if blocked != [] do
+      raise "Cannot reverse: #{Enum.join(blocked, ", ")} still reference the buses this " <>
+              "migration created, and this file cannot null them. Clear them first, or " <>
+              "rebuild the whole mapping with `mix power_model.ingest map_buses`."
+    end
+
+    # Written one side at a time: a line with a synthetic bus on one end and a
+    # NULL on the other has no row to join the second endpoint against, and a
+    # two-endpoint join would skip it.
     execute("""
-    UPDATE transmission_lines tl
-    SET from_bus_id = CASE WHEN fb.source_id LIKE 'line\\_%' THEN NULL ELSE tl.from_bus_id END,
-        to_bus_id   = CASE WHEN tb.source_id LIKE 'line\\_%' THEN NULL ELSE tl.to_bus_id END
-    FROM buses fb, buses tb
-    WHERE fb.id = tl.from_bus_id AND tb.id = tl.to_bus_id
+    UPDATE transmission_lines SET from_bus_id = NULL
+    WHERE from_bus_id IN (SELECT id FROM buses WHERE #{@synthetic_bus_where})
     """)
 
-    execute("DELETE FROM buses WHERE source = 'synthetic' AND source_id LIKE 'line\\_%'")
+    execute("""
+    UPDATE transmission_lines SET to_bus_id = NULL
+    WHERE to_bus_id IN (SELECT id FROM buses WHERE #{@synthetic_bus_where})
+    """)
+
+    execute("""
+    UPDATE generators SET bus_id = NULL
+    WHERE bus_id IN (SELECT id FROM buses WHERE #{@synthetic_bus_where})
+    """)
+
+    execute("DELETE FROM buses WHERE #{@synthetic_bus_where}")
+  end
+
+  # Tables whose bus reference this file has no honest way to clear:
+  # `simulation_results.bus_id` is NOT NULL, and the rest carry a mapping a
+  # different pass owns. Zero rows in the database this was written against —
+  # the check is here so a future one fails with a sentence instead of a
+  # constraint name halfway through the rollback.
+  defp blocking_referents do
+    for {table, column} <- [
+          {"simulation_results", "bus_id"},
+          {"loads", "bus_id"},
+          {"btm_solar", "bus_id"},
+          {"datacenters", "bus_id"},
+          {"water_facilities", "bus_id"},
+          {"transformers", "from_bus_id"},
+          {"transformers", "to_bus_id"},
+          {"dc_ties", "from_bus_id"},
+          {"dc_ties", "to_bus_id"}
+        ],
+        count = referent_count(table, column),
+        count > 0,
+        do: "#{count} #{table}.#{column}"
+  end
+
+  defp referent_count(table, column) do
+    %{rows: [[count]]} =
+      repo().query!(
+        "SELECT COUNT(*) FROM #{table} WHERE #{column} IN " <>
+          "(SELECT id FROM buses WHERE #{@synthetic_bus_where})",
+        [],
+        timeout: :infinity
+      )
+
+    count
   end
 
   defp null_endpoint_lines do

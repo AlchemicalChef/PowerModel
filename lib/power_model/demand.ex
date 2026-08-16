@@ -70,20 +70,118 @@ defmodule PowerModel.Demand do
   # or a badly skewed baseline; they are applied but logged.
   @sane_factor_range {0.05, 2.0}
 
-  # EIA's own published identity, `net_generation - (demand + interchange)`,
-  # counts as CLOSED for an hour when it lands inside this tolerance — the
-  # same shape `PowerModel.Ingestion.Validation` screens balance rows with,
-  # widened to 5% because this screen is looking for a systematic bias, not
-  # for rounding (REVIEW ENE-18).
+  # The identity counts as CLOSED for an hour when it lands inside this
+  # tolerance. 5%, not 1%: the screen is looking for a systematic bias, not for
+  # rounding (REVIEW ENE-18). `PowerModel.Ingestion.Validation` reads these
+  # through `identity_tolerance/0` rather than carrying its own pair —
+  # ENE-22's "sign or column divergence" was neither, it was that module
+  # screening at 1% while this one screened at 5%, which is why the two
+  # reported different broken sets from the same rows.
   @identity_tolerance_mw 50.0
   @identity_tolerance_rel 0.05
 
   # A BA is only called persistently broken on a real history (a handful of
   # hours is a gap, not a pattern) and only when the identity fails on MOST
-  # of it. Measured 2026-08-15: BPAT closes 0 of 4,417 hours, MISO 4,389 of
-  # 4,389, CISO 2,090 of 2,473 — so this screen catches BPAT alone.
+  # of it. Measured 2026-08-16 on the fuel-sum identity: BPAT closes 0 of
+  # 4,417 hours and WALC 1,365 of 4,368 (31.3%); next-worst IID at 60.8%.
   @identity_min_hours 24
   @identity_max_closure 0.5
+
+  # One residual, computed once, for both counters and every aggregate below.
+  # `gen_mw` is the SUM of the BA's per-fuel columns — the series dispatch
+  # actually places (REVIEW ENE-23) — and `eia_residual` is EIA's own
+  # net-generation column against the same pair, kept as context because a BA
+  # can close one and miss the other by 20% of its demand (WALC does).
+  @identity_sql """
+  WITH fuel AS (
+    SELECT ba_code, timestamp_utc, sum(net_generation_mw) AS gen_mw
+    FROM ba_fuel_hour GROUP BY 1, 2
+  ),
+  residuals AS (
+    SELECT d.balancing_authority_id AS ba_id,
+           ba.code AS ba_code,
+           fuel.gen_mw - (d.demand_mw + d.total_interchange_mw) AS residual,
+           d.net_generation_mw - (d.demand_mw + d.total_interchange_mw) AS eia_residual,
+           greatest($1, $2 * abs(d.demand_mw)) AS tolerance
+    FROM ba_demand_hourly d
+    JOIN balancing_authorities ba ON ba.id = d.balancing_authority_id
+    JOIN fuel ON fuel.ba_code = ba.code AND fuel.timestamp_utc = d.timestamp_utc
+    WHERE d.demand_mw IS NOT NULL AND d.demand_mw > 0
+      AND d.total_interchange_mw IS NOT NULL
+  )
+  SELECT ba_id,
+         ba_code,
+         count(*),
+         count(*) FILTER (WHERE abs(residual) <= tolerance),
+         count(*) FILTER (WHERE eia_residual IS NOT NULL AND abs(eia_residual) <= tolerance),
+         avg(residual),
+         coalesce(avg(abs(residual)) FILTER (WHERE abs(residual) > tolerance), 0),
+         coalesce(max(abs(residual)), 0)
+  FROM residuals
+  GROUP BY ba_id, ba_code
+  """
+
+  @doc """
+  The `{mw, relative}` tolerance the identity closes within. See
+  `identity_closure_by_ba/0`.
+  """
+  @spec identity_tolerance() :: {float(), float()}
+  def identity_tolerance, do: {@identity_tolerance_mw, @identity_tolerance_rel}
+
+  @doc """
+  The `{min_hours, max_closure_rate}` a BA must clear to be screened in as
+  persistently broken. See `broken_identity_bas/0`.
+  """
+  @spec identity_screen() :: {pos_integer(), float()}
+  def identity_screen, do: {@identity_min_hours, @identity_max_closure}
+
+  @doc """
+  Every BA's EIA-930 identity closure, measured once for all callers:
+  `%{ba_id => %{ba_code:, hours:, closed:, closure_rate:, mean_error_mw:,
+  mean_abs_residual_mw:, max_residual_mw:, eia_closed:, eia_closure_rate:}}`.
+
+  The identity is `sum(per-fuel generation) − (demand + interchange)` over the
+  BA-hours that carry a positive demand, an interchange and a per-fuel series.
+  REVIEW ENE-23: the per-fuel SUM, not the `net_generation` column, because
+  the per-fuel columns are what `PowerModel.Dispatch` places — WALC's
+  net-generation column closes on 99.5% of its hours while its fuel columns
+  close on 31.3%, over-dispatching a fifth of its own demand where a
+  net-generation screen sees nothing wrong.
+
+  `eia_closed` is the same measurement against EIA's `net_generation` column,
+  reported alongside so the two can be told apart (ENE-18's data caveat).
+
+  This is the ONE identity implementation; `PowerModel.Ingestion.Validation`
+  reports from this function rather than from a screen of its own (ENE-22).
+  BAs with no per-fuel series are absent — nothing downstream dispatches them.
+  """
+  @spec identity_closure_by_ba() :: %{optional(integer()) => map()}
+  def identity_closure_by_ba do
+    {:ok, %{rows: rows}} =
+      Repo.query(@identity_sql, [@identity_tolerance_mw, @identity_tolerance_rel])
+
+    Map.new(rows, fn [ba_id, code, hours, closed, eia_closed, mean_error, mean_abs, max_abs] ->
+      {ba_id,
+       %{
+         ba_code: code,
+         hours: hours,
+         closed: closed,
+         closure_rate: safe_rate(closed, hours),
+         mean_error_mw: to_float(mean_error),
+         mean_abs_residual_mw: to_float(mean_abs),
+         max_residual_mw: to_float(max_abs),
+         eia_closed: eia_closed,
+         eia_closure_rate: safe_rate(eia_closed, hours)
+       }}
+    end)
+  end
+
+  defp safe_rate(_closed, 0), do: 0.0
+  defp safe_rate(closed, hours), do: closed / hours
+
+  defp to_float(nil), do: 0.0
+  defp to_float(%Decimal{} = d), do: Decimal.to_float(d)
+  defp to_float(value), do: value * 1.0
 
   @doc """
   The `{min, max}` UTC timestamps covered by ingested demand data,
@@ -197,13 +295,21 @@ defmodule PowerModel.Demand do
   @doc """
   Actual demand per balancing authority for the given hour:
   `%{ba_id => demand_mw}`.
+
+  A BA that reported generation and interchange but no demand (`demand_mw`
+  IS NULL — an interchange-only or generation-only BA, which EIA does publish
+  and `EIA.Form930` now stores rather than drops) is ABSENT from the map, not
+  present with a nil value. Every reader keys on absence already
+  (`ba_scale_factors/3`'s `is_number` guard, `Dispatch.anchor_buckets`'
+  `anchored?`), so absence is the reading they were written for; a nil value
+  would instead reach the arithmetic in `scale_loads_to_national/2`.
   """
   def demand_at(%DateTime{} = timestamp) do
     hour = truncate_to_hour(timestamp)
 
     Repo.all(
       from d in BADemandHour,
-        where: d.timestamp_utc == ^hour,
+        where: d.timestamp_utc == ^hour and not is_nil(d.demand_mw),
         select: {d.balancing_authority_id, d.demand_mw}
     )
     |> Map.new()
@@ -405,52 +511,35 @@ defmodule PowerModel.Demand do
   end
 
   @doc """
-  Balancing authorities whose own EIA-930 identity — `net_generation −
-  (demand + interchange)` — is persistently broken:
-  `%{ba_id => %{hours:, closed:, closure_rate:, mean_error_mw:}}`.
+  Balancing authorities whose EIA-930 identity is persistently broken —
+  `identity_closure_by_ba/0` filtered to at least #{@identity_min_hours} hours
+  of history and a closure rate below #{trunc(@identity_max_closure * 100)}%.
 
   REVIEW ENE-18 recorded three such BAs by name. That list is not a constant:
   the ENE-16 re-ingest fixed two of them, and a re-ingest can fix or break
-  others. So the screen is a measurement, taken per call — a BA qualifies
-  only with at least #{@identity_min_hours} hours of history and a closure
-  rate below #{trunc(@identity_max_closure * 100)}%.
+  others. So the screen is a measurement, taken per call.
 
   `PowerModel.Dispatch` uses it to anchor a screened BA's generation budget on
-  `demand + interchange` rather than on a net-generation column that cannot be
-  reconciled with either.
+  `demand + interchange` rather than on generation columns that cannot be
+  reconciled with either. Measured 2026-08-16: BPAT (0 of 4,417) and — new
+  under ENE-23's fuel-sum identity — WALC (1,365 of 4,368), whose
+  net-generation column closes on 99.5% of hours while its fuel columns run
+  +202 MW long on average.
   """
   @spec broken_identity_bas() :: %{optional(integer()) => map()}
-  def broken_identity_bas do
-    {:ok, %{rows: rows}} =
-      Repo.query(
-        """
-        SELECT d.balancing_authority_id,
-               count(*),
-               count(*) FILTER (
-                 WHERE abs(d.net_generation_mw - (d.demand_mw + d.total_interchange_mw))
-                       <= greatest($1, $2 * abs(d.demand_mw))),
-               avg(d.net_generation_mw - (d.demand_mw + d.total_interchange_mw))
-        FROM ba_demand_hourly d
-        WHERE d.demand_mw IS NOT NULL AND d.demand_mw > 0
-          AND d.net_generation_mw IS NOT NULL
-          AND d.total_interchange_mw IS NOT NULL
-        GROUP BY 1
-        """,
-        [@identity_tolerance_mw, @identity_tolerance_rel]
-      )
+  def broken_identity_bas, do: broken_identity_bas(identity_closure_by_ba())
 
-    for [ba_id, hours, closed, mean_error] <- rows,
-        hours >= @identity_min_hours,
-        closed / hours < @identity_max_closure,
-        into: %{} do
-      {ba_id,
-       %{
-         hours: hours,
-         closed: closed,
-         closure_rate: closed / hours,
-         mean_error_mw: (mean_error || 0.0) * 1.0
-       }}
-    end
+  @doc """
+  `broken_identity_bas/0` applied to a closure map already in hand, for a
+  caller that also reports the BAs the screen leaves alone.
+  """
+  @spec broken_identity_bas(%{optional(integer()) => map()}) :: %{optional(integer()) => map()}
+  def broken_identity_bas(closure) when is_map(closure) do
+    closure
+    |> Enum.filter(fn {_ba_id, stats} ->
+      stats.hours >= @identity_min_hours and stats.closure_rate < @identity_max_closure
+    end)
+    |> Map.new()
   end
 
   @doc """
@@ -760,6 +849,11 @@ defmodule PowerModel.Demand do
   @doc """
   Actual hourly demand per interconnection for one UTC date:
   `%{interconnection_id => %{hour => demand_mw}}`.
+
+  Rows without a demand figure are skipped rather than summed: this is a
+  SEPARATE query from `demand_at/1`, so it carries the same `not is_nil`
+  filter on its own account (a nil in the accumulator meets `&1 + mw` on the
+  BA's second row and takes the dashboard down with it).
   """
   def interconnection_demand_for_date(%Date{} = date) do
     start_ts = DateTime.new!(date, ~T[00:00:00], "Etc/UTC")
@@ -767,7 +861,9 @@ defmodule PowerModel.Demand do
     ba_ic = ba_interconnection_map()
 
     from(d in BADemandHour,
-      where: d.timestamp_utc >= ^start_ts and d.timestamp_utc < ^end_ts,
+      where:
+        d.timestamp_utc >= ^start_ts and d.timestamp_utc < ^end_ts and
+          not is_nil(d.demand_mw),
       select: {d.balancing_authority_id, d.timestamp_utc, d.demand_mw}
     )
     |> Repo.all()

@@ -1,47 +1,55 @@
 {
-  "generated_at": "2026-08-16T04:58:59Z",
+  "generated_at": "2026-08-16T10:54:33Z",
   "metrics": {
-    "bus_count": 92670,
-    "buses_without_ba": 2701,
+    "bus_count": 93093,
+    "buses_without_ba": 3124,
     "generator_count": 26882,
     "generators_without_bus": 1,
-    "geolocated_bus_count": 92670,
-    "geolocated_buses_without_ba": 2701,
+    "geolocated_bus_count": 93093,
+    "geolocated_buses_without_ba": 3124,
     "geolocated_buses_without_interconnection": 0,
     "interconnections": {
       "ERCOT": {
         "component_count": 176,
-        "connected_bus_count": 6201,
-        "connected_fraction": 0.9577,
-        "geolocated_bus_count": 6475,
-        "largest_component_bus_count": 5656,
-        "largest_component_fraction": 0.8735
+        "connected_bus_count": 6284,
+        "connected_fraction": 0.9607,
+        "degree_1_load_mw": 4791,
+        "degree_1_load_share": 0.0536,
+        "geolocated_bus_count": 6541,
+        "largest_component_bus_count": 5748,
+        "largest_component_fraction": 0.8788
       },
       "Eastern": {
-        "component_count": 902,
-        "connected_bus_count": 62875,
-        "connected_fraction": 0.9398,
-        "geolocated_bus_count": 66902,
-        "largest_component_bus_count": 59606,
-        "largest_component_fraction": 0.8909
+        "component_count": 896,
+        "connected_bus_count": 63096,
+        "connected_fraction": 0.9405,
+        "degree_1_load_mw": 110581,
+        "degree_1_load_share": 0.139,
+        "geolocated_bus_count": 67085,
+        "largest_component_bus_count": 59826,
+        "largest_component_fraction": 0.8918
       },
       "Western": {
-        "component_count": 270,
-        "connected_bus_count": 18241,
-        "connected_fraction": 0.9455,
-        "geolocated_bus_count": 19293,
-        "largest_component_bus_count": 17343,
-        "largest_component_fraction": 0.8989
+        "component_count": 275,
+        "connected_bus_count": 18450,
+        "connected_fraction": 0.9478,
+        "degree_1_load_mw": 31781,
+        "degree_1_load_share": 0.1254,
+        "geolocated_bus_count": 19467,
+        "largest_component_bus_count": 17517,
+        "largest_component_fraction": 0.8998
       }
     },
-    "line_count": 100274,
-    "lines_in_service": 100158,
-    "lines_unmapped_endpoints": 6139,
+    "line_count": 104759,
+    "lines_in_service": 104643,
+    "lines_unmapped_endpoints": 4691,
     "self_loop_lines": 0,
     "self_loop_transformers": 0,
+    "stranded_nameplate_mw": 99792,
     "transformer_count": 14376,
-    "transformers_unmapped_endpoints": 0
+    "transformers_unmapped_endpoints": 0,
+    "zero_capability_generator_buses": 804
   },
-  "note": "Topology census baseline written by PowerModel.Ingestion.Validation. Regenerate with `mix power_model.ingest validate --update-baseline` and commit the change together with the ingest change that caused it.",
+  "note": "Topology census baseline written by PowerModel.Ingestion.Validation. Regenerate with `mix power_model.ingest validate --update-baseline` and commit the change together with the ingest change that caused it. buses_without_ba is a KNOWN-OPEN number, not a target: REVIEW DAT-23 owns it, and its fix will move this figure down and need this file regenerated in the same change. stranded_nameplate_mw / zero_capability_generator_buses / <ic>.degree_1_load_* are DAT-28's placement gate — they move when generator placement or load allocation degrades, which counts alone cannot see.",
   "version": 1
 }

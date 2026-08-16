@@ -173,6 +173,9 @@ defmodule PowerModel.Dispatch.Storage do
   from. `PowerModel.Dispatch` passes this shape straight through from its
   `:storage_profile` option, so fixtures can supply a profile without a repo;
   records outside the day are ignored rather than rejected.
+
+  These are the BA's WHOLE published MW. A snapshot holding only part of a BA
+  runs them through `scale_profile/2` first — see that function for why.
   """
   def profile([], _hour), do: %{}
 
@@ -224,6 +227,42 @@ defmodule PowerModel.Dispatch.Storage do
 
       {ba_id, records}
     end)
+  end
+
+  @doc """
+  Rewrite a profile into the MW THIS snapshot's fleet is measured against:
+  every `net_load_mw` and `other_mw` multiplied by the BA's snapshot share.
+
+  REVIEW ENE-24. The duty cycle is bounded by the `"other"` column and sized
+  against a fleet capability that only counts the snapshot's own units, but
+  `profile/2` reads the BA's whole published series. `PowerModel.Dispatch`
+  share-scales the fuel targets (ENE-20) before it schedules storage, so the
+  hour being dispatched arrived scaled while the other 23 hours of the same
+  window did not — `cap_to_measurement`'s ceiling and `gain/3`'s charging
+  calibration then compared a snapshot-sized schedule against BA-sized
+  columns, and the error grows with `1 - share`.
+
+  An absent BA is 1.0 and share 1.0 returns the profile unchanged, so a
+  repo-free fixture and a whole-BA snapshot are untouched.
+  """
+  def scale_profile(profile, shares) when is_map(profile) and is_map(shares) do
+    Map.new(profile, fn {ba_id, records} ->
+      case Map.get(shares, ba_id, 1.0) do
+        share when is_number(share) and share != 1.0 ->
+          {ba_id, Enum.map(records, &scale_record(&1, share))}
+
+        _ ->
+          {ba_id, records}
+      end
+    end)
+  end
+
+  defp scale_record(record, share) do
+    %{
+      record
+      | net_load_mw: record.net_load_mw * share,
+        other_mw: record.other_mw && record.other_mw * share
+    }
   end
 
   @doc """

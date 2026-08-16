@@ -395,7 +395,10 @@ defmodule Mix.Tasks.PowerModel.Ingest do
   # runs, in dependency order, each printing its own result. File-based
   # stages read from data/ and raise if their inputs are missing rather than
   # silently producing a degenerate grid.
-  defp pipeline_stages do
+  # Public so the ordering constraints between stages can be asserted without
+  # running a four-hour pipeline (REVIEW DAT-26).
+  @doc false
+  def pipeline_stages do
     [
       {"Ingesting transmission lines (vendored HIFLD Next snapshot)",
        fn -> ingest_lines_default() end},
@@ -407,9 +410,26 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       {"Updating capacity factors from EIA-923 (data/)",
        fn -> PowerModel.Ingestion.EIA.Form923.ingest("data") end},
       {"Ingesting eGRID data (data/)", fn -> PowerModel.Ingestion.EPA.EGrid.ingest("data") end},
+      # REVIEW DAT-26: the line pass runs BEFORE map_buses because
+      # `map_generators_to_buses` ranks candidate buses on connected branch
+      # capacity, which sums `rating_a_mva` — nil until this pass writes it.
+      # On a fresh database that made 87.8% of the capability at generator
+      # buses read as zero, and DR-4's placement rule fell through to the
+      # pre-DR-4 nearest-any-level one it exists to replace.
+      #
+      # Only the LINE pass moves. It reads `length_km`, then the line's own
+      # geometry, and only then its endpoint buses — and every line it owns
+      # (HIFLD; matpower/international/connectivity_repair are externally
+      # authored) carries geometry, so it never reaches the endpoints. Its two
+      # siblings stay where they are: `synthesize_line_end_reactors` selects on
+      # `from_bus_id`/`to_bus_id` being non-null and would find nothing here.
+      {"Estimating line parameters (before bus mapping ranks on them)",
+       fn -> PowerModel.Ingestion.ParameterEstimator.estimate_line_parameters() end},
       {"Mapping components to buses", fn -> PowerModel.Ingestion.map_buses() end},
       {"Creating international connections",
        fn -> PowerModel.Ingestion.ingest_international_connections() end},
+      # Version-stamped, so the line pass above is not repeated: what runs here
+      # is generator Q limits and the line-end reactors, which need endpoints.
       {"Estimating electrical parameters", fn -> PowerModel.Ingestion.estimate_parameters() end},
       {"Mapping balancing authorities (data/)",
        fn -> PowerModel.Ingestion.map_balancing_authorities("data") end},
@@ -431,6 +451,17 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       # 50 km last-resort search recovered and joins only what is still apart.
       {"Repairing network connectivity",
        fn -> PowerModel.Ingestion.BusMapper.repair_connectivity() end},
+      # REVIEW DAT-26: `map_generators_to_buses` is a FILL — it never revisits
+      # a generator that already has a bus — so the plants placed before
+      # cleanup and connectivity repair never see the branch capacity those
+      # stages added. This is the re-map half, and it runs here for the same
+      # reason migration 150003 ran last of the DR-4 set: the three stages
+      # before it change the capacity term the rule ranks on. It moves a plant
+      # only when its bus fails the rule AND the rule's pick is a strict
+      # improvement, so re-running is a no-op. Until now it had no pipeline
+      # caller at all: a fresh database got the fill and never the repair.
+      {"Re-mapping stranded generators",
+       fn -> PowerModel.Ingestion.BusMapper.remap_stranded_generators() end},
       # ROADMAP 2.5 item 30. Last of the data stages: it allocates onto the
       # PQ-buses-with-loads universe, so it must see the bus set that cleanup
       # and connectivity repair leave behind, not the one estimate_loads saw.

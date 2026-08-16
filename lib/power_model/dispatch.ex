@@ -268,6 +268,8 @@ defmodule PowerModel.Dispatch do
       is a DIFFERENT series from the measured MW, so `:fuel_totals` does not
       cover it: this is queried whenever the snapshot holds a battery and the
       option is absent. Pass `%{}` for a repo-free run with storage in it.
+      Supplied or queried, it is stated in the BA's WHOLE published MW and is
+      share-scaled on the way into the schedule (ENE-24).
     * `:ba_snapshot_share` — `%{ba_id => share in 0..1}`, the share of each
       BA's load universe this snapshot holds (REVIEW ENE-20). Queried through
       `PowerModel.Demand.snapshot_load_shares/1` when omitted and a database
@@ -410,15 +412,18 @@ defmodule PowerModel.Dispatch do
     # cycle is bounded by the "other" column, and sizing it on an unscaled
     # column only to net it against a scaled target would double-count the
     # difference.
-    {fuel_totals, share_stats} =
-      scale_to_snapshot_share(fuel_totals, hour, loads, islands, opts)
+    shares = snapshot_shares(opts, loads, islands)
+
+    {fuel_totals, share_stats} = scale_to_snapshot_share(fuel_totals, hour, shares, opts)
 
     # Batteries run their own duty cycle rather than filling a fuel target
     # that is measured NET of their charging (ROADMAP item 17), so they leave
     # the pool first and the "other" target the pool is offered drops by what
-    # they were scheduled to do.
+    # they were scheduled to do. The same shares go into the storage profile
+    # (ENE-24), so the whole 24 h window it is shaped from is in the units the
+    # scaled "other" target above is already in.
     {storage, non_storage} = Enum.split_with(dispatchable, & &1.storage?)
-    {storage_alloc, storage_stats} = schedule_storage(storage, hour, fuel_totals, opts)
+    {storage_alloc, storage_stats} = schedule_storage(storage, hour, fuel_totals, opts, shares)
 
     fuel_totals = Storage.adjust_fuel_totals(fuel_totals, storage_stats)
 
@@ -601,8 +606,7 @@ defmodule PowerModel.Dispatch do
 
   # Rewrite each BA's measured fuel MW into the target THIS snapshot's units
   # should be offered, and return the per-BA arithmetic for coverage.
-  defp scale_to_snapshot_share(fuel_totals, hour, loads, islands, opts) do
-    shares = snapshot_shares(opts, loads, islands)
+  defp scale_to_snapshot_share(fuel_totals, hour, shares, opts) do
     anchors = identity_anchors(opts, hour)
 
     Enum.reduce(fuel_totals, {%{}, %{}}, fn {ba_id, fuels}, {totals, stats} ->
@@ -1056,17 +1060,22 @@ defmodule PowerModel.Dispatch do
   # series entirely — gating it left every replayed hour with an idle fleet
   # AND its share of the "other" column stranded as unserved. A caller with no
   # repo passes `:storage_profile` (`%{}` for none).
-  defp schedule_storage([], _hour, _fuel_totals, _opts), do: {%{}, %{}}
+  defp schedule_storage([], _hour, _fuel_totals, _opts, _shares), do: {%{}, %{}}
 
-  defp schedule_storage(storage, hour, fuel_totals, opts) do
+  defp schedule_storage(storage, hour, fuel_totals, opts, shares) do
+    # Scaled AFTER the option is read, not only inside the query, so a
+    # fixture-supplied profile lands in the same units as a queried one
+    # (ENE-24). With every share 1.0 this is the identity.
     profile =
-      Keyword.get_lazy(opts, :storage_profile, fn ->
+      opts
+      |> Keyword.get_lazy(:storage_profile, fn ->
         storage
         |> Enum.map(& &1.ba_id)
         |> Enum.reject(&is_nil/1)
         |> Enum.uniq()
         |> Storage.profile(hour)
       end)
+      |> Storage.scale_profile(shares)
 
     Storage.schedule(storage, hour, profile, fuel_totals)
   end
