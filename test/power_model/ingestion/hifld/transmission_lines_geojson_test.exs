@@ -54,13 +54,16 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLinesGeoJSONTest do
       assert attrs.voltage_kv == 130.5
     end
 
-    test "a row with neither a usable VOLTAGE nor VOLT_CLASS is dropped" do
-      assert TransmissionLines.parse_geojson_feature(
-               feature(
-                 %{"source_ID" => "1", "VOLTAGE" => -999_999.0, "VOLT_CLASS" => "NOT AVAILABLE"},
-                 line_string([[-90.0, 30.0], [-90.1, 30.0]])
-               )
-             ) == nil
+    test "a feature that carries its own voltage is marked as such" do
+      attrs =
+        feature(
+          %{"source_ID" => "1", "VOLTAGE" => 230.0},
+          line_string([[-90.0, 30.0], [-90.1, 30.0]])
+        )
+        |> TransmissionLines.parse_geojson_feature()
+
+      assert attrs.voltage_kv == 230.0
+      assert attrs.voltage_source == :hifld
     end
 
     test "HVDC is marked from either TYPE or VOLT_CLASS (LIN-6)" do
@@ -115,13 +118,160 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLinesGeoJSONTest do
     end
   end
 
+  describe "parse_geojson_feature/2 restoring a circuit with no voltage (TOPO-1)" do
+    # 8,814 of the snapshot's features carry the -999999 sentinel AND an
+    # unparseable VOLT_CLASS. They used to be dropped; each rule below is one
+    # of the four ways a voltage is now inferred for them.
+    defp no_voltage_feature(sub_1, sub_2) do
+      feature(
+        %{
+          "source_ID" => "1",
+          "VOLTAGE" => -999_999.0,
+          "VOLT_CLASS" => "NOT AVAILABLE",
+          "SUB_1" => sub_1,
+          "SUB_2" => sub_2
+        },
+        line_string([[-90.0, 30.0], [-90.1, 30.0]])
+      )
+    end
+
+    defp restore(sub_1, sub_2, index) do
+      TransmissionLines.parse_geojson_feature(no_voltage_feature(sub_1, sub_2), index)
+    end
+
+    test "takes the highest level both yards have" do
+      attrs =
+        restore("KEYSTONE", "MIDWAY", %{
+          "KEYSTONE" => [{-90.0, 30.0, 345.0}, {-90.0, 30.0, 138.0}],
+          "MIDWAY" => [{-90.1, 30.0, 345.0}, {-90.1, 30.0, 138.0}]
+        })
+
+      assert attrs.voltage_kv == 345.0
+      assert attrs.voltage_source == :shared_level
+    end
+
+    test "115 kV and 120 kV count as the same shared level" do
+      attrs =
+        restore("KEYSTONE", "MIDWAY", %{
+          "KEYSTONE" => [{-90.0, 30.0, 115.0}],
+          "MIDWAY" => [{-90.1, 30.0, 120.0}]
+        })
+
+      assert attrs.voltage_kv == 115.0
+      assert attrs.voltage_source == :shared_level
+    end
+
+    test "with only one yard known, takes that yard's LOWEST level" do
+      attrs =
+        restore("KEYSTONE", "TAP999", %{
+          "KEYSTONE" => [{-90.0, 30.0, 345.0}, {-90.0, 30.0, 138.0}]
+        })
+
+      assert attrs.voltage_kv == 138.0
+      assert attrs.voltage_source == :single_yard
+    end
+
+    test "two yards with no level in common straddle at the lower yard's top level" do
+      attrs =
+        restore("KEYSTONE", "MIDWAY", %{
+          "KEYSTONE" => [{-90.0, 30.0, 345.0}],
+          "MIDWAY" => [{-90.1, 30.0, 230.0}, {-90.1, 30.0, 69.0}]
+        })
+
+      assert attrs.voltage_kv == 230.0
+      assert attrs.voltage_source == :straddle
+    end
+
+    test "neither yard known falls back to the 138 kV default BusMapper would use" do
+      assert %{voltage_kv: 138.0, voltage_source: :default} = restore("KEYSTONE", "MIDWAY", %{})
+    end
+
+    test "a same-name yard beyond the name-match radius lends nothing" do
+      # 0.5 degrees of latitude is ~55 km, twice EndpointMatcher's 25 km.
+      attrs = restore("MIDWAY", "MIDWAY", %{"MIDWAY" => [{-90.0, 30.5, 500.0}]})
+
+      assert attrs.voltage_kv == 138.0
+      assert attrs.voltage_source == :default
+    end
+
+    test "a bare sentinel name is not a yard key, so it lends nothing" do
+      attrs =
+        restore("NOT AVAILABLE", "NOT AVAILABLE", %{
+          "NOT AVAILABLE" => [{-90.0, 30.0, 500.0}]
+        })
+
+      assert attrs.voltage_source == :default
+    end
+
+    test "UNKNOWN<id>/TAP<id> ARE yard keys (Names) and do lend their level" do
+      attrs =
+        restore("UNKNOWN128553", "TAP139917", %{
+          "UNKNOWN128553" => [{-90.0, 30.0, 161.0}],
+          "TAP139917" => [{-90.1, 30.0, 161.0}]
+        })
+
+      assert attrs.voltage_kv == 161.0
+      assert attrs.voltage_source == :shared_level
+    end
+  end
+
+  describe "build_yard_voltage_index/1" do
+    @tag :tmp_dir
+    test "indexes both endpoints of a line that carries a voltage", %{tmp_dir: tmp_dir} do
+      path = write_features(tmp_dir, [{"345.0", "AC; OVERHEAD", "ALPHA", "BETA"}])
+
+      index = TransmissionLines.build_yard_voltage_index(path)
+
+      assert %{"ALPHA" => [{-90.0, 30.0, 345.0}], "BETA" => [{-90.1, 30.0, 345.0}]} = index
+    end
+
+    @tag :tmp_dir
+    test "an HVDC bipole never lends its pole-to-pole voltage (LIN-12)", %{tmp_dir: tmp_dir} do
+      # HIFLD stores the Pacific DC Intertie at VOLTAGE 1000 for a +/-500 kV
+      # link. A restored circuit at Celilo must not come out at 1000 kV.
+      path = write_features(tmp_dir, [{"1000.0", "DC; OVERHEAD", "CELILO", "SYLMAR EAST"}])
+
+      assert TransmissionLines.build_yard_voltage_index(path) == %{}
+    end
+
+    @tag :tmp_dir
+    test "no AC line above 765 kV lends its voltage either", %{tmp_dir: tmp_dir} do
+      path = write_features(tmp_dir, [{"1100.0", "AC; OVERHEAD", "ALPHA", "BETA"}])
+
+      assert TransmissionLines.build_yard_voltage_index(path) == %{}
+    end
+
+    defp write_features(tmp_dir, specs) do
+      path = Path.join(tmp_dir, "lines.geojsonl")
+
+      body =
+        specs
+        |> Enum.with_index(1)
+        |> Enum.map_join("\n", fn {{voltage, type, sub_1, sub_2}, i} ->
+          %{
+            "source_ID" => to_string(i),
+            "VOLTAGE" => String.to_float(voltage),
+            "TYPE" => type,
+            "SUB_1" => sub_1,
+            "SUB_2" => sub_2
+          }
+          |> feature(line_string([[-90.0, 30.0], [-90.1, 30.0]]))
+          |> Jason.encode!()
+        end)
+
+      File.write!(path, body)
+      path
+    end
+  end
+
   describe "ingest_geojson/1" do
-    test "ingests the converted fixture and is idempotent" do
-      assert {:ok, 21} = TransmissionLines.ingest_geojson(@lines_fixture)
-      assert Repo.aggregate(TransmissionLine, :count) == 21
+    test "ingests every feature of the converted fixture and is idempotent" do
+      # 25 features: 21 with a HIFLD voltage, 4 restored (TOPO-1).
+      assert {:ok, 25} = TransmissionLines.ingest_geojson(@lines_fixture)
+      assert Repo.aggregate(TransmissionLine, :count) == 25
 
       TransmissionLines.ingest_geojson(@lines_fixture)
-      assert Repo.aggregate(TransmissionLine, :count) == 21
+      assert Repo.aggregate(TransmissionLine, :count) == 25
     end
 
     test "SUB_1/SUB_2 are stored — they are the connectivity keys" do
@@ -133,7 +283,35 @@ defmodule PowerModel.Ingestion.HIFLD.TransmissionLinesGeoJSONTest do
           :count
         )
 
-      assert with_names == 21
+      assert with_names == 25
+    end
+
+    test "every inserted line has a positive voltage and is left to the estimator" do
+      TransmissionLines.ingest_geojson(@lines_fixture)
+
+      lines = Repo.all(TransmissionLine)
+
+      assert Enum.all?(lines, &(&1.voltage_kv > 0.0)),
+             "a line with no voltage would have no class to estimate from"
+
+      # Below ParameterEstimator.params_version/0, so the restored circuits get
+      # an impedance and a rating like every other row.
+      assert Enum.all?(lines, &(&1.params_version == 0))
+      assert Enum.all?(lines, &is_nil(&1.x_pu))
+    end
+
+    test "the restored circuits are the ones HIFLD gave no voltage" do
+      TransmissionLines.ingest_geojson(@lines_fixture)
+
+      restored =
+        Repo.all(
+          from l in TransmissionLine,
+            where: l.source_id in ["100000", "100003", "100012", "100018"],
+            select: {l.source_id, l.voltage_kv}
+        )
+
+      assert length(restored) == 4
+      assert Enum.all?(restored, fn {_id, kv} -> kv > 0.0 end)
     end
   end
 end

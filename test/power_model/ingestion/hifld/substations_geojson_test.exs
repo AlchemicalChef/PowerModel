@@ -199,6 +199,45 @@ defmodule PowerModel.Ingestion.HIFLD.SubstationsGeoJSONTest do
       end
     end
 
+    test "an HVDC line never lends its voltage to the yards it names (LIN-12)" do
+      # The Pacific DC Intertie is stored at voltage_kv 1000 — HIFLD's field
+      # holds the +/-500 kV bipole's pole-to-pole rating. Seeding that as a
+      # yard level is what built the phantom 1000 kV buses and the 1000->500
+      # transformer that censused as a "765 kV+" class.
+      sub = Repo.get_by!(Substation, name: "LOUIS DOC BONIN")
+      %Geo.Point{coordinates: {lon, lat}} = sub.coordinates
+
+      insert_line = fn source_id, voltage_kv, line_type ->
+        Repo.insert!(%TransmissionLine{
+          source: "test",
+          source_id: source_id,
+          voltage_kv: voltage_kv,
+          line_type: line_type,
+          status: "in_service",
+          geometry: %Geo.LineString{
+            coordinates: [{lon, lat}, {lon + 0.01, lat}],
+            srid: 4326
+          },
+          sub_1: sub.name,
+          sub_2: "NOT AVAILABLE"
+        })
+      end
+
+      insert_line.("pdci", 1000.0, "dc")
+      insert_line.("uhv", 1100.0, "AC; OVERHEAD")
+      insert_line.("real-ehv", 500.0, "AC; OVERHEAD")
+
+      Substations.augment_voltage_levels_from_lines()
+
+      levels = Repo.get!(Substation, sub.id).voltage_levels
+
+      assert Enum.all?(levels, &(&1 <= 765.0)),
+             "a DC or above-765 kV line seeded a yard level: #{inspect(levels)}"
+
+      # Control: the pass did run, and a real EHV line at the same yard landed.
+      assert 500.0 in levels
+    end
+
     test "running it twice changes nothing the second time" do
       first = Substations.augment_voltage_levels_from_lines()
       assert first.substations_updated > 0

@@ -70,6 +70,13 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
   # Names that carry no identity: merging them would fuse unrelated endpoints.
   @sentinel_names ["NOT AVAILABLE", "NONE", "DEADHEAD"]
 
+  # Highest voltage that can be a real AC level of a yard. Above it the number
+  # is not a bus voltage at all: HIFLD writes an HVDC bipole's pole-to-pole
+  # rating into the same VOLTAGE field (LIN-12 — the Pacific DC Intertie,
+  # source_id 200823, CELILO->SYLMAR EAST, carries 1000 for a +/-500 kV link).
+  # The US grid's highest AC class is 765 kV.
+  @max_ac_kv 765.0
+
   @doc """
   Derive substations from transmission line API data.
 
@@ -325,6 +332,18 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
 
   Endpoints are attributed by name (`EndpointMatcher`), so this runs after
   both lines and substations are ingested and before `map_buses`.
+
+  ## What a line is not allowed to lend (LIN-12)
+
+  DC lines and anything above #{trunc(@max_ac_kv)} kV are excluded. The
+  Pacific DC Intertie is stored with `voltage_kv` 1000 — HIFLD's field holds
+  the +/-500 kV bipole's pole-to-pole rating — and `grid.ex` correctly keeps
+  it out of every AC solve, but this pass had no such filter and seeded a
+  1000 kV level into CELILO and SYLMAR EAST. `BusMapper` then built two
+  1000 kV buses and the 1000->500 and 1000->230 transformers to reach them,
+  and those stubs entered every Western snapshot and censused as a "765 kV+"
+  voltage class that does not exist. The corridor's real power transfer is
+  carried by `dc_ties`, not by these rows.
   """
   def augment_voltage_levels_from_lines do
     index = EndpointMatcher.build_index()
@@ -334,7 +353,9 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
     # to read their first and last point is gigabytes for eight numbers each.
     voltages_by_substation =
       from(l in TransmissionLine,
-        where: not is_nil(l.voltage_kv) and l.voltage_kv > 0.0 and not is_nil(l.geometry),
+        where:
+          not is_nil(l.voltage_kv) and l.voltage_kv > 0.0 and l.voltage_kv <= @max_ac_kv and
+            (is_nil(l.line_type) or l.line_type != "dc") and not is_nil(l.geometry),
         select: %{
           sub_1: l.sub_1,
           sub_2: l.sub_2,

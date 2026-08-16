@@ -27,9 +27,11 @@ defmodule PowerModel.Ingestion.VendoredPipelineTest do
   end
 
   test "the fixtures carry the counts the conversion produced", %{lines: lines, substations: subs} do
-    assert lines == 21
+    # All 25 converted features: 21 carry a HIFLD voltage, 4 are restored from
+    # their endpoint yards (TOPO-1).
+    assert lines == 25
     assert subs == 51
-    assert Repo.aggregate(TransmissionLine, :count) == 21
+    assert Repo.aggregate(TransmissionLine, :count) == 25
     assert Repo.aggregate(Substation, :count) == 51
   end
 
