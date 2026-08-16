@@ -245,6 +245,38 @@ L ≈ multi-week.
 >   secondary tier island-wide, redispatch keeps tertiary; protection layers
 >   read FDPF voltages only, never DC.
 
+> **STATUS 2026-08-16 (later): Wave 3b LANDED — item 20 complete, and with it
+> every Phase 4 item except the UI surfacing.** Measured:
+> - **The first voltage-driven cascade this model has produced** (ERCOT daytime
+>   hour, α = 0.20 / 10.67 GW — the largest AC-feasible load — single
+>   highest-flow line tripped): a 62-bus undervoltage pocket at 0.668 pu →
+>   17.92 MW of rooftop tripped on voltage across 48 buses (5.37 legacy /
+>   12.54 modern, breakdown balanced) → 7 PRC-024 undervoltage generator trips
+>   → 69 UVLS blocks by depth → settled in 4 steps / 24.5 s, conservation
+>   residual −0.0 MW. IEC overcurrent outruns conductor thermal at 186–324%
+>   loading (the two-timescale design working); distance relays evaluated
+>   6,964 branches, closest approach 1.007× a zone-3 reach.
+> - **Regression at real demand, attributed by kill-switch**: conductor thermal
+>   and the whole voltage layer are bit-identical no-ops; AGC is the entire
+>   delta. Run to SETTLEMENT (step-budget comparisons of unfinished cascades
+>   are invalid — a 50-step read showed a false 10× regression): baseline
+>   9,028.8 MW shed / 126 gens / 79 lines / 9 xfmrs in 89 steps vs wired
+>   9,213.2 MW (+2.0%) / 106 / 65 / 4 in 70 steps — AGC trades +184 MW shed
+>   for 20 fewer machines lost and settlement in half the simulated time,
+>   robust under perturbation controls.
+> - **Voltage-layer coverage at real demand is 93 of 170 island-solves**: the
+>   main island diverges (LIN-13) but every fragment converges — the voltage
+>   chain is live mid-cascade TODAY; Phase 2 data repair raises coverage
+>   rather than enabling it.
+> - Structural guarantees: one writer for the AC layer (no path from a DC
+>   solve to a voltage protection), Blue Cut double-count guarded both
+>   directions, AGC-secondary/tertiary no-double-draw, UVLS+UFLS accounting
+>   exact, intensive voltage timers conserved across splits.
+> - Remaining for Phase 4: the UI wave — UI-M15 (real N-1 from
+>   ContingencyScreening), surfacing voltage_layer/btm_trip_breakdown/AGC
+>   fields, reconciling the display-side AC refinement with FDPF's config
+>   (CAS-19 and the new event causes in CAS-17 ride along).
+
 > **Salvage note (2026-08-15):** the absorbed pre-reset history (tip `159e900`,
 > retrievable via `git show 159e900:<path>` — do NOT use `origin/master`, which
 > now points at current work; the richer harmonics-era `lib.rs` is blob

@@ -492,7 +492,11 @@ x=1.148 pu radial branch; Eastern 15 branches (max 243°), converges ≤15%. Fix
 items 8/10/12 + DAT-21 (impedance recompute, EHV classes, connectivity repair) — more
 solver is not. Until then the voltage chain (UVLS, distance relays, IBR LVRT) is inert
 at real demand: CAS-1's honest-degradation rule correctly keeps DC. Found by FDPF
-convergence probing, 2026-08-15.
+convergence probing, 2026-08-15. PRACTICAL CORRECTION (Wave 3b, 2026-08-16): in a settled
+real-demand ERCOT cascade, 93 of 170 island-solves DID carry a voltage layer — the ~5,400-bus
+main island diverges every time, but every fragment that breaks off converges. LIN-13 is
+true of the whole island and false of the pieces; the voltage chain is live mid-cascade
+today, and the Phase 2 data repair raises coverage rather than enabling it.
 **SOL-12 (MED) [OPEN]** `YBus.effective_reactance/1` floors |x| at 1.0e-3 pu — far
 coarser than the divide-by-zero guard requires. Three real ACTIVSg2000 branches
 (true x 7.0e-4–8.8e-4) are inflated 14–43%, confirmed as the sole source of the case's
@@ -520,11 +524,22 @@ contingency at dispatch time. Found by the β acceptance work, 2026-08-15.
 **CAS-18 (VOLUME, LOW) [OPEN]** Large cascades now emit ~16.7k ufls_shed events on the
 ERCOT reference case (was 948) — per-load event granularity at collapse scale. Needs a
 DAT-20-style aggregation decision when payloads are next reshaped (UI-H6 territory).
+**CAS-19 (LOW) [OPEN]** Two Wave 3b bookkeeping refinements, deliberately not made
+mid-wave: (a) `Protection.gfl_derate/3` takes one fleet-wide p_set_pu, treating every
+inverter as fully loaded (knee 0.833 pu); deriving per-unit p_set from
+p_dispatch/p_nameplate inside the function is strictly more accurate and
+gfl_available_fraction/2 already supports it. (b) `AGC.step/3` records commanded MW, not
+delivered — when Reserves caps delivery at the deficit, dispatched_by_unit overstates and
+reserve_remaining_mw/1 is pessimistic (measured 1,709 MW commanded vs ~100 MW deliverable;
+bounded and self-limiting since ACE → 0 as the deficit closes). Found at Wave 3b, 2026-08-16.
 **CAS-17 (DRIFT, LOW) [OPEN]** `FailureEvent` changeset whitelists component_type to
 transmission_line/generator/transformer/load/bus, but live event streams also carry
 water_facility, datacenter, island, cascade, and (new) btm_solar — nothing routes through
-the changeset today, so it is drift, not breakage. Reconcile when events are next persisted
-through it. Found at item-31 integration, 2026-08-15.
+the changeset today, so it is drift, not breakage. Wave 3b grew the surface again: causes
+uvls_shed (load), btm_voltage_trip (btm_solar), undervoltage_trip/overvoltage_trip
+(generator), voltage_violation + generator_voltage_trips (island), conductor_thermal,
+distance_zone1/2/3. Reconcile when events are next persisted through it. Found at item-31
+integration, 2026-08-15.
 **DAT-21 (DATA QUALITY, MED) [OPEN→Phase 5]** 13,520 substations (17%) in the native
 layer report no voltage and receive the default 138 kV bus; 70% of connectivity-repair
 joints connect two such yards (mean 0.78 km apart — the joins are right, the level and
