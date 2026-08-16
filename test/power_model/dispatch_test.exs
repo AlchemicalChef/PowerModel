@@ -4,7 +4,7 @@ defmodule PowerModel.DispatchTest do
   alias PowerModel.Demand.{BADemandHour, BAFuelHour}
   alias PowerModel.Dispatch
   alias PowerModel.Dispatch.Storage
-  alias PowerModel.Grid.{BalancingAuthority, Bus, Generator}
+  alias PowerModel.Grid.{BalancingAuthority, Bus, Generator, Load}
   alias PowerModel.Solver.{DCPowerFlow, Frequency}
 
   # July -> EIA summer capability season
@@ -212,6 +212,229 @@ defmodule PowerModel.DispatchTest do
 
       assert dispatch[1] == 0.0
       assert coverage.by_ba[1].by_fuel["other"].target_mw == -50.0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # The snapshot's share (REVIEW ENE-20)
+  # ---------------------------------------------------------------------------
+
+  describe "snapshot share" do
+    test "a BA at share 0.5 is offered half of every fuel, mix untouched" do
+      gens = [
+        gen(1, bus_id: 1, fuel_type: "BIT", p_max_mw: 500.0, capacity_factor: 0.9),
+        gen(2, bus_id: 1, fuel_type: "NG", p_max_mw: 500.0, capacity_factor: 0.4),
+        # A second BA at full share: its measurement is untouched.
+        gen(3, bus_id: 2, fuel_type: "WND", p_max_mw: 500.0)
+      ]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{
+            1 => %{"coal" => 300.0, "natural_gas" => 100.0},
+            2 => %{"wind" => 120.0}
+          },
+          ba_snapshot_share: %{1 => 0.5}
+        )
+
+      assert dispatch[1] == 150.0
+      assert dispatch[2] == 50.0
+      assert dispatch[3] == 120.0
+
+      ba = coverage.by_ba[1]
+      assert ba.share == 0.5
+      assert ba.by_fuel["coal"].target_mw == 150.0
+      # The published measurement is kept beside the target it was scaled into.
+      assert ba.by_fuel["coal"].reported_mw == 300.0
+      # Same share on both fuels, so the BA's fuel mix is exactly as published.
+      assert ba.by_fuel["natural_gas"].target_mw == 50.0
+      assert coverage.by_ba[2].share == 1.0
+      assert_in_delta coverage.share.aggregate, 320.0 / 520.0, 1.0e-12
+      assert coverage.share.partial_bas == 1
+    end
+
+    test "an offline unit is still an explicit 0.0 at a partial share" do
+      gens = [
+        gen(1, bus_id: 1, capacity_factor: 0.9, p_max_mw: 100.0),
+        gen(2, bus_id: 1, capacity_factor: 0.1, p_max_mw: 100.0)
+      ]
+
+      {:ok, %{dispatch: dispatch}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"natural_gas" => 160.0}},
+          ba_snapshot_share: %{1 => 0.5}
+        )
+
+      assert dispatch[1] == 80.0
+      assert dispatch[2] == 0.0
+    end
+
+    test "without the option and without a database every share is 1.0" do
+      # The property that keeps every repo-free fixture in this file valid:
+      # absent means whole, so nothing is scaled.
+      gens = [gen(1, bus_id: 1, p_max_mw: 500.0)]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"natural_gas" => 300.0}}
+        )
+
+      assert dispatch[1] == 300.0
+      assert coverage.by_ba[1].share == 1.0
+      assert coverage.share.aggregate == 1.0
+    end
+
+    test "the interchange identity is compared against the share of what EIA reported" do
+      gens = [gen(1, bus_id: 1, fuel_type: "BIT", p_max_mw: 500.0)]
+
+      {:ok, %{coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"coal" => 400.0}},
+          loads: [%{bus_id: 1, p_mw: 100.0}],
+          ba_snapshot_share: %{1 => 0.5}
+        )
+
+      ba = coverage.by_ba[1]
+      # 200 MW placed against 100 MW of served load: the snapshot's half of a
+      # BA exporting 200 MW, which is what half of the reported figure means.
+      assert ba.implied_interchange_mw == 100.0
+      assert ba.reported_interchange_mw == nil
+      assert ba.scaled_interchange_mw == nil
+      assert ba.share == 0.5
+    end
+  end
+
+  describe "identity anchoring (ENE20-C)" do
+    test "a screened BA's budget comes from demand + interchange, in its published mix" do
+      gens = [
+        gen(1, bus_id: 1, fuel_type: "WAT", prime_mover: "HY", p_max_mw: 20_000.0),
+        gen(2, bus_id: 1, fuel_type: "NUC", p_max_mw: 20_000.0)
+      ]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          # BPAT's shape: the published net-generation column is 4,000 MW
+          # short of the demand and interchange published beside it.
+          fuel_totals: %{1 => %{"hydro" => 6_000.0, "nuclear" => 2_000.0}},
+          ba_identity_anchor: %{1 => 12_000.0}
+        )
+
+      # 12,000 MW spread 3:1, the proportions the fuel columns report.
+      assert dispatch[1] == 9_000.0
+      assert dispatch[2] == 3_000.0
+      assert coverage.by_ba[1].identity_correction_mw == 4_000.0
+      assert coverage.share.bas_corrected == 1
+      assert coverage.share.identity_correction_mw == 4_000.0
+    end
+
+    test "the snapshot's share applies to the anchored budget too" do
+      gens = [gen(1, bus_id: 1, fuel_type: "WAT", prime_mover: "HY", p_max_mw: 20_000.0)]
+
+      {:ok, %{dispatch: dispatch}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"hydro" => 6_000.0}},
+          ba_identity_anchor: %{1 => 12_000.0},
+          ba_snapshot_share: %{1 => 0.25}
+        )
+
+      assert dispatch[1] == 3_000.0
+    end
+
+    test "an unscreened BA keeps its published measurement" do
+      gens = [gen(1, bus_id: 1, fuel_type: "BIT", p_max_mw: 500.0)]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"coal" => 300.0}},
+          ba_identity_anchor: %{2 => 9_999.0}
+        )
+
+      assert dispatch[1] == 300.0
+      assert coverage.by_ba[1].identity_correction_mw == 0.0
+      assert coverage.share.bas_corrected == 0
+    end
+  end
+
+  describe "minimum-load lumpiness (ENE20-B)" do
+    # ERCO's four nuclear units, to the MW: minimum loads at 90-97% of
+    # seasonal capability, totalling 4,775 MW against a 4,808 MW target.
+    defp erco_nuclear do
+      [
+        {6380, 1_235.0, 1_112.0},
+        {6392, 1_225.0, 1_103.0},
+        {5836, 1_340.0, 1_280.0},
+        {5857, 1_320.0, 1_280.0}
+      ]
+      |> Enum.map(fn {id, capability, p_min} ->
+        gen(id,
+          bus_id: 1,
+          fuel_type: "NUC",
+          prime_mover: "ST",
+          p_max_mw: capability,
+          summer_capacity_mw: capability,
+          winter_capacity_mw: capability,
+          p_min_mw: p_min,
+          capacity_factor: 0.925
+        )
+      end)
+    end
+
+    test "a target between two commitment points runs the whole group, not one fewer" do
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(erco_nuclear(), @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"nuclear" => 4_808.4}}
+        )
+
+      # A merit fill loads three units flat out and offers the 4th only the
+      # 1,008 MW left over — below its 1,280 MW minimum, so it used to stay
+      # cold and strand a gigawatt.
+      assert coverage.by_ba[1].by_fuel["nuclear"].online_units == 4
+      assert_in_delta coverage.unserved_mw, 0.0, 1.0e-6
+      assert_in_delta Enum.sum(Map.values(dispatch)), 4_808.4, 1.0e-6
+
+      for unit <- erco_nuclear() do
+        mw = dispatch[unit.id]
+        assert mw >= unit.p_min_mw - 1.0e-9, "unit #{unit.id} at #{mw} is below its minimum"
+        assert mw <= unit.p_max_mw + 1.0e-9, "unit #{unit.id} at #{mw} is above its capability"
+      end
+    end
+
+    test "MW the group genuinely cannot hold are still reported unserved" do
+      # Below every minimum load in the group: no commitment can bracket it.
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(erco_nuclear(), @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"nuclear" => 800.0}}
+        )
+
+      assert Enum.all?(Map.values(dispatch), &(&1 == 0.0))
+      assert_in_delta coverage.unserved_mw, 800.0, 1.0e-9
+    end
+
+    test "a merit fill that places every MW is left alone" do
+      # The rule must not reach groups the merit order already served. Here
+      # the marginal unit's share (1,140 MW) clears its own 1,112 MW minimum,
+      # so the merit fill places all 3,800 MW and the last unit stays cold —
+      # a re-load would have started it for no reason.
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(erco_nuclear(), @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"nuclear" => 3_800.0}}
+        )
+
+      assert dispatch[5836] == 1_340.0
+      assert dispatch[5857] == 1_320.0
+      assert dispatch[6380] == 1_140.0
+      assert dispatch[6392] == 0.0
+      assert_in_delta coverage.unserved_mw, 0.0, 1.0e-9
     end
   end
 
@@ -1100,6 +1323,98 @@ defmodule PowerModel.DispatchTest do
     end
 
     @tag :db
+    test "computes the share and the identity anchor from the database" do
+      # REVIEW ENE-20 end to end: half of the BA's load universe sits on a
+      # bus the snapshot does not hold, and the BA's published identity never
+      # closes — so the units are offered half of `demand + interchange`
+      # rather than all of the net-generation column.
+      ba = Repo.insert!(%BalancingAuthority{code: "BPAT", name: "Bonneville"})
+      in_snapshot = insert_geolocated_bus(ba)
+      off_snapshot = insert_geolocated_bus(ba)
+
+      Repo.insert!(%Load{bus_id: in_snapshot.id, p_mw: 400.0, status: "in_service"})
+      Repo.insert!(%Load{bus_id: off_snapshot.id, p_mw: 400.0, status: "in_service"})
+
+      hydro =
+        Repo.insert!(%Generator{
+          bus_id: in_snapshot.id,
+          fuel_type: "WAT",
+          prime_mover: "HY",
+          p_max_mw: 5_000.0,
+          p_min_mw: 0.0,
+          capacity_factor: 0.5
+        })
+
+      Repo.insert!(%BAFuelHour{
+        ba_code: "BPAT",
+        timestamp_utc: @hour,
+        fuel: "hydro",
+        net_generation_mw: 1_000.0
+      })
+
+      # 4,417 hours of a broken identity: net generation 1,000 MW against a
+      # demand and interchange totalling 2,000.
+      for offset <- 0..29 do
+        Repo.insert!(%BADemandHour{
+          balancing_authority_id: ba.id,
+          timestamp_utc: DateTime.add(@hour, offset * 3600, :second),
+          demand_mw: 1_200.0,
+          net_generation_mw: 1_000.0,
+          total_interchange_mw: 800.0
+        })
+      end
+
+      screened = PowerModel.Demand.broken_identity_bas()
+      assert screened[ba.id].closure_rate == 0.0
+      assert screened[ba.id].hours == 30
+      assert PowerModel.Demand.broken_identity_anchors(@hour)[ba.id] == 2_000.0
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour([hydro], @hour,
+          islands: [MapSet.new([in_snapshot.id])],
+          loads: [%{bus_id: in_snapshot.id, p_mw: 600.0}]
+        )
+
+      assert coverage.by_ba[ba.id].share == 0.5
+      # Half of 2,000, not half of the 1,000 MW the fuel column claims.
+      assert dispatch[hydro.id] == 1_000.0
+      assert coverage.by_ba[ba.id].identity_correction_mw == 500.0
+      assert coverage.by_ba[ba.id].scaled_interchange_mw == 400.0
+    end
+
+    @tag :db
+    test "a BA publishing generation but no demand row is reported unanchored" do
+      # REVIEW ENE-20 (ENE20-E): DEAA/GRID/HGMA/AVRN publish fuel MW with no
+      # demand row to anchor them. Their MW are real exports, so they are
+      # dispatched — and named, so the residual stays attributable.
+      ba = Repo.insert!(%BalancingAuthority{code: "GRID", name: "Gridforce"})
+      bus = insert_geolocated_bus(ba)
+
+      g =
+        Repo.insert!(%Generator{
+          bus_id: bus.id,
+          fuel_type: "NG",
+          prime_mover: "CT",
+          p_max_mw: 200.0,
+          p_min_mw: 0.0,
+          capacity_factor: 0.5
+        })
+
+      Repo.insert!(%BAFuelHour{
+        ba_code: "GRID",
+        timestamp_utc: @hour,
+        fuel: "natural_gas",
+        net_generation_mw: 900.0
+      })
+
+      {:ok, %{coverage: coverage}} = Dispatch.for_hour([g], @hour)
+
+      assert [%{code: "GRID", published_mw: 900.0, dispatched_mw: 200.0}] = coverage.unanchored
+      assert coverage.unanchored_mw == 900.0
+      assert coverage.no_data == []
+    end
+
+    @tag :db
     test "a minute past the hour resolves to the same hour's data" do
       ba = Repo.insert!(%BalancingAuthority{code: "ERCO", name: "ERCOT"})
       bus = Repo.insert!(%Bus{base_kv: 345.0, source: "test", balancing_authority_id: ba.id})
@@ -1125,5 +1440,17 @@ defmodule PowerModel.DispatchTest do
 
       assert dispatch[g.id] == 700.0
     end
+  end
+
+  # A geolocated, BA-assigned bus: the population `snapshot_load_shares/1`
+  # measures its universe over.
+  defp insert_geolocated_bus(ba) do
+    Repo.insert!(%Bus{
+      base_kv: 230.0,
+      source: "test",
+      source_id: "bus-#{System.unique_integer([:positive])}",
+      coordinates: %Geo.Point{coordinates: {-122.0, 45.6}, srid: 4326},
+      balancing_authority_id: ba.id
+    })
   end
 end

@@ -279,21 +279,22 @@ defmodule Mix.Tasks.PowerModel.Validate do
     row("dispatch source", sources, "")
   end
 
-  # The load side and the generation side are measured over different
-  # populations. Printing that first stops every balance number below it from
-  # being read as a dispatch failure.
+  # Since ENE-17 and ENE-20 both sides are measured over the SAME population:
+  # the snapshot's share of each BA's load universe scales its demand and its
+  # measured generation alike. Printing the share first says what fraction of
+  # the country every balance number below it describes.
   defp render_coverage(s) do
     Mix.shell().info("\n  COVERAGE UNIVERSES (the two sides of every balance number)")
 
     row(
       "load side",
-      "#{pct(s.bus_coverage_load_weighted)} of BA buses",
-      "carries 100% of BA demand"
+      "#{pct(s.load_share_weighted)} of BA load universe",
+      "serves that share of BA demand"
     )
 
     row(
       "generation side",
-      "#{pct(s.generation_coverage)} of measured MW",
+      "#{pct(s.generation_coverage)} of the MW offered",
       "placed on mapped units"
     )
 
@@ -314,7 +315,7 @@ defmodule Mix.Tasks.PowerModel.Validate do
         pad("tv", 8) <>
         pad("gen GW", 9) <>
         pad("meas GW", 10) <>
-        pad("bus cov", 9) <>
+        pad("share", 9) <>
         pad("gen cov", 9) <> pad("ix err", 10) <> "biggest fuel error"
     )
 
@@ -326,7 +327,7 @@ defmodule Mix.Tasks.PowerModel.Validate do
           pad(tv(ba.fuel_mix_tv), 8) <>
           pad(gw(ba.model_generation_mw), 9) <>
           pad(gw(ba.actual_generation_mw), 10) <>
-          pad(pct(ba.bus_coverage), 9) <>
+          pad(pct(ba.load_share), 9) <>
           pad(pct(ba.generation_coverage), 9) <>
           pad(mw(ba.interchange_mae_mw), 10) <> biggest_fuel_error(ba)
       )

@@ -34,6 +34,13 @@ defmodule PowerModel.Demand do
   `baseline_coverage/2` reports each BA's scoped/total share, and
   `scale_loads/3` logs it, so the share a run represents is always visible.
 
+  The generation side reads the same share back out through
+  `snapshot_load_shares/1`: `PowerModel.Dispatch` offers a BA's units their
+  share of that BA's measured MW, so the two sides of every balance metric
+  are scaled by one number (REVIEW ENE-20). Dispatch cannot recompute it from
+  the snapshot's loads — they have already been scaled by the time it runs —
+  which is why the share is read from the untouched table instead.
+
   Loads on buses without a BA assignment (run `mix power_model.ingest map_bas`)
   or in BAs without demand data for the hour keep their baseline values. A BA
   with no geolocated loads in the database (synthetic fixtures, an un-ingested
@@ -62,6 +69,21 @@ defmodule PowerModel.Demand do
   # Per-BA scale factors outside this range usually indicate bad demand data
   # or a badly skewed baseline; they are applied but logged.
   @sane_factor_range {0.05, 2.0}
+
+  # EIA's own published identity, `net_generation - (demand + interchange)`,
+  # counts as CLOSED for an hour when it lands inside this tolerance — the
+  # same shape `PowerModel.Ingestion.Validation` screens balance rows with,
+  # widened to 5% because this screen is looking for a systematic bias, not
+  # for rounding (REVIEW ENE-18).
+  @identity_tolerance_mw 50.0
+  @identity_tolerance_rel 0.05
+
+  # A BA is only called persistently broken on a real history (a handful of
+  # hours is a gap, not a pattern) and only when the identity fails on MOST
+  # of it. Measured 2026-08-15: BPAT closes 0 of 4,417 hours, MISO 4,389 of
+  # 4,389, CISO 2,090 of 2,473 — so this screen catches BPAT alone.
+  @identity_min_hours 24
+  @identity_max_closure 0.5
 
   @doc """
   The `{min, max}` UTC timestamps covered by ingested demand data,
@@ -285,9 +307,13 @@ defmodule PowerModel.Demand do
 
   # Every BA's whole load universe, in ONE query: in-service loads on
   # geolocated, BA-assigned buses. That is the same population the replay
-  # harness measures bus coverage over, so the load and generation sides of a
+  # harness measures its share over, so the load and generation sides of a
   # balance metric describe the same network.
-  defp universe_baselines do
+  #
+  # With `bus_ids` it is the same query restricted to a bus set, which is what
+  # makes the numerator of `snapshot_load_shares/1` and the denominator here
+  # two readings of one measurement.
+  defp universe_baselines(bus_ids \\ nil) do
     from(l in Load,
       join: b in Bus,
       on: l.bus_id == b.id,
@@ -297,6 +323,9 @@ defmodule PowerModel.Demand do
       group_by: [b.balancing_authority_id, l.load_type],
       select: {b.balancing_authority_id, l.load_type, sum(l.p_mw)}
     )
+    |> then(fn query ->
+      if bus_ids, do: from([l, _b] in query, where: l.bus_id in ^bus_ids), else: query
+    end)
     |> Repo.all()
     |> Enum.reduce(%{}, fn {ba_id, load_type, mw}, acc ->
       mw = (mw || 0.0) * 1.0
@@ -338,6 +367,119 @@ defmodule PowerModel.Demand do
          share: if(total_mw > 0.0, do: scoped_mw / total_mw, else: 0.0)
        }}
     end)
+  end
+
+  @doc """
+  What share of each BA's load universe a set of buses holds:
+  `%{ba_id => share in 0..1}`.
+
+  The same quantity `baseline_coverage/2` reports, read straight from the
+  `loads` table for an arbitrary bus set instead of from a snapshot's load
+  list. That difference is the point: by the time `PowerModel.Dispatch` runs,
+  the snapshot's loads have already been through `scale_loads/3` and no
+  longer carry the baseline the share is defined against, while the table
+  itself is never rewritten.
+
+  Non-datacenter loads only — datacenters are held flat and carry absolute
+  MW, so they are no part of the share the hourly curve is applied through
+  (ENE-17). A BA with no load on the bus set is omitted; callers read an
+  absent BA as 1.0, i.e. "no part of this BA's load universe is missing here".
+
+  Because the read happens per call, connectivity repair that pulls off-main
+  fragments back into the main component moves these shares toward 1.0 on
+  their own, and the dispatch correction they drive retires itself
+  (REVIEW ENE-20).
+  """
+  @spec snapshot_load_shares([integer()]) :: %{optional(integer()) => float()}
+  def snapshot_load_shares([]), do: %{}
+
+  def snapshot_load_shares(bus_ids) when is_list(bus_ids) do
+    universe = universe_baselines()
+    scoped = universe_baselines(bus_ids)
+
+    Map.new(scoped, fn {ba_id, %{baseline_mw: scoped_mw}} ->
+      {total_mw, _dc_mw} = denominator(ba_id, scoped_mw, 0.0, universe)
+
+      {ba_id, if(total_mw > 0.0, do: min(scoped_mw / total_mw, 1.0), else: 0.0)}
+    end)
+  end
+
+  @doc """
+  Balancing authorities whose own EIA-930 identity — `net_generation −
+  (demand + interchange)` — is persistently broken:
+  `%{ba_id => %{hours:, closed:, closure_rate:, mean_error_mw:}}`.
+
+  REVIEW ENE-18 recorded three such BAs by name. That list is not a constant:
+  the ENE-16 re-ingest fixed two of them, and a re-ingest can fix or break
+  others. So the screen is a measurement, taken per call — a BA qualifies
+  only with at least #{@identity_min_hours} hours of history and a closure
+  rate below #{trunc(@identity_max_closure * 100)}%.
+
+  `PowerModel.Dispatch` uses it to anchor a screened BA's generation budget on
+  `demand + interchange` rather than on a net-generation column that cannot be
+  reconciled with either.
+  """
+  @spec broken_identity_bas() :: %{optional(integer()) => map()}
+  def broken_identity_bas do
+    {:ok, %{rows: rows}} =
+      Repo.query(
+        """
+        SELECT d.balancing_authority_id,
+               count(*),
+               count(*) FILTER (
+                 WHERE abs(d.net_generation_mw - (d.demand_mw + d.total_interchange_mw))
+                       <= greatest($1, $2 * abs(d.demand_mw))),
+               avg(d.net_generation_mw - (d.demand_mw + d.total_interchange_mw))
+        FROM ba_demand_hourly d
+        WHERE d.demand_mw IS NOT NULL AND d.demand_mw > 0
+          AND d.net_generation_mw IS NOT NULL
+          AND d.total_interchange_mw IS NOT NULL
+        GROUP BY 1
+        """,
+        [@identity_tolerance_mw, @identity_tolerance_rel]
+      )
+
+    for [ba_id, hours, closed, mean_error] <- rows,
+        hours >= @identity_min_hours,
+        closed / hours < @identity_max_closure,
+        into: %{} do
+      {ba_id,
+       %{
+         hours: hours,
+         closed: closed,
+         closure_rate: closed / hours,
+         mean_error_mw: (mean_error || 0.0) * 1.0
+       }}
+    end
+  end
+
+  @doc """
+  Generation anchor at `timestamp` for every BA `broken_identity_bas/0`
+  screens in: `%{ba_id => demand_mw + total_interchange_mw}`.
+
+  What the BA's fleet must have produced to serve the demand and interchange
+  EIA published for it, which for a screened BA is the only self-consistent
+  reading of its row.
+  """
+  @spec broken_identity_anchors(DateTime.t()) :: %{optional(integer()) => float()}
+  def broken_identity_anchors(%DateTime{} = timestamp) do
+    screened = broken_identity_bas()
+
+    if map_size(screened) == 0 do
+      %{}
+    else
+      hour = truncate_to_hour(timestamp)
+      ba_ids = Map.keys(screened)
+
+      from(d in BADemandHour,
+        where:
+          d.timestamp_utc == ^hour and d.balancing_authority_id in ^ba_ids and
+            not is_nil(d.demand_mw) and not is_nil(d.total_interchange_mw),
+        select: {d.balancing_authority_id, d.demand_mw + d.total_interchange_mw}
+      )
+      |> Repo.all()
+      |> Map.new()
+    end
   end
 
   # ENE-9: a zero/negative demand row would produce factor 0.0 and black out

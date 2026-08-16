@@ -843,10 +843,17 @@ defmodule PowerModel.Ingestion.Validation do
   residual means the per-fuel columns are being read wrong (the ENE-16 class
   of bug), not that the grid failed to balance. Measured 2026-08-15: 94.5% of
   rows screened in, 4.0% of those out of tolerance (mean residual 53.5 MW,
-  concentrated in PJM). Three BAs — BPAT (0 of 4,417 hours), MISO (5) and
-  CISO (611 of 2,473) — fail EIA's own identity on most or all of their
-  hours and are reported separately: almost nothing about them can be
-  validated at all.
+  concentrated in PJM).
+
+  WHICH BAs fail EIA's own identity is a measurement, not a list. The ENE-16
+  re-ingest changed the answer: at a 5% tolerance MISO now closes 4,389 of
+  4,389 hours and CISO 2,090 of 2,473 (84.5%), while **BPAT still closes 0 of
+  4,417** (mean residual -4,317 MW, sd 725 — a systematic bias, not noise) and
+  is the one BA about which almost nothing can be validated. The next-worst is
+  IID at 60.9%. `PowerModel.Demand.broken_identity_bas/0` re-runs that screen
+  per call, and is what `PowerModel.Dispatch` anchors a broken BA's generation
+  budget on `demand + interchange` from (REVIEW ENE-20). Re-measured
+  2026-08-15 after ENE-16.
 
   ## Options
 
@@ -1073,6 +1080,7 @@ defmodule PowerModel.Ingestion.Validation do
     JOIN balancing_authorities ba ON ba.id = d.balancing_authority_id
     JOIN fuel ON fuel.ba_code = ba.code AND fuel.timestamp_utc = d.timestamp_utc
     WHERE d.net_generation_mw IS NOT NULL AND d.total_interchange_mw IS NOT NULL
+      AND d.demand_mw IS NOT NULL
   )
   SELECT code,
          count(*),

@@ -27,14 +27,14 @@ defmodule PowerModel.Validation.Replay do
       load should reproduce its real interchange; the residual is how far
       from that the modeled fleet lands. It is NOT an independent signal —
       see the decomposition below.
-    * **Served-load error** per BA: the snapshot's scaled load against EIA
-      demand. `Demand.scale_loads/3` makes this zero BY CONSTRUCTION wherever
-      it produced a factor — it rescales each BA's snapshot loads to that
-      BA's whole demand however few of the BA's buses survived into the
-      snapshot. A non-zero value therefore means the BA got NO factor and
-      kept the ~2× synthetic baseline (REVIEW ENE-8/ENE-13), which is the
-      failure worth catching. `load_scale_factor` (served ÷ baseline) is
-      reported alongside so the metric carries the size of the correction
+    * **Served-load error** per BA: the snapshot's scaled load against its
+      SHARE of EIA demand. `Demand.scale_loads/3` makes this zero BY
+      CONSTRUCTION wherever it produced a factor — it serves each BA the
+      fraction of its demand matching the fraction of its load baseline the
+      snapshot holds (ENE-17). A non-zero value therefore means the BA got NO
+      factor and kept the ~2× synthetic baseline (REVIEW ENE-8/ENE-13), which
+      is the failure worth catching. `load_scale_factor` (served ÷ baseline)
+      is reported alongside so the metric carries the size of the correction
       rather than an uninformative zero.
     * **Generation-conservation residual**: `Σdispatch − Σload` per
       electrical island, plus the MW the dispatch could not place at all
@@ -45,38 +45,43 @@ defmodule PowerModel.Validation.Replay do
       Phase 2 plant-mapping progress shows up here as the nuclear line
       falling.
 
-  ## Two coverage universes — read the balance numbers through this
+  ## One coverage universe — read every balance number through this
 
-  The generation side and the load side of every balance metric are measured
-  over different populations, and will stay that way until ROADMAP item 12
-  (connectivity repair) lands:
+  Both sides of every balance metric are measured over the SAME population,
+  and `load_share` is what names it: the fraction of each BA's geolocated
+  load baseline this snapshot holds. `Demand.scale_loads/3` serves that share
+  of the BA's demand (ENE-17) and `PowerModel.Dispatch` offers that share of
+  its measured generation (ENE-20), both from
+  `Demand.snapshot_load_shares/1` — the same function this harness calls, so
+  the share reported here is the share the dispatch applied.
 
-    * **Load**: `Demand.scale_loads/3` puts a BA's ENTIRE demand on whichever
-      of its buses reached the simulated component — measured nationally at
-      `bus_coverage` ≈ 0.28 of geolocated buses. Served load therefore equals
-      EIA demand exactly, on roughly a quarter of the real network.
-    * **Generation**: only measured MW that found a mapped in-service unit of
-      the right fuel is placed — `generation_coverage`, measured ≈ 0.86.
+  Every EIA reference is therefore scaled by it before an error is taken
+  against it (`scaled_demand_mw`, `scaled_generation_mw`,
+  `scaled_interchange_mw`), while the raw published figures stay beside them
+  under their own names. What is left in `generation_coverage` is the
+  fleet-mapping gap alone — measured MW the snapshot was offered that no
+  mapped in-service unit of the right fuel could hold (REVIEW ENE-15) — with
+  none of the old scaling asymmetry mixed into it.
 
-  So a negative conservation residual is mostly this asymmetry, NOT a
-  dispatch failure: the load side is complete by construction and the
-  generation side is short by exactly the MW no unit could hold. Both ratios
-  are reported per BA and in every summary (and in the CI summary line) so
-  the residual is never read as the dispatcher losing power.
+  Before ENE-17 the two sides genuinely disagreed: a BA's whole demand landed
+  on whatever slice of its buses survived (≈ 0.28 of geolocated buses
+  nationally) while only ≈ 0.86 of its measured MW found a unit, and the
+  conservation residual was mostly that. It no longer is, and a large
+  residual is now a real finding.
 
-  The interchange error is likewise not independent. With served load equal
-  to demand, it decomposes exactly:
+  The interchange error is not an independent signal. It decomposes exactly:
 
       interchange_error = generation_error + eia_identity_residual
                           − served_load_error
 
-  where `generation_error` is model minus measured generation (the placement
-  gap) and `eia_identity_residual` is EIA's own `generation − demand −
-  interchange`, which does not close on 4% of BA-hours and never closes for
-  BPAT, MISO or CISO. All three terms are reported per BA. Note that
-  `Dispatch`'s own coverage `implied_interchange_mw` offers no cleaner
-  alternative — it is built from the same scaled loads (`dispatch.ex:492`)
-  and carries the identical distortion.
+  where `generation_error` is model minus OFFERED generation (the placement
+  gap) and `eia_identity_residual` is the snapshot's share of EIA's own
+  `generation − demand − interchange`, which does not close on 4% of BA-hours
+  and never closes for BPAT (0 of 4,417 — see `Demand.broken_identity_bas/0`,
+  which screens by measurement rather than by a stored list). All three terms
+  are reported per BA. Note that `Dispatch`'s own coverage
+  `implied_interchange_mw` offers no cleaner alternative — it is built from
+  the same scaled loads and carries the identical distortion.
 
   ## Legacy comparison
 
@@ -122,11 +127,15 @@ defmodule PowerModel.Validation.Replay do
   alias PowerModel.Demand.BAFuelHour
   alias PowerModel.Dispatch
   alias PowerModel.Grid
-  alias PowerModel.Grid.{BalancingAuthority, Bus}
+  alias PowerModel.Grid.BalancingAuthority
   alias PowerModel.Repo
   alias PowerModel.Simulation.Cascading.IslandDetector
 
-  @schema_version 1
+  # v2 (REVIEW ENE-20): `bus_coverage`/`snapshot_buses` became `load_share`;
+  # the served-load, generation and interchange errors are taken against
+  # share-scaled references (`scaled_*`) rather than against the whole BA's
+  # published figures.
+  @schema_version 2
 
   # Model MW on a fuel EIA-930 has no generation column for. Never present in
   # the measurement, so every MW here is a full contribution to TV distance.
@@ -303,37 +312,17 @@ defmodule PowerModel.Validation.Replay do
       bus_interconnection: bus_interconnection,
       ba_codes: ba_codes(),
       ba_interconnection: ba_interconnection(snapshots),
-      ba_bus_coverage: ba_bus_coverage(bus_ba)
+      ba_load_share: Demand.snapshot_load_shares(Enum.map(buses, & &1.id))
     }
   end
 
-  # What share of each BA's geolocated buses the snapshot actually contains.
-  # The denominator is every geolocated bus of the BA, not just those inside
-  # the selected interconnections, because that is the universe the LOAD side
-  # is scaled against: `Demand.scale_loads/3` puts the BA's whole demand on
-  # whatever slice survived, so a BA at 0.3 coverage carries 100% of its
-  # demand on 30% of its buses.
-  defp ba_bus_coverage(bus_ba) do
-    geolocated =
-      from(b in Bus,
-        where: not is_nil(b.coordinates) and not is_nil(b.balancing_authority_id),
-        group_by: b.balancing_authority_id,
-        select: {b.balancing_authority_id, count(b.id)}
-      )
-      |> Repo.all()
-      |> Map.new()
-
-    in_snapshot = bus_ba |> Map.values() |> Enum.reject(&is_nil/1) |> Enum.frequencies()
-
-    Map.new(geolocated, fn {ba_id, total} ->
-      {ba_id,
-       %{
-         snapshot_buses: Map.get(in_snapshot, ba_id, 0),
-         geolocated_buses: total,
-         coverage: safe_div(Map.get(in_snapshot, ba_id, 0), total)
-       }}
-    end)
-  end
+  # What share of each BA's LOAD UNIVERSE the snapshot holds — the exact
+  # number `Demand.scale_loads/3` scales its loads by and `PowerModel.Dispatch`
+  # scales its fuel targets by, from the one function all three call
+  # (REVIEW ENE-20). It replaced a bus-count coverage ratio, which measured a
+  # different thing and drifted from the applied share by 9 points on PJM
+  # (0.764 of buses against 0.671 of load MW): a harness keyed to bus counts
+  # would score a correctly-scaled dispatch as wrong.
 
   # Every BA, not just the modeled ones: the unmodeled BAs are reported by
   # code too, and there are only a few dozen rows.
@@ -376,9 +365,10 @@ defmodule PowerModel.Validation.Replay do
       fuel_totals: Demand.fuel_generation_at(hour),
       demand: Demand.demand_at(hour),
       interchange: Demand.interchange_at(hour),
+      ba_identity_anchor: Demand.broken_identity_anchors(hour),
       ba_codes: context.ba_codes,
       ba_interconnection: Map.get(context, :ba_interconnection, %{}),
-      ba_bus_coverage: Map.get(context, :ba_bus_coverage, %{})
+      ba_load_share: Map.get(context, :ba_load_share, %{})
     }
   end
 
@@ -426,11 +416,15 @@ defmodule PowerModel.Validation.Replay do
       interchange: %{},
       ba_codes: %{},
       ba_interconnection: %{},
-      ba_bus_coverage: %{}
+      ba_load_share: %{},
+      ba_identity_anchor: %{}
     }
 
     Map.merge(defaults, input)
   end
+
+  # An unlisted BA is whole: nothing of its load universe is missing here.
+  defp load_share(input, ba_id), do: Map.get(input.ba_load_share, ba_id, 1.0)
 
   @doc """
   The dispatch a simulation would run for this hour, as
@@ -445,12 +439,19 @@ defmodule PowerModel.Validation.Replay do
   def dispatch_for(input, :measured) do
     input = normalize_input(input)
 
+    # `:fuel_totals` declares this harness the source of truth for the hour, so
+    # Dispatch makes no database read of its own — the share has to travel with
+    # it. Passing the harness's own map is what pins the two sides together:
+    # the share the report prints is the share the dispatch applied, from one
+    # `Demand.snapshot_load_shares/1` call (REVIEW ENE-20).
     dispatch_opts = [
       bus_ba: input.bus_ba,
       bus_interconnection: input.bus_interconnection,
       islands: input.islands,
       loads: input.loads,
-      fuel_totals: input.fuel_totals
+      fuel_totals: input.fuel_totals,
+      ba_snapshot_share: input.ba_load_share,
+      ba_identity_anchor: input.ba_identity_anchor
     ]
 
     case Dispatch.for_hour(input.generators, input.hour, dispatch_opts) do
@@ -536,6 +537,16 @@ defmodule PowerModel.Validation.Replay do
     demand_mw = Map.get(input.demand, ba_id)
     reported_ix = Map.get(input.interchange, ba_id)
 
+    # REVIEW ENE-20: every EIA reference is the WHOLE BA's, and the snapshot
+    # holds `share` of it on both sides. Scoring an error against the whole
+    # figure would charge the model for the part of the BA that is not in the
+    # run — so each reference is scaled by the same share the dispatch and the
+    # load scaling used, and the decomposition below stays an identity.
+    share = load_share(input, ba_id)
+    scaled_gen = actual_gen * share
+    scaled_demand = demand_mw && demand_mw * share
+    scaled_ix = reported_ix && reported_ix * share
+
     %{
       ba_id: ba_id,
       ba_code: Map.get(input.ba_codes, ba_id) || "BA #{ba_id}",
@@ -543,30 +554,36 @@ defmodule PowerModel.Validation.Replay do
       fuel_mix_tv: tv_distance(model_mix, actual_mix),
       model_generation_mw: model_gen,
       actual_generation_mw: actual_gen,
-      generation_error_mw: model_gen - actual_gen,
+      load_share: share,
+      scaled_generation_mw: scaled_gen,
+      scaled_demand_mw: scaled_demand,
+      scaled_interchange_mw: scaled_ix,
+      # The placement gap: MW the snapshot was OFFERED that no mapped unit of
+      # the right fuel could hold.
+      generation_error_mw: model_gen - scaled_gen,
       model_fuel_mw: fill_fuels(model_mix),
       actual_fuel_mw: fill_fuels(actual_mix),
       served_load_mw: load_mw,
       baseline_load_mw: baseline_mw,
       load_scale_factor: safe_div(load_mw, baseline_mw),
       eia_demand_mw: demand_mw,
-      served_load_error_mw: demand_mw && load_mw - demand_mw,
-      served_load_error_pct: relative_error(load_mw, demand_mw),
+      served_load_error_mw: scaled_demand && load_mw - scaled_demand,
+      served_load_error_pct: relative_error(load_mw, scaled_demand),
       implied_interchange_mw: model_gen - load_mw,
       reported_interchange_mw: reported_ix,
-      interchange_error_mw: reported_ix && model_gen - load_mw - reported_ix,
-      # EIA's own trio need not close (measured: 4% of BA-hours miss by more
-      # than 1 GW, and BPAT/MISO/CISO miss on nearly every hour). Carrying it
-      # here keeps the interchange decomposition exact instead of charging
-      # EIA's inconsistency to the model.
-      eia_identity_residual_mw: reported_ix && demand_mw && actual_gen - demand_mw - reported_ix,
-      # The two coverage universes, side by side: `bus_coverage` is the share
-      # of the BA's geolocated buses the snapshot holds (the LOAD side lands
-      # 100% of demand on it regardless), `generation_coverage` is the share
-      # of measured MW the mapped fleet could hold.
-      bus_coverage: get_in(input.ba_bus_coverage, [ba_id, :coverage]),
-      snapshot_buses: get_in(input.ba_bus_coverage, [ba_id, :snapshot_buses]),
-      generation_coverage: safe_div(model_gen, actual_gen),
+      interchange_error_mw: scaled_ix && model_gen - load_mw - scaled_ix,
+      # EIA's own trio need not close (measured 2026-08-15: 4% of BA-hours
+      # miss by more than 1 GW, and BPAT misses on every one of its 4,417).
+      # Carrying it here keeps the interchange decomposition exact instead of
+      # charging EIA's inconsistency to the model.
+      eia_identity_residual_mw:
+        scaled_ix && scaled_demand && scaled_gen - scaled_demand - scaled_ix,
+      # The two coverage universes, side by side. Since ENE-17 and ENE-20 they
+      # are the SAME universe by construction — `load_share` is applied to the
+      # BA's demand and to its measured generation alike — so
+      # `generation_coverage` is now purely the fleet-mapping gap
+      # (REVIEW ENE-15), with none of the old scaling asymmetry mixed into it.
+      generation_coverage: safe_div(model_gen, scaled_gen),
       dispatch_to_load: safe_div(model_gen, load_mw)
     }
   end
@@ -782,19 +799,20 @@ defmodule PowerModel.Validation.Replay do
       model_load_mw: sum_by(input.loads, & &1.p_mw),
       actual_generation_mw: sum_by(scored, & &1.actual_generation_mw),
       eia_demand_mw: sum_by(scored, &(&1.eia_demand_mw || 0.0)),
-      # The asymmetry the conservation residual is mostly made of: the load
-      # side carries every scored BA's full demand, the generation side only
-      # the measured MW that found a mapped unit, and the buses under both
-      # are a fraction of the real network.
+      # What is left of the conservation residual once ENE-17 and ENE-20 put
+      # both sides on the same universe: the measured MW the snapshot was
+      # offered and no mapped unit of the right fuel could hold.
       generation_coverage:
         safe_div(
           sum_by(scored, & &1.model_generation_mw),
-          sum_by(scored, & &1.actual_generation_mw)
+          sum_by(scored, & &1.scaled_generation_mw)
         ),
       dispatch_to_load:
         safe_div(sum_by(scored, & &1.model_generation_mw), sum_by(scored, & &1.served_load_mw)),
-      bus_coverage_load_weighted:
-        weighted_mean(Enum.map(scored, & &1.bus_coverage), demand_weights),
+      # The share of their load universe the scored BAs are represented by —
+      # the one number both sides were scaled with, and the one that moves
+      # toward 1.0 as connectivity repair lands (REVIEW ENE-20).
+      load_share_weighted: weighted_mean(Enum.map(scored, & &1.load_share), demand_weights),
       conservation_residual_mw: islands.residual_mw,
       island_abs_residual_mw: islands.abs_residual_mw,
       unserved_mw: coverage && coverage.unserved_mw,
@@ -862,7 +880,7 @@ defmodule PowerModel.Validation.Replay do
     served_load_mae_mw served_load_bias_mw served_load_mape load_scale_factor_median
     outsized_scale_load_mw
     model_generation_mw model_load_mw actual_generation_mw eia_demand_mw
-    generation_coverage dispatch_to_load bus_coverage_load_weighted
+    generation_coverage dispatch_to_load load_share_weighted
     conservation_residual_mw island_abs_residual_mw
     interchange_from_placement_mw interchange_from_eia_residual_mw
     interchange_from_load_error_mw
@@ -918,7 +936,8 @@ defmodule PowerModel.Validation.Replay do
     served_load_mw baseline_load_mw load_scale_factor
     eia_demand_mw served_load_error_mw served_load_error_pct
     implied_interchange_mw reported_interchange_mw interchange_error_mw
-    eia_identity_residual_mw bus_coverage generation_coverage dispatch_to_load
+    eia_identity_residual_mw load_share scaled_generation_mw scaled_demand_mw
+    scaled_interchange_mw generation_coverage dispatch_to_load
   )a
 
   defp aggregate_bas(scores) do
@@ -1037,7 +1056,7 @@ defmodule PowerModel.Validation.Replay do
   @summary_keys ~w(
     hours bas_scored tv_load_weighted tv_generation_weighted tv_mean
     interchange_mae_mw served_load_mape conservation_residual_mw
-    unplaced_mw unplaced_nuclear_mw generation_coverage bus_coverage_load_weighted
+    unplaced_mw unplaced_nuclear_mw generation_coverage load_share_weighted
   )a
 
   defp metric_pairs(summary) do

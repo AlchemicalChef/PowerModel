@@ -343,19 +343,29 @@ defmodule PowerModel.Ingestion.EIA.Form930 do
     end
   end
 
+  # REVIEW ENE-20 (ENE20-E): the row is kept whenever ANY of the three series
+  # holds a number, not only when demand does. A generation-only BA — DEAA,
+  # GRID, HGMA, AVRN — has no demand cell to fill but does publish net
+  # generation and total interchange, and dropping the whole row for the blank
+  # demand cell threw those away, leaving ~1.6 GW of Western injection with
+  # nothing to anchor it to. `demand_mw` is nullable precisely so this row can
+  # exist; every reader already treats a non-numeric demand as "no demand
+  # data" (`Demand.ba_scale_factors/3` keeps such a BA's loads at baseline).
   defp demand_entries(row, columns, ba_codes, code, timestamp, now) do
     demand = first_number(row, columns.demand)
+    net_gen = first_number(row, columns.net_gen)
+    interchange = first_number(row, columns.interchange)
     ba_id = Map.get(ba_codes, code)
 
-    if ba_id && demand do
+    if ba_id && (demand || net_gen || interchange) do
       [
         {:demand,
          %{
            balancing_authority_id: ba_id,
            timestamp_utc: timestamp,
            demand_mw: demand,
-           net_generation_mw: first_number(row, columns.net_gen),
-           total_interchange_mw: first_number(row, columns.interchange),
+           net_generation_mw: net_gen,
+           total_interchange_mw: interchange,
            inserted_at: now,
            updated_at: now
          }}

@@ -21,21 +21,50 @@ defmodule PowerModel.Ingestion.EIA.Form930Test do
   end
 
   defp demand_for(code, iso8601) do
+    case demand_row(code, iso8601) do
+      nil -> nil
+      row -> row.demand_mw
+    end
+  end
+
+  defp demand_row(code, iso8601) do
     {:ok, ts, 0} = DateTime.from_iso8601(iso8601)
 
     Repo.one(
       from d in BADemandHour,
         join: ba in assoc(d, :balancing_authority),
-        where: ba.code == ^code and d.timestamp_utc == ^ts,
-        select: d.demand_mw
+        where: ba.code == ^code and d.timestamp_utc == ^ts
     )
   end
 
-  test "ingests demand rows, skipping generation-only BAs" do
-    assert {:ok, 9} = Form930.ingest_file(@fixture)
+  test "keeps a generation-only BA's row for its generation and interchange" do
+    assert {:ok, 11} = Form930.ingest_file(@fixture)
 
-    # 4 CISO + 4 ERCO + 1 SEC; GRID has no demand and is skipped entirely
-    assert Repo.aggregate(BADemandHour, :count) == 9
+    # 4 CISO + 4 ERCO + 1 SEC + 2 GRID. REVIEW ENE-20 (ENE20-E): GRID leaves
+    # the demand cell blank, and dropping the whole row for that threw away
+    # the net generation and interchange published beside it — the only
+    # anchor a generation-only BA's injection has.
+    assert Repo.aggregate(BADemandHour, :count) == 11
+
+    # Stored at hour start, so this is the row whose UTC end is 19:00.
+    row = demand_row("GRID", "2024-07-15T18:00:00Z")
+    assert row.demand_mw == nil
+    assert row.net_generation_mw == 618.0
+    assert row.total_interchange_mw == 618.0
+  end
+
+  test "a row with none of the three series is still dropped" do
+    {:ok, _} = Form930.ingest_file(@fixture)
+
+    # Nothing in the fixture is blank across all three, so every ingested row
+    # carries at least one number — an all-blank row would carry no data at
+    # all and has nothing to contribute.
+    assert Repo.all(
+             from d in BADemandHour,
+               where:
+                 is_nil(d.demand_mw) and is_nil(d.net_generation_mw) and
+                   is_nil(d.total_interchange_mw)
+           ) == []
   end
 
   test "prefers adjusted demand, falls back to raw when adjusted is blank" do
@@ -65,7 +94,7 @@ defmodule PowerModel.Ingestion.EIA.Form930Test do
   end
 
   test "re-ingestion is idempotent and refreshes values" do
-    {:ok, 9} = Form930.ingest_file(@fixture)
+    {:ok, 11} = Form930.ingest_file(@fixture)
 
     # Corrupt one value, re-ingest, confirm it is restored and nothing duplicated
     {:ok, ts, 0} = DateTime.from_iso8601("2024-07-15T17:00:00Z")
@@ -73,9 +102,9 @@ defmodule PowerModel.Ingestion.EIA.Form930Test do
     from(d in BADemandHour, where: d.timestamp_utc == ^ts)
     |> Repo.update_all(set: [demand_mw: 1.0])
 
-    {:ok, 9} = Form930.ingest_file(@fixture)
+    {:ok, 11} = Form930.ingest_file(@fixture)
 
-    assert Repo.aggregate(BADemandHour, :count) == 9
+    assert Repo.aggregate(BADemandHour, :count) == 11
     assert demand_for("CISO", "2024-07-15T17:00:00Z") == 41_123.0
   end
 
@@ -149,7 +178,7 @@ defmodule PowerModel.Ingestion.EIA.Form930Test do
       assert Enum.sort(stored) -- BAFuelHour.fuels() == []
     end
 
-    test "ingests fuel rows for generation-only BAs that have no demand row" do
+    test "ingests fuel rows for generation-only BAs, which report no demand" do
       {:ok, _} = Form930.ingest_file(@fuels_fixture)
 
       assert demand_for("GRID", "2024-07-15T18:00:00Z") == nil
@@ -189,7 +218,7 @@ defmodule PowerModel.Ingestion.EIA.Form930Test do
     File.cp!(@fixture, Path.join(tmp, "EIA930_BALANCE_2024_Jul_Dec.csv"))
 
     try do
-      assert {:ok, 9} = Form930.ingest(tmp)
+      assert {:ok, 11} = Form930.ingest(tmp)
     after
       File.rm_rf!(tmp)
     end

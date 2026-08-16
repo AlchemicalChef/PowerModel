@@ -8,14 +8,37 @@ defmodule PowerModel.Dispatch do
   filled into that BA's in-service units of that fuel in merit order —
   capacity factor descending — each unit capped at its seasonal capability.
 
-  ## Absolute MW, never rescaled
+  ## Absolute MW, scaled only by the snapshot's share (REVIEW ENE-20)
 
-  The measured MW are used as absolute targets. Nothing is normalized to the
+  The measured MW are used as absolute targets: nothing is normalized to the
   snapshot's load, so a BA's generation minus its load reproduces its real
   interchange by construction instead of the fictitious self-sufficiency a
-  load-balanced dispatch imposes (ROADMAP item 6). Coverage therefore reports
-  `implied_interchange_mw` alongside the interchange EIA reported, and the two
-  should agree wherever the network's BA mapping is complete.
+  load-balanced dispatch imposes (ROADMAP item 6).
+
+  There is exactly one scaling, and it is the one the LOAD side already
+  applies. `PowerModel.Demand.scale_loads/3` serves a snapshot its SHARE of
+  each BA's demand — the fraction of that BA's geolocated load baseline the
+  snapshot actually holds (ENE-17) — so this module offers that BA's units the
+  same share of its measured generation. Placing 100% of a BA's fuel MW into a
+  snapshot serving 67% of its demand is what made Eastern's operating point run
+  65.3 GW long, which is 23% of Eastern's load baseline sitting on off-main
+  fragments showing up on the generation side and nowhere else.
+
+  The share is read from the database AT DISPATCH TIME
+  (`Demand.snapshot_load_shares/1`) rather than carried as a constant, so
+  connectivity repair that returns those fragments to the main component moves
+  every share toward 1.0 and retires the correction on its own. Coverage
+  reports it per BA and in aggregate, and compares `implied_interchange_mw`
+  against `share x reported` — the whole BA's interchange belongs to the whole
+  BA, not to this slice of it.
+
+  One BA-level exception (ENE20-C). EIA's own identity `net_generation -
+  (demand + interchange)` does not close for every BA: BPAT misses by ~4.4 GW
+  on every hour it publishes. For a BA `Demand.broken_identity_bas/0` screens
+  in — by measurement, never by a stored list, because a re-ingest changes who
+  qualifies — the generation budget is anchored on `share x (demand +
+  interchange)` and spread over the BA's published fuel mix, and the MW that
+  correction moved are reported as `identity_correction_mw`.
 
   ## Utility-scale solar and wind, onsite solar and wind
 
@@ -84,6 +107,17 @@ defmodule PowerModel.Dispatch do
   allocation moves on to the next unit in merit order, which may be small
   enough to take it. Every generator appears in the returned map — offline
   ones with an explicit `0.0`.
+
+  When that leaves measured MW STRANDED — the merit order ran out of units it
+  could start while machines were still cold — the group is re-loaded instead
+  (ENE20-B): the shortest merit-order prefix that can bracket the target is
+  committed, and each committed unit takes its minimum load plus a share of
+  the remainder proportional to the room it has above that minimum. ERCO's
+  four nuclear units are the case it exists for: their minimum loads total
+  4,775 MW against a 4,808 MW target, so all four can run — but a merit fill
+  offering the 4th unit only the leftover 1,008 MW left it below its own
+  minimum, ran three units, and stranded ~1 GW. Only groups the merit fill
+  could not serve are touched.
 
   That explicit zero is load-bearing. `Cascade.apply_dispatch/2` defaults a
   generator MISSING from the dispatch map to `p_max_mw * capacity_factor`, and
@@ -155,6 +189,20 @@ defmodule PowerModel.Dispatch do
           target_mw: float,          # measured MW offered to units
           dispatched_mw: float,      # MW actually placed (fuel + fallback)
           unserved_mw: float,        # measured MW no unit could absorb
+          share: %{                 # REVIEW ENE-20, the snapshot's share
+            aggregate: float,        # target / published, measurement-weighted
+            published_mw: float, target_mw: float,
+            identity_correction_mw: float, bas_corrected: integer,
+            partial_bas: integer, by_ba: %{ba_id => share}
+          },
+          # BAs with published fuel MW but no demand row for the hour: real
+          # exports to neighbours, with nothing local to check them against
+          unanchored: [%{ba_id:, code:, published_mw:, dispatched_mw:, load_mw:}],
+          unanchored_mw: float,
+          # BAs in the snapshot EIA published nothing at all for: their loads
+          # keep the synthetic baseline and their units run on the fallback
+          no_data: [%{ba_id:, code:, published_mw:, dispatched_mw:, load_mw:}],
+          no_data_mw: float,
           fallback_mw: float,        # MW placed by the island fallback
           fallback_capacity_mw: float,
           onsite_mw: float,          # MW placed on onsite solar/wind
@@ -181,8 +229,11 @@ defmodule PowerModel.Dispatch do
             target_mw: float, dispatched_mw: float, unserved_mw: float,
             storage_mw: float,
             load_mw: float | nil,
+            share: float,                    # this snapshot's share of the BA
+            identity_correction_mw: float,   # MW the ENE20-C anchor moved
             implied_interchange_mw: float | nil,
             reported_interchange_mw: float | nil,
+            scaled_interchange_mw: float | nil,   # share x reported
             by_fuel: %{fuel => %{target_mw: float, reported_mw: float,
                                  dispatched_mw: float,
                                  units: integer, online_units: integer,
@@ -217,6 +268,15 @@ defmodule PowerModel.Dispatch do
       is a DIFFERENT series from the measured MW, so `:fuel_totals` does not
       cover it: this is queried whenever the snapshot holds a battery and the
       option is absent. Pass `%{}` for a repo-free run with storage in it.
+    * `:ba_snapshot_share` — `%{ba_id => share in 0..1}`, the share of each
+      BA's load universe this snapshot holds (REVIEW ENE-20). Queried through
+      `PowerModel.Demand.snapshot_load_shares/1` when omitted and a database
+      is available; **an absent BA is 1.0**, so a repo-free fixture dispatches
+      exactly the MW it is given.
+    * `:ba_identity_anchor` — `%{ba_id => demand_mw + interchange_mw}` for the
+      BAs whose published identity is persistently broken (ENE20-C). Queried
+      through `PowerModel.Demand.broken_identity_anchors/1` when omitted and a
+      database is available; an absent BA keeps its published fuel mix.
   """
 
   require Logger
@@ -339,6 +399,20 @@ defmodule PowerModel.Dispatch do
     units = Enum.map(generators, &unit(&1, bus_ba, bus_interconnection, season))
     {dispatchable, unavailable} = Enum.split_with(units, & &1.in_service?)
 
+    # Kept so coverage can report what EIA published next to what the pool was
+    # actually asked for, once the snapshot's share and the batteries' MW have
+    # come out of it.
+    reported_totals = fuel_totals
+
+    # REVIEW ENE-20: the snapshot serves its SHARE of each BA's demand
+    # (ENE-17), so its units are offered that same share of the BA's measured
+    # generation. This runs BEFORE the storage schedule on purpose — the duty
+    # cycle is bounded by the "other" column, and sizing it on an unscaled
+    # column only to net it against a scaled target would double-count the
+    # difference.
+    {fuel_totals, share_stats} =
+      scale_to_snapshot_share(fuel_totals, hour, loads, islands, opts)
+
     # Batteries run their own duty cycle rather than filling a fuel target
     # that is measured NET of their charging (ROADMAP item 17), so they leave
     # the pool first and the "other" target the pool is offered drops by what
@@ -346,9 +420,6 @@ defmodule PowerModel.Dispatch do
     {storage, non_storage} = Enum.split_with(dispatchable, & &1.storage?)
     {storage_alloc, storage_stats} = schedule_storage(storage, hour, fuel_totals, opts)
 
-    # Kept so coverage can report what EIA published next to what the pool was
-    # asked for once the batteries' MW came out of it.
-    reported_totals = fuel_totals
     fuel_totals = Storage.adjust_fuel_totals(fuel_totals, storage_stats)
 
     # EIA-930 measures utility-scale solar and wind, so onsite units of those
@@ -412,6 +483,7 @@ defmodule PowerModel.Dispatch do
         bus_ba,
         reported_totals,
         reserve_stats,
+        share_stats,
         opts
       )
 
@@ -524,6 +596,92 @@ defmodule PowerModel.Dispatch do
   defp season_for(%DateTime{}), do: :winter
 
   # ---------------------------------------------------------------------------
+  # Snapshot share and identity anchoring (REVIEW ENE-20)
+  # ---------------------------------------------------------------------------
+
+  # Rewrite each BA's measured fuel MW into the target THIS snapshot's units
+  # should be offered, and return the per-BA arithmetic for coverage.
+  defp scale_to_snapshot_share(fuel_totals, hour, loads, islands, opts) do
+    shares = snapshot_shares(opts, loads, islands)
+    anchors = identity_anchors(opts, hour)
+
+    Enum.reduce(fuel_totals, {%{}, %{}}, fn {ba_id, fuels}, {totals, stats} ->
+      share = Map.get(shares, ba_id, 1.0)
+      {targets, correction_mw} = ba_targets(fuels, share, Map.get(anchors, ba_id))
+
+      stat = %{
+        share: share,
+        published_mw: sum_values(fuels),
+        target_mw: sum_values(targets),
+        identity_correction_mw: correction_mw
+      }
+
+      {Map.put(totals, ba_id, targets), Map.put(stats, ba_id, stat)}
+    end)
+  end
+
+  # The plain rule: the snapshot is offered its share of every fuel column,
+  # which leaves the BA's measured fuel MIX exactly as published.
+  defp ba_targets(fuels, share, nil), do: {scale_fuels(fuels, share), 0.0}
+
+  # ENE20-C: a BA whose own published identity `NG - (D + TI)` never closes
+  # (BPAT misses by ~4.4 GW on every one of its 4,417 hours) cannot have its
+  # net-generation column and its demand/interchange columns both be right,
+  # and this dispatch is judged against the second pair — served load and
+  # implied interchange. So a SCREENED BA's budget is anchored on `D + TI`,
+  # spread over the fuels in the proportions the measurement reports, and the
+  # snapshot's share applies to that instead. `PowerModel.Demand` decides who
+  # is screened by measurement, never by a stored list.
+  defp ba_targets(fuels, share, anchor_mw) do
+    positive_mw = fuels |> Map.values() |> Enum.filter(&(&1 > 0.0)) |> Enum.sum()
+
+    if positive_mw <= 0.0 do
+      {scale_fuels(fuels, share), 0.0}
+    else
+      budget_mw = max(anchor_mw, 0.0) * share
+
+      targets =
+        Map.new(fuels, fn
+          {fuel, mw} when mw > 0.0 -> {fuel, budget_mw * mw / positive_mw}
+          # A negative column is storage charging, not generation to re-budget.
+          {fuel, mw} -> {fuel, mw * share}
+        end)
+
+      {targets, sum_values(targets) - share * sum_values(fuels)}
+    end
+  end
+
+  defp scale_fuels(fuels, 1.0), do: fuels
+  defp scale_fuels(fuels, share), do: Map.new(fuels, fn {fuel, mw} -> {fuel, mw * share} end)
+
+  # Absent from the options and with no database, every share is 1.0 and this
+  # module runs exactly as it did before ENE-20 — which is what keeps repo-free
+  # fixtures byte-identical.
+  defp snapshot_shares(opts, loads, islands) do
+    Keyword.get_lazy(opts, :ba_snapshot_share, fn ->
+      if opts[:db?], do: Demand.snapshot_load_shares(snapshot_bus_ids(loads, islands)), else: %{}
+    end)
+  end
+
+  defp identity_anchors(opts, hour) do
+    Keyword.get_lazy(opts, :ba_identity_anchor, fn ->
+      if opts[:db?], do: Demand.broken_identity_anchors(hour), else: %{}
+    end)
+  end
+
+  # The buses this snapshot holds. Islands cover the whole bus set; the load
+  # bus ids are the half that can carry a baseline, and are enough on their own
+  # when the caller passed no islands.
+  defp snapshot_bus_ids(loads, islands) do
+    island_ids = if islands, do: Enum.flat_map(islands, &MapSet.to_list/1), else: []
+
+    island_ids
+    |> Enum.concat(Enum.map(loads, &Map.get(&1, :bus_id)))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  # ---------------------------------------------------------------------------
   # Measured allocation
   # ---------------------------------------------------------------------------
 
@@ -605,11 +763,100 @@ defmodule PowerModel.Dispatch do
     sorted = Enum.sort_by(units, &{-&1.capacity_factor, -&1.capability_mw, &1.id})
     {alloc, remaining} = fill_pass(sorted, target_mw, holdback, %{})
 
-    if remaining > 1.0e-9 and map_size(holdback) > 0 do
-      fill_pass(sorted, remaining, %{}, alloc)
+    {alloc, remaining} =
+      if remaining > 1.0e-9 and map_size(holdback) > 0 do
+        fill_pass(sorted, remaining, %{}, alloc)
+      else
+        {alloc, remaining}
+      end
+
+    if remaining > 1.0e-9 do
+      proportional_fill(sorted, target_mw, alloc, remaining)
     else
       {alloc, remaining}
     end
+  end
+
+  # REVIEW ENE-20 (ENE20-B): a merit fill loads each unit flat out and offers
+  # the REMAINDER to the next one, so a target that falls between two
+  # commitment points strands the last slice — ERCO's nuclear group ran 3 of
+  # 4 units and left ~1 GW unserved the moment ENE-20 scaled its target down.
+  # The MW are there; the merit order just cannot cut a unit in half.
+  #
+  # So when a merit fill ends short with machines still cold, the group is
+  # re-loaded instead: commit the shortest merit-order prefix that can bracket
+  # the target, then give every committed unit its minimum load plus a share
+  # of what is left, proportional to the room it has above that minimum.
+  #
+  # Loading over the RANGE rather than over capability is what makes this work
+  # on the case it was built for: ERCO's four units carry minimum loads at
+  # 90-97% of capability, so a uniform fraction of capability would push two
+  # of them under their own minimum even though the group's minimums
+  # (4,775 MW) sit below the 4,808 MW target. Anywhere between those two
+  # bounds an operating point exists, and every committed unit lands inside
+  # `[p_min, capability]` by construction.
+  #
+  # Commitment order, the per-fuel total and the minimum-load rule all
+  # survive; only the loading changes, and only for groups the merit fill
+  # could not serve.
+  defp proportional_fill(sorted, target_mw, merit_alloc, merit_remaining) do
+    idle? =
+      Enum.any?(sorted, &(Map.get(merit_alloc, &1.id, 0.0) <= 0.0 and &1.capability_mw > 0.0))
+
+    case idle? and commit(sorted, [], 0.0, 0.0, target_mw) do
+      committed when is_list(committed) ->
+        room_mw = sum_by(committed, &(&1.capability_mw - &1.p_min_mw))
+        above_minimum_mw = target_mw - sum_by(committed, & &1.p_min_mw)
+
+        alloc =
+          Enum.reduce(committed, Map.new(sorted, &{&1.id, 0.0}), fn unit, alloc ->
+            room = unit.capability_mw - unit.p_min_mw
+            extra = if room_mw > 0.0, do: above_minimum_mw * room / room_mw, else: 0.0
+
+            Map.put(alloc, unit.id, unit.p_min_mw + extra)
+          end)
+
+        {alloc, 0.0}
+
+      _ ->
+        {merit_alloc, merit_remaining}
+    end
+  end
+
+  # Grow the committed set in merit order until its capability covers the
+  # target. A committed set also has to be able to run DOWN to the target, so
+  # when its minimum loads already exceed it the largest must-run unit is
+  # dropped and the search continues. A dropped unit never returns, so this
+  # terminates in at most two passes over the group. `nil` when no prefix can
+  # bracket the target, which leaves the merit fill — and its unserved MW,
+  # genuinely unplaceable at that point — exactly as it was.
+  defp commit(rest, committed, capability_mw, minimum_mw, target_mw)
+       when capability_mw >= target_mw do
+    if minimum_mw <= target_mw do
+      Enum.reverse(committed)
+    else
+      worst = Enum.max_by(committed, &{&1.p_min_mw, &1.id})
+
+      commit(
+        rest,
+        committed -- [worst],
+        capability_mw - worst.capability_mw,
+        minimum_mw - worst.p_min_mw,
+        target_mw
+      )
+    end
+  end
+
+  defp commit([], _committed, _capability_mw, _minimum_mw, _target_mw), do: nil
+
+  defp commit([unit | rest], committed, capability_mw, minimum_mw, target_mw) do
+    commit(
+      rest,
+      [unit | committed],
+      capability_mw + unit.capability_mw,
+      minimum_mw + unit.p_min_mw,
+      target_mw
+    )
   end
 
   defp fill_pass(sorted_units, target_mw, holdback, alloc) do
@@ -906,12 +1153,14 @@ defmodule PowerModel.Dispatch do
          bus_ba,
          reported_totals,
          reserve_stats,
+         share_stats,
          opts
        ) do
     by_ba_fuel = Enum.group_by(group_stats, fn {{ba_id, _fuel}, _stat} -> ba_id end)
     load_by_ba = load_by_ba(loads, bus_ba)
 
     reported = if opts[:db?], do: Demand.interchange_at(hour), else: %{}
+    demand = if opts[:db?], do: Demand.demand_at(hour), else: %{}
 
     dispatch_by_ba = dispatch_by_ba(units, dispatch)
 
@@ -937,6 +1186,8 @@ defmodule PowerModel.Dispatch do
         target = fuels |> Map.values() |> sum_by(& &1.target_mw)
         ba_dispatch = Map.get(dispatch_by_ba, ba_id, 0.0)
         load_mw = Map.get(load_by_ba, ba_id)
+        share = share_stats |> Map.get(ba_id, %{}) |> Map.get(:share, 1.0)
+        reported_ix = Map.get(reported, ba_id)
 
         {ba_id,
          %{
@@ -946,13 +1197,23 @@ defmodule PowerModel.Dispatch do
            unserved_mw: max(target - (fuels |> Map.values() |> sum_by(& &1.dispatched_mw)), 0.0),
            storage_mw: storage_stats |> Map.get(ba_id, %{}) |> Map.get(:net_mw, 0.0),
            load_mw: load_mw,
+           # ENE-20: the snapshot holds `share` of this BA's load universe, so
+           # it should reproduce `share` of the interchange EIA reported — the
+           # full figure belongs to the whole BA, not to this slice of it.
+           share: share,
+           identity_correction_mw:
+             share_stats |> Map.get(ba_id, %{}) |> Map.get(:identity_correction_mw, 0.0),
            implied_interchange_mw: load_mw && ba_dispatch - load_mw,
-           reported_interchange_mw: Map.get(reported, ba_id),
+           reported_interchange_mw: reported_ix,
+           scaled_interchange_mw: reported_ix && reported_ix * share,
            by_fuel: fuels
          }}
       end)
 
+    snapshot_bas = bus_ba |> Map.values() |> Enum.reject(&is_nil/1) |> MapSet.new()
+    anchors = anchor_buckets(reported_totals, demand, dispatch_by_ba, load_by_ba, snapshot_bas)
     by_ba = if opts[:db?], do: attach_codes(by_ba), else: by_ba
+    anchors = if opts[:db?], do: attach_bucket_codes(anchors), else: anchors
     target_mw = by_ba |> Map.values() |> sum_by(& &1.target_mw)
     dispatched_mw = dispatch |> Map.values() |> Enum.sum()
     online = Enum.count(dispatch, fn {_id, mw} -> mw > 0.0 end)
@@ -962,6 +1223,11 @@ defmodule PowerModel.Dispatch do
       season: season,
       target_mw: target_mw,
       dispatched_mw: dispatched_mw,
+      share: share_coverage(Map.take(share_stats, MapSet.to_list(snapshot_bas))),
+      unanchored: anchors.unanchored,
+      unanchored_mw: sum_by(anchors.unanchored, & &1.published_mw),
+      no_data: anchors.no_data,
+      no_data_mw: sum_by(anchors.no_data, & &1.dispatched_mw),
       unserved_mw: by_ba |> Map.values() |> sum_by(& &1.unserved_mw),
       fallback_mw: fallback_mw,
       fallback_capacity_mw: sum_by(leftover, & &1.capability_mw),
@@ -980,9 +1246,86 @@ defmodule PowerModel.Dispatch do
     }
   end
 
-  # What the BA reported for the fuel before storage was netted out of it.
+  # What the BA reported for the fuel before the snapshot's share and the
+  # batteries' MW were taken out of it.
   defp reported_mw(reported_totals, ba_id, fuel) do
     reported_totals |> Map.get(ba_id, %{}) |> Map.get(fuel, 0.0)
+  end
+
+  # ENE20-D: the aggregate share, weighted by the measurement it was applied
+  # to, so one number says how much of the country's published generation this
+  # snapshot was offered — and drifts back toward 1.0 as connectivity repair
+  # pulls fragments into the main component.
+  defp share_coverage(share_stats) do
+    stats = Map.values(share_stats)
+    published_mw = sum_by(stats, & &1.published_mw)
+    target_mw = sum_by(stats, & &1.target_mw)
+
+    %{
+      aggregate: if(published_mw != 0.0, do: target_mw / published_mw, else: 1.0),
+      published_mw: published_mw,
+      target_mw: target_mw,
+      identity_correction_mw: sum_by(stats, & &1.identity_correction_mw),
+      bas_corrected: Enum.count(stats, &(&1.identity_correction_mw != 0.0)),
+      partial_bas: Enum.count(stats, &(&1.share < 0.999)),
+      by_ba: Map.new(share_stats, fn {ba_id, stat} -> {ba_id, stat.share} end)
+    }
+  end
+
+  # ENE20-E: the two ways a BA can carry MW with nothing to anchor them to.
+  #
+  #   * `unanchored` — EIA published per-fuel generation for it but no demand
+  #     row for the hour, so there is no demand and no interchange to check
+  #     its injection against (measured: DEAA, GRID, HGMA, AVRN, ~1.6 GW in
+  #     Western). Their MW are real exports to neighbours whose demand IS
+  #     counted, so they are dispatched — and named here, because otherwise
+  #     they read as an unexplained residual in the interconnection balance.
+  #   * `no_data` — a BA in the snapshot that EIA published nothing for this
+  #     hour (measured: GRIF has no row of either kind, ever; SEPA and YAD
+  #     report zero fuel MW). Its loads keep the synthetic baseline and its
+  #     units run on the island fallback, which is a different quantity from
+  #     an unanchored measurement and must not be added to it.
+  defp anchor_buckets(reported_totals, demand, dispatch_by_ba, load_by_ba, snapshot_bas) do
+    anchored? = fn ba_id -> is_number(Map.get(demand, ba_id)) end
+
+    {unanchored, no_data} =
+      snapshot_bas
+      |> Enum.reject(anchored?)
+      |> Enum.map(fn ba_id ->
+        %{
+          ba_id: ba_id,
+          code: nil,
+          published_mw: reported_totals |> Map.get(ba_id, %{}) |> sum_values(),
+          dispatched_mw: Map.get(dispatch_by_ba, ba_id, 0.0),
+          load_mw: Map.get(load_by_ba, ba_id, 0.0)
+        }
+      end)
+      |> Enum.split_with(&(&1.published_mw != 0.0))
+
+    %{
+      unanchored: Enum.sort_by(unanchored, &(-&1.published_mw)),
+      no_data:
+        no_data
+        |> Enum.reject(&(&1.dispatched_mw == 0.0 and &1.load_mw == 0.0))
+        |> Enum.sort_by(&(-&1.dispatched_mw))
+    }
+  end
+
+  defp attach_bucket_codes(%{unanchored: unanchored, no_data: no_data} = buckets) do
+    ba_ids = Enum.map(unanchored ++ no_data, & &1.ba_id)
+
+    if ba_ids == [] do
+      buckets
+    else
+      codes =
+        from(ba in BalancingAuthority, where: ba.id in ^ba_ids, select: {ba.id, ba.code})
+        |> Repo.all()
+        |> Map.new()
+
+      Map.new(buckets, fn {key, entries} ->
+        {key, Enum.map(entries, &%{&1 | code: Map.get(codes, &1.ba_id)})}
+      end)
+    end
   end
 
   defp reserve_coverage(reserve_stats) do
@@ -1056,6 +1399,33 @@ defmodule PowerModel.Dispatch do
         "#{length(unavailable)} units out of service)"
     )
 
+    share = coverage.share
+
+    if share.partial_bas > 0 or share.identity_correction_mw != 0.0 do
+      Logger.info(
+        "Dispatch share (ENE-20): units were offered #{pct(share.aggregate)} of the " <>
+          "#{gw(share.published_mw)} GW EIA published for the snapshot's BAs " <>
+          "(#{share.partial_bas} of #{map_size(share.by_ba)} BAs partially in the snapshot)" <>
+          if(share.bas_corrected == 0,
+            do: "",
+            else:
+              ", including #{round1(share.identity_correction_mw)} MW of identity correction " <>
+                "on #{share.bas_corrected} BA(s) whose published NG - (D + TI) never closes"
+          )
+      )
+    end
+
+    if coverage.unanchored != [] or coverage.no_data != [] do
+      Logger.info(
+        "Dispatch anchoring: #{round1(coverage.unanchored_mw)} MW published by " <>
+          "#{length(coverage.unanchored)} BAs with no demand row " <>
+          "(#{bucket_codes(coverage.unanchored, :published_mw)}); " <>
+          "#{round1(coverage.no_data_mw)} MW of fallback dispatch on " <>
+          "#{length(coverage.no_data)} BAs EIA published nothing for " <>
+          "(#{bucket_codes(coverage.no_data, :dispatched_mw)})"
+      )
+    end
+
     for {name, r} <- coverage.reserve.by_interconnection do
       Logger.info(
         "Dispatch reserve #{name}: #{Float.round(r.primary_reserve_mw, 0)} MW primary-capable " <>
@@ -1082,8 +1452,19 @@ defmodule PowerModel.Dispatch do
   end
 
   defp gw(mw), do: Float.round(mw / 1000.0, 1)
+  defp round1(mw), do: Float.round(mw * 1.0, 1)
+  defp pct(share), do: "#{Float.round(share * 100.0, 1)}%"
+
+  defp bucket_codes([], _key), do: "none"
+
+  defp bucket_codes(entries, key) do
+    entries
+    |> Enum.take(6)
+    |> Enum.map_join(", ", &"#{&1.code || "BA #{&1.ba_id}"} #{round1(Map.fetch!(&1, key))} MW")
+  end
 
   defp sum_by(list, fun), do: list |> Enum.map(fun) |> Enum.sum()
+  defp sum_values(map), do: map |> Map.values() |> Enum.sum()
 
   defp bus_ba_map(generators) do
     bus_ids = generator_bus_ids(generators)

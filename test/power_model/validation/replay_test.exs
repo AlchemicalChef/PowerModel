@@ -224,31 +224,73 @@ defmodule PowerModel.Validation.ReplayTest do
                       1.0e-9
     end
 
-    test "the two coverage universes are reported side by side" do
+    test "one coverage universe: every EIA reference is scaled by the load share" do
       score =
         Replay.score_hour(
           input(
             generators: [gen(1, bus_id: 1, fuel_type: "BIT", p_max_mw: 100.0)],
-            loads: [load(1, 500.0)],
+            # The snapshot holds half of this BA's load universe, so it serves
+            # half its demand (ENE-17) and is offered half its measured MW.
+            loads: [load(1, 250.0)],
             fuel_totals: %{10 => %{"coal" => 400.0}},
             demand: %{10 => 500.0},
-            # The snapshot holds 3 of this BA's 30 geolocated buses, yet its
-            # loads carry all 500 MW of demand.
-            ba_bus_coverage: %{10 => %{snapshot_buses: 3, geolocated_buses: 30, coverage: 0.1}}
+            ba_load_share: %{10 => 0.5}
           )
         )
 
       row = ba(score, "ALPHA")
-      assert row.bus_coverage == 0.1
-      assert row.snapshot_buses == 3
-      assert row.generation_coverage == 0.25
-      assert row.dispatch_to_load == 0.2
-      assert score.totals.bus_coverage_load_weighted == 0.1
-      assert score.totals.generation_coverage == 0.25
+      assert row.load_share == 0.5
+      assert row.eia_demand_mw == 500.0
+      assert row.scaled_demand_mw == 250.0
+      assert row.scaled_generation_mw == 200.0
+      # Served load matches the share of demand it is supposed to: no error.
+      assert row.served_load_error_mw == 0.0
+      # 200 MW offered, a 100 MW fleet to hold it — the fleet-mapping gap
+      # alone, with none of the pre-ENE-17 scaling asymmetry in it.
+      assert row.generation_coverage == 0.5
+      assert row.generation_error_mw == -100.0
+      assert row.dispatch_to_load == 0.4
+      assert score.totals.load_share_weighted == 0.5
+      assert score.totals.generation_coverage == 0.5
 
-      # The conservation residual is that asymmetry, not lost dispatch: all
-      # 500 MW of load, only the 100 MW of coal the fleet could hold.
-      assert score.totals.conservation_residual_mw == -400.0
+      # The residual is that gap, not lost dispatch: 250 MW of load against
+      # the 100 MW of coal the fleet could hold.
+      assert score.totals.conservation_residual_mw == -150.0
+    end
+
+    test "the share the harness reports is the share the dispatch applied" do
+      # REVIEW ENE-20: one `Demand.snapshot_load_shares/1` map, handed to
+      # Dispatch and scored against, so the two sides cannot drift.
+      shares = %{10 => 0.5, 20 => 0.25}
+
+      input =
+        input(
+          generators: [
+            gen(1, bus_id: 1, fuel_type: "BIT", p_max_mw: 500.0),
+            gen(2, bus_id: 2, fuel_type: "NUC", p_max_mw: 500.0)
+          ],
+          loads: [load(1, 200.0), load(2, 50.0)],
+          fuel_totals: %{10 => %{"coal" => 400.0}, 20 => %{"nuclear" => 800.0}},
+          demand: %{10 => 400.0, 20 => 200.0},
+          ba_load_share: shares
+        )
+
+      {dispatch, :eia_fuel, coverage} = Replay.dispatch_for(input)
+      score = Replay.score_hour(input)
+
+      # Half of BA 10's 400 MW, a quarter of BA 20's 800 MW.
+      assert dispatch[1] == 200.0
+      assert dispatch[2] == 200.0
+
+      for {ba_id, share} <- shares do
+        assert coverage.by_ba[ba_id].share == share
+        assert Enum.find(score.by_ba, &(&1.ba_id == ba_id)).load_share == share
+      end
+
+      # Nothing was stranded, so the dispatch reproduces the scaled reference
+      # exactly and both error terms vanish.
+      assert Enum.all?(score.by_ba, &(&1.generation_error_mw == 0.0))
+      assert Enum.all?(score.by_ba, &(&1.served_load_error_mw == 0.0))
     end
 
     test "served-load error and scale factor compare against the pre-scaling baseline" do
