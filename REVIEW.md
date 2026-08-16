@@ -617,6 +617,14 @@ suspect. Until fixed, census gates on Western must be stated ±1 or pinned to on
 draw. Also: Eastern base-overload reads differ by path (DR-2 census 781 vs UI-3
 screening-base 807 on the same tree) — reconcile the two bases when ENE-21 is fixed.
 Found by DR-2's A/B harness, 2026-08-16.
+**ENE-22 (MED, DISCREPANCY) [OPEN]** Two identity screens disagree at runtime:
+`Demand.broken_identity_bas/0` (DR-1, drives the dispatch correction) finds BPAT alone
+broken, while `Ingestion.Validation`'s balance screen still reproduces the OLD numbers
+(BPAT 0/4,417, MISO 5/4,389, CISO 611/2,473) on the same DB — observed in the 2026-08-16
+re-ingest validate run. Same nominal formula (NG − (D+TI)); suspect a sign/column
+divergence (raw vs Adjusted, or TI orientation) in validation.ex's SQL vs Demand's.
+Reconcile to ONE identity implementation both call; until then the validate WARN text
+overstates the broken set.
 **ENE-18 (DATA CAVEAT) [RE-MEASURED 2026-08-16]** EIA-930's own identity NG − (D+TI)
 fails for BPAT alone in the current DB: 0 of 4,417 hours close at 5% tolerance, mean
 residual −4,317 MW (sd 725). The previously-recorded MISO and CISO are no longer broken
