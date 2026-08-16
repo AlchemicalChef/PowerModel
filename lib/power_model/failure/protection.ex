@@ -459,7 +459,8 @@ defmodule PowerModel.Failure.Protection do
   end
 
   # The envelopes are listed most severe first, so the first band whose
-  # allowance is exhausted is the one to report.
+  # allowance is exhausted is the one to report. Shared by the frequency and
+  # the voltage envelopes — same `{band, allowance}` shape, same rule.
   #
   # A zero allowance means "not for an instant": REACHING the band operates
   # the protection, whether or not the excursion dwelt there long enough to
@@ -480,6 +481,533 @@ defmodule PowerModel.Failure.Protection do
   # is invisible to inertia, governors and protection alike.
   defp online?(gen) do
     (Map.get(gen, :capacity_factor) || 1.0) > 0.0 and (Map.get(gen, :p_max_mw) || 0.0) > 0.0
+  end
+
+  # ===========================================================================
+  # Generator voltage protection — PRC-024 Attachment 2 (ROADMAP item 20)
+  # ===========================================================================
+
+  # Low-voltage ride-through envelope: `{band_pu, allowance_seconds}`, deepest
+  # band first. Transcribed from NERC PRC-024 Attachment 2, "Low Voltage Ride
+  # Through Duration":
+  #
+  #     Voltage (pu)   Time (sec)
+  #        <0.45          0.15
+  #        <0.65          0.30
+  #        <0.75          2.00
+  #        <0.90          3.00
+  #
+  # Unlike the frequency envelope's numbers, these ARE a verbatim transcription
+  # — the table is printed in the standard rather than drawn only as a curve.
+  # The bands are NESTED, not disjoint: a bus at 0.40 pu is below every one of
+  # them at once, so all four timers run and the 0.15 s allowance is what
+  # binds. Verified against the Attachment 2 table as printed in PRC-024-1
+  # through PRC-024-3 (the voltage curve is unchanged across those revisions).
+  @undervoltage_envelope [
+    {0.45, 0.15},
+    {0.65, 0.30},
+    {0.75, 2.00},
+    {0.90, 3.00}
+  ]
+
+  # High-voltage ride-through envelope, same shape, highest band first. From
+  # the same attachment's "High Voltage Ride Through Duration":
+  #
+  #     Voltage (pu)   Time (sec)
+  #       >=1.200    Instantaneous trip
+  #       >=1.175         0.20
+  #       >=1.15          0.50
+  #       >=1.10          1.00
+  #
+  # "Instantaneous trip" is carried as a ZERO allowance, the same encoding the
+  # frequency envelopes use for their must-trip bands: reaching 1.20 pu ends
+  # the ride-through obligation outright.
+  @overvoltage_envelope [
+    {1.200, 0.0},
+    {1.175, 0.20},
+    {1.150, 0.50},
+    {1.100, 1.00}
+  ]
+
+  # The continuous-operation band, i.e. the region the curves impose no
+  # duration limit on at all. Returning here ENDS the excursion — see
+  # `advance_voltage_timers/3` for why that is the only thing that resets a
+  # timer.
+  @voltage_continuous_low 0.90
+  @voltage_continuous_high 1.100
+
+  @doc """
+  The low-voltage ride-through envelope as `[{band_pu, allowance_s}]`, deepest
+  band first. Single source of truth for the bands (PRC-024 Attachment 2).
+  """
+  def undervoltage_envelope, do: @undervoltage_envelope
+
+  @doc """
+  The high-voltage ride-through envelope as `[{band_pu, allowance_s}]`,
+  highest band first (PRC-024 Attachment 2).
+  """
+  def overvoltage_envelope, do: @overvoltage_envelope
+
+  @doc """
+  The continuous-operation voltage band as `{low_pu, high_pu}` — the region
+  both envelopes leave unbounded in time, and the only region that resets a
+  ride-through timer.
+  """
+  def continuous_voltage_band, do: {@voltage_continuous_low, @voltage_continuous_high}
+
+  @doc """
+  A fresh generator voltage-protection state: nothing has timed, nothing has
+  tripped.
+
+  Shape:
+
+      %{
+        generators: %{
+          generator_id => %{
+            lv: %{band_pu => seconds},
+            hv: %{band_pu => seconds},
+            tripped: boolean(),
+            vm_pu: float() | nil
+          }
+        },
+        elapsed_s: float()
+      }
+
+  Keyed by GENERATOR id, which is what makes it survive island splits for
+  free: see `split_voltage_state/2`.
+  """
+  @spec fresh_voltage_state() :: map()
+  def fresh_voltage_state do
+    %{generators: %{}, elapsed_s: 0.0}
+  end
+
+  @doc """
+  Generators whose PRC-024 voltage protection has operated over one `dt_s`
+  segment, and the advanced state.
+
+  The voltage companion to `generator_frequency_trips/2`, and deliberately a
+  different shape, because the two protections read different things:
+
+    * Frequency is an ISLAND-WIDE scalar with a trajectory, so the frequency
+      function integrates a whole excursion in one pure call and needs no
+      state.
+    * Voltage is PER BUS and arrives one power-flow solution at a time, so
+      the duration has to be accumulated across cascade steps. Hence the
+      threaded state and the `dt_s`.
+
+  That difference is also why nothing here trips instantaneously on the low
+  side: a bus dipping to 0.70 pu for 100 ms is inside the no-trip zone and
+  must not produce an event, however alarming the number looks.
+
+  Pure: no database, no process state, no randomness, no logging.
+
+  ## Parameters
+
+    * `generators` — generator maps with `id` and `bus_id`. Offline units
+      contribute no trips, using the same `capacity_factor > 0 and
+      p_max_mw > 0` test the swing model and the frequency envelopes use. A
+      unit with no `id` cannot be tracked across steps and is skipped.
+    * `vm_by_bus` — either a `%{bus_id => vm_pu}` map or a single float
+      applied to every generator (the island-wide form, for callers with no
+      per-bus solution). A bus MISSING from the map has no measurement: its
+      timers are left exactly as they were rather than reset, because a
+      missing reading is not a recovered voltage. Same rule
+      `PowerModel.Failure.LoadShedding.apply_uvls_with_state/4` uses.
+    * `voltage_state` — the state from a previous call, or `nil` to start fresh
+    * `dt_s` — simulated seconds this segment advanced
+
+  ## Returns
+
+  `{trips, voltage_state}`. Trips are in the codebase's usual shape, most
+  severe first (deepest sag, then highest swell):
+
+      %{
+        component_type: "generator",
+        component_id: term(),
+        failure_cause: "undervoltage_trip" | "overvoltage_trip",
+        details: %{
+          band_pu: float(),        # the envelope band whose allowance ran out
+          allowance_s: float(),    # how long that band permits
+          time_in_band_s: float(), # how long the excursion actually spent there
+          vm_pu: float()           # the voltage that finished it
+        }
+      }
+
+  A generator trips at most ONCE: the state records it and later calls skip
+  it, so a caller that keeps handing back the same fleet does not re-emit the
+  same event every step. When both sides are somehow violated at once, the
+  low side is reported — a collapsing voltage is the mechanism that matters.
+
+  ## Timer semantics: cumulative, not continuous
+
+  PRC-024 Attachment 2's "Voltage Ride-Through Curve Clarifications" state
+  that the envelope represents the CUMULATIVE voltage duration, and give the
+  worked example of a voltage that crosses 1.15 pu, comes back below it, and
+  accumulates only the time it was above. So a band's timer is NOT reset by
+  the voltage merely climbing out of that band — it holds, and resumes if the
+  voltage falls back in.
+
+  What does reset every timer is a return to the continuous-operation band
+  (`continuous_voltage_band/0`): at that point the excursion is over and the
+  next one starts from zero. This is the opposite convention from the UVLS
+  stage timers, which are ordinary definite-time relay elements and drop out
+  the moment their threshold clears. Both are right for what they model.
+  """
+  @spec generator_voltage_trips(list(map()), map() | number(), map() | nil, number()) ::
+          {list(map()), map()}
+  def generator_voltage_trips(generators, vm_by_bus, voltage_state, dt_s) do
+    state = voltage_state || fresh_voltage_state()
+    dt = max(dt_s * 1.0, 0.0)
+
+    {gen_states, trips} =
+      Enum.reduce(generators, {state.generators, []}, fn gen, {acc, trips} ->
+        evaluate_generator_voltage(gen, vm_by_bus, dt, acc, trips)
+      end)
+
+    trips = Enum.sort_by(trips, &(-voltage_trip_severity(&1)))
+
+    {trips, %{state | generators: gen_states, elapsed_s: state.elapsed_s + dt}}
+  end
+
+  defp evaluate_generator_voltage(gen, vm_by_bus, dt, acc, trips) do
+    id = Map.get(gen, :id)
+    prior = Map.get(acc, id)
+
+    cond do
+      is_nil(id) ->
+        {acc, trips}
+
+      prior && prior.tripped ->
+        {acc, trips}
+
+      not online?(gen) ->
+        {acc, trips}
+
+      true ->
+        case bus_voltage(vm_by_bus, Map.get(gen, :bus_id)) do
+          nil ->
+            # No measurement this segment. Hold the timers untouched.
+            {acc, trips}
+
+          vm_pu ->
+            advanced = advance_voltage_timers(prior || fresh_voltage_timers(), vm_pu, dt)
+
+            case voltage_violation(advanced, vm_pu) do
+              nil ->
+                {Map.put(acc, id, advanced), trips}
+
+              {cause, {band_pu, allowance_s, time_in_band_s}} ->
+                trip = %{
+                  component_type: "generator",
+                  component_id: id,
+                  failure_cause: cause,
+                  details: %{
+                    band_pu: band_pu,
+                    allowance_s: allowance_s,
+                    time_in_band_s: time_in_band_s,
+                    vm_pu: vm_pu
+                  }
+                }
+
+                {Map.put(acc, id, %{advanced | tripped: true}), [trip | trips]}
+            end
+        end
+    end
+  end
+
+  defp fresh_voltage_timers do
+    %{
+      lv: Map.new(@undervoltage_envelope, fn {band, _} -> {band, 0.0} end),
+      hv: Map.new(@overvoltage_envelope, fn {band, _} -> {band, 0.0} end),
+      tripped: false,
+      vm_pu: nil
+    }
+  end
+
+  # One generator's band timers over one segment.
+  #
+  # Inside the continuous band the excursion is over and everything resets;
+  # outside it, every band the voltage is currently in accumulates `dt` and
+  # every band it is not in HOLDS its accumulated total (the cumulative rule).
+  defp advance_voltage_timers(timers, vm_pu, dt) do
+    if vm_pu >= @voltage_continuous_low and vm_pu < @voltage_continuous_high do
+      fresh = fresh_voltage_timers()
+      %{timers | lv: fresh.lv, hv: fresh.hv, vm_pu: vm_pu}
+    else
+      %{
+        timers
+        | lv: accumulate_bands(timers.lv, @undervoltage_envelope, dt, &(vm_pu < &1)),
+          hv: accumulate_bands(timers.hv, @overvoltage_envelope, dt, &(vm_pu >= &1)),
+          vm_pu: vm_pu
+      }
+    end
+  end
+
+  defp accumulate_bands(times, envelope, dt, in_band?) do
+    Map.new(envelope, fn {band, _allowance} ->
+      elapsed = Map.get(times, band, 0.0)
+      {band, if(in_band?.(band), do: elapsed + dt, else: elapsed)}
+    end)
+  end
+
+  defp voltage_violation(timers, vm_pu) do
+    under = worst_violation(@undervoltage_envelope, timers.lv, &(vm_pu < &1))
+    over = worst_violation(@overvoltage_envelope, timers.hv, &(vm_pu >= &1))
+
+    case {under, over} do
+      {nil, nil} -> nil
+      {nil, over_violation} -> {"overvoltage_trip", over_violation}
+      {under_violation, _} -> {"undervoltage_trip", under_violation}
+    end
+  end
+
+  # How far from nominal the REPORTED band sits, so the worst sag sorts ahead
+  # of the worst swell rather than the two interleaving by insertion order.
+  defp voltage_trip_severity(%{failure_cause: "undervoltage_trip", details: %{band_pu: band}}),
+    do: 1.0 - band
+
+  defp voltage_trip_severity(%{details: %{band_pu: band}}), do: band - 1.0
+
+  defp bus_voltage(voltages, _bus_id) when is_number(voltages), do: voltages * 1.0
+  defp bus_voltage(voltages, bus_id) when is_map(voltages), do: Map.get(voltages, bus_id)
+  defp bus_voltage(_voltages, _bus_id), do: nil
+
+  @doc """
+  Restrict a voltage state to a set of generator ids — the SPLIT half of
+  island-state threading.
+
+  Voltage ride-through timers are keyed by generator and are INTENSIVE: "this
+  machine has been below 0.65 pu for 0.2 s" is a property of the machine, not
+  a quantity to be shared out. So unlike the frequency state's cumulative
+  megawatts (which `PowerModel.Failure.Cascade` apportions by load share when
+  an island splits), these need no scaling at all — partitioning by key is the
+  whole operation, and every timer is conserved exactly.
+
+  Accepts a list, `MapSet` or map of generator ids.
+  """
+  @spec split_voltage_state(map() | nil, Enumerable.t()) :: map()
+  def split_voltage_state(nil, _generator_ids), do: fresh_voltage_state()
+
+  def split_voltage_state(state, generator_ids) do
+    keep = MapSet.new(generator_ids)
+
+    %{
+      state
+      | generators: Map.filter(state.generators, fn {id, _} -> MapSet.member?(keep, id) end)
+    }
+  end
+
+  @doc """
+  Combine voltage states from islands that have re-joined — the MERGE half.
+
+  Islands partition the generator set, so in normal use no key appears twice.
+  A collision is resolved deterministically anyway: a unit recorded as tripped
+  stays tripped, and otherwise the entry that has timed the longest wins, so
+  merging can never hand a generator BACK ride-through allowance it has
+  already spent.
+
+  `elapsed_s` takes the maximum rather than the sum: it is a clock, not a
+  tally.
+  """
+  @spec merge_voltage_states(list(map() | nil)) :: map()
+  def merge_voltage_states(states) do
+    states
+    |> Enum.reject(&is_nil/1)
+    |> Enum.reduce(fresh_voltage_state(), fn state, acc ->
+      %{
+        generators: Map.merge(acc.generators, state.generators, &merge_voltage_timers/3),
+        elapsed_s: max(acc.elapsed_s, Map.get(state, :elapsed_s, 0.0))
+      }
+    end)
+  end
+
+  defp merge_voltage_timers(_id, a, b) do
+    cond do
+      a.tripped -> a
+      b.tripped -> b
+      max_timer(a) >= max_timer(b) -> a
+      true -> b
+    end
+  end
+
+  defp max_timer(timers) do
+    (Map.values(timers.lv) ++ Map.values(timers.hv)) |> Enum.max(fn -> 0.0 end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Grid-following inverter current limiting (ROADMAP item 20)
+  # ---------------------------------------------------------------------------
+
+  # Terminal voltage below which a grid-following inverter can no longer push
+  # its dispatched power through its current ceiling.
+  # Momentary current ceiling of a grid-following inverter, per unit of its
+  # rated current. This is the ONE constant the derate is parameterized on, and
+  # the knee falls out of it rather than being set independently.
+  #
+  # 1.2 pu is this model's documented default, in the same convention as the
+  # UVLS stage table: utility inverter designs commonly sit in the 1.1–1.35 pu
+  # band for short-duration current, no value is canonical, and the number
+  # lives only here. IEEE 2800-2022 sets ride-through and current-injection
+  # DUTIES for transmission-connected IBRs without fixing a universal ceiling —
+  # the ceiling is a manufacturer design parameter, so there is nothing to
+  # transcribe the way PRC-024's curve could be transcribed.
+  #
+  # Why this rather than the salvaged model's fixed 0.70 pu knee: a 0.70 knee
+  # implies a 1/0.70 ≈ 1.43 pu ceiling for a fully-loaded unit, which flatters
+  # inverters exactly where the voltage-collapse feedback loop is decided.
+  @gfl_current_limit_pu 1.2
+
+  # EIA-860 fuel codes whose plant is inverter-coupled. SUN and WND are the
+  # fleet this matters for; MWH/BAT are batteries, which are inverter-coupled
+  # in exactly the same way.
+  #
+  # The salvaged pre-reset model listed `AB` here too. That is agricultural
+  # byproduct — a conventional steam plant with a real rotor — and it is
+  # deliberately NOT carried over.
+  @inverter_fuel_types ~w(SUN WND MWH BAT PV)
+
+  @doc """
+  The default grid-following current ceiling, per unit of rated current.
+  Single source of truth; `gfl_available_fraction/2` takes `:current_limit_pu`
+  as an override.
+  """
+  def gfl_current_limit_pu, do: @gfl_current_limit_pu
+
+  @doc """
+  Terminal voltage (pu) at which the current ceiling starts to bind, for a unit
+  loaded at `p_set_pu` of its rating (default: fully loaded).
+
+  Derived, not set: `knee = P_set / I_max`, so the default ceiling of 1.2 pu
+  puts a fully-loaded unit's knee at `1 / 1.2 ≈ 0.833` pu. A unit at half
+  output does not reach its knee until 0.417 pu, which is the whole point of
+  parameterizing on the ceiling — a lightly-loaded inverter really does ride
+  much lower voltages before anything binds.
+  """
+  def gfl_knee_pu(p_set_pu \\ 1.0, opts \\ []) do
+    i_max = Keyword.get(opts, :current_limit_pu, @gfl_current_limit_pu)
+
+    if i_max <= 0.0, do: 0.0, else: p_set_pu / i_max
+  end
+
+  @doc """
+  Is this generator inverter-coupled, by EIA-860 fuel code?
+
+  A generator carrying an explicit `:inverter_based` boolean is believed over
+  its fuel code, so a caller with better information (a synchronous-condenser
+  conversion, a Type-3 wind machine) can say so.
+  """
+  def inverter_based?(gen) do
+    case Map.get(gen, :inverter_based) do
+      nil -> String.upcase(to_string(Map.get(gen, :fuel_type) || "")) in @inverter_fuel_types
+      flag -> !!flag
+    end
+  end
+
+  @doc """
+  The fraction of its dispatched active power a grid-following inverter can
+  still deliver at terminal voltage `vm_pu`.
+
+  An inverter is a current source behind a ceiling. Holding P as the terminal
+  voltage falls means raising current, and once the ceiling binds the
+  deliverable power follows the voltage down:
+
+      P_available = min(P_set, V · I_max)
+
+  ## Ceiling form — the default
+
+      fraction = min(1.0, V · I_max / P_set)
+
+  parameterized on the current ceiling (`:current_limit_pu`, default
+  `gfl_current_limit_pu/0` = 1.2 pu) and the unit's loading (`:p_set_pu`, a
+  fraction of rating, default `1.0`). The knee is DERIVED — `P_set / I_max`,
+  so 0.833 pu for a fully-loaded unit — which is why a lightly-loaded inverter
+  correctly rides much lower voltages before anything binds, and why a unit
+  somehow dispatched above its ceiling is derated even at nominal voltage.
+  Continuous at the knee by construction.
+
+  ## Knee form — opt in with `:knee_pu`
+
+  Passing `:knee_pu` selects the salvaged pre-reset model's shape instead:
+  `1.0` at or above the knee and `V / knee` below it, with the knee set flat
+  rather than derived from loading. `knee_pu: 0.70` reproduces the salvaged
+  behaviour exactly. It is kept reachable because it is the shape the prior
+  architecture was tuned against, not because it is the better physics: a flat
+  0.70 knee implies a 1.43 pu ceiling for every unit whatever its loading.
+
+  `:knee_pu` wins if both it and `:current_limit_pu` are passed — the form is
+  chosen by which parameterization the caller names.
+
+  ## This is a quasi-steady approximation
+
+  It is a power-flow-timescale statement about what an inverter can deliver
+  at a held terminal voltage. It is NOT a transient model: it says nothing
+  about the fault-ride-through current waveform, nothing about reactive-current
+  priority (real 1547-2018/PRC-029 units divert active-current headroom to
+  dynamic voltage support below roughly 0.9 pu, which this ignores), and
+  nothing about recovery ramp rates after the voltage returns. Use it to
+  answer "how much P is this island actually getting while the voltage sits
+  here", not "what did the inverter do in the first three cycles".
+
+  Returns `1.0` for any voltage at or above the knee, and clamps at `0.0`.
+  """
+  @spec gfl_available_fraction(number(), keyword()) :: float()
+  def gfl_available_fraction(vm_pu, opts \\ []) do
+    v = max(vm_pu * 1.0, 0.0)
+
+    case Keyword.get(opts, :knee_pu) do
+      nil ->
+        i_max = Keyword.get(opts, :current_limit_pu, @gfl_current_limit_pu)
+        p_set = Keyword.get(opts, :p_set_pu, 1.0)
+
+        if p_set <= 0.0, do: 1.0, else: min(1.0, v * i_max / p_set)
+
+      knee ->
+        if knee <= 0.0 or v >= knee, do: 1.0, else: v / knee
+    end
+  end
+
+  @doc """
+  Available-power fractions for the inverter-based units in a fleet, as
+  `%{generator_id => fraction}`.
+
+  Only inverter-coupled units (`inverter_based?/1`) appear; a synchronous
+  machine has no current ceiling of this kind and is simply absent, so read
+  the result with `Map.get(fractions, id, 1.0)`.
+
+  A generator whose bus is missing from `vm_by_bus` is also absent — no
+  measurement, no derate — for the same reason
+  `generator_voltage_trips/4` holds its timers.
+
+  ## Landmine for the caller
+
+  This derates DISPATCHED power. `PowerModel.Dispatch` places onsite
+  (non-`utility_scale`) solar and wind OUTSIDE the EIA-930 fuel-anchored pool,
+  so those units' MW were never measured against a BA target. Derating them
+  changes an island's generation without changing any dispatch target, which
+  is correct physically but will not show up in any fuel-mix comparison.
+  Decide deliberately which pool is being derated; `:only` narrows it.
+
+  ## Options
+
+    * `:only` — a predicate on the generator map, applied on top of
+      `inverter_based?/1` (e.g. `& &1.utility_scale`)
+    * any option `gfl_available_fraction/2` accepts
+  """
+  @spec gfl_derate(list(map()), map() | number(), keyword()) :: map()
+  def gfl_derate(generators, vm_by_bus, opts \\ []) do
+    {only, fraction_opts} = Keyword.pop(opts, :only)
+
+    generators
+    |> Enum.filter(fn gen -> inverter_based?(gen) and (is_nil(only) or only.(gen)) end)
+    |> Enum.reduce(%{}, fn gen, acc ->
+      id = Map.get(gen, :id)
+
+      case {id, bus_voltage(vm_by_bus, Map.get(gen, :bus_id))} do
+        {nil, _} -> acc
+        {_, nil} -> acc
+        {id, vm_pu} -> Map.put(acc, id, gfl_available_fraction(vm_pu, fraction_opts))
+      end
+    end)
   end
 
   defp component_type_string(:line), do: "transmission_line"

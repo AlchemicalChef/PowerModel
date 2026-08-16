@@ -817,4 +817,389 @@ defmodule PowerModel.Failure.ProtectionTest do
       assert_in_delta schedule[:shed_fraction], 0.30, 1.0e-9
     end
   end
+
+  # ===========================================================================
+  # PRC-024 Attachment 2 generator voltage protection (ROADMAP item 20)
+  # ===========================================================================
+
+  describe "generator_voltage_trips/4" do
+    defp fleet(n \\ 2) do
+      for i <- 1..n, do: %{id: i, bus_id: 100 + i, p_max_mw: 500.0, capacity_factor: 0.8}
+    end
+
+    # Hold `vm_pu` at every generator's bus for `seconds`, stepping `dt`.
+    # Returns `{all_trips, state}` so a test can look at both.
+    defp hold(generators, vm_pu, seconds, opts) do
+      dt = Keyword.get(opts, :dt, 0.05)
+      state = Keyword.get(opts, :state)
+      steps = max(round(seconds / dt), 1)
+
+      Enum.reduce(1..steps, {[], state}, fn _step, {acc, st} ->
+        voltages =
+          Map.new(generators, fn gen -> {gen.bus_id, vm_pu} end)
+
+        {trips, st} = Protection.generator_voltage_trips(generators, voltages, st, dt)
+        {acc ++ trips, st}
+      end)
+    end
+
+    test "a point inside the no-trip zone never trips, however long it is held" do
+      # 0.95 pu and 1.05 pu are both inside the continuous band: no envelope
+      # bounds their duration at all.
+      assert {[], _} = hold(fleet(), 0.95, 600.0, dt: 1.0)
+      assert {[], _} = hold(fleet(), 1.05, 600.0, dt: 1.0)
+
+      # 0.90 pu is the boundary itself, and the band is "<0.90" — exclusive.
+      assert {[], _} = hold(fleet(), 0.90, 600.0, dt: 1.0)
+    end
+
+    test "a shallow dip does not trip: 0.70 pu for 100 ms is inside the zone" do
+      assert {[], _} = hold(fleet(), 0.70, 0.1, dt: 0.1)
+    end
+
+    test "a 0.60 pu excursion trips only after its boundary duration" do
+      # 0.60 pu sits below 0.65, whose allowance is 0.30 s. It is also below
+      # 0.75 and 0.90, but those allowances are far away.
+      assert {[], state} = hold(fleet(), 0.60, 0.25, dt: 0.05)
+
+      {trips, _} = hold(fleet(), 0.60, 0.10, dt: 0.05, state: state)
+
+      assert length(trips) == 2
+      assert Enum.all?(trips, &(&1.failure_cause == "undervoltage_trip"))
+      assert Enum.all?(trips, &(&1.details.band_pu == 0.65))
+      assert Enum.all?(trips, &(&1.details.allowance_s == 0.30))
+      assert Enum.all?(trips, &(&1.details.time_in_band_s > 0.30))
+      assert Enum.all?(trips, &(&1.component_type == "generator"))
+      assert Enum.map(trips, & &1.component_id) |> Enum.sort() == [1, 2]
+    end
+
+    test "the deepest band binds: 0.40 pu gets 0.15 s and not the 0.30 s above it" do
+      assert {[], state} = hold(fleet(1), 0.40, 0.10, dt: 0.05)
+
+      {trips, _} = hold(fleet(1), 0.40, 0.10, dt: 0.05, state: state)
+
+      assert [trip] = trips
+      assert trip.details.band_pu == 0.45
+      assert trip.details.allowance_s == 0.15
+    end
+
+    test "the shallowest band still has a limit: 0.85 pu survives 2.9 s and not 3.1" do
+      assert {[], state} = hold(fleet(1), 0.85, 2.9, dt: 0.1)
+
+      {trips, _} = hold(fleet(1), 0.85, 0.2, dt: 0.1, state: state)
+
+      assert [trip] = trips
+      assert trip.details.band_pu == 0.90
+      assert trip.details.allowance_s == 3.0
+    end
+
+    test "recovery into the continuous band resets the timers" do
+      # Most of the 0.65 pu band's allowance is spent...
+      {[], state} = hold(fleet(1), 0.60, 0.25, dt: 0.05)
+
+      # ...then the voltage recovers, which ENDS the excursion.
+      {[], state} = hold(fleet(1), 1.00, 1.0, dt: 0.1, state: state)
+
+      # The same dip that would have finished it now starts from zero.
+      assert {[], state} = hold(fleet(1), 0.60, 0.25, dt: 0.05, state: state)
+      assert {[_], _} = hold(fleet(1), 0.60, 0.10, dt: 0.05, state: state)
+    end
+
+    test "climbing out of a band without recovering does NOT reset it" do
+      # PRC-024 Attachment 2's clarifications make the envelope CUMULATIVE.
+      # 0.2 s below 0.65 pu, then a spell at 0.80 pu (still an excursion —
+      # below 0.90 — but out of the 0.65 band), then back down: the 0.65
+      # timer resumes from 0.2 s rather than restarting.
+      {[], state} = hold(fleet(1), 0.60, 0.20, dt: 0.05)
+      {[], state} = hold(fleet(1), 0.80, 1.0, dt: 0.1, state: state)
+
+      {trips, _} = hold(fleet(1), 0.60, 0.15, dt: 0.05, state: state)
+
+      assert [trip] = trips
+      assert trip.details.band_pu == 0.65
+      assert_in_delta trip.details.time_in_band_s, 0.35, 1.0e-9
+    end
+
+    test "the high side is symmetric in shape" do
+      # 1.05 pu is continuous; 1.12 pu gets a second; 1.25 pu gets nothing.
+      assert {[], _} = hold(fleet(1), 1.05, 60.0, dt: 1.0)
+
+      assert {[], state} = hold(fleet(1), 1.12, 0.9, dt: 0.1)
+      {timed, _} = hold(fleet(1), 1.12, 0.2, dt: 0.1, state: state)
+      assert [trip] = timed
+      assert trip.failure_cause == "overvoltage_trip"
+      assert trip.details.band_pu == 1.100
+      assert trip.details.allowance_s == 1.00
+
+      {instant, _} = Protection.generator_voltage_trips(fleet(1), 1.25, nil, 0.0)
+      assert [trip] = instant
+      assert trip.failure_cause == "overvoltage_trip"
+      assert trip.details.band_pu == 1.200
+      assert trip.details.allowance_s == 0.0
+    end
+
+    test "a bus missing from the voltage map keeps its timers" do
+      generators = fleet(1)
+
+      {[], state} = hold(generators, 0.60, 0.25, dt: 0.05)
+      before = state.generators[1].lv
+
+      # An empty map is a missing READING, not a recovered voltage.
+      {trips, held} = Protection.generator_voltage_trips(generators, %{}, state, 5.0)
+
+      assert trips == []
+      assert held.generators[1].lv == before
+
+      # And the excursion resumes where it left off.
+      assert {[_], _} = hold(generators, 0.60, 0.10, dt: 0.05, state: held)
+    end
+
+    test "a generator trips at most once" do
+      generators = fleet(1)
+
+      {trips, state} = hold(generators, 0.30, 1.0, dt: 0.05)
+      assert length(trips) == 1
+
+      {again, _} = hold(generators, 0.30, 1.0, dt: 0.05, state: state)
+      assert again == []
+    end
+
+    test "offline units have no breaker left to open" do
+      generators = [
+        %{id: 1, bus_id: 1, p_max_mw: 500.0, capacity_factor: 0.8},
+        %{id: 2, bus_id: 1, p_max_mw: 0.0, capacity_factor: 1.0},
+        %{id: 3, bus_id: 1, p_max_mw: 500.0, capacity_factor: 0.0}
+      ]
+
+      {trips, _} = hold(generators, 0.30, 1.0, dt: 0.05)
+      assert Enum.map(trips, & &1.component_id) == [1]
+    end
+
+    test "an island-wide scalar voltage stands in for a per-bus map" do
+      {trips, _} = Protection.generator_voltage_trips(fleet(2), 0.30, nil, 1.0)
+      assert length(trips) == 2
+    end
+
+    test "the deepest sag sorts ahead of the highest swell" do
+      generators = [
+        %{id: :sag, bus_id: 1, p_max_mw: 500.0, capacity_factor: 1.0},
+        %{id: :swell, bus_id: 2, p_max_mw: 500.0, capacity_factor: 1.0}
+      ]
+
+      {trips, _} =
+        Protection.generator_voltage_trips(generators, %{1 => 0.30, 2 => 1.25}, nil, 1.0)
+
+      assert Enum.map(trips, & &1.component_id) == [:sag, :swell]
+    end
+
+    test "the envelopes are exposed as the single source of truth" do
+      assert Protection.undervoltage_envelope() == [
+               {0.45, 0.15},
+               {0.65, 0.30},
+               {0.75, 2.00},
+               {0.90, 3.00}
+             ]
+
+      assert Protection.overvoltage_envelope() == [
+               {1.200, 0.0},
+               {1.175, 0.20},
+               {1.150, 0.50},
+               {1.100, 1.00}
+             ]
+
+      assert Protection.continuous_voltage_band() == {0.90, 1.100}
+    end
+
+    test "monotone in depth: a deeper sag never trips fewer units" do
+      counts =
+        for vm <- [0.95, 0.88, 0.80, 0.74, 0.64, 0.44] do
+          {trips, _} = hold(fleet(4), vm, 2.5, dt: 0.05)
+          length(trips)
+        end
+
+      assert counts == Enum.sort(counts)
+      assert List.last(counts) == 4
+    end
+  end
+
+  describe "voltage state threading across island splits" do
+    test "splitting apportions by key and conserves every timer" do
+      generators = [
+        %{id: 1, bus_id: 1, p_max_mw: 100.0, capacity_factor: 1.0},
+        %{id: 2, bus_id: 2, p_max_mw: 100.0, capacity_factor: 1.0},
+        %{id: 3, bus_id: 3, p_max_mw: 100.0, capacity_factor: 1.0}
+      ]
+
+      {[], state} =
+        Protection.generator_voltage_trips(
+          generators,
+          %{1 => 0.60, 2 => 0.60, 3 => 0.60},
+          nil,
+          0.2
+        )
+
+      left = Protection.split_voltage_state(state, [1, 2])
+      right = Protection.split_voltage_state(state, [3])
+
+      assert Map.keys(left.generators) |> Enum.sort() == [1, 2]
+      assert Map.keys(right.generators) == [3]
+
+      # Intensive, so no scaling: each half keeps the timers it had.
+      assert left.generators[1] == state.generators[1]
+      assert right.generators[3] == state.generators[3]
+
+      # And the split halves still trip on the same total exposure.
+      assert {[_], _} =
+               Protection.generator_voltage_trips(
+                 [Enum.at(generators, 2)],
+                 %{3 => 0.60},
+                 right,
+                 0.15
+               )
+    end
+
+    test "merging re-joined islands keeps the longest timer and any trip" do
+      generators = [%{id: 1, bus_id: 1, p_max_mw: 100.0, capacity_factor: 1.0}]
+
+      {[], short} = Protection.generator_voltage_trips(generators, %{1 => 0.60}, nil, 0.1)
+      {[], long} = Protection.generator_voltage_trips(generators, %{1 => 0.60}, nil, 0.25)
+
+      merged = Protection.merge_voltage_states([short, long])
+      assert merged.generators[1] == long.generators[1]
+
+      {[_], tripped} = Protection.generator_voltage_trips(generators, %{1 => 0.60}, long, 0.1)
+      assert Protection.merge_voltage_states([short, tripped]).generators[1].tripped
+    end
+
+    test "a nil state splits into a fresh one" do
+      assert Protection.split_voltage_state(nil, [1]) == Protection.fresh_voltage_state()
+      assert Protection.merge_voltage_states([nil, nil]) == Protection.fresh_voltage_state()
+    end
+  end
+
+  describe "gfl_available_fraction/2 — current-ceiling form (default)" do
+    test "the default ceiling is 1.2 pu and the knee is derived from it" do
+      assert Protection.gfl_current_limit_pu() == 1.2
+      assert_in_delta Protection.gfl_knee_pu(), 1.0 / 1.2, 1.0e-12
+
+      # A lightly loaded unit does not reach its knee until far lower voltage.
+      assert_in_delta Protection.gfl_knee_pu(0.5), 0.5 / 1.2, 1.0e-12
+    end
+
+    test "is unity at and above the knee" do
+      assert Protection.gfl_available_fraction(Protection.gfl_knee_pu()) == 1.0
+      assert Protection.gfl_available_fraction(0.95) == 1.0
+      assert Protection.gfl_available_fraction(1.05) == 1.0
+    end
+
+    test "falls proportionally with voltage below the knee" do
+      # min(1, V · I_max): the ceiling binds and P follows V down.
+      assert_in_delta Protection.gfl_available_fraction(0.50), 0.60, 1.0e-12
+      assert_in_delta Protection.gfl_available_fraction(0.35), 0.42, 1.0e-12
+      assert Protection.gfl_available_fraction(0.0) == 0.0
+    end
+
+    test "0.70 pu is no longer unity — the salvaged knee flattered inverters" do
+      # The prior architecture's flat 0.70 knee implied a 1.43 pu ceiling. Under
+      # a 1.2 pu ceiling a fully loaded unit is already derated here.
+      assert_in_delta Protection.gfl_available_fraction(0.70), 0.84, 1.0e-12
+    end
+
+    test "is continuous at the knee" do
+      just_below = Protection.gfl_available_fraction(Protection.gfl_knee_pu() - 1.0e-9)
+      assert_in_delta just_below, 1.0, 1.0e-8
+    end
+
+    test "is monotone in voltage" do
+      fractions = for v <- 0..14, do: Protection.gfl_available_fraction(v / 10.0)
+      assert fractions == Enum.sort(fractions)
+    end
+
+    test "loading moves the knee: a half-loaded unit rides much lower" do
+      assert Protection.gfl_available_fraction(0.6, p_set_pu: 0.5) == 1.0
+      assert_in_delta Protection.gfl_available_fraction(0.3, p_set_pu: 0.5), 0.72, 1.0e-12
+    end
+
+    test "an overridden ceiling applies directly" do
+      # A fully loaded unit against a 1.0 pu ceiling delivers exactly V.
+      assert_in_delta Protection.gfl_available_fraction(0.5, current_limit_pu: 1.0), 0.5, 1.0e-12
+      assert Protection.gfl_available_fraction(0.6, current_limit_pu: 1.0, p_set_pu: 0.5) == 1.0
+    end
+
+    test "a unit dispatched above its ceiling is derated even at nominal voltage" do
+      assert_in_delta Protection.gfl_available_fraction(1.0,
+                        current_limit_pu: 1.0,
+                        p_set_pu: 1.1
+                      ),
+                      1.0 / 1.1,
+                      1.0e-12
+    end
+
+    test "clamps a negative voltage rather than returning a negative fraction" do
+      assert Protection.gfl_available_fraction(-0.2) == 0.0
+    end
+  end
+
+  describe "gfl_available_fraction/2 — knee form (opt in)" do
+    test ":knee_pu reproduces the salvaged pre-reset shape" do
+      assert Protection.gfl_available_fraction(0.70, knee_pu: 0.70) == 1.0
+      assert Protection.gfl_available_fraction(0.95, knee_pu: 0.70) == 1.0
+      assert_in_delta Protection.gfl_available_fraction(0.50, knee_pu: 0.70), 0.5 / 0.7, 1.0e-12
+    end
+
+    test ":knee_pu wins when both parameterizations are named" do
+      assert Protection.gfl_available_fraction(0.70, knee_pu: 0.70, current_limit_pu: 1.0) == 1.0
+    end
+
+    test "a degenerate zero knee derates nothing" do
+      assert Protection.gfl_available_fraction(0.1, knee_pu: 0.0) == 1.0
+    end
+  end
+
+  describe "gfl_derate/3" do
+    test "covers inverter-coupled units only" do
+      generators = [
+        %{id: 1, bus_id: 1, fuel_type: "SUN"},
+        %{id: 2, bus_id: 1, fuel_type: "WND"},
+        %{id: 3, bus_id: 1, fuel_type: "MWH"},
+        %{id: 4, bus_id: 1, fuel_type: "NG"},
+        %{id: 5, bus_id: 1, fuel_type: "AB"}
+      ]
+
+      fractions = Protection.gfl_derate(generators, %{1 => 0.35})
+
+      assert Map.keys(fractions) |> Enum.sort() == [1, 2, 3]
+      assert_in_delta fractions[1], 0.42, 1.0e-12
+      # A synchronous machine has no ceiling of this kind: absent, read as 1.0.
+      assert Map.get(fractions, 4, 1.0) == 1.0
+      # Agricultural byproduct is a steam plant, not an inverter.
+      assert Map.get(fractions, 5, 1.0) == 1.0
+    end
+
+    test "an explicit :inverter_based flag beats the fuel code" do
+      generators = [
+        %{id: 1, bus_id: 1, fuel_type: "NG", inverter_based: true},
+        %{id: 2, bus_id: 1, fuel_type: "SUN", inverter_based: false}
+      ]
+
+      assert Map.keys(Protection.gfl_derate(generators, %{1 => 0.35})) == [1]
+    end
+
+    test "a bus with no measurement gets no derate" do
+      generators = [%{id: 1, bus_id: 1, fuel_type: "SUN"}, %{id: 2, bus_id: 2, fuel_type: "SUN"}]
+
+      assert Map.keys(Protection.gfl_derate(generators, %{1 => 0.35})) == [1]
+    end
+
+    test ":only narrows the pool, for the utility-scale carve-out" do
+      generators = [
+        %{id: 1, bus_id: 1, fuel_type: "SUN", utility_scale: true},
+        %{id: 2, bus_id: 1, fuel_type: "SUN", utility_scale: false}
+      ]
+
+      fractions = Protection.gfl_derate(generators, %{1 => 0.35}, only: & &1.utility_scale)
+
+      assert Map.keys(fractions) == [1]
+    end
+  end
 end

@@ -708,4 +708,290 @@ defmodule PowerModel.Failure.BtmTripTest do
       assert_conserved(state)
     end
   end
+
+  # ===========================================================================
+  # The VOLTAGE half of Blue Cut — IEEE 1547 voltage trips (pure layer)
+  # ===========================================================================
+  #
+  # These exercise `PowerModel.Grid.BtmSolar`'s pure envelope functions
+  # directly. The cascade wiring is Wave 3b's; what is pinned here is the math
+  # and the state shapes it will thread.
+
+  describe "BtmSolar.fleet_by_bus/1" do
+    test "splits output by vintage and aggregates the sectors of one bus" do
+      entries = [
+        btm(1, 100.0, legacy_fraction: 0.30, sector: "residential"),
+        btm(1, 50.0, legacy_fraction: 0.30, sector: "commercial")
+      ]
+
+      assert %{1 => mw} = BtmSolar.fleet_by_bus(entries)
+      assert_in_delta mw.legacy_mw, 45.0, 1.0e-9
+      assert_in_delta mw.modern_mw, 105.0, 1.0e-9
+    end
+
+    test "drops buses with nothing to lose" do
+      entries = [btm(1, 0.0, legacy_fraction: 0.30), %{sector: "residential", output_mw: 10.0}]
+
+      assert BtmSolar.fleet_by_bus(entries) == %{}
+    end
+
+    test "falls back to the configured legacy share when a row carries none" do
+      assert %{1 => mw} = BtmSolar.fleet_by_bus([btm(1, 100.0)])
+      assert_in_delta mw.legacy_mw, 100.0 * BtmSolar.legacy_fraction(), 1.0e-9
+    end
+  end
+
+  describe "BtmSolar.voltage_trips/5 — legacy versus modern" do
+    defp fleet(bus_id \\ 1), do: %{bus_id => %{legacy_mw: 30.0, modern_mw: 70.0}}
+
+    test "V = 0.40 pu for 0.2 s trips the legacy fraction only" do
+      {trips, _state} = BtmSolar.voltage_trips(fleet(), %{1 => 0.40}, nil, 0.2)
+
+      assert %{1 => detail} = trips
+      assert_in_delta detail.tripped_mw, 30.0, 1.0e-9
+      assert_in_delta detail.by_vintage.legacy, 30.0, 1.0e-9
+      assert detail.by_vintage.modern == 0.0
+
+      # 1547-2003 UV2: below 0.50 pu, 0.16 s.
+      assert [%{vintage: :legacy, element: :uv2, threshold_pu: 0.50, clearing_s: 0.16}] =
+               detail.elements
+    end
+
+    test "modern Category III rides through the same excursion" do
+      # Cat III UV2 sits at 0.50 pu with a 2 s clearing time, so the modern
+      # fleet is still there long after the legacy fleet has gone.
+      {trips, state} = BtmSolar.voltage_trips(fleet(), %{1 => 0.40}, nil, 0.2)
+      assert trips[1].by_vintage.modern == 0.0
+      refute state.buses[1].modern.tripped
+
+      # ...and it does eventually go, once its own clearing time is reached.
+      {trips, _} = BtmSolar.voltage_trips(fleet(), %{1 => 0.40}, state, 2.0)
+      assert_in_delta trips[1].by_vintage.modern, 70.0, 1.0e-9
+      assert trips[1].by_vintage.legacy == 0.0
+    end
+
+    test "Category II is NOT the same answer as Category III at 0.40 pu" do
+      # Cat II's UV2 is 0.45 pu / 0.16 s — nearly as brittle as legacy. This
+      # is why the default category is a documented choice, not a detail.
+      {trips, _} =
+        BtmSolar.voltage_trips(fleet(), %{1 => 0.40}, nil, 0.2, modern_category: :category_ii)
+
+      assert_in_delta trips[1].tripped_mw, 100.0, 1.0e-9
+      assert_in_delta trips[1].by_vintage.modern, 70.0, 1.0e-9
+    end
+
+    test "V = 0.85 for 2.5 s trips legacy on the 0.50-0.88 band" do
+      {trips, _} = BtmSolar.voltage_trips(fleet(), %{1 => 0.85}, nil, 2.5)
+
+      assert_in_delta trips[1].tripped_mw, 30.0, 1.0e-9
+
+      assert [%{vintage: :legacy, element: :uv1, threshold_pu: 0.88, clearing_s: 2.0}] =
+               trips[1].elements
+    end
+
+    test "0.85 pu is inside the modern envelope for a long time" do
+      # Cat III UV1 is 0.88 pu / 21 s.
+      {trips, state} = BtmSolar.voltage_trips(fleet(), %{1 => 0.85}, nil, 2.5)
+      refute state.buses[1].modern.tripped
+      assert trips[1].by_vintage.modern == 0.0
+
+      {trips, _} = BtmSolar.voltage_trips(fleet(), %{1 => 0.85}, state, 19.0)
+      assert_in_delta trips[1].by_vintage.modern, 70.0, 1.0e-9
+    end
+
+    test "an excursion shorter than the clearing time trips nothing" do
+      assert {trips, _} = BtmSolar.voltage_trips(fleet(), %{1 => 0.40}, nil, 0.1)
+      assert trips == %{}
+    end
+
+    test "normal voltage trips nothing, however long it is held" do
+      {trips, _} = BtmSolar.voltage_trips(fleet(), %{1 => 1.0}, nil, 3600.0)
+      assert trips == %{}
+    end
+
+    test "the over-voltage elements fire too" do
+      # OV2 is 1.20 pu / 0.16 s in EVERY vintage, 2003 and 2018 alike, so a
+      # 1.25 pu bus takes the whole rooftop fleet with it.
+      {trips, _} = BtmSolar.voltage_trips(fleet(), %{1 => 1.25}, nil, 0.2)
+      assert_in_delta trips[1].tripped_mw, 100.0, 1.0e-9
+      assert Enum.map(trips[1].elements, & &1.element) == [:ov2, :ov2]
+
+      # OV1 is where they diverge: 1 s legacy, 13 s for Category III.
+      {trips, _} = BtmSolar.voltage_trips(fleet(), %{1 => 1.15}, nil, 1.5)
+      assert [%{vintage: :legacy, element: :ov1, threshold_pu: 1.10}] = trips[1].elements
+    end
+
+    test "a definite-time element resets when the voltage clears its threshold" do
+      {%{}, state} = BtmSolar.voltage_trips(fleet(), %{1 => 0.85}, nil, 1.5)
+      {%{}, state} = BtmSolar.voltage_trips(fleet(), %{1 => 1.0}, state, 0.1)
+
+      # The 2 s UV1 timer restarted, so 1.5 s more is not enough.
+      assert {trips, _} = BtmSolar.voltage_trips(fleet(), %{1 => 0.85}, state, 1.5)
+      assert trips == %{}
+    end
+
+    test "a bus missing from the voltage map keeps its timers" do
+      {%{}, state} = BtmSolar.voltage_trips(fleet(), %{1 => 0.85}, nil, 1.5)
+      before = state.buses[1].legacy.timers
+
+      {trips, held} = BtmSolar.voltage_trips(fleet(), %{}, state, 60.0)
+
+      assert trips == %{}
+      assert held.buses[1].legacy.timers == before
+
+      # ...and the excursion resumes where it left off, rather than restarting.
+      assert {trips, _} = BtmSolar.voltage_trips(fleet(), %{1 => 0.85}, held, 0.6)
+      assert_in_delta trips[1].tripped_mw, 30.0, 1.0e-9
+    end
+
+    test "a bus trips at most once per vintage" do
+      {trips, state} = BtmSolar.voltage_trips(fleet(), %{1 => 0.40}, nil, 0.2)
+      assert map_size(trips) == 1
+
+      {again, _} = BtmSolar.voltage_trips(fleet(), %{1 => 0.40}, state, 5.0)
+      assert again[1].by_vintage.legacy == 0.0
+    end
+
+    test "a frequency trip recorded into the state blocks a second voltage trip" do
+      # The double-counting guard between the two Blue Cut halves: the
+      # cascade's 59.3 Hz trip already took this bus's legacy fleet.
+      state = BtmSolar.mark_tripped(nil, 1, [:legacy])
+
+      {trips, _} = BtmSolar.voltage_trips(fleet(), %{1 => 0.40}, state, 0.2)
+
+      assert trips == %{}
+    end
+
+    test "an island-wide scalar voltage stands in for a per-bus map" do
+      fleet = Map.merge(fleet(1), fleet(2))
+
+      {trips, _} = BtmSolar.voltage_trips(fleet, 0.40, nil, 0.2)
+
+      assert Map.keys(trips) |> Enum.sort() == [1, 2]
+    end
+
+    test "tripped_mw_by_bus/1 flattens to what a gross-up needs" do
+      {trips, _} = BtmSolar.voltage_trips(fleet(), %{1 => 0.40}, nil, 0.2)
+
+      assert %{1 => mw} = BtmSolar.tripped_mw_by_bus(trips)
+      assert_in_delta mw, 30.0, 1.0e-9
+    end
+
+    test "the settings tables are exposed as the single source of truth" do
+      assert BtmSolar.voltage_trip_settings(:legacy) == [
+               {:uv2, :under, 0.50, 0.16},
+               {:uv1, :under, 0.88, 2.00},
+               {:ov2, :over, 1.20, 0.16},
+               {:ov1, :over, 1.10, 1.00}
+             ]
+
+      assert BtmSolar.voltage_trip_settings(:category_iii) == [
+               {:uv2, :under, 0.50, 2.00},
+               {:uv1, :under, 0.88, 21.0},
+               {:ov2, :over, 1.20, 0.16},
+               {:ov1, :over, 1.10, 13.0}
+             ]
+
+      assert BtmSolar.modern_category() == :category_iii
+    end
+  end
+
+  describe "BtmSolar voltage state threading across island splits" do
+    test "splitting apportions by key and conserves every timer" do
+      fleet = %{
+        1 => %{legacy_mw: 10.0, modern_mw: 20.0},
+        2 => %{legacy_mw: 10.0, modern_mw: 20.0},
+        3 => %{legacy_mw: 10.0, modern_mw: 20.0}
+      }
+
+      {%{}, state} = BtmSolar.voltage_trips(fleet, 0.85, nil, 1.5)
+
+      left = BtmSolar.split_voltage_state(state, [1, 2])
+      right = BtmSolar.split_voltage_state(state, [3])
+
+      assert Map.keys(left.buses) |> Enum.sort() == [1, 2]
+      assert Map.keys(right.buses) == [3]
+
+      # Intensive: the halves keep the timers unscaled...
+      assert left.buses[1] == state.buses[1]
+      assert right.buses[3] == state.buses[3]
+
+      # ...so the remaining exposure still finishes the element on schedule.
+      assert {trips, _} = BtmSolar.voltage_trips(fleet, 0.85, right, 0.6)
+      assert Map.keys(trips) == [3]
+    end
+
+    test "merging re-joined islands keeps the longest timer and any trip" do
+      fleet = fleet(1)
+
+      {%{}, short} = BtmSolar.voltage_trips(fleet, %{1 => 0.85}, nil, 0.5)
+      {%{}, long} = BtmSolar.voltage_trips(fleet, %{1 => 0.85}, nil, 1.5)
+
+      merged = BtmSolar.merge_voltage_states([short, long])
+      assert merged.buses[1].legacy == long.buses[1].legacy
+
+      {_, tripped} = BtmSolar.voltage_trips(fleet, %{1 => 0.85}, long, 1.0)
+      assert BtmSolar.merge_voltage_states([short, tripped]).buses[1].legacy.tripped
+    end
+
+    test "a nil state splits into a fresh one" do
+      assert BtmSolar.split_voltage_state(nil, [1]) == BtmSolar.fresh_voltage_state()
+      assert BtmSolar.merge_voltage_states([nil]) == BtmSolar.fresh_voltage_state()
+    end
+  end
+
+  describe "cause-tagged btm_tripped bookkeeping" do
+    test "an island-level event distinguishes voltage from frequency" do
+      fleet = Map.merge(fleet(1), fleet(2))
+      {trips, _} = BtmSolar.voltage_trips(fleet, 0.40, nil, 0.2)
+
+      event = BtmSolar.voltage_trip_event(trips)
+
+      assert event.component_type == "btm_solar"
+      assert event.failure_cause == "btm_voltage_trip"
+      assert event.details.cause == :voltage
+      assert event.component_id == 1
+      assert event.details.bus_count == 2
+      assert_in_delta event.details.tripped_mw, 60.0, 1.0e-9
+      assert_in_delta event.details.legacy_mw, 60.0, 1.0e-9
+      assert event.details.modern_mw == 0.0
+      assert_in_delta event.details.vm_pu_min, 0.40, 1.0e-9
+
+      # ONE event for the whole island, never one per bus.
+      refute is_list(event)
+    end
+
+    test "nothing tripped means no event at all" do
+      assert BtmSolar.voltage_trip_event(%{}) == nil
+    end
+
+    test "the breakdown of mixed frequency and voltage trips still balances" do
+      breakdown =
+        BtmSolar.fresh_trip_breakdown()
+        |> BtmSolar.record_trip(:frequency, 12.0)
+        |> BtmSolar.record_trip(:voltage, 30.0)
+        |> BtmSolar.record_trip(:frequency, 4.5)
+
+      assert_in_delta breakdown.frequency_mw, 16.5, 1.0e-9
+      assert_in_delta breakdown.voltage_mw, 30.0, 1.0e-9
+      assert_in_delta breakdown.total_mw, 46.5, 1.0e-9
+      assert BtmSolar.trip_breakdown_balanced?(breakdown)
+    end
+
+    test "total_mw is exactly the conservation identity's btm_tripped term" do
+      # The identity `served + shed + blackout == original + btm_tripped` keeps
+      # its shape: the breakdown refines one number, it does not add a term.
+      breakdown =
+        Enum.reduce(
+          [{:frequency, 1.0}, {:voltage, 2.0}, {:voltage, 3.5}],
+          BtmSolar.fresh_trip_breakdown(),
+          fn
+            {cause, mw}, acc -> BtmSolar.record_trip(acc, cause, mw)
+          end
+        )
+
+      assert_in_delta breakdown.total_mw, breakdown.frequency_mw + breakdown.voltage_mw, 1.0e-12
+      assert_in_delta breakdown.total_mw, 6.5, 1.0e-9
+    end
+  end
 end
