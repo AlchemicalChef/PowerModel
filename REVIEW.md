@@ -890,7 +890,13 @@ ERCOT +1.55%) no longer reproduce on the current tree (+0.76% / +1.66%) — meas
 invariant under every fix-wave change, so the drift belongs to the DR-4/DR-5 remaps plus
 dev-DB movement (incl. the 2026-08-16 migration incident: dev is functionally consistent
 but not bit-identical; +10 synthetic buses, +24 NULL endpoints). Still inside all gates;
-re-measure and re-record when next touched.
+re-measure and re-record when next touched. Baseline caveat (dated 2026-08-16):
+priv/topology_baseline.json was regenerated post-incident, so it bakes in the +10
+synthetic buses (93,093) and +24 unrecovered endpoints (4,691) — checked behaviourally
+inert: the diff tolerances (±4,655 / ±235) swallow both deltas, so a clean re-ingest
+landing on pre-incident values diffs clean in both directions. Not annotated in the JSON
+itself because write_baseline! regenerates the note field verbatim and an incident line
+there would outlive its truth.
 **Notes for the record (fix-solver, confirmed by query):** no bus in the DB is marked
 slack (bus_type=3 count 0) — all three solvers fall through to the largest-generator
 tiebreak, stable in measurement but the slack MOVES when that unit trips, which is a
