@@ -364,6 +364,10 @@ Micro [DEFER]: num_points u16 clamp in grid_export.
 
 ## UI — LiveView / map / JS
 
+**UI-M17 (LOW) [OPEN]** Island splits are counted but never LISTED: thermal mw_at_risk
+dominates the ranking, so 0 of the top-10 entries are :island_split on any interconnection
+(41% of ERCOT branches are bridges). If splits are to be actionable they need their own
+ranked row. Found at UI-3 integration, 2026-08-16.
 **UI-L14 (LOW) [OPEN]** Flow-classification id lists (rerouted/overloaded/stressed) are
 re-sent in full on every cascade step — 60% (134 KB) of a 50-step cascade's client
 payload. Delta-encoding them changes the map repaint/scrub contract and is deliberately
@@ -447,7 +451,12 @@ class mismatches (115/161 kV, water pipeline, crypto) — align keys and rows. *
 R3-engine adds ids to elements it modifies). **UI-L10 (LOW) [DEFER]** No LiveView tests —
 R3-engine must add tests for what it changes. **UI-L11 (LOW) [DEFER]** daisyUI in scaffold
 chrome. **UI-L12 (LOW) [FIX:R3-data]** Export name nil-guard for TextLayer.
-**UI-M15 (MED) [DEFER→roadmap]** The N-1 screening result shown in the UI is a stub:
+**UI-M15 (FIXED 2026-08-16)** Real N-1 is live: ContingencyScreening via the engine's
+screening_snapshot, per-scope budgets, largest-island disclosure for multi-island scopes
+(the default "all" is THREE islands and LODF refuses them — the naive wiring would have
+failed every fresh session's first click). First real numbers post-DR-1: Eastern worst
+mw_at_risk 582,431.6 → 10,819.8 MW (54×; top entry a 345/138 step-down transformer at
+1072%), sweep 65.7 s. ORIGINAL: The N-1 screening result shown in the UI was a stub:
 `index.ex` (~:399-407 pre-R3) returns `length(tripped_lines) + length(tripped_generators)`
 — the count of components the user already tripped, presented as a violations count with no
 relationship to what it claims to measure. Found by the solver accuracy exploration
@@ -605,7 +614,9 @@ on a snapshot agreeing to 1e-13; flips the Western overload census 585/586 betwe
 identical runs. The solver is exonerated (row-shuffled and repeated solves bit-identical;
 1e-9 MW injection swap moves flows 1.8e-9 MW). Dispatch-side map/order dependence is the
 suspect. Until fixed, census gates on Western must be stated ±1 or pinned to one dispatch
-draw. Found by DR-2's A/B harness, 2026-08-16.
+draw. Also: Eastern base-overload reads differ by path (DR-2 census 781 vs UI-3
+screening-base 807 on the same tree) — reconcile the two bases when ENE-21 is fixed.
+Found by DR-2's A/B harness, 2026-08-16.
 **ENE-18 (DATA CAVEAT) [RE-MEASURED 2026-08-16]** EIA-930's own identity NG − (D+TI)
 fails for BPAT alone in the current DB: 0 of 4,417 hours close at 5% tolerance, mean
 residual −4,317 MW (sd 725). The previously-recorded MISO and CISO are no longer broken
