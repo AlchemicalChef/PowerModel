@@ -50,11 +50,28 @@
 .freq-warning { color: #f5a623; }
 .freq-critical { color: #e74c3c; }
 .text-red { color: #e74c3c; }
+.text-amber { color: #f1c40f; }
 
 .metric-sub {
   font-size: 10px;
   font-weight: 400;
   color: #888;
+}
+
+/* The BTM term in the demand denominator: rooftop that tripped is demand the
+   wire stopped seeing, so it belongs beside the number it reconciles. */
+.metric-btm { color: #f1c40f; }
+
+/* Frequency trace (UIW-5): the nadir is a sub-label now, so the recovery has
+   to be visible somewhere. Inline SVG, no charting dependency. */
+.metric-frequency { min-width: 120px; }
+
+.freq-spark {
+  width: 120px;
+  height: 28px;
+  display: block;
+  margin-top: 2px;
+  opacity: 0.9;
 }
 
 /* Cascade Timeline */
@@ -413,6 +430,11 @@
 .affected-item.cause-ufls { border-left-color: #3498db; }
 .affected-item.cause-manual { border-left-color: #9b59b6; }
 .affected-item.cause-blackout { border-left-color: #2c3e50; }
+/* DER ride-through (rooftop PV dropping off) — solar yellow, matching the
+   generator fuel swatch so the two read as the same resource class. */
+.affected-item.cause-der { border-left-color: #f1c40f; }
+/* A cause this build does not know about still draws as a row (UIW-7). */
+.affected-item.cause-unknown { border-left-color: #6b6b7d; }
 .affected-icon { font-size: 14px; width: 20px; text-align: center; opacity: 0.7; }
 .affected-info { flex: 1; display: flex; gap: 4px; align-items: baseline; }
 .affected-type { font-size: 11px; color: #ccc; }
@@ -471,3 +493,85 @@
 }
 .violation-count { font-size: 18px; font-weight: 700; color: #e74c3c; }
 .violation-text { font-size: 11px; color: #ccc; }
+
+/* N-1 screening results (UIW-2 / UIW-3) */
+.n1-hint { margin-top: 6px; font-size: 10px; color: #888; }
+.n1-result { margin-top: 10px; }
+
+.n1-stale {
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  border-radius: 5px;
+  background: rgba(245, 166, 35, 0.15);
+  border: 1px solid rgba(245, 166, 35, 0.4);
+  color: #f5a623;
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.n1-summary { display: flex; gap: 6px; }
+
+.n1-summary-cell {
+  flex: 1;
+  padding: 6px 4px;
+  border-radius: 5px;
+  background: rgba(50, 50, 70, 0.5);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+}
+
+.n1-summary-count { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.n1-summary-label { font-size: 9px; color: #888; text-transform: uppercase; letter-spacing: 0.4px; }
+.n1-split { color: #7f9db9; }
+.n1-clean { color: #2ecc71; }
+
+.n1-base {
+  margin-top: 8px;
+  font-size: 10px;
+  color: #999;
+  line-height: 1.35;
+}
+
+.n1-ranked { margin-top: 8px; max-height: 200px; overflow-y: auto; }
+
+.n1-entry {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-left: 3px solid transparent;
+  border-radius: 3px;
+}
+
+.n1-entry:hover { background: rgba(50, 50, 70, 0.5); }
+.n1-entry-thermal { border-left-color: #e74c3c; }
+.n1-entry-split { border-left-color: rgb(52, 73, 94); }
+
+.n1-entry-branch {
+  flex: 1;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0;
+  color: #ccc;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.n1-entry-branch:hover { color: #4ecdc4; }
+.n1-entry-metrics { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; }
+.n1-entry-mw { font-size: 11px; font-weight: 600; color: #e0e0e0; font-variant-numeric: tabular-nums; }
+.n1-entry-caption { font-size: 9px; color: #777; }
+.n1-entry-loading { width: 46px; text-align: right; font-size: 10px; color: #999; font-variant-numeric: tabular-nums; }
+
+.n1-footnote { margin-top: 8px; font-size: 9px; color: #666; line-height: 1.35; }
+
+/* Legend footnote for the partial voltage overlay */
+.legend-footnote { font-size: 9px; color: #777; line-height: 1.3; margin-top: 4px; }
+
+/* Solver badge: a cascade cut off at its step budget is NOT a settled
+   collapse (the other status dots live in map.css). Amber says "we stopped
+   watching", not "it ended here". */
+.status-truncated { background: #f5a623; }

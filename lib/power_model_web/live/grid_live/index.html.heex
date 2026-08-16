@@ -98,6 +98,11 @@
   <.live_component
     module={PowerModelWeb.GridLive.FailureControls}
     id="failure-controls"
+    screening={@n1_screening}
+    screen_error={@n1_error}
+    screen={@n1_result}
+    stale={@n1_stale}
+    hint={@n1_hint}
   />
 
   <%!-- Info Panel (selected component) --%>
@@ -115,7 +120,8 @@
     <.live_component
       module={PowerModelWeb.GridLive.AffectedList}
       id="affected-list"
-      events={get_cascade_events(@cascade_steps)}
+      events={@cascade_events}
+      total={@cascade_event_total}
     />
   <% end %>
 
@@ -455,6 +461,33 @@
           <div class="legend-item">
             <span class="legend-dot" style="background: rgb(255, 50, 30);"></span>
             <span>Tripped / Dead</span>
+          </div>
+        </div>
+        <%!-- UIW-4: the voltage overlay is PARTIAL by construction. It covers
+             only the islands whose AC solve converged during the cascade; the
+             rest of the map is the DC picture and carries no voltage claim at
+             all. The footnote is part of the legend, not decoration. --%>
+        <div class="legend-divider"></div>
+        <div class="legend-section" id="legend-voltage-pu">
+          <div class="legend-title">Voltage (pu)</div>
+          <div class="legend-item">
+            <span
+              class="legend-swatch legend-voltage-ramp"
+              style="background: linear-gradient(to right, rgb(231,76,60), rgb(245,166,35)); width: 80px;"
+            >
+            </span>
+          </div>
+          <div class="legend-item legend-scale-labels">
+            <span>&le; 0.85</span>
+            <span>0.95</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot legend-voltage-high" style="background: rgb(155, 89, 182);">
+            </span>
+            <span>&gt; 1.05 (Ferranti)</span>
+          </div>
+          <div class="legend-footnote">
+            Only islands whose AC solve converged; elsewhere the map is DC.
           </div>
         </div>
       <% end %>

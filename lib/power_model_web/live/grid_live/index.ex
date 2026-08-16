@@ -3,11 +3,26 @@ defmodule PowerModelWeb.GridLive.Index do
 
   require Logger
 
+  alias PowerModel.Analysis.ContingencyScreening
   alias PowerModel.Engine.SimulationServer
+  alias PowerModel.Solver.Partition
 
   # UI-M11: an N-1 screen that neither reports nor dies within this window is
   # declared failed so the button never sticks at "Scanning...".
-  @n1_screening_timeout 60_000
+  #
+  # UIW-2: 60 s was BELOW the work. A full Eastern sweep measured 63.0-65.5 s
+  # of wall time on its own, so the old deadline declared the real screen
+  # failed seconds before it would have reported. The budget is now per scope:
+  # a single interconnection gets ~2x its measured worst case, and "all"
+  # additionally pays for partitioning and base-solving the national snapshot
+  # before the sweep it feeds is the Eastern one anyway.
+  @n1_budget_scoped_ms 120_000
+  @n1_budget_national_ms 240_000
+
+  # Ranked entries kept from a sweep. The summary is computed over every
+  # contingency screened regardless of this (ContingencyScreening.screen/2),
+  # so trimming the list costs no counts.
+  @n1_ranked_limit 10
 
   @impl true
   def mount(_params, _session, socket) do
@@ -36,6 +51,7 @@ defmodule PowerModelWeb.GridLive.Index do
       |> assign(:selected_component, nil)
       |> assign(:cascade_steps, [])
       |> assign(:cascade_active, false)
+      |> assign_cascade_events(:reset)
       |> assign(:system_metrics, initial_metrics())
       |> assign(:solver_status, :idle)
       |> assign(:view_mode, "voltage_level")
@@ -53,6 +69,7 @@ defmodule PowerModelWeb.GridLive.Index do
       |> assign(:trip_task, nil)
       |> assign(:reset_task, nil)
       |> assign(:n1_task, nil)
+      |> assign_n1(:reset)
 
     {:ok, socket, layout: {PowerModelWeb.Layouts, :grid}}
   end
@@ -116,7 +133,11 @@ defmodule PowerModelWeb.GridLive.Index do
               |> assign(:solver_status, :solving)
               # UI-M2: each injection is a new disturbance; the nadir
               # tracking starts fresh at nominal frequency.
-              |> update(:system_metrics, &%{&1 | frequency_hz: 60.0})
+              |> update(:system_metrics, &rearm_frequency/1)
+              # UIW-3: the LODF screen was computed for the pre-trip
+              # injection vector, so it is advisory the instant a component
+              # leaves the network.
+              |> assign(:n1_stale, true)
               |> start_trip_task(type, component_id)
 
             {:noreply, socket}
@@ -155,10 +176,12 @@ defmodule PowerModelWeb.GridLive.Index do
       socket
       |> assign(:reset_task, Process.monitor(task_pid))
       |> assign(:cascade_steps, [])
+      |> assign_cascade_events(:reset)
       |> assign(:cascade_active, false)
       |> assign(:selected_component, nil)
       |> assign(:solver_status, :resetting)
       |> assign(:system_metrics, initial_metrics())
+      |> assign_n1(:reset)
       |> push_event("reset_grid", %{})
       |> push_event("deselect_highlight", %{})
 
@@ -178,8 +201,23 @@ defmodule PowerModelWeb.GridLive.Index do
     {:noreply, socket}
   end
 
-  def handle_event("viewport_changed", %{"zoom" => zoom, "bounds" => bounds}, socket) do
-    {:noreply, push_event(socket, "update_lod", %{zoom: zoom, bounds: bounds})}
+  # UIW-8: the client's own ViewportTracker already rebuilt the LOD before it
+  # told us; echoing the viewport back made the map rebuild ~90k line paths a
+  # second time per pan. The server has nothing to add to a viewport change.
+  def handle_event("viewport_changed", %{"zoom" => _zoom, "bounds" => _bounds}, socket) do
+    {:noreply, socket}
+  end
+
+  def handle_event("run_n1_screening", _params, socket) do
+    send(self(), :run_n1_screening)
+
+    socket =
+      socket
+      |> assign(:n1_screening, true)
+      |> assign(:n1_error, false)
+      |> assign(:n1_hint, n1_hint(socket.assigns.interconnection))
+
+    {:noreply, socket}
   end
 
   def handle_event("scrub_timeline", %{"step" => step}, socket) do
@@ -315,9 +353,15 @@ defmodule PowerModelWeb.GridLive.Index do
   end
 
   def handle_info({:simulation_ac_update, payload}, socket) do
+    # UIW-4: the only AC that runs now is the cascade's own per-island QSS-AC,
+    # and it covers the islands that converged and no others. Labelling that
+    # "AC Converged" would claim a whole-grid voltage solution the server
+    # explicitly did not produce.
+    status = if payload[:partial_ac], do: :ac_partial, else: :ac_solved
+
     socket =
       socket
-      |> put_solver_result_status(:ac_solved)
+      |> put_solver_result_status(status)
       |> update_metrics(payload)
       |> push_event("ac_results", payload)
 
@@ -330,34 +374,46 @@ defmodule PowerModelWeb.GridLive.Index do
     socket =
       socket
       |> assign(:cascade_steps, steps)
+      |> assign_cascade_events({:step, payload})
+      |> assign(:n1_stale, socket.assigns.n1_stale or step_component_trips(payload) > 0)
       |> update(:system_metrics, fn m ->
         m
         |> merge_balance(payload[:balance])
         |> Map.put(:islands, payload[:islands] || m.islands)
         # UI-M3: the Tripped metric moves WITH the cascade, not only at the end
         |> Map.update!(:tripped_count, &(&1 + step_component_trips(payload)))
-        # UI-M2: frequency = worst (minimum) nadir reported by shed events
-        |> track_frequency_nadir(payload)
+        |> track_frequency(payload)
+        |> merge_present(:voltage_layer, payload[:voltage_layer])
+        |> merge_present(:agc, payload[:agc])
       end)
-      |> push_event("cascade_step", payload)
+      # UIW-5: the browser gets the map channels only. The panel channels
+      # (:trips and friends) are 83% of a collapse-scale frame and no JS
+      # consumer reads them -- the LiveView above is their only reader.
+      |> push_event("cascade_step", SimulationServer.client_step_payload(payload))
 
     {:noreply, socket}
   end
 
   def handle_info({:simulation_cascade_done, payload}, socket) do
     # CAS-3: an unstable end state (blackout, exhausted step budget) must not
-    # be presented as "Stable".
+    # be presented as "Stable". UIW-3: and a run that stopped at the step
+    # BUDGET is not the same claim as one that settled into collapse -- the
+    # cascade's own :reason is the only thing that separates them, and reading
+    # a truncated run as a collapse is the false-10x hazard.
     stable = payload[:stable] == true
 
     socket =
       socket
       |> assign(:cascade_active, false)
-      |> assign(:solver_status, if(stable, do: :stable, else: :unstable))
+      |> assign(:solver_status, cascade_status(payload[:reason], stable))
       |> update(:system_metrics, fn m ->
         m
         |> merge_balance(payload[:balance])
         # CAS-8: component trips only -- never total_events (one per shed load)
         |> Map.put(:tripped_count, payload[:tripped_count] || m.tripped_count)
+        |> merge_present(:voltage_layer, payload[:voltage_layer])
+        |> merge_present(:agc, payload[:agc])
+        |> merge_present(:btm_trip_breakdown, payload[:btm_trip_breakdown])
       end)
       # UI-C1 / contract #2: tell the map the cascade ended so it can leave
       # cascade mode (ghosting, vignette, forced layers).
@@ -370,9 +426,11 @@ defmodule PowerModelWeb.GridLive.Index do
     socket =
       socket
       |> assign(:cascade_steps, [])
+      |> assign_cascade_events(:reset)
       |> assign(:cascade_active, false)
       |> assign(:solver_status, :idle)
       |> assign(:system_metrics, initial_metrics())
+      |> assign_n1(:reset)
       # UI-M14: server-side frame list is cleared above; without this push the
       # client keeps its frames and every later scrub replays the wrong prefix.
       |> push_event("reset_grid", %{})
@@ -386,6 +444,7 @@ defmodule PowerModelWeb.GridLive.Index do
     lv = self()
     interconnection = socket.assigns.interconnection
     hour = socket.assigns.selected_hour
+    budget = n1_budget_ms(interconnection)
 
     # UI-M11: the screening task is monitored and deadlined -- a dead or hung
     # task must never leave the button stuck at "Scanning...".
@@ -394,15 +453,7 @@ defmodule PowerModelWeb.GridLive.Index do
         result =
           try do
             with {:ok, _pid} <- ensure_sim_server(sim_id, interconnection, hour) do
-              case SimulationServer.get_state(sim_id) do
-                %{has_dc_solution: true} = state ->
-                  # N-1 screening would run here against the current DC solution
-                  # For now, broadcast the result count back
-                  {:ok, length(state.tripped_lines) + length(state.tripped_generators)}
-
-                _ ->
-                  {:ok, 0}
-              end
+              sim_id |> SimulationServer.screening_snapshot() |> screen_snapshot()
             end
           catch
             :exit, reason -> {:error, reason}
@@ -412,7 +463,7 @@ defmodule PowerModelWeb.GridLive.Index do
       end)
 
     ref = Process.monitor(task_pid)
-    Process.send_after(self(), {:n1_screening_timeout, ref}, @n1_screening_timeout)
+    Process.send_after(self(), {:n1_screening_timeout, ref}, budget)
 
     {:noreply, assign(socket, :n1_task, ref)}
   end
@@ -455,27 +506,22 @@ defmodule PowerModelWeb.GridLive.Index do
     socket = assign(socket, :n1_task, nil)
 
     case result do
-      {:ok, violations} ->
-        send_update(PowerModelWeb.GridLive.FailureControls,
-          id: "failure-controls",
-          screening: false,
-          screen_error: false,
-          violations: violations
-        )
+      {:ok, screen} ->
+        {:noreply, assign_n1(socket, {:result, screen})}
 
       {:error, reason} ->
         Logger.error("N-1 screening failed: #{inspect(reason)}")
-        n1_error_update()
+        {:noreply, assign_n1(socket, :error)}
     end
-
-    {:noreply, socket}
   end
 
   def handle_info({:n1_screening_timeout, ref}, socket) do
     if socket.assigns.n1_task == ref do
-      Logger.error("N-1 screening timed out after #{@n1_screening_timeout}ms")
-      n1_error_update()
-      {:noreply, assign(socket, :n1_task, nil)}
+      Logger.error(
+        "N-1 screening timed out after #{n1_budget_ms(socket.assigns.interconnection)}ms"
+      )
+
+      {:noreply, socket |> assign(:n1_task, nil) |> assign_n1(:error)}
     else
       {:noreply, socket}
     end
@@ -509,12 +555,12 @@ defmodule PowerModelWeb.GridLive.Index do
       socket.assigns.n1_task == ref ->
         socket = assign(socket, :n1_task, nil)
 
-        unless reason == :normal do
+        if reason == :normal do
+          {:noreply, socket}
+        else
           Logger.error("N-1 screening task died: #{inspect(reason)}")
-          n1_error_update()
+          {:noreply, assign_n1(socket, :error)}
         end
-
-        {:noreply, socket}
 
       true ->
         {:noreply, socket}
@@ -650,8 +696,10 @@ defmodule PowerModelWeb.GridLive.Index do
       |> assign(:sim_server, nil)
       |> assign(:server_scope, nil)
       |> assign(:cascade_steps, [])
+      |> assign_cascade_events(:reset)
       |> assign(:cascade_active, false)
       |> assign(:system_metrics, initial_metrics())
+      |> assign_n1(:reset)
       |> push_event("reset_grid", %{})
 
     case reason do
@@ -703,7 +751,7 @@ defmodule PowerModelWeb.GridLive.Index do
   # AC refinement must not overwrite the classification with "AC Converged";
   # its flows/metrics still land. A new trip or reset re-arms the status.
   defp put_solver_result_status(socket, status) do
-    if socket.assigns.solver_status in [:stable, :unstable] do
+    if socket.assigns.solver_status in [:stable, :unstable, :truncated, :solve_failed] do
       socket
     else
       assign(socket, :solver_status, status)
@@ -719,13 +767,94 @@ defmodule PowerModelWeb.GridLive.Index do
     |> push_event("cascade_done", %{stable: false})
   end
 
-  defp n1_error_update do
-    send_update(PowerModelWeb.GridLive.FailureControls,
-      id: "failure-controls",
-      screening: false,
-      screen_error: true,
-      violations: 0
-    )
+  # ---------------------------------------------------------------------------
+  # N-1 contingency screening (UIW-2 / UIW-3)
+  # ---------------------------------------------------------------------------
+
+  # Eastern's sweep alone measured 63.0-65.5 s; the national scope pays for a
+  # partition and a base solve of the whole snapshot first.
+  defp n1_budget_ms("all"), do: @n1_budget_national_ms
+  defp n1_budget_ms(_scope), do: @n1_budget_scoped_ms
+
+  defp n1_hint("all"), do: "Screening the largest island — up to ~2 minutes"
+  defp n1_hint(_scope), do: "Screening every branch — up to ~1 minute"
+
+  @doc false
+  # Screen one electrical island, which is what LODF requires: `LODF.init/3`
+  # refuses a disconnected graph outright (`{:error, {:disconnected, n}}`), and
+  # the default "all" scope IS disconnected -- it is the three asynchronous
+  # interconnections, joined only by DC ties, which no linear AC sensitivity
+  # crosses. Handing that straight to the sweep would put the panel in its
+  # error state on the first click of a fresh session, forever. So the sweep
+  # runs on the LARGEST island and the panel says how much of the snapshot
+  # that was.
+  #
+  # The session's own DC solution is reused only when the snapshot IS one
+  # island -- it is a per-island merge, and `screening_snapshot/1` documents
+  # that passing it asserts exactly that.
+  def screen_snapshot(%{snapshot: snapshot} = session) do
+    case Partition.split(snapshot) do
+      {[], _dead} ->
+        {:error, :no_solvable_island}
+
+      {islands, dead} ->
+        island = Enum.max_by(islands, &length(&1.buses))
+        opts = [base_mva: session.base_mva, limit: @n1_ranked_limit]
+
+        # The base solve is reusable only for a single-island snapshot, which
+        # is the ordinary case for ONE interconnection. It is never the case
+        # for the "all" scope: `Grid.get_full_grid_snapshot/1` keeps every
+        # component of at least 200 buses, so the national snapshot is the
+        # three asynchronous systems (measured: 3 islands, 51,713 of 74,629
+        # buses in the largest). Cascade islanding produces the same shape.
+        result =
+          if islands == [island] and dead == [] and session.dc_solution != nil do
+            ContingencyScreening.run(island, session.dc_solution, opts)
+          else
+            ContingencyScreening.run(island, opts)
+          end
+
+        # UIW-2 (verifier): run/2 and run/3 both answer {:ok, result}. The
+        # tuple has to come off here or the panel renders a two-element list.
+        with {:ok, screen} <- result do
+          {:ok,
+           Map.put(screen, :scope, %{
+             # Dead islands count: an islanded fragment with no generator is
+             # still part of the network the user is looking at, and leaving
+             # it out of the denominator would overstate the coverage.
+             islands: length(islands) + length(dead),
+             buses_screened: length(island.buses),
+             buses_total: length(snapshot.buses)
+           })}
+        end
+    end
+  end
+
+  def screen_snapshot(_session), do: {:error, :no_snapshot}
+
+  defp assign_n1(socket, :reset) do
+    socket
+    |> assign(:n1_screening, false)
+    |> assign(:n1_error, false)
+    |> assign(:n1_result, nil)
+    |> assign(:n1_stale, false)
+    |> assign(:n1_hint, nil)
+  end
+
+  defp assign_n1(socket, :error) do
+    socket
+    |> assign(:n1_screening, false)
+    |> assign(:n1_error, true)
+    |> assign(:n1_hint, nil)
+  end
+
+  defp assign_n1(socket, {:result, screen}) do
+    socket
+    |> assign(:n1_screening, false)
+    |> assign(:n1_error, false)
+    |> assign(:n1_result, screen)
+    |> assign(:n1_stale, false)
+    |> assign(:n1_hint, nil)
   end
 
   # UI-M3: only component trips count toward the Tripped metric
@@ -735,23 +864,86 @@ defmodule PowerModelWeb.GridLive.Index do
       length(payload[:tripped_generator_ids] || [])
   end
 
-  # UI-M2: shed events carry the swing-simulation nadir in their details;
-  # the metric shows the worst (minimum) frequency seen this cascade.
-  defp track_frequency_nadir(metrics, payload) do
+  # UIW-5. Frequency is TWO numbers, and the bug this closes is reporting one
+  # as the other: the panel latched the nadir and never let go, so a cascade
+  # that AGC had walked back to 60.00 Hz kept showing 59.21 in critical red
+  # forever. `frequency_hz` is where the system is now; `frequency_nadir_hz`
+  # is the deepest dip on the way there, and it is the number that explains
+  # what tripped and what was shed.
+  #
+  # Both sources feed it. The engine's own `:frequency` (load-weighted across
+  # islands) is authoritative when present; the shed events' `frequency_nadir`
+  # is kept because it is the only nadir a manual-trip step carries, and
+  # because the shed AGGREGATE carries the group MINIMUM precisely so this
+  # running minimum survives aggregation.
+  defp track_frequency(metrics, payload) do
+    metrics
+    |> apply_frequency(payload[:frequency])
+    |> apply_shed_nadir(payload[:trips])
+    |> record_frequency_point(payload[:simulated_time])
+  end
+
+  defp apply_frequency(metrics, %{} = frequency) do
+    f_hz = number_or(frequency[:f_hz], metrics.frequency_hz)
+    nadir = number_or(frequency[:nadir_hz], metrics.frequency_nadir_hz)
+
+    %{metrics | frequency_hz: f_hz, frequency_nadir_hz: min(metrics.frequency_nadir_hz, nadir)}
+  end
+
+  defp apply_frequency(metrics, _absent), do: metrics
+
+  defp apply_shed_nadir(metrics, trips) when is_list(trips) do
     nadir =
-      (payload[:trips] || [])
+      trips
       |> Enum.map(fn trip -> trip |> Map.get(:details) |> nadir_from_details() end)
       |> Enum.filter(&is_number/1)
       |> Enum.min(fn -> nil end)
 
     case nadir do
       nil -> metrics
-      hz -> %{metrics | frequency_hz: min(metrics.frequency_hz, hz * 1.0)}
+      hz -> %{metrics | frequency_nadir_hz: min(metrics.frequency_nadir_hz, hz * 1.0)}
     end
   end
 
+  defp apply_shed_nadir(metrics, _trips), do: metrics
+
+  # A bounded trace for the sparkline. Simulated time is the x axis when the
+  # step carries it; steps without one fall in at their arrival order.
+  @freq_history_points 120
+
+  defp record_frequency_point(metrics, t) do
+    point = {number_or(t, 0.0), metrics.frequency_hz}
+    history = Enum.take(metrics.freq_history ++ [point], -@freq_history_points)
+    %{metrics | freq_history: history}
+  end
+
+  defp rearm_frequency(metrics) do
+    %{metrics | frequency_hz: 60.0, frequency_nadir_hz: 60.0, freq_history: []}
+  end
+
+  defp number_or(v, _default) when is_number(v), do: v * 1.0
+  defp number_or(_v, default), do: default
+
   defp nadir_from_details(%{} = details), do: Map.get(details, :frequency_nadir)
   defp nadir_from_details(_), do: nil
+
+  # Contract rule: absence means "no information", never zero. A step whose
+  # voltage layer never ran carries no :voltage_layer key, and overwriting the
+  # last real reading with a zeroed one would report "no undervoltage" for a
+  # cascade that never looked.
+  defp merge_present(metrics, _key, nil), do: metrics
+  defp merge_present(metrics, _key, []), do: metrics
+  defp merge_present(metrics, key, value), do: Map.put(metrics, key, value)
+
+  # UIW-3: `stable` alone cannot separate a run that stopped at the step
+  # budget from one that settled into collapse. Both leave it false, and the
+  # engine's :reason is the only thing that tells them apart. A payload
+  # without a reason (an older frame, a hand-built fixture) keeps the original
+  # two-state reading.
+  defp cascade_status(:budget_exhausted, _stable), do: :truncated
+  defp cascade_status(:solve_failed, _stable), do: :solve_failed
+  defp cascade_status(_reason, true), do: :stable
+  defp cascade_status(_reason, false), do: :unstable
 
   # Changing the demand hour invalidates the running simulation's snapshot;
   # terminate it so the next failure injection rebuilds at the new hour.
@@ -765,10 +957,14 @@ defmodule PowerModelWeb.GridLive.Index do
       socket
       |> assign(:selected_hour, selected_hour)
       |> assign(:cascade_steps, [])
+      |> assign_cascade_events(:reset)
       |> assign(:cascade_active, false)
       |> assign(:selected_component, nil)
       |> assign(:solver_status, :idle)
       |> assign(:system_metrics, initial_metrics())
+      # A new hour is a new injection vector, and LODF sensitivities are a
+      # linearisation about the old one -- the ranking is advisory now.
+      |> assign(:n1_stale, true)
       |> push_event("reset_grid", %{})
       |> push_event("deselect_highlight", %{})
     end
@@ -837,7 +1033,17 @@ defmodule PowerModelWeb.GridLive.Index do
       served_mw: 0.0,
       shed_mw: 0.0,
       blackout_mw: 0.0,
+      # UIW-3/UIW-6: rooftop PV that tripped off is demand the wire no longer
+      # sees. Without it the displayed served + shed + blackout exceeds the
+      # displayed demand by exactly the BTM amount and nothing on the panel
+      # explains the gap.
+      btm_tripped_mw: 0.0,
+      btm_trip_breakdown: nil,
       frequency_hz: 60.0,
+      frequency_nadir_hz: 60.0,
+      freq_history: [],
+      voltage_layer: nil,
+      agc: [],
       islands: 1,
       tripped_count: 0,
       overload: %{
@@ -871,7 +1077,11 @@ defmodule PowerModelWeb.GridLive.Index do
       | demand_mw: balance[:original_load_mw] || metrics.demand_mw,
         served_mw: balance[:served_load_mw] || metrics.served_mw,
         shed_mw: balance[:shed_load_mw] || metrics.shed_mw,
-        blackout_mw: balance[:blackout_load_mw] || metrics.blackout_mw
+        blackout_mw: balance[:blackout_load_mw] || metrics.blackout_mw,
+        # The conservation identity the engine holds to is
+        # served + shed + blackout == original + btm_tripped; dropping the
+        # last term is what broke it on the display side.
+        btm_tripped_mw: balance[:btm_tripped_mw] || metrics.btm_tripped_mw
     }
   end
 
@@ -880,8 +1090,11 @@ defmodule PowerModelWeb.GridLive.Index do
   defp solver_status_class(:resetting), do: "status-solving"
   defp solver_status_class(:dc_solved), do: "status-dc"
   defp solver_status_class(:ac_solved), do: "status-ac"
+  defp solver_status_class(:ac_partial), do: "status-ac"
   defp solver_status_class(:stable), do: "status-stable"
   defp solver_status_class(:unstable), do: "status-rejected"
+  defp solver_status_class(:truncated), do: "status-truncated"
+  defp solver_status_class(:solve_failed), do: "status-rejected"
   defp solver_status_class(:error), do: "status-rejected"
   defp solver_status_class(:not_in_network), do: "status-rejected"
   defp solver_status_class(:already_tripped), do: "status-rejected"
@@ -892,8 +1105,15 @@ defmodule PowerModelWeb.GridLive.Index do
   defp solver_status_text(:resetting), do: "Resetting..."
   defp solver_status_text(:dc_solved), do: "DC Solved"
   defp solver_status_text(:ac_solved), do: "AC Converged"
+  # UIW-4: the cascade's QSS-AC covers the islands that converged and says
+  # nothing about the rest, so this is never "AC Converged".
+  defp solver_status_text(:ac_partial), do: "AC (partial)"
   defp solver_status_text(:stable), do: "Stable"
   defp solver_status_text(:unstable), do: "Unstable"
+  # The cascade was still tripping when it ran out of step budget. It is NOT
+  # a settled collapse and must not be read as one.
+  defp solver_status_text(:truncated), do: "Unstable (step budget)"
+  defp solver_status_text(:solve_failed), do: "Solve failed"
   defp solver_status_text(:error), do: "Simulation failed"
   defp solver_status_text(:not_in_network), do: "Not in simulated network"
   defp solver_status_text(:already_tripped), do: "Already tripped"
@@ -1220,15 +1440,46 @@ defmodule PowerModelWeb.GridLive.Index do
     """
   end
 
-  defp get_cascade_events(cascade_steps) do
-    cascade_steps
-    |> Enum.flat_map(fn step ->
-      trips = step[:trips]
-      trips = if is_list(trips), do: trips, else: []
+  # ---------------------------------------------------------------------------
+  # Affected-components feed (UIW-5)
+  # ---------------------------------------------------------------------------
+  #
+  # The panel used to re-flat_map every event of every step on EVERY render,
+  # and then show `Enum.take(events, 50)` -- the OLDEST fifty. At collapse
+  # scale that is both the expensive way to build the list and the wrong half
+  # of it: the terminal-phase voltage, UVLS and ride-through events, which are
+  # the ones worth reading, could never appear.
+  #
+  # The feed is now maintained incrementally, NEWEST FIRST, and bounded. The
+  # true event total is tracked separately from the list, because the payload's
+  # `trips` is a panel VIEW (aggregated and capped by the server) while
+  # `trip_count` is the real number of events the step emitted.
+  @event_feed_limit 200
 
-      Enum.map(trips, fn trip ->
-        Map.put(trip, :step, step[:step])
-      end)
-    end)
+  defp assign_cascade_events(socket, :reset) do
+    socket
+    |> assign(:cascade_events, [])
+    |> assign(:cascade_event_total, 0)
+  end
+
+  defp assign_cascade_events(socket, {:step, payload}) do
+    trips = if is_list(payload[:trips]), do: payload[:trips], else: []
+    step = payload[:step]
+
+    newest =
+      trips
+      |> Enum.reverse()
+      |> Enum.map(&Map.put(&1, :step, step))
+
+    feed = Enum.take(newest ++ socket.assigns.cascade_events, @event_feed_limit)
+
+    # `trip_count` is the step's TRUE event count; `trips` is the panel view.
+    # At collapse scale they differ by thousands and the header must report
+    # the former (UI-2's contract note).
+    total = socket.assigns.cascade_event_total + (payload[:trip_count] || length(trips))
+
+    socket
+    |> assign(:cascade_events, feed)
+    |> assign(:cascade_event_total, total)
   end
 end
