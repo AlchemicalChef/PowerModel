@@ -185,4 +185,77 @@ defmodule PowerModel.Failure.ReservesTest do
       assert_in_delta Reserves.primary_capability_mw_total(units), 160.0, 1.0e-9
     end
   end
+
+  describe "the secondary tier's source" do
+    # The tiers here are OPEN-LOOP: what the clock allowed, delivered against
+    # an arithmetic deficit. `PowerModel.Controls.AGC` is the closed loop, and
+    # `allocate/4` lets it REPLACE this tier — never join it. The AGC-side
+    # behaviour is covered in `PowerModel.Controls.AGCTest`; what is pinned
+    # here is that Reserves' own contract did not move.
+
+    test "defaults to the clock, and the three-argument call is unchanged" do
+      units = [unit(1, "NG", 1000.0, 500.0)]
+
+      assert Reserves.allocate(units, 100.0, 600.0) ==
+               Reserves.allocate(units, 100.0, 600.0, [])
+
+      assert Reserves.allocate(units, 100.0, 600.0, secondary: :clock) ==
+               Reserves.allocate(units, 100.0, 600.0)
+
+      assert Reserves.allocate(units, 100.0, 600.0).secondary_source == :clock
+      assert Reserves.secondary_capability_mw(hd(units), 600.0) == 500.0
+    end
+
+    test "an AGC-fed tier delivers AGC's megawatts, capped by physical headroom" do
+      units = [unit(1, "NG", 1000.0, 500.0), unit(2, "NG", 1000.0, 950.0)]
+
+      # AGC asks for 120 MW from unit 1 and 200 MW from unit 2 — but unit 2
+      # only has 50 MW of headroom, and the physical limit is the one both
+      # sides must agree on.
+      alloc =
+        Reserves.allocate(units, 400.0, 600.0, secondary: {:agc, %{1 => 120.0, 2 => 200.0}})
+
+      assert alloc.secondary_source == :agc
+      assert_in_delta alloc.secondary_capability_mw, 170.0, 1.0e-9
+      assert_in_delta Map.fetch!(alloc.sustained_by_unit, 2), 50.0, 1.0e-9
+    end
+
+    test "a unit AGC did not raise contributes no secondary reserve at all" do
+      units = [unit(1, "NG", 1000.0, 500.0), unit(2, "NG", 1000.0, 500.0)]
+
+      alloc = Reserves.allocate(units, 400.0, 600.0, secondary: {:agc, %{1 => 60.0}})
+
+      assert_in_delta alloc.secondary_mw, 60.0, 1.0e-9
+      refute Map.has_key?(alloc.sustained_by_unit, 2)
+
+      # The clocked tier would have offered both units their whole headroom:
+      # this is the tier being REPLACED, not supplemented.
+      assert Reserves.allocate(units, 400.0, 600.0).secondary_mw == 400.0
+    end
+
+    test "an unsynchronised machine is not on AGC however much it is offered" do
+      offline = unit(1, "NG", 1000.0, 0.0)
+
+      assert Reserves.secondary_capability_mw(offline, 600.0, {:agc, %{1 => 500.0}}) == 0.0
+    end
+
+    test "tertiary stays on the clock while secondary is closed-loop" do
+      units = [unit(1, "BIT", 1000.0, 500.0)]
+      deltas = %{1 => 40.0}
+
+      # Inside the start-up delay there is no tertiary in either mode.
+      assert Reserves.allocate(units, 500.0, 60.0, secondary: {:agc, deltas}).tertiary_capability_mw ==
+               0.0
+
+      # Past it the tier ramps on elapsed time exactly as it always did: 15
+      # minutes of coal's 2%/min is 300 MW, and the clock is still what binds.
+      late = Reserves.allocate(units, 500.0, 1500.0, secondary: {:agc, deltas})
+      assert_in_delta late.tertiary_capability_mw, 300.0, 1.0e-9
+
+      # Once the ramp has run long enough for headroom to bind instead, the
+      # 40 MW AGC already took is deducted — the two tiers draw on one pool.
+      later = Reserves.allocate(units, 500.0, 2400.0, secondary: {:agc, deltas})
+      assert_in_delta later.tertiary_capability_mw, 460.0, 1.0e-9
+    end
+  end
 end

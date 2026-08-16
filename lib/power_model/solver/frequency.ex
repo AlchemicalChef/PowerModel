@@ -427,6 +427,15 @@ defmodule PowerModel.Solver.Frequency do
   def governor_deadband_hz, do: @governor_deadband_hz
 
   @doc """
+  Governor droop coefficient R (per unit): the fractional frequency deviation
+  that commands 100% of rated output. Exposed so secondary control
+  (`PowerModel.Controls.AGC`) can derive an island's natural frequency
+  response β from the same slope the swing model integrates, instead of
+  hard-coding a second copy of it.
+  """
+  def droop, do: @droop
+
+  @doc """
   The window (seconds) over which primary response is defined. Multiplying a
   unit's primary response RATE by this window gives the MW of sustained
   primary response it can be asked for.

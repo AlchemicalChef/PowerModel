@@ -9,12 +9,27 @@ defmodule PowerModel.Failure.Reserves do
   | tier | timescale | who answers | what bounds it |
   |------|-----------|-------------|----------------|
   | primary | seconds | governors on spinning, governor-duty units | `Frequency.primary_response_capability_mw/1` (delivery rate x the 10 s nadir window, capped by headroom) |
-  | secondary | 30 s - 10 min | AGC on spinning units | `Frequency.secondary_ramp_mw_per_min/1` x elapsed |
+  | secondary | 30 s - 10 min | AGC on spinning units | `Frequency.secondary_ramp_mw_per_min/1` x elapsed — or, closed-loop, what AGC actually dispatched (see `allocate/4`) |
   | tertiary | 10 min+ | supplemental/non-spinning units and the rest of the spinning headroom | the same ramp over the elapsed time past the start-up delay |
 
   `allocate/3` is pure: it takes the island's units, the sustained deficit it
   has to close, and how long the deficit has been open on the cascade clock,
   and returns the MW each tier can deliver plus the per-unit allocation.
+
+  ## Open-loop tiers, and the closed loop that replaces one of them
+
+  These tiers are OPEN-LOOP: the secondary number is what the fleet could have
+  ramped in the time available, delivered against an arithmetic deficit
+  whether or not the frequency still needs it, and stopping when the deficit
+  is covered rather than when the frequency is back at 60 Hz. That is a good
+  model of how much reserve a clock allows and a poor model of secondary
+  CONTROL, which is a closed loop on Area Control Error.
+
+  `PowerModel.Controls.AGC` is that loop, and `allocate/4` accepts its output
+  in place of the secondary tier's clock ramp — `secondary: {:agc, deltas}`.
+  The two are alternatives, never addends; see `allocate/4` for the contract
+  and for why summing them would let a fleet deliver reserve it does not
+  carry.
 
   ## Primary arrests, secondary replaces
 
@@ -85,18 +100,50 @@ defmodule PowerModel.Failure.Reserves do
         primary_by_unit: %{id => mw},
         secondary_capability_mw: float(), # what each tier COULD have delivered
         tertiary_capability_mw: float(),
-        primary_capability_mw: float()
+        primary_capability_mw: float(),
+        secondary_source: :clock | :agc  # which secondary tier answered
       }
 
   The capability figures are reported whether or not the tier was used, so a
   caller can say "the headroom was there and the clock was not" — which is the
   whole point of the item.
-  """
-  @spec allocate(list(map()), float(), float() | :infinity) :: map()
-  def allocate(units, deficit_mw, elapsed_s) do
-    deficit_mw = max(deficit_mw * 1.0, 0.0)
 
-    secondary_caps = Enum.map(units, &{&1, secondary_capability_mw(&1, elapsed_s)})
+  ## Options
+
+    * `:secondary` — where the secondary tier's capability comes from.
+
+      `:clock` (default) is the open-loop tier described above:
+      `ramp × elapsed`, capped by headroom.
+
+      `{:agc, %{id => mw}}` is CLOSED-LOOP secondary control. The map is the
+      per-unit setpoint INCREMENT `PowerModel.Controls.AGC.step/3` just
+      issued, and it becomes this tier's per-unit capability (still capped by
+      the unit's physical headroom, which is the one bound AGC's own limits
+      and this module must agree on). The clock plays no part: what the tier
+      delivers is what the frequency error called for.
+
+  ### Why the two can never be summed
+
+  Both tiers dispatch the SAME megawatts out of the same headroom — the
+  open-loop one because the clock says they could have ramped, the closed-loop
+  one because ACE says they were needed. Running both would raise a unit twice
+  for one deficit and, since the cascade recomputes each step's deficit from
+  the raised dispatch, would show a fleet delivering more reserve than it
+  physically carries. `:secondary` therefore SELECTS a tier; it does not add
+  one. Tertiary stays on the clock in both modes (it answers a different,
+  slower question), and the primary tier still rides on whatever the sustained
+  tiers left.
+
+  The AGC map must be the per-step increment, never the cumulative position:
+  the cascade adds the allocation to its dispatch, and the next step's deficit
+  already reflects it.
+  """
+  @spec allocate(list(map()), float(), float() | :infinity, keyword()) :: map()
+  def allocate(units, deficit_mw, elapsed_s, opts \\ []) do
+    deficit_mw = max(deficit_mw * 1.0, 0.0)
+    secondary = Keyword.get(opts, :secondary, :clock)
+
+    secondary_caps = Enum.map(units, &{&1, secondary_capability_mw(&1, elapsed_s, secondary)})
     secondary_capability = sum_caps(secondary_caps)
 
     {secondary_alloc, secondary_mw} = fill_pro_rata(secondary_caps, deficit_mw)
@@ -145,9 +192,13 @@ defmodule PowerModel.Failure.Reserves do
       primary_by_unit: primary_alloc,
       secondary_capability_mw: secondary_capability,
       tertiary_capability_mw: tertiary_capability,
-      primary_capability_mw: primary_capability
+      primary_capability_mw: primary_capability,
+      secondary_source: secondary_source(secondary)
     }
   end
+
+  defp secondary_source({:agc, _deltas}), do: :agc
+  defp secondary_source(_), do: :clock
 
   @doc """
   Spinning secondary reserve one unit can deliver after `elapsed_s`.
@@ -156,9 +207,24 @@ defmodule PowerModel.Failure.Reserves do
   on synchronised machines under AGC. The bound is the technology ramp over
   the elapsed time, capped at the unit's remaining headroom and at the
   ten-minute secondary horizon.
+
+  With `source` = `{:agc, %{id => mw}}` the ramp-and-clock bound is replaced by
+  the MW closed-loop AGC actually dispatched to this unit — still capped by
+  its headroom. See `allocate/4`.
   """
-  @spec secondary_capability_mw(map(), float() | :infinity) :: float()
-  def secondary_capability_mw(unit, elapsed_s) do
+  @spec secondary_capability_mw(map(), float() | :infinity, :clock | {:agc, map()}) :: float()
+  def secondary_capability_mw(unit, elapsed_s, source \\ :clock)
+
+  def secondary_capability_mw(unit, _elapsed_s, {:agc, deltas}) do
+    if spinning?(unit) do
+      dispatched = Map.get(deltas, Map.get(unit, :id), 0.0)
+      min(max(dispatched, 0.0), headroom_mw(unit))
+    else
+      0.0
+    end
+  end
+
+  def secondary_capability_mw(unit, elapsed_s, _clock) do
     if spinning?(unit) do
       bounded_by(
         headroom_mw(unit),
