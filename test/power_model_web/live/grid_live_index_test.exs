@@ -78,6 +78,14 @@ defmodule PowerModelWeb.GridLiveIndexTest do
     end)
   end
 
+  # Every state a finished cascade can settle on. This test island is two
+  # buses with one line, so tripping that line strands its only load and the
+  # honest verdict is "collapsed" -- these tests care that the cascade REACHED
+  # a terminal state, not which one.
+  @terminal_statuses ~w(stable stable_shed unstable collapsed truncated solve_failed)
+
+  defp finished?(view), do: status(view) in @terminal_statuses
+
   defp await(fun, timeout_ms \\ 8_000) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     do_await(fun, deadline)
@@ -344,7 +352,7 @@ defmodule PowerModelWeb.GridLiveIndexTest do
         "id" => Integer.to_string(line_a.id)
       })
 
-      assert await(fn -> status(view) in ["stable", "unstable"] end),
+      assert await(fn -> finished?(view) end),
              "first cascade never finished (status: #{inspect(status(view))})"
 
       # Second injection targets interconnection B. Before CAS-7 this was
@@ -354,7 +362,7 @@ defmodule PowerModelWeb.GridLiveIndexTest do
         "id" => Integer.to_string(line_b.id)
       })
 
-      assert await(fn -> status(view) in ["stable", "unstable"] end),
+      assert await(fn -> finished?(view) end),
              "second cascade did not run; status: #{inspect(status(view))}"
 
       refute status(view) == "not_in_network"

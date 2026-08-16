@@ -386,6 +386,7 @@ defmodule PowerModel.Engine.SimulationServerBroadcastTest do
   @moduletag :db
 
   alias PowerModel.Engine.SimulationServer
+  alias PowerModel.Failure.Cascade
   alias PowerModel.Grid.{Bus, Generator, Load, TransmissionLine}
 
   defp point(lon, lat), do: %Geo.Point{coordinates: {lon, lat}, srid: 4326}
@@ -549,9 +550,82 @@ defmodule PowerModel.Engine.SimulationServerBroadcastTest do
     # step stream can never carry :budget_exhausted, so a consumer deriving
     # this from the stream would mislabel every truncated run as a collapse.
     assert done.reason in [:settled, :budget_exhausted, :solve_failed]
+
+    # Orthogonal to reason, and always present: it is defined for any state
+    # termination/1 accepts, so a consumer never has to fall back to reading
+    # settled-vs-collapsed off `stable`.
+    #
+    # `:unknown` is in the set because a :solve_failed run has no trustworthy
+    # balance to classify -- Cascade suppresses the verdict at the source
+    # rather than making every consumer remember that precedence. This module
+    # forwards whatever the engine returns and never interprets it, so the
+    # fourth atom needs no code here; only this assertion has to know the range.
+    assert done.outcome in [:collapsed, :degraded, :intact, :unknown]
     assert %{islands_ac: _, ac_diverged: _} = done.voltage_layer
     assert %{frequency_mw: _, voltage_mw: _, total_mw: _} = done.btm_trip_breakdown
     assert is_list(done.agc)
+  end
+
+  test "outcome forwards Cascade.outcome/1 on the server's own final state", %{
+    sim_id: sim_id,
+    big_gen: gen
+  } do
+    # This is the seam's actual responsibility: not the thresholds, which are
+    # Cascade's and tested there, but that the payload carries the engine's
+    # verdict on the state the server ended in rather than a re-derivation.
+    assert {:ok, _} = SimulationServer.trip_generator(sim_id, gen.id)
+    assert_receive {:simulation_cascade_done, done}, 20_000
+
+    [{pid, _}] = Registry.lookup(PowerModel.SimulationRegistry, sim_id)
+    final_state = :sys.get_state(pid).cascade_state
+
+    assert done.outcome == Cascade.outcome(final_state)
+  end
+
+  test "losing most of the fleet reports :collapsed, whatever the loop did", %{
+    sim_id: sim_id,
+    big_gen: gen
+  } do
+    # 300 MW of 360 MW online serving 240 MW: its loss leaves the island far
+    # short, and the balance below is what makes :collapsed the honest label
+    # even when the loop settles.
+    assert {:ok, _} = SimulationServer.trip_generator(sim_id, gen.id)
+    assert_receive {:simulation_cascade_done, done}, 20_000
+
+    b = done.balance
+    standing = b.original_load_mw + b.btm_tripped_mw
+
+    assert b.served_load_mw / standing < 0.5,
+           "fixture no longer collapses; this test would assert the wrong bucket"
+
+    assert done.outcome == :collapsed
+  end
+
+  # No live `:intact` case here on purpose. Both units in this fixture are
+  # dispatched, so there is no spare generator whose loss sheds nothing, and
+  # the feeder is radial, so every line outage strands load. Manufacturing one
+  # would be contorting the fixture to exercise Cascade's classification rather
+  # than this module's forwarding -- `Cascade.outcome/1` owns and tests the
+  # three buckets; the forwarding test above owns the seam.
+
+  test "outcome and reason are independent fields, neither derived from the other", %{
+    sim_id: sim_id,
+    big_gen: gen
+  } do
+    assert {:ok, _} = SimulationServer.trip_generator(sim_id, gen.id)
+    assert_receive {:simulation_cascade_done, done}, 20_000
+
+    # {:settled, :collapsed} is the pairing that motivates outcome existing:
+    # the loop reached a fixed point and the fixed point is a blackout. A
+    # consumer reading `stable` or `reason` alone would call that "Stable".
+    assert done.reason in [:settled, :budget_exhausted, :solve_failed]
+    assert done.outcome == :collapsed
+
+    if done.reason == :settled do
+      assert done.stable == true,
+             "this cascade settled, so `stable` says so -- and it is exactly why " <>
+               "outcome has to be read alongside it"
+    end
   end
 
   test "the wire balance still closes: served + shed + blackout == original + BTM", %{

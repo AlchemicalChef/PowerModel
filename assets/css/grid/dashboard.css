@@ -575,3 +575,21 @@
    collapse (the other status dots live in map.css). Amber says "we stopped
    watching", not "it ended here". */
 .status-truncated { background: #f5a623; }
+
+/* Under half of standing demand served. The strongest state on the badge —
+   it has to outrank the plain-red rejected dot at a glance. */
+.status-collapsed {
+  background: #ff3b30;
+  box-shadow: 0 0 6px rgba(255, 59, 48, 0.9);
+}
+
+/* Settled, but load was given up to get there. Solar yellow, the same hue
+   the BTM and DER rows use for "a resource stopped carrying its share". */
+.status-degraded { background: #f1c40f; }
+
+.solver-note {
+  font-size: 10px;
+  color: #999;
+  padding-left: 6px;
+  border-left: 1px solid rgba(100, 100, 120, 0.4);
+}

@@ -53,7 +53,7 @@ defmodule PowerModelWeb.GridLive.Index do
       |> assign(:cascade_active, false)
       |> assign_cascade_events(:reset)
       |> assign(:system_metrics, initial_metrics())
-      |> assign(:solver_status, :idle)
+      |> put_status(:idle)
       |> assign(:view_mode, "voltage_level")
       |> assign(:interconnection, "all")
       |> assign(:demand_range, PowerModel.Demand.available_range())
@@ -130,7 +130,7 @@ defmodule PowerModelWeb.GridLive.Index do
             socket =
               socket
               |> assign(:cascade_active, true)
-              |> assign(:solver_status, :solving)
+              |> put_status(:solving)
               # UI-M2: each injection is a new disturbance; the nadir
               # tracking starts fresh at nominal frequency.
               |> update(:system_metrics, &rearm_frequency/1)
@@ -179,7 +179,7 @@ defmodule PowerModelWeb.GridLive.Index do
       |> assign_cascade_events(:reset)
       |> assign(:cascade_active, false)
       |> assign(:selected_component, nil)
-      |> assign(:solver_status, :resetting)
+      |> put_status(:resetting)
       |> assign(:system_metrics, initial_metrics())
       |> assign_n1(:reset)
       |> push_event("reset_grid", %{})
@@ -401,11 +401,12 @@ defmodule PowerModelWeb.GridLive.Index do
     # cascade's own :reason is the only thing that separates them, and reading
     # a truncated run as a collapse is the false-10x hazard.
     stable = payload[:stable] == true
+    {status, note} = cascade_status(payload[:reason], payload[:outcome], stable)
 
     socket =
       socket
       |> assign(:cascade_active, false)
-      |> assign(:solver_status, cascade_status(payload[:reason], stable))
+      |> put_status(status, note)
       |> update(:system_metrics, fn m ->
         m
         |> merge_balance(payload[:balance])
@@ -428,7 +429,7 @@ defmodule PowerModelWeb.GridLive.Index do
       |> assign(:cascade_steps, [])
       |> assign_cascade_events(:reset)
       |> assign(:cascade_active, false)
-      |> assign(:solver_status, :idle)
+      |> put_status(:idle)
       |> assign(:system_metrics, initial_metrics())
       |> assign_n1(:reset)
       # UI-M14: server-side frame list is cleared above; without this push the
@@ -472,7 +473,7 @@ defmodule PowerModelWeb.GridLive.Index do
     socket =
       socket
       |> assign(:cascade_active, false)
-      |> assign(:solver_status, reason)
+      |> put_status(reason)
 
     {:noreply, socket}
   end
@@ -494,11 +495,11 @@ defmodule PowerModelWeb.GridLive.Index do
 
       {:error, {reason, _call}} when reason in [:noproc, :normal, :shutdown] ->
         # No server running -- nothing to reset; the cleared UI is correct
-        {:noreply, assign(socket, :solver_status, :idle)}
+        {:noreply, put_status(socket, :idle)}
 
       {:error, reason} ->
         Logger.error("simulation reset failed: #{inspect(reason)}")
-        {:noreply, assign(socket, :solver_status, :error)}
+        {:noreply, put_status(socket, :error)}
     end
   end
 
@@ -549,7 +550,7 @@ defmodule PowerModelWeb.GridLive.Index do
           {:noreply, socket}
         else
           Logger.error("reset task died: #{inspect(reason)}")
-          {:noreply, assign(socket, :solver_status, :error)}
+          {:noreply, put_status(socket, :error)}
         end
 
       socket.assigns.n1_task == ref ->
@@ -704,14 +705,14 @@ defmodule PowerModelWeb.GridLive.Index do
 
     case reason do
       normal when normal in [:normal, :shutdown] ->
-        {:noreply, assign(socket, :solver_status, :idle)}
+        {:noreply, put_status(socket, :idle)}
 
       {:shutdown, _} ->
-        {:noreply, assign(socket, :solver_status, :idle)}
+        {:noreply, put_status(socket, :idle)}
 
       other ->
         Logger.error("simulation server crashed: #{inspect(other)}")
-        {:noreply, assign(socket, :solver_status, :error)}
+        {:noreply, put_status(socket, :error)}
     end
   end
 
@@ -750,11 +751,27 @@ defmodule PowerModelWeb.GridLive.Index do
   # CAS-3: once a cascade is classified (Stable/Unstable) the late-arriving
   # AC refinement must not overwrite the classification with "AC Converged";
   # its flows/metrics still land. A new trip or reset re-arms the status.
+  # The badge's two halves always move together: a status change that left a
+  # stale sub-label behind would caption the new state with the old one's
+  # caveat.
+  defp put_status(socket, status, note \\ nil) do
+    socket |> assign(:solver_status, status) |> assign(:solver_note, note)
+  end
+
+  @terminal_statuses [
+    :stable,
+    :stable_shed,
+    :unstable,
+    :collapsed,
+    :truncated,
+    :solve_failed
+  ]
+
   defp put_solver_result_status(socket, status) do
-    if socket.assigns.solver_status in [:stable, :unstable, :truncated, :solve_failed] do
+    if socket.assigns.solver_status in @terminal_statuses do
       socket
     else
-      assign(socket, :solver_status, status)
+      put_status(socket, status)
     end
   end
 
@@ -763,7 +780,7 @@ defmodule PowerModelWeb.GridLive.Index do
   defp fail_simulation(socket) do
     socket
     |> assign(:cascade_active, false)
-    |> assign(:solver_status, :error)
+    |> put_status(:error)
     |> push_event("cascade_done", %{stable: false})
   end
 
@@ -935,15 +952,54 @@ defmodule PowerModelWeb.GridLive.Index do
   defp merge_present(metrics, _key, []), do: metrics
   defp merge_present(metrics, key, value), do: Map.put(metrics, key, value)
 
-  # UIW-3: `stable` alone cannot separate a run that stopped at the step
-  # budget from one that settled into collapse. Both leave it false, and the
-  # engine's :reason is the only thing that tells them apart. A payload
-  # without a reason (an older frame, a hand-built fixture) keeps the original
-  # two-state reading.
-  defp cascade_status(:budget_exhausted, _stable), do: :truncated
-  defp cascade_status(:solve_failed, _stable), do: :solve_failed
-  defp cascade_status(_reason, true), do: :stable
-  defp cascade_status(_reason, false), do: :unstable
+  # Three independent facts arrive on `cascade_done`, and the badge has to
+  # combine them without letting any one of them hide another:
+  #
+  #   :reason   why the run STOPPED     -- :settled | :budget_exhausted | :solve_failed
+  #   :outcome  what it LEFT STANDING   -- :collapsed | :degraded | :intact
+  #   :stable   the engine's own flag
+  #
+  # The precedence below is not a styling choice. Each rule is about which
+  # statement we are entitled to make.
+  #
+  # 1. A failed solve outranks everything, INCLUDING a collapse. `outcome/1`
+  #    is computed entirely from `balance/1`, which is downstream of the solve
+  #    that failed -- so on :solve_failed the collapse verdict is derived from
+  #    numbers the engine has already declared untrustworthy. "Collapsed"
+  #    there would assert we know the grid went down, when what we know is
+  #    that we stopped being able to compute. It also buries the one fact the
+  #    operator needs. So: no outcome, not even as a sub-label.
+  # 2. A collapse outranks how the run ended. :settled and :budget_exhausted
+  #    both leave the balance trustworthy, so a collapse measured from it is
+  #    real, and "Unstable" understates a grid serving under half its load.
+  #    Truncation survives as the sub-label rather than being dropped -- a
+  #    cascade cut off mid-collapse was still getting worse.
+  # 3. `stable: true` is deliberately NOT allowed to produce "Stable" when the
+  #    outcome says otherwise. The reference cascade ends `stable: true,
+  #    reason: :settled` while serving 3.6 MW of 42,653 MW; that pairing is
+  #    what this whole escalation exists to stop rendering as "Stable".
+  #
+  # An absent or unrecognised outcome falls back to the reason-only reading,
+  # so an older frame or a value added later degrades instead of crashing.
+  # `:outcome` is `:unknown` on exactly the solve-failed runs, where the
+  # engine withholds the classification for the reason in rule 1 -- that
+  # lands on the first clause and never reaches the fallback. The fallback
+  # still matters: it is what renders a payload from a server that predates
+  # the field, which is what a rolling restart produces.
+  defp cascade_status(:solve_failed, _outcome, _stable), do: {:solve_failed, nil}
+  defp cascade_status(reason, :collapsed, _stable), do: {:collapsed, truncation_note(reason)}
+  defp cascade_status(:budget_exhausted, outcome, _stable), do: {:truncated, shed_note(outcome)}
+  defp cascade_status(_reason, :degraded, _stable), do: {:stable_shed, nil}
+  defp cascade_status(_reason, :intact, true), do: {:stable, nil}
+  defp cascade_status(_reason, :intact, false), do: {:unstable, nil}
+  defp cascade_status(_reason, _outcome, true), do: {:stable, nil}
+  defp cascade_status(_reason, _outcome, false), do: {:unstable, nil}
+
+  defp truncation_note(:budget_exhausted), do: "step budget"
+  defp truncation_note(_reason), do: nil
+
+  defp shed_note(:degraded), do: "load shed"
+  defp shed_note(_outcome), do: nil
 
   # Changing the demand hour invalidates the running simulation's snapshot;
   # terminate it so the next failure injection rebuilds at the new hour.
@@ -960,7 +1016,7 @@ defmodule PowerModelWeb.GridLive.Index do
       |> assign_cascade_events(:reset)
       |> assign(:cascade_active, false)
       |> assign(:selected_component, nil)
-      |> assign(:solver_status, :idle)
+      |> put_status(:idle)
       |> assign(:system_metrics, initial_metrics())
       # A new hour is a new injection vector, and LODF sensitivities are a
       # linearisation about the old one -- the ranking is advisory now.
@@ -1092,7 +1148,9 @@ defmodule PowerModelWeb.GridLive.Index do
   defp solver_status_class(:ac_solved), do: "status-ac"
   defp solver_status_class(:ac_partial), do: "status-ac"
   defp solver_status_class(:stable), do: "status-stable"
+  defp solver_status_class(:stable_shed), do: "status-degraded"
   defp solver_status_class(:unstable), do: "status-rejected"
+  defp solver_status_class(:collapsed), do: "status-collapsed"
   defp solver_status_class(:truncated), do: "status-truncated"
   defp solver_status_class(:solve_failed), do: "status-rejected"
   defp solver_status_class(:error), do: "status-rejected"
@@ -1109,7 +1167,12 @@ defmodule PowerModelWeb.GridLive.Index do
   # nothing about the rest, so this is never "AC Converged".
   defp solver_status_text(:ac_partial), do: "AC (partial)"
   defp solver_status_text(:stable), do: "Stable"
+  # Settled, and it kept the lights on by giving some of them up.
+  defp solver_status_text(:stable_shed), do: "Stable (load shed)"
   defp solver_status_text(:unstable), do: "Unstable"
+  # Under half of standing demand is being served. "Unstable" does not cover
+  # a grid in that state, whatever the engine's own stable flag says.
+  defp solver_status_text(:collapsed), do: "Collapsed"
   # The cascade was still tripping when it ran out of step budget. It is NOT
   # a settled collapse and must not be read as one.
   defp solver_status_text(:truncated), do: "Unstable (step budget)"

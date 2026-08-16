@@ -114,6 +114,8 @@ defmodule PowerModelWeb.GridLiveN1ScreeningTest do
 
   defp assigns(view), do: :sys.get_state(view.pid).socket.assigns
 
+  @terminal_statuses [:stable, :stable_shed, :unstable, :collapsed, :truncated, :solve_failed]
+
   defp enter_n1_mode(view) do
     view |> element("#failure-mode-n1") |> render_click()
   end
@@ -237,6 +239,15 @@ defmodule PowerModelWeb.GridLiveN1ScreeningTest do
       # graph, so the next screen has to choose an island and say which.
       sim_id = assigns(view).sim_id
       {:ok, _steps} = SimulationServer.trip_branch(sim_id, spur_line.id)
+
+      # End-to-end check of the outcome field on a REAL cascade, which the
+      # synthetic-payload tests cannot give: this trip strands 100 MW of the
+      # island's 300 MW, so whatever `Cascade.outcome/1` returns it cannot be
+      # :intact, and the badge must not read a bare "Stable".
+      assert await(fn -> assigns(view).solver_status in @terminal_statuses end),
+             "the real cascade never reached a terminal badge state"
+
+      refute assigns(view).solver_status == :stable
 
       view |> element("#run-n1-screen-btn") |> render_click()
 

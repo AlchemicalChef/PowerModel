@@ -434,6 +434,21 @@ defmodule PowerModel.Engine.SimulationServer do
 
   # UIW-3. Four additive keys beyond the original five:
   #
+  #   :outcome             what the cascade LEFT STANDING, from
+  #                        `Cascade.outcome/1`: `:collapsed | :degraded |
+  #                        :intact | :unknown`, the last returned when the run
+  #                        is `:solve_failed` and there is no trustworthy
+  #                        balance to classify. Suppressing it there is
+  #                        Cascade's job, not a precedence rule each consumer
+  #                        re-derives. ORTHOGONAL to `:reason` -- every
+  #                        combination occurs, and the pairing that motivates
+  #                        it is `{:settled, :collapsed}`: the loop reached a
+  #                        fixed point and the fixed point is a blackout.
+  #                        Forwarded unconditionally rather than through the
+  #                        presence convention, because it is defined for any
+  #                        state `termination/1` accepts -- absence would force
+  #                        a consumer back onto the settled-vs-collapsed
+  #                        confusion this exists to end.
   #   :reason              why the cascade stopped, from `Cascade.termination/1`
   #                        on the FINAL STATE. Never derived from the step
   #                        stream: the budget clause fires instead of a step,
@@ -461,6 +476,7 @@ defmodule PowerModel.Engine.SimulationServer do
         Enum.count(final_cascade.events, &(&1.component_type in @component_trip_types)),
       balance: Cascade.balance(final_cascade),
       reason: Cascade.termination(final_cascade),
+      outcome: Cascade.outcome(final_cascade),
       voltage_layer: final_cascade.voltage_layer,
       btm_trip_breakdown: final_cascade.btm_trip_breakdown,
       agc: final_step_agc(step_results)

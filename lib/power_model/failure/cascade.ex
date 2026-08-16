@@ -191,6 +191,11 @@ defmodule PowerModel.Failure.Cascade do
       whole-grid metric or averaged with DC results.
     * `termination` — `nil` while the cascade is still running, and on the
       final step the reason it stopped. See `termination/1`.
+
+  `termination` says only why the loop stopped iterating. What it LEFT is a
+  separate question with a separate answer, `outcome/1`, read from the final
+  state rather than from a step — a cascade that sheds an interconnection to
+  nothing and then finds nothing further to trip is `{:settled, :collapsed}`.
   """
 
   require Logger
@@ -262,6 +267,12 @@ defmodule PowerModel.Failure.Cascade do
   # overlay exists to colour every bus a converged island has a voltage for.
   @overlay_undervoltage_pu 0.9
   @overlay_overvoltage_pu 1.1
+
+  # Thresholds for `outcome/1` — what the cascade LEFT, as distinct from why it
+  # stopped. Documented in full on that function.
+  @outcome_collapsed_served_fraction 0.5
+  @outcome_degraded_mw 1.0
+  @outcome_degraded_fraction 0.001
 
   defstruct [
     :buses,
@@ -777,6 +788,99 @@ defmodule PowerModel.Failure.Cascade do
     }
   end
 
+  @doc """
+  What the cascade LEFT STANDING, as an atom. Orthogonal to `termination/1`,
+  which says only why the loop stopped iterating.
+
+  The two answer different questions and every combination of them occurs. A
+  cascade that sheds an interconnection down to nothing and then has nothing
+  further to trip is `{:settled, :collapsed}` — the loop reached a fixed point,
+  and the fixed point is a blackout. Presenting that as "stable" because the
+  termination said `:settled` is the specific misreading this exists to stop.
+
+    * `:collapsed` — less than #{trunc(@outcome_collapsed_served_fraction * 100)}%
+      of standing demand is still served. Because the conservation identity in
+      `balance/1` holds, this is exactly equivalent to shed plus blackout
+      exceeding the other #{trunc((1.0 - @outcome_collapsed_served_fraction) * 100)}%,
+      so the two framings can never disagree.
+    * `:degraded` — customers were lost, but most are still served. The floor
+      is deliberately two-sided so it means the same thing at both ends of the
+      four orders of magnitude this engine runs over: more than
+      `#{@outcome_degraded_mw}` MW lost in absolute terms (which catches a real
+      shed on a national snapshot, where any relative floor would be enormous),
+      OR more than #{@outcome_degraded_fraction * 100}% of standing demand
+      (which catches a real shed on a small test island, where any absolute
+      floor would be enormous). What falls through both is float residue from
+      the reserve and rooftop arithmetic — fractions of a megawatt — and that
+      is the only thing this is filtering.
+    * `:intact` — everything still standing is served.
+    * `:unknown` — the run ended in a failed solve and there is no trustworthy
+      balance to classify. Occurs EXACTLY when `termination/1` is
+      `:solve_failed`, and never otherwise.
+
+  ## The one place this reads `termination/1`, and why
+
+  Everything above is computed from `balance/1` alone. The single exception is
+  `:solve_failed`, where the classification is suppressed rather than computed.
+
+  `termination/1` documents `:solve_failed` as "nothing downstream of the
+  failed solve is trustworthy", and a balance is precisely downstream: an
+  island's power flow died partway, so `state.loads` may still hold load that
+  was never actually served and `shed_load_mw` may hold a partial tally that
+  stopped mid-step. Classifying that would return a confident verdict computed
+  from numbers this module has already disowned — reporting `:intact` for a
+  solve that died before it could shed anything, or `:collapsed` for one that
+  died after a partial shed, either of which claims we know what the grid did
+  when what we know is that we stopped being able to compute.
+
+  `balance/1` itself stays honest and unsuppressed: it is bookkeeping of what
+  the state RECORDS, and that record is accurate. It is the interpretation of
+  those numbers as a verdict on the grid that inherits the untrustworthiness.
+
+  Suppressing here rather than at each consumer is deliberate. A consumer that
+  forgets the precedence renders a reassuring green outcome beside a failure,
+  and the next consumer will forget it again.
+
+  ## Standing demand, not original demand
+
+  The denominator is `original_load_mw + btm_tripped_mw`: the identity's own
+  right-hand side, and the demand actually standing at the buses by the end.
+  Tripped rooftop is load that was never in `original_load_mw` (EIA-930 demand
+  is metered net of it — see `balance/1`), so dividing by `original_load_mw`
+  alone would let a heavy rooftop trip report more than 100% served. With no
+  behind-the-meter layer the two are identical, which is the common case.
+
+  Non-`nil` for any state `termination/1` accepts, including one that has
+  never run a cascade.
+  """
+  @spec outcome(%__MODULE__{}) :: :collapsed | :degraded | :intact | :unknown
+  def outcome(%__MODULE__{termination: :solve_failed}), do: :unknown
+
+  def outcome(%__MODULE__{} = state) do
+    balance = balance(state)
+    standing_mw = balance.original_load_mw + balance.btm_tripped_mw
+    lost_mw = balance.shed_load_mw + balance.blackout_load_mw
+
+    cond do
+      # A snapshot with no load at all has nothing to lose. Also the guard that
+      # keeps the fractions below from dividing by zero.
+      standing_mw <= 0.0 ->
+        :intact
+
+      balance.served_load_mw / standing_mw < @outcome_collapsed_served_fraction ->
+        :collapsed
+
+      lost_mw > @outcome_degraded_mw ->
+        :degraded
+
+      lost_mw / standing_mw > @outcome_degraded_fraction ->
+        :degraded
+
+      true ->
+        :intact
+    end
+  end
+
   defp compute_base_overloads(snapshot, dispatch, base_mva) do
     dispatched_gens =
       Enum.map(snapshot.generators, fn g ->
@@ -1106,7 +1210,12 @@ defmodule PowerModel.Failure.Cascade do
     * `:solve_failed` — an island's power flow failed numerically and the run
       is terminal. Nothing downstream of the failed solve is trustworthy.
 
-  `stable` alone cannot distinguish the last two: both leave it `false`.
+  `stable` alone cannot distinguish the last two: both leave it `false`. And
+  none of the three says anything about how much load survived — that is
+  `outcome/1`, which is orthogonal to this and must be read alongside it. The
+  one point where the two are coupled is `:solve_failed`, which suppresses
+  `outcome/1` to `:unknown` for the reason stated here: nothing downstream of
+  the failed solve is trustworthy, and a balance is downstream.
 
   The same value is on the last element of the step-result list (each earlier
   step carries `nil`, meaning "still running"), so a consumer that only sees

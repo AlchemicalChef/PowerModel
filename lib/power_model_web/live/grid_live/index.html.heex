@@ -79,6 +79,10 @@
     <div class="solver-badge" id="solver-badge" data-status={@solver_status}>
       <span class={"status-dot " <> solver_status_class(@solver_status)}></span>
       <span>{solver_status_text(@solver_status)}</span>
+      <%!-- The caveat the headline could not carry: a collapse that was cut
+           off at the step budget, or a truncated run that had already shed
+           load. Never a restatement of the headline. --%>
+      <span :if={@solver_note} class="solver-note" id="solver-note">{@solver_note}</span>
     </div>
   </div>
 

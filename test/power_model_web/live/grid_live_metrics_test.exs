@@ -63,10 +63,30 @@ defmodule PowerModelWeb.GridLiveMetricsTest do
         total_events: 3,
         tripped_count: 1,
         balance: nil,
-        reason: :settled
+        reason: :settled,
+        outcome: :intact
       },
       overrides
     )
+  end
+
+  # The measured ERCOT reference cascade: trip line 77246 at 2024-11-30T18:00Z
+  # ends `stable: true, reason: :settled` while serving 3.6 MW of 42,653.0.
+  # That pairing is the whole reason the outcome field exists -- read off
+  # `stable` alone, the worst cascade in the corpus renders "Stable".
+  defp collapse_reference do
+    done(%{
+      stable: true,
+      reason: :settled,
+      outcome: :collapsed,
+      balance: %{
+        original_load_mw: 42_653.0,
+        served_load_mw: 3.6,
+        shed_load_mw: 43_247.2,
+        blackout_load_mw: 0.0,
+        btm_tripped_mw: 597.76
+      }
+    })
   end
 
   describe "the displayed balance identity (UIW-3 / UIW-6)" do
@@ -160,6 +180,8 @@ defmodule PowerModelWeb.GridLiveMetricsTest do
 
       send(view.pid, {:simulation_cascade_done, done(%{stable: true, reason: :settled})})
       assert has_element?(view, ~s(#solver-badge[data-status="stable"]))
+      assert render(element(view, "#solver-badge")) =~ "Stable"
+      refute has_element?(view, "#solver-note")
     end
 
     test "a payload with no reason keeps the original two-state reading",
@@ -168,6 +190,155 @@ defmodule PowerModelWeb.GridLiveMetricsTest do
 
       send(view.pid, {:simulation_cascade_done, Map.delete(done(%{stable: false}), :reason)})
       assert has_element?(view, ~s(#solver-badge[data-status="unstable"]))
+    end
+
+    test "the reference cascade renders Collapsed, not Stable", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      send(view.pid, {:simulation_cascade_done, collapse_reference()})
+
+      html = render(element(view, "#solver-badge"))
+      assert html =~ "Collapsed"
+      assert has_element?(view, ~s(#solver-badge[data-status="collapsed"]))
+
+      # The engine's own flag said stable: true. It must not win here.
+      refute html =~ "Stable"
+      refute html =~ "Unstable"
+    end
+
+    test "a settled cascade that shed load says so", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      send(view.pid, {:simulation_cascade_done, done(%{reason: :settled, outcome: :degraded})})
+
+      assert render(element(view, "#solver-badge")) =~ "Stable (load shed)"
+      assert has_element?(view, ~s(#solver-badge[data-status="stable_shed"]))
+    end
+
+    test "a solve failure outranks the collapse verdict it cannot trust",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      # `outcome/1` reads only `balance/1`, which is downstream of the solve
+      # that failed. Rendering "Collapsed" here would assert we know the grid
+      # went down when what we know is that we stopped being able to compute,
+      # and it would bury the one fact the operator needs.
+      #
+      # DELIBERATELY NON-PRODUCIBLE: the engine now suppresses the
+      # classification at the source and a solve-failed run always carries
+      # `outcome: :unknown` (see the test below for the shape the server
+      # actually emits). This pairing is kept as a hostile-input case — it is
+      # what a stale payload looks like during a rolling restart, and it is
+      # the only test that proves the SUPPRESSION lives in the renderer and
+      # not merely in the engine that feeds it.
+      send(
+        view.pid,
+        {:simulation_cascade_done,
+         done(%{stable: false, reason: :solve_failed, outcome: :collapsed})}
+      )
+
+      html = render(element(view, "#solver-badge"))
+      assert html =~ "Solve failed"
+      refute html =~ "Collapsed"
+      # Not even as a sub-label.
+      refute has_element?(view, "#solver-note")
+    end
+
+    test "the shape a real solve failure emits renders the same way", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      # What the server actually sends now: no verdict at all. Without the
+      # suppression a failed solve reported `:intact`, because nothing had
+      # been shed before it died — a reassuring green verdict next to a
+      # failure.
+      send(
+        view.pid,
+        {:simulation_cascade_done,
+         done(%{stable: false, reason: :solve_failed, outcome: :unknown})}
+      )
+
+      assert render(element(view, "#solver-badge")) =~ "Solve failed"
+      assert has_element?(view, ~s(#solver-badge[data-status="solve_failed"]))
+      refute has_element?(view, "#solver-note")
+    end
+
+    test "an outcome of :unknown outside a solve failure falls back, not crashes",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      # The engine pairs `:unknown` only with `:solve_failed`, so this should
+      # never arrive. If it ever does, "we have no verdict" has to degrade to
+      # the pre-outcome reading rather than inventing one.
+      send(
+        view.pid,
+        {:simulation_cascade_done, done(%{stable: true, reason: :settled, outcome: :unknown})}
+      )
+
+      assert has_element?(view, ~s(#solver-badge[data-status="stable"]))
+
+      send(
+        view.pid,
+        {:simulation_cascade_done, done(%{stable: false, reason: :settled, outcome: :unknown})}
+      )
+
+      assert has_element?(view, ~s(#solver-badge[data-status="unstable"]))
+    end
+
+    test "a collapse cut off at the budget keeps both facts", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      send(
+        view.pid,
+        {:simulation_cascade_done,
+         done(%{stable: false, reason: :budget_exhausted, outcome: :collapsed})}
+      )
+
+      # The balance is trustworthy on a budget stop, so the collapse is real
+      # and leads; the truncation survives as the caveat rather than being
+      # dropped -- a cascade cut off mid-collapse was still getting worse.
+      assert render(element(view, "#solver-badge")) =~ "Collapsed"
+      assert render(element(view, "#solver-note")) =~ "step budget"
+    end
+
+    test "a truncated run that had already shed load is sub-labelled",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      send(
+        view.pid,
+        {:simulation_cascade_done,
+         done(%{stable: false, reason: :budget_exhausted, outcome: :degraded})}
+      )
+
+      assert render(element(view, "#solver-badge")) =~ "Unstable (step budget)"
+      assert render(element(view, "#solver-note")) =~ "load shed"
+    end
+
+    test "an unrecognised outcome degrades to the reason-only reading",
+         %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      # A fourth outcome value added later must not crash the badge.
+      send(
+        view.pid,
+        {:simulation_cascade_done,
+         done(%{stable: false, reason: :budget_exhausted, outcome: :brownout})}
+      )
+
+      assert render(element(view, "#solver-badge")) =~ "Unstable (step budget)"
+      refute has_element?(view, "#solver-note")
+    end
+
+    test "a stale note never survives the next state change", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      send(view.pid, {:simulation_cascade_done, collapse_reference()})
+      assert has_element?(view, ~s(#solver-badge[data-status="collapsed"]))
+
+      send(view.pid, {:simulation_reset, %{}})
+
+      assert has_element?(view, ~s(#solver-badge[data-status="idle"]))
+      refute has_element?(view, "#solver-note")
     end
 
     test "the partial AC overlay is never labelled AC Converged", %{conn: conn} do

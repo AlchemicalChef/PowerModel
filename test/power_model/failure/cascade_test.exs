@@ -1900,4 +1900,234 @@ defmodule PowerModel.Failure.CascadeTest do
       end
     end
   end
+
+  # ===========================================================================
+  # What the cascade LEFT, as distinct from why it stopped
+  # ===========================================================================
+
+  describe "outcome/1" do
+    # A state whose balance says exactly this, for pinning the thresholds
+    # without needing a network that happens to land on them.
+    defp balance_state(opts) do
+      Cascade.init(three_bus_snapshot())
+      |> Map.merge(%{
+        original_load_mw: Keyword.fetch!(opts, :original),
+        loads: [load(1, 2, p_mw: Keyword.fetch!(opts, :served))],
+        shed_load_mw: Keyword.get(opts, :shed, 0.0),
+        blackout_load_mw: Keyword.get(opts, :blackout, 0.0),
+        btm_tripped_mw: Keyword.get(opts, :btm, 0.0)
+      })
+    end
+
+    test "a cascade that settles into a blackout is {:settled, :collapsed}" do
+      # Tripping line 1 strands buses 2+3 — all 100 MW of the snapshot's load —
+      # on an island with no generation. The loop then has nothing left to
+      # trip, so it SETTLES. Reading that as "stable" is the misreading.
+      state = Cascade.init(three_bus_snapshot())
+      {final_state, _steps} = Cascade.trip_line(state, 1)
+
+      assert Cascade.termination(final_state) == :settled
+      assert final_state.stable
+      assert Cascade.outcome(final_state) == :collapsed
+
+      balance = Cascade.balance(final_state)
+      assert balance.served_load_mw == 0.0
+      assert_in_delta balance.blackout_load_mw, 100.0, 1.0e-6
+    end
+
+    test "a clean ride-through is {:settled, :intact}" do
+      buses = [bus(1, bus_type: 3), bus(2)]
+      lines = [line(1, 1, 2, rating_a_mva: 500.0, x_pu: 0.1)]
+      gens = [generator(1, 1, p_max_mw: 200.0)]
+      loads = [load(1, 2, p_mw: 50.0)]
+
+      state = Cascade.init(make_snapshot(buses, lines, [], gens, loads))
+      {final_state, _steps} = Cascade.run_cascade(state)
+
+      assert Cascade.termination(final_state) == :settled
+      assert Cascade.outcome(final_state) == :intact
+
+      balance = Cascade.balance(final_state)
+      assert balance.shed_load_mw == 0.0
+      assert balance.blackout_load_mw == 0.0
+    end
+
+    test "a partial shed that settles is :degraded, not :collapsed" do
+      # Island A is 30 MW beyond what its 90 MW machine can hold up and sheds
+      # that much; island B rides through untouched. Most customers keep their
+      # power, so this is neither a collapse nor an intact grid.
+      buses = [bus(1, bus_type: 3), bus(2), bus(3, bus_type: 3), bus(4)]
+
+      lines = [
+        line(1, 1, 2, rating_a_mva: 500.0, x_pu: 0.1),
+        line(2, 3, 4, rating_a_mva: 500.0, x_pu: 0.1)
+      ]
+
+      gens = [generator(1, 1, p_max_mw: 90.0), generator(3, 3, p_max_mw: 200.0)]
+      loads = [load(1, 2, p_mw: 120.0), load(2, 4, p_mw: 100.0)]
+
+      state = Cascade.init(make_snapshot(buses, lines, [], gens, loads))
+      {final_state, _steps} = Cascade.run_cascade(state)
+
+      assert Cascade.termination(final_state) == :settled
+      assert Cascade.outcome(final_state) == :degraded
+
+      balance = Cascade.balance(final_state)
+      assert balance.shed_load_mw > 1.0
+      assert balance.served_load_mw / balance.original_load_mw > 0.5
+    end
+
+    test "the collapse threshold is served < 50% of standing demand" do
+      # Exactly half served is NOT a collapse: the test is strict.
+      assert Cascade.outcome(balance_state(original: 100.0, served: 50.0, shed: 50.0)) ==
+               :degraded
+
+      assert Cascade.outcome(balance_state(original: 100.0, served: 49.9, shed: 50.1)) ==
+               :collapsed
+
+      # Blackout counts the same as shed — both are customers without power.
+      assert Cascade.outcome(balance_state(original: 100.0, served: 10.0, blackout: 90.0)) ==
+               :collapsed
+    end
+
+    test "the degraded floor is 1 MW absolute OR 0.1% relative" do
+      # National scale: the relative floor is 100 MW, so the ABSOLUTE floor is
+      # the one doing the work.
+      assert Cascade.outcome(balance_state(original: 100_000.0, served: 99_999.0, shed: 1.0)) ==
+               :intact
+
+      assert Cascade.outcome(balance_state(original: 100_000.0, served: 99_998.5, shed: 1.5)) ==
+               :degraded
+
+      # Small-island scale: the absolute floor is 1% of the island, so the
+      # RELATIVE floor is the one doing the work.
+      assert Cascade.outcome(balance_state(original: 100.0, served: 99.9, shed: 0.1)) == :intact
+
+      assert Cascade.outcome(balance_state(original: 100.0, served: 99.8, shed: 0.2)) ==
+               :degraded
+    end
+
+    test "the denominator is standing demand, so a rooftop trip cannot hide a collapse" do
+      # 100 MW of metered load plus 100 MW of rooftop that tripped and became
+      # load standing at the buses. 110 of those 200 MW were shed, so only 45%
+      # of what the system was actually asked to serve is still served — a
+      # collapse. Dividing by original_load_mw alone reads 90/100 = 90% served
+      # and calls the same state merely degraded.
+      state = balance_state(original: 100.0, served: 90.0, shed: 110.0, btm: 100.0)
+
+      balance = Cascade.balance(state)
+
+      # The identity the denominator is taken from.
+      assert_in_delta balance.served_load_mw + balance.shed_load_mw + balance.blackout_load_mw,
+                      balance.original_load_mw + balance.btm_tripped_mw,
+                      1.0e-6
+
+      assert Cascade.outcome(state) == :collapsed
+
+      # And the reason the original-only denominator is wrong in the other
+      # direction too: it can report more than everything served.
+      all_served = balance_state(original: 100.0, served: 200.0, btm: 100.0)
+      served_balance = Cascade.balance(all_served)
+
+      assert served_balance.served_load_mw / served_balance.original_load_mw == 2.0
+
+      assert served_balance.served_load_mw /
+               (served_balance.original_load_mw + served_balance.btm_tripped_mw) == 1.0
+
+      assert Cascade.outcome(all_served) == :intact
+    end
+
+    test "is non-nil on any state termination/1 accepts, including a fresh one" do
+      fresh = Cascade.init(three_bus_snapshot())
+
+      # A state that has never run a cascade has no termination at all, but it
+      # always has an outcome.
+      assert Cascade.termination(fresh) == nil
+      assert Cascade.outcome(fresh) == :intact
+
+      # A snapshot with no load has nothing to lose (and nothing to divide by).
+      empty =
+        Cascade.init(
+          make_snapshot([bus(1, bus_type: 3)], [], [], [generator(1, 1, p_max_mw: 10.0)], [])
+        )
+
+      assert Cascade.outcome(empty) == :intact
+    end
+
+    test "a solve-failed state is :unknown whatever its balance says" do
+      # The classification is SUPPRESSED, not computed: outcome/1 reads only
+      # balance/1, and a balance is downstream of the solve that failed. Both
+      # directions of the mistake are proved here — the reassuring one and the
+      # alarming one — by fabricating each balance twice and flipping only the
+      # termination.
+      collapsed_looking = balance_state(original: 100.0, served: 1.0, shed: 99.0)
+      intact_looking = balance_state(original: 100.0, served: 100.0)
+
+      assert Cascade.outcome(collapsed_looking) == :collapsed
+      assert Cascade.outcome(intact_looking) == :intact
+
+      assert Cascade.outcome(%{collapsed_looking | termination: :solve_failed}) == :unknown
+      assert Cascade.outcome(%{intact_looking | termination: :solve_failed}) == :unknown
+
+      # EXACTLY :solve_failed — no other termination suppresses the verdict.
+      for cause <- [nil, :settled, :budget_exhausted] do
+        assert Cascade.outcome(%{collapsed_looking | termination: cause}) == :collapsed
+        assert Cascade.outcome(%{intact_looking | termination: cause}) == :intact
+      end
+    end
+
+    test "a real failed island solve reports :unknown, not a reassuring :intact" do
+      # The end-to-end case: two parallel lines whose reactances cancel make
+      # island 1-2-3's B' singular, so its solve throws and the run is
+      # terminal. Nothing was shed before it died, so the recorded balance
+      # still shows all 100 MW served — which is exactly the reassuring green
+      # verdict that must not be rendered beside a failure.
+      buses = [bus(1, bus_type: 3), bus(2), bus(3), bus(10, bus_type: 3), bus(11)]
+
+      lines = [
+        line(1, 1, 2, x_pu: 1.0, rating_a_mva: 1_000.0),
+        line(2, 1, 2, x_pu: -1.0, rating_a_mva: 1_000.0),
+        line(3, 2, 3, x_pu: 1.0, rating_a_mva: 1_000.0),
+        line(10, 10, 11, x_pu: 0.1, rating_a_mva: 1_000.0)
+      ]
+
+      gens = [generator(1, 1, p_max_mw: 100.0), generator(10, 10, p_max_mw: 10.0)]
+      loads = [load(1, 3, p_mw: 100.0)]
+
+      state = Cascade.init(make_snapshot(buses, lines, [], gens, loads))
+      {final_state, _steps} = Cascade.trip_line(state, 10)
+
+      assert Cascade.termination(final_state) == :solve_failed
+      refute final_state.stable
+      assert Cascade.outcome(final_state) == :unknown
+
+      # The balance itself stays honest and unsuppressed — it is an accurate
+      # record of what the state holds. Only its INTERPRETATION is withheld.
+      balance = Cascade.balance(final_state)
+      assert balance.shed_load_mw == 0.0
+
+      assert_in_delta balance.served_load_mw + balance.shed_load_mw + balance.blackout_load_mw,
+                      balance.original_load_mw + balance.btm_tripped_mw,
+                      0.01
+
+      # Proof that the suppression is what produced :unknown: the very same
+      # balance classifies normally once the termination is not a failed solve.
+      assert Cascade.outcome(%{final_state | termination: :settled}) == :intact
+    end
+
+    test "is orthogonal to termination: a truncated run still reports what it left" do
+      state = %{at_limit_conductor_state() | step: 49}
+
+      {final_state, _steps} = Cascade.run_cascade(state)
+
+      assert Cascade.termination(final_state) == :budget_exhausted
+      assert Cascade.outcome(final_state) in [:collapsed, :degraded, :intact]
+
+      # The two axes move independently: same termination, different outcomes.
+      assert Cascade.outcome(balance_state(original: 100.0, served: 100.0)) == :intact
+
+      assert Cascade.outcome(balance_state(original: 100.0, served: 1.0, shed: 99.0)) ==
+               :collapsed
+    end
+  end
 end
