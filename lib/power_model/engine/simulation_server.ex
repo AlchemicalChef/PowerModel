@@ -9,6 +9,28 @@ defmodule PowerModel.Engine.SimulationServer do
   owning LiveView monitors the server and rebuilds on demand instead.
   Idle servers reap themselves after `@default_idle_timeout` without calls
   so abandoned browser sessions do not pin a full grid snapshot forever.
+
+  ## The broadcast contract (REVIEW UIW-3/4/5)
+
+  Five PubSub messages leave this server: `dc_update`, `ac_update`,
+  `cascade_step`, `cascade_done` and `reset`. Two rules govern their payloads.
+
+  **Absence means "no information", never zero.** Every key this module adds
+  beyond the original set is present only when it carries something. A step
+  that ran no voltage layer has no `:voltage_layer` key; a step with no bus
+  outside the overlay band has no `:bus_voltage` key. A consumer that reads a
+  missing key as `0` would report "no undervoltage" for a cascade whose
+  voltage layer never ran, which is the honest-degradation failure CAS-1
+  exists to prevent.
+
+  **There is one voltage authority, and it is structurally partial.** The
+  cascade's own QSS-AC is the only thing that solves AC now; the post-cascade
+  whole-grid FDPF refinement is gone (it re-solved the same island the cascade
+  had just failed to solve, and CAS-1's all-or-nothing merge discarded the
+  result at real demand — see `merge_ac_solutions/5`). What the cascade DID
+  converge is forwarded on `ac_update` under the `:ac_overlay` key, covering
+  those islands and saying nothing whatever about the rest. Nothing inside
+  `:ac_overlay` may be merged into a whole-grid metric.
   """
 
   use GenServer, restart: :temporary
@@ -16,7 +38,7 @@ defmodule PowerModel.Engine.SimulationServer do
   require Logger
 
   alias PowerModel.Grid
-  alias PowerModel.Solver.{DCPowerFlow, FDPF, Solution, Partition}
+  alias PowerModel.Solver.{DCPowerFlow, Solution, Partition}
   alias PowerModel.Failure.Cascade
 
   defstruct [
@@ -64,6 +86,23 @@ defmodule PowerModel.Engine.SimulationServer do
 
   def get_state(sim_id) do
     GenServer.call(via(sim_id), :get_state, 30_000)
+  end
+
+  @doc """
+  The session's live topology and base solve, for N-1 screening (UIW-2).
+
+  Returns the ACTIVE snapshot (tripped components removed, generation set to
+  the cascade's dispatch) plus the dispatch map and the DC solution already
+  computed for it, so a screening sweep neither re-queries the database (4.6 s
+  on Eastern) nor re-solves a base case the session has in hand.
+
+  `:dc_solution` is `nil` before the first solve completes, and comes from
+  `DCPowerFlow.solve_islands/2` — a MERGE of per-island solutions. A caller
+  passing it to `ContingencyScreening.run/3` is asserting that the network is
+  one island; on a split network, let `run/2` solve its own base case.
+  """
+  def screening_snapshot(sim_id) do
+    GenServer.call(via(sim_id), :screening_snapshot, @trip_timeout)
   end
 
   def reset(sim_id) do
@@ -281,6 +320,24 @@ defmodule PowerModel.Engine.SimulationServer do
     {:reply, reply, state}
   end
 
+  def handle_call(:screening_snapshot, _from, state) do
+    state = touch(state)
+
+    reply = %{
+      snapshot: active_snapshot(state),
+      dc_solution: state.dc_solution,
+      dispatch: state.cascade_state.dispatch,
+      base_mva: state.base_mva,
+      interconnection_id: state.interconnection_id,
+      hour: state.hour,
+      # The epoch a sweep was started against: a result computed here is
+      # stale the moment another trip lands, exactly as for AC refinements.
+      epoch: state.epoch
+    }
+
+    {:reply, reply, state}
+  end
+
   def handle_call(:reset, _from, state) do
     # CAS-13 / UI-C2: reply immediately -- the base-case rebuild (a full DC
     # solve) runs in a continue so the caller never blocks behind it. The
@@ -310,6 +367,11 @@ defmodule PowerModel.Engine.SimulationServer do
   end
 
   # Private
+
+  # Every cause under which a load loses demand. Frequency-driven shedding
+  # ("ufls_shed", plus "ufls" kept for safety), the voltage-driven stage
+  # ("uvls_shed" -- absent here before UIW-6), and an island going dark.
+  @shed_causes ~w(ufls_shed ufls uvls_shed island_blackout)
 
   # The user-injected failure itself must reach the map immediately: cascade
   # step payloads only carry trips DISCOVERED during the cascade, so without
@@ -349,8 +411,11 @@ defmodule PowerModel.Engine.SimulationServer do
         broadcast(state.sim_id, "dc_update", solution_payload(solution, state))
         state = %{state | dc_solution: solution}
 
-        # Spawn AC refinement in background
-        spawn_ac_refinement(state)
+        # UIW-4: the voltage picture comes from the cascade's own per-island
+        # AC solves, not from a second whole-grid FDPF. Sent BEFORE
+        # cascade_done so the terminal status the UI settles on is the
+        # cascade's, not "AC solved".
+        broadcast_voltage_overlay(state, step_results)
 
         broadcast(state.sim_id, "cascade_done", cascade_done_payload(step_results, final_cascade))
 
@@ -367,6 +432,23 @@ defmodule PowerModel.Engine.SimulationServer do
 
   @component_trip_types ~w(transmission_line transformer generator)
 
+  # UIW-3. Four additive keys beyond the original five:
+  #
+  #   :reason              why the cascade stopped, from `Cascade.termination/1`
+  #                        on the FINAL STATE. Never derived from the step
+  #                        stream: the budget clause fires instead of a step,
+  #                        so `:budget_exhausted` is stamped onto the returned
+  #                        list and the callback stream never carries it.
+  #                        `stable` alone cannot separate a truncated run from
+  #                        a collapse -- both leave it false, and reading a
+  #                        truncated run as a collapse is the false-10x hazard.
+  #   :voltage_layer       AC coverage counters for the whole cascade.
+  #   :btm_trip_breakdown  rooftop MW lost, split frequency vs voltage. The
+  #                        wire balance's `btm_tripped_mw` is the total; this
+  #                        says which mechanism took it.
+  #   :agc                 the final per-island secondary-control summaries,
+  #                        read off the last step result so this module does
+  #                        not re-derive what the cascade already published.
   defp cascade_done_payload(step_results, final_cascade) do
     %{
       steps: length(step_results),
@@ -377,8 +459,18 @@ defmodule PowerModel.Engine.SimulationServer do
       # emits one event per shed load, which is not "tripped equipment".
       tripped_count:
         Enum.count(final_cascade.events, &(&1.component_type in @component_trip_types)),
-      balance: Cascade.balance(final_cascade)
+      balance: Cascade.balance(final_cascade),
+      reason: Cascade.termination(final_cascade),
+      voltage_layer: final_cascade.voltage_layer,
+      btm_trip_breakdown: final_cascade.btm_trip_breakdown,
+      agc: final_step_agc(step_results)
     }
+  end
+
+  defp final_step_agc([]), do: []
+
+  defp final_step_agc(step_results) do
+    step_results |> List.last() |> Map.get(:agc) |> List.wrap()
   end
 
   defp solve_dc(state) do
@@ -463,85 +555,107 @@ defmodule PowerModel.Engine.SimulationServer do
     Enum.reduce(snapshot.loads, 0.0, fn load, acc -> acc + (load.p_mw || 0.0) end)
   end
 
-  # `FDPF.solve/2` picks its own path per island — dense Newton-Raphson below
-  # its cutoff, fast-decoupled above — so this cap is no longer about which
-  # solver runs. It is a budget: an AC attempt on the Eastern interconnection
-  # is seconds of background CPU per step whether or not it converges, and this
-  # covers all three interconnections with room to spare.
+  # The size above which an island is not attempted at all. This module no
+  # longer runs any AC solve of its own (UIW-4 removed the post-cascade
+  # refinement: it re-attempted the same island the cascade had just failed to
+  # solve, and the merge below then discarded the result), so the cap survives
+  # only as the coverage guard's threshold and as the number the `{:partial,
+  # reason}` message quotes.
   @max_ac_island_buses 60_000
 
-  defp spawn_ac_refinement(state) do
-    server = self()
-    epoch = state.epoch
+  # UIW-4. The cascade's converged per-island voltages, forwarded once per
+  # cascade on the `ac_update` message (the name is kept so the client's
+  # existing AC branch needs no change).
+  #
+  # The DC classification lists ride along unchanged from the `dc_update` that
+  # fired immediately before: the client's AC branch delegates to its DC
+  # painter, which CLEARS every flow state before applying the lists it is
+  # given, so an overlay without them would blank the map that was just
+  # painted. Sending the same lists makes that repaint idempotent.
+  #
+  # Every AC-derived number stays inside `:ac_overlay`. CAS-1's rule is that a
+  # solve covering a subset of islands may never speak for the grid, and this
+  # channel covers whatever subset the cascade reached -- typically none of the
+  # main island at real demand.
+  defp broadcast_voltage_overlay(state, step_results) do
+    case voltage_overlay_payload(step_results) do
+      nil ->
+        :ok
 
-    Task.start(fn ->
-      snapshot = active_snapshot(state)
-      # AC refinement is also per electrical island -- a Y-bus spanning
-      # disconnected systems is singular.
-      {subs, dead} = Partition.split(snapshot)
+      overlay ->
+        payload =
+          state.dc_solution
+          |> solution_payload(state)
+          |> Map.put(:partial_ac, true)
+          |> Map.put(:ac_overlay, overlay)
 
-      {tractable, skipped} =
-        Enum.split_with(subs, &(length(&1.buses) <= @max_ac_island_buses))
+        broadcast(state.sim_id, "ac_update", payload)
+    end
+  end
 
-      solutions =
-        tractable
-        |> Enum.map(&solve_island_ac(&1, state))
-        |> Enum.reject(&is_nil/1)
-        |> Enum.filter(& &1.converged)
+  @doc """
+  The `:ac_overlay` value for a finished cascade, or `nil` when no island
+  reached an AC solution (the ordinary case at real demand).
 
-      dead_buses = Enum.reduce(dead, MapSet.new(), &MapSet.union(&2, &1))
-
-      dead_info = %{
-        dead_load_mw:
-          snapshot.loads
-          |> Enum.filter(&MapSet.member?(dead_buses, &1.bus_id))
-          |> Enum.reduce(0.0, fn load, acc -> acc + (load.p_mw || 0.0) end),
-        dead_bus_count: MapSet.size(dead_buses)
-      }
-
-      skipped_sizes = Enum.map(skipped, &length(&1.buses))
-
-      case merge_ac_solutions(solutions, length(subs), skipped_sizes, dead_info, state.base_mva) do
-        {:ok, merged} ->
-          send(server, {:ac_result, epoch, merged})
-
-        {:partial, reason} ->
-          Logger.info(
-            "[sim #{state.sim_id}] AC refinement discarded: #{reason}; DC results stand"
-          )
+  Built from the LAST step that converged something: earlier steps' overlays
+  describe topologies the cascade has since torn up.
+  """
+  def voltage_overlay_payload(step_results) do
+    step_results
+    |> Enum.reverse()
+    |> Enum.find_value(fn step ->
+      case Map.get(step, :voltage_overlay) do
+        %{islands: [_ | _]} = overlay -> overlay_payload(overlay)
+        _ -> nil
       end
     end)
   end
 
-  # One island's AC solve. `FDPF.solve/2` chooses dense Newton-Raphson or
-  # fast-decoupled by island size and falls back between them on its own; what
-  # is handled here is the case it cannot solve at all, which throws (a system
-  # that cannot be solved must never come back as quietly wrong numbers). A
-  # nil result drops out of the merge, and CAS-1 then keeps the DC picture.
-  defp solve_island_ac(sub, state) do
-    case FDPF.solve(sub, base_mva: state.base_mva, warm_start: state.dc_solution) do
-      {:ok, solution} -> solution
-      _ -> nil
-    end
-  catch
-    thrown ->
-      Logger.info(
-        "[sim #{state.sim_id}] AC solve of a #{length(sub.buses)}-bus island " <>
-          "failed: #{inspect(thrown)}"
-      )
+  defp overlay_payload(overlay) do
+    %{
+      # Structural, not a status: this covers the islands AC reached and is
+      # silent about the rest. Never average or total it with DC results.
+      partial: true,
+      island_count: length(overlay.islands),
+      covered_bus_count: overlay.covered_bus_count,
+      undervoltage_bus_ids: overlay.undervoltage_bus_ids,
+      overvoltage_bus_ids: overlay.overvoltage_bus_ids,
+      islands:
+        Enum.map(overlay.islands, fn island ->
+          %{
+            island_id: island.island_id,
+            at_s: island.at_s,
+            bus_count: island.bus_count,
+            undervoltage_bus_ids: island.undervoltage_bus_ids,
+            overvoltage_bus_ids: island.overvoltage_bus_ids,
+            # The FULL magnitude map, deliberately: a per-cell minimum over an
+            # H3 hexbin needs every bus in the cell, not only the ones already
+            # outside the band. Rounded to 1e-4 pu, which is two orders of
+            # magnitude finer than any band edge and roughly halves the bytes.
+            vm_by_bus: round_vm(island.vm_by_bus)
+          }
+        end)
+    }
+  end
 
-      nil
+  defp round_vm(vm_by_bus) do
+    Map.new(vm_by_bus, fn {bus_id, vm} -> {bus_id, Float.round(vm * 1.0, 4)} end)
   end
 
   @doc """
-  CAS-1: an AC refinement may only replace the DC picture when it covers
-  EVERY island the DC solve covered. A merge of a strict subset of islands
-  used to be broadcast as whole-grid authoritative, erasing marks and
-  collapsing metrics to the fragment's totals on every skipped island.
+  CAS-1: an AC solution may only replace the DC picture when it covers EVERY
+  island the DC solve covered. A merge of a strict subset of islands used to
+  be broadcast as whole-grid authoritative, erasing marks and collapsing
+  metrics to the fragment's totals on every skipped island.
 
   Returns `{:ok, merged_solution}` only when no island was skipped for size
   and all `n_islands` solvable islands produced a converged AC solution;
   `{:partial, reason}` otherwise (honest degradation: the DC results stand).
+
+  UIW-4 removed this module's only caller — the post-cascade refinement that
+  re-solved, per trip, the same island the cascade had just failed to solve.
+  The rule it encodes did not go away with it: it is why the cascade's own
+  per-island voltages travel as `:ac_overlay` rather than as a solution.
   """
   def merge_ac_solutions(solutions, n_islands, skipped_sizes, dead_info, base_mva) do
     n_solved = length(solutions)
@@ -734,10 +848,11 @@ defmodule PowerModel.Engine.SimulationServer do
       |> Enum.map(& &1.component_id)
 
     # Categorize trips by failure cause (load shedding affects buses).
-    # LoadShedding emits "ufls_shed"; "ufls" kept for safety.
+    # UIW-6: "uvls_shed" (LoadShedding's voltage-driven stage) was missing
+    # here, so a purely voltage-driven collapse produced an empty shed channel.
     shed_ids =
       trips
-      |> Enum.filter(&(&1.failure_cause in ["ufls_shed", "ufls", "island_blackout"]))
+      |> Enum.filter(&(&1.failure_cause in @shed_causes))
       |> Enum.map(& &1.component_id)
 
     # Critical-infrastructure impacts (water facilities, datacenters)
@@ -767,14 +882,19 @@ defmodule PowerModel.Engine.SimulationServer do
         end
       )
 
+    {panel_trips, trips_omitted} = panel_trips(trips, bus_by_load(state))
+
     %{
       step: step.step,
       simulated_time: Map.get(step, :simulated_time, 0.0),
       islands: step.islands,
-      trips: trips,
+      trips: panel_trips,
       tripped_line_ids: tripped_line_ids,
       tripped_transformer_ids: tripped_transformer_ids,
       tripped_generator_ids: tripped_generator_ids,
+      # The TRUE event count for this step, not `length(trips)`: `trips` is the
+      # itemized-plus-aggregated view built for the panel. This is the number
+      # that reconciles with the balance's shed MW.
       trip_count: length(trips),
       overloaded_line_ids: merged.overloaded_line_ids,
       stressed_line_ids: merged.stressed_line_ids,
@@ -806,6 +926,172 @@ defmodule PowerModel.Engine.SimulationServer do
         end),
       balance: Map.get(step, :balance)
     }
+    |> put_present(:trips_omitted, if(trips_omitted > 0, do: trips_omitted))
+    |> put_present(:voltage_layer, Map.get(step, :voltage_layer))
+    |> put_present(:frequency, Map.get(step, :frequency))
+    |> put_present(:agc, Map.get(step, :agc))
+    |> put_present(:bus_voltage, violating_bus_voltage(Map.get(step, :voltage_overlay)))
+  end
+
+  # A key is added only when it carries information (UIW-3). `false` and `0.0`
+  # are information; `nil`, `[]` and `%{}` are not, and shipping them would let
+  # a consumer read "the voltage layer found no violation" off a cascade whose
+  # voltage layer never ran.
+  defp put_present(payload, _key, nil), do: payload
+  defp put_present(payload, _key, []), do: payload
+  defp put_present(payload, _key, empty) when empty == %{}, do: payload
+  defp put_present(payload, key, value), do: Map.put(payload, key, value)
+
+  @doc """
+  Per-bus magnitudes for the buses a step left OUTSIDE the overlay band.
+
+  The full magnitude map is far larger and travels once per cascade on
+  `ac_update`, not once per step; what a step needs is the alarm set. Returns
+  `%{}` when the voltage layer produced nothing, and the caller then omits the
+  key rather than shipping an empty map that reads as "no violations".
+
+  The band is the cascade's overlay band (0.9/1.1 pu), applied by
+  `Cascade`, and it is deliberately TIGHTER than the 0.85/1.15 alarm band the
+  protection layer trips on. They answer different questions; do not reconcile
+  them.
+  """
+  def violating_bus_voltage(%{islands: islands}) when is_list(islands) do
+    Enum.reduce(islands, %{}, fn island, acc ->
+      island.undervoltage_bus_ids
+      |> Enum.concat(island.overvoltage_bus_ids)
+      |> Enum.reduce(acc, fn bus_id, acc ->
+        case Map.fetch(island.vm_by_bus, bus_id) do
+          {:ok, vm} -> Map.put(acc, bus_id, Float.round(vm * 1.0, 4))
+          :error -> acc
+        end
+      end)
+    end)
+  end
+
+  def violating_bus_voltage(_overlay), do: %{}
+
+  @max_itemized_trips 200
+
+  @doc """
+  The panel view of one step's trips: `{events, omitted_count}`.
+
+  UIW-5. A collapse emits one event per shed load -- 11,304 of them in the
+  ERCOT reference cascade, 2.2 MB of JSON in a single frame. The map paints
+  none of them (it reads the typed id lists) and the panel can show fifty
+  rows, so per-load shedding travels as ONE synthetic event per cause per step
+  and the itemized remainder is capped at #{@max_itemized_trips}.
+
+  `bus_by_load` maps load id to bus id, which is what lets an aggregate name
+  the island it came from.
+
+  This is a VIEW, not the truth: the step payload's `trip_count` stays the
+  true event total, so anything reconciling counts against the balance's shed
+  MW is unaffected by either the aggregation or the cap.
+  """
+  def panel_trips(trips, bus_by_load) do
+    {shed, itemized} =
+      Enum.split_with(trips, &(&1.component_type == "load" and &1.failure_cause in @shed_causes))
+
+    kept = cap_itemized(itemized)
+    {kept ++ shed_aggregates(shed, bus_by_load), length(itemized) - length(kept)}
+  end
+
+  # The cap reserves a slot for the FIRST event of every cause before filling
+  # the rest chronologically. A step where one relay type fires 199 times must
+  # not hide the single distance-zone or voltage event that fired after it --
+  # those rarer causes are usually the ones worth reading.
+  defp cap_itemized(itemized) when length(itemized) <= @max_itemized_trips, do: itemized
+
+  defp cap_itemized(itemized) do
+    indexed = Enum.with_index(itemized)
+
+    reserved =
+      indexed
+      |> Enum.uniq_by(fn {trip, _i} -> trip.failure_cause end)
+      |> Enum.take(@max_itemized_trips)
+      |> MapSet.new(fn {_trip, i} -> i end)
+
+    filler =
+      indexed
+      |> Enum.reject(fn {_trip, i} -> MapSet.member?(reserved, i) end)
+      |> Enum.take(@max_itemized_trips - MapSet.size(reserved))
+      |> MapSet.new(fn {_trip, i} -> i end)
+
+    keep = MapSet.union(reserved, filler)
+
+    for {trip, i} <- indexed, MapSet.member?(keep, i), do: trip
+  end
+
+  # One synthetic event per shed cause per step.
+  #
+  # `component_id` is the lowest BUS id among the aggregated loads, which is
+  # the identifier convention island-level events already use (`btm_trip`,
+  # `island_blackout`). It names the island exactly when a single island shed
+  # in this step -- the ordinary case, since shedding is applied per island --
+  # and the lowest of them otherwise.
+  #
+  # `details.frequency_nadir` is the MINIMUM over the group, not the mean:
+  # the UI's frequency metric is a running minimum over shed events, so the
+  # aggregate has to preserve the deepest dip or the reported nadir rises.
+  defp shed_aggregates([], _bus_by_load), do: []
+
+  defp shed_aggregates(shed, bus_by_load) do
+    shed
+    |> Enum.group_by(& &1.failure_cause)
+    |> Enum.map(fn {cause, events} ->
+      nadirs =
+        events
+        |> Enum.map(&get_in(&1, [:details, :frequency_nadir]))
+        |> Enum.filter(&is_number/1)
+
+      %{
+        component_type: "island",
+        component_id: aggregate_id(events, bus_by_load),
+        failure_cause: cause,
+        details:
+          %{
+            aggregated: true,
+            count: length(events),
+            shed_mw: Enum.reduce(events, 0.0, &(&2 + shed_event_mw(&1)))
+          }
+          |> put_present(:frequency_nadir, Enum.min(nadirs, fn -> nil end))
+      }
+    end)
+    |> Enum.sort_by(& &1.failure_cause)
+  end
+
+  defp aggregate_id(events, bus_by_load) do
+    events
+    |> Enum.map(&Map.get(bus_by_load, &1.component_id, &1.component_id))
+    |> Enum.min(fn -> nil end)
+  end
+
+  defp bus_by_load(state) do
+    Map.new(state.cascade_state.loads, &{&1.id, &1.bus_id})
+  end
+
+  # UFLS/UVLS report what they took as `shed_mw`; an island blackout reports it
+  # as `lost_mw`. Both are MW of demand removed at this step.
+  defp shed_event_mw(%{details: %{} = details}) do
+    (Map.get(details, :shed_mw) || Map.get(details, :lost_mw) || 0.0) * 1.0
+  end
+
+  defp shed_event_mw(_event), do: 0.0
+
+  @doc """
+  The `cascade_step` payload with the channels no browser reads removed.
+
+  `:trips`, `:water_facility_trips`, `:datacenter_trips` and `:shed_ids` exist
+  for the LiveView, which builds the Affected panel and the frequency metric
+  from them server-side. Nothing in `assets/js` reads any of the four (UIW-4),
+  and on the reference cascade they are essentially the entire frame. Push the
+  result of this function to the client; keep the PubSub payload for the
+  LiveView's own assigns.
+  """
+  @client_dropped_keys [:trips, :water_facility_trips, :datacenter_trips, :shed_ids]
+
+  def client_step_payload(payload) when is_map(payload) do
+    Map.drop(payload, @client_dropped_keys)
   end
 
   defp via(sim_id) do
