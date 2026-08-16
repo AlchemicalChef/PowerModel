@@ -97,6 +97,8 @@ defmodule PowerModel.Failure.Reserves do
         primary_mw: float(),
         remaining_mw: float(),        # deficit no tier could reach in time
         sustained_by_unit: %{id => mw},  # secondary + tertiary, per unit
+        secondary_by_unit: %{id => mw},  # the same, split by tier, for the
+        tertiary_by_unit: %{id => mw},   # caller's ramp ledger (`:delivered`)
         primary_by_unit: %{id => mw},
         secondary_capability_mw: float(), # what each tier COULD have delivered
         tertiary_capability_mw: float(),
@@ -137,13 +139,46 @@ defmodule PowerModel.Failure.Reserves do
   The AGC map must be the per-step increment, never the cumulative position:
   the cascade adds the allocation to its dispatch, and the next step's deficit
   already reflects it.
+
+    * `:delivered` — the caller's ramp ledger, `%{id => %{secondary: mw,
+      tertiary: mw}}`: what each unit has ALREADY put on the system under the
+      same `elapsed_s` clock. Each clock-ramped tier's bound becomes
+      `ramp(elapsed) - delivered`, so repeated allocations against one clock
+      hand out ONE ramp between them rather than one each.
+
+  ### Why a stateless ramp bound is not enough
+
+  `allocate/4` is pure, and one call in isolation is correct: a unit that has
+  had 60 s of a 20 MW/min ramp can deliver 20 MW. But a caller that allocates
+  more than once against the SAME clock — `PowerModel.Failure.Cascade` makes up
+  to three allocations per island per step — gets 20 MW each time, because the
+  raised operating point moves the HEADROOM bound and nothing moves the ramp
+  bound. Measured at 60 MW from a 20 MW/min unit past 600 s, which is a fleet
+  answering a deficit faster than it physically can and UFLS under-firing as a
+  result (REVIEW CAS-22).
+
+  The ledger is per TIER because the two clock-ramped tiers cover disjoint
+  windows of the same ramp — secondary the first `#{@secondary_horizon_s} s`,
+  tertiary everything past `#{@tertiary_start_delay_s} s` — so their sum is
+  `ramp(elapsed)` exactly once. Folding them into one figure would let a unit
+  that spent its secondary window deny itself the tertiary one.
+
+  The ledger belongs to the caller because only the caller knows when the clock
+  it is measured against restarts: a ledger that outlives its `elapsed_s`
+  origin is a ramp budget charged against a clock that no longer exists.
   """
   @spec allocate(list(map()), float(), float() | :infinity, keyword()) :: map()
   def allocate(units, deficit_mw, elapsed_s, opts \\ []) do
     deficit_mw = max(deficit_mw * 1.0, 0.0)
     secondary = Keyword.get(opts, :secondary, :clock)
+    delivered = Keyword.get(opts, :delivered) || %{}
 
-    secondary_caps = Enum.map(units, &{&1, secondary_capability_mw(&1, elapsed_s, secondary)})
+    secondary_caps =
+      Enum.map(units, fn u ->
+        {u,
+         secondary_capability_mw(u, elapsed_s, secondary, delivered_mw(delivered, u, :secondary))}
+      end)
+
     secondary_capability = sum_caps(secondary_caps)
 
     {secondary_alloc, secondary_mw} = fill_pro_rata(secondary_caps, deficit_mw)
@@ -155,7 +190,13 @@ defmodule PowerModel.Failure.Reserves do
 
     tertiary_caps =
       Enum.map(units, fn u ->
-        {u, tertiary_capability_mw(u, elapsed_s, Map.get(secondary_alloc, u.id, 0.0))}
+        {u,
+         tertiary_capability_mw(
+           u,
+           elapsed_s,
+           Map.get(secondary_alloc, u.id, 0.0),
+           delivered_mw(delivered, u, :tertiary)
+         )}
       end)
 
     tertiary_capability = sum_caps(tertiary_caps)
@@ -189,6 +230,8 @@ defmodule PowerModel.Failure.Reserves do
       primary_mw: primary_mw,
       remaining_mw: max(deficit_mw - secondary_mw - tertiary_mw - primary_mw, 0.0),
       sustained_by_unit: sustained_by_unit,
+      secondary_by_unit: secondary_alloc,
+      tertiary_by_unit: tertiary_alloc,
       primary_by_unit: primary_alloc,
       secondary_capability_mw: secondary_capability,
       tertiary_capability_mw: tertiary_capability,
@@ -211,11 +254,17 @@ defmodule PowerModel.Failure.Reserves do
   With `source` = `{:agc, %{id => mw}}` the ramp-and-clock bound is replaced by
   the MW closed-loop AGC actually dispatched to this unit — still capped by
   its headroom. See `allocate/4`.
-  """
-  @spec secondary_capability_mw(map(), float() | :infinity, :clock | {:agc, map()}) :: float()
-  def secondary_capability_mw(unit, elapsed_s, source \\ :clock)
 
-  def secondary_capability_mw(unit, _elapsed_s, {:agc, deltas}) do
+  `delivered_mw` is what this unit has already delivered from THIS tier under
+  the same clock; it is subtracted from the ramp bound so a second call cannot
+  re-grant the first call's megawatts. It has no effect on the AGC form, whose
+  bound is a closed-loop command rather than an elapsed-time budget.
+  """
+  @spec secondary_capability_mw(map(), float() | :infinity, :clock | {:agc, map()}, float()) ::
+          float()
+  def secondary_capability_mw(unit, elapsed_s, source \\ :clock, delivered_mw \\ 0.0)
+
+  def secondary_capability_mw(unit, _elapsed_s, {:agc, deltas}, _delivered_mw) do
     if spinning?(unit) do
       dispatched = Map.get(deltas, Map.get(unit, :id), 0.0)
       min(max(dispatched, 0.0), headroom_mw(unit))
@@ -224,11 +273,11 @@ defmodule PowerModel.Failure.Reserves do
     end
   end
 
-  def secondary_capability_mw(unit, elapsed_s, _clock) do
+  def secondary_capability_mw(unit, elapsed_s, _clock, delivered_mw) do
     if spinning?(unit) do
       bounded_by(
         headroom_mw(unit),
-        ramp_mw(unit, credited_seconds(elapsed_s, @secondary_horizon_s))
+        ramp_remaining(unit, credited_seconds(elapsed_s, @secondary_horizon_s), delivered_mw)
       )
     else
       0.0
@@ -242,11 +291,17 @@ defmodule PowerModel.Failure.Reserves do
   Spinning units contribute the headroom secondary could not reach inside its
   horizon; non-spinning units contribute only after the start-up delay, and
   then ramp like any other machine of their technology.
+
+  The two "already" figures answer different questions and both bind.
+  `already_mw` is secondary taken from this unit's HEADROOM in the same
+  allocation; `delivered_mw` is tertiary this unit has already delivered under
+  the same CLOCK, and comes off the ramp bound (see `allocate/4`'s
+  `:delivered`).
   """
-  @spec tertiary_capability_mw(map(), float() | :infinity, float()) :: float()
-  def tertiary_capability_mw(unit, elapsed_s, already_mw \\ 0.0) do
+  @spec tertiary_capability_mw(map(), float() | :infinity, float(), float()) :: float()
+  def tertiary_capability_mw(unit, elapsed_s, already_mw \\ 0.0, delivered_mw \\ 0.0) do
     past_delay = seconds_past(elapsed_s, @tertiary_start_delay_s)
-    ramp_bound = ramp_mw(unit, past_delay)
+    ramp_bound = ramp_remaining(unit, past_delay, delivered_mw)
 
     if spinning?(unit) do
       bounded_by(max(headroom_mw(unit) - already_mw, 0.0), ramp_bound)
@@ -319,6 +374,24 @@ defmodule PowerModel.Failure.Reserves do
 
   defp ramp_mw(_unit, :infinity), do: :infinity
   defp ramp_mw(unit, seconds), do: Frequency.secondary_ramp_mw_per_min(unit) * seconds / 60.0
+
+  # The ramp this tier still allows, net of what the unit already delivered
+  # from it under the same clock. An unbounded ramp stays unbounded: the
+  # `:infinity` clock is the "not an event" case, where there is no budget to
+  # spend down.
+  defp ramp_remaining(_unit, :infinity, _delivered_mw), do: :infinity
+
+  defp ramp_remaining(unit, seconds, delivered_mw),
+    do: max(ramp_mw(unit, seconds) - max(delivered_mw, 0.0), 0.0)
+
+  # One unit's entry in the caller's ramp ledger. A ledger with no entry for a
+  # unit is a unit that has delivered nothing, which is also what an absent
+  # ledger means — the pure single-call case, unchanged.
+  defp delivered_mw(delivered, unit, tier) do
+    delivered
+    |> Map.get(Map.get(unit, :id), %{})
+    |> Map.get(tier, 0.0)
+  end
 
   defp credited_seconds(:infinity, _horizon), do: :infinity
   defp credited_seconds(elapsed_s, horizon), do: min(max(elapsed_s, 0.0), horizon)

@@ -398,11 +398,12 @@ defmodule PowerModel.Failure.CascadeVoltageTest do
       end
     end
 
-    test "distance pickups carry zone-keyed causes so relay duty cannot cross zones" do
-      # Relay duty is keyed {cause, type, id}. A branch migrating from zone 3
-      # to zone 2 must start a fresh timer rather than inherit the slower
-      # zone's accumulated duty, and the zone-keyed cause string is what
-      # guarantees it.
+    test "every zone of one branch's distance element shares a duty key" do
+      # REVIEW CAS-23. A real relay runs its zone timers in PARALLEL, so the
+      # accrued duty has to survive a branch migrating from zone 3 to zone 2 —
+      # which a zone-keyed cause string could not do. One key per branch, with
+      # the per-zone timers inside the value, is what carries it across. Duty
+      # from OTHER protections on the same branch stays separate, as before.
       zone3 =
         Cascade.relay_key(%{
           failure_cause: "distance_zone3",
@@ -424,9 +425,268 @@ defmodule PowerModel.Failure.CascadeVoltageTest do
           component_id: 7
         })
 
-      assert zone3 != zone2
+      other_branch =
+        Cascade.relay_key(%{
+          failure_cause: "distance_zone2",
+          component_type: "transmission_line",
+          component_id: 8
+        })
+
+      assert zone3 == zone2
       assert zone3 != thermal
       assert zone2 != thermal
+      assert zone2 != other_branch
+    end
+
+    test "a fault walking inward trips SOONER than a static one, never later" do
+      # The CAS-23 repro. Zone 3's definite timer is 1.50 s and zone 2's is
+      # 0.40 s. A branch that has spent 0.9 of its zone-3 timer (1.35 s) and
+      # then sees the apparent impedance walk into zone 2 must still trip on
+      # the zone-3 element 0.15 s later — total 1.50 s, the same as if it had
+      # stood still. Restarting the timer on the zone change instead gave
+      # 1.35 + 0.40 = 1.75 s: a worsening fault cleared more slowly.
+      delays = Protection.distance_settings().delays_s
+      assert delays[2] == 0.40
+      assert delays[3] == 1.50
+
+      branch = %{component_type: "transmission_line", component_id: 7}
+
+      zone3_pickup =
+        Map.merge(branch, %{
+          failure_cause: "distance_zone3",
+          details: %{zone: 3, delay_s: delays[3]},
+          trip_time_s: delays[3]
+        })
+
+      zone2_pickup =
+        Map.merge(branch, %{
+          failure_cause: "distance_zone2",
+          details: %{zone: 2, delay_s: delays[2]},
+          trip_time_s: delays[2]
+        })
+
+      key = Cascade.relay_key(zone3_pickup)
+
+      # 1.35 s of the zone-3 timer already spent.
+      carried = %{key => %{3 => 0.9}}
+
+      # Standing still: the remaining 0.15 s, and the branch trips.
+      {static_trip, static_advance, _duty} =
+        Cascade.advance_relay_timers([zone3_pickup], carried)
+
+      assert_in_delta static_advance, 0.15, 1.0e-9
+      assert static_trip.failure_cause == "distance_zone3"
+
+      # Walking inward to zone 2: the zone-3 timer keeps running alongside the
+      # freshly started zone-2 one, so the SAME 0.15 s clears it.
+      {migrated_trip, migrated_advance, _duty} =
+        Cascade.advance_relay_timers([zone2_pickup], carried)
+
+      assert_in_delta migrated_advance, 0.15, 1.0e-9
+      assert migrated_advance <= static_advance
+      refute is_nil(migrated_trip)
+
+      # 1.35 s already spent + 0.15 s here = 1.50 s total, at or under the
+      # static fault's clearing time.
+      assert_in_delta 0.9 * delays[3] + migrated_advance, 1.50, 1.0e-9
+
+      # The measurement stays what it was — zone 2 is where the impedance is —
+      # and the element that actually finished is named beside it.
+      assert migrated_trip.details.zone == 2
+      assert migrated_trip.details.operating_zone == 3
+    end
+
+    test "an inner zone dropped out resets while the outer one keeps timing" do
+      # The other half of the parallel-timer rule: a fault RECEDING out of
+      # zone 2 back to zone 3 alone drops the zone-2 element (a definite-time
+      # timer resets on dropout) but must not disturb zone 3, which the
+      # impedance never left.
+      delays = Protection.distance_settings().delays_s
+      branch = %{component_type: "transmission_line", component_id: 7}
+
+      zone3_pickup =
+        Map.merge(branch, %{
+          failure_cause: "distance_zone3",
+          details: %{zone: 3, delay_s: delays[3]},
+          trip_time_s: delays[3]
+        })
+
+      key = Cascade.relay_key(zone3_pickup)
+
+      # A faster relay elsewhere sets the step's clock advance, so the distance
+      # element is still mid-timing when the duty map is read.
+      faster = %{
+        component_type: "transmission_line",
+        component_id: 9,
+        failure_cause: "thermal_overload",
+        details: %{},
+        trip_time_s: 0.1
+      }
+
+      {trip, advance, duty} =
+        Cascade.advance_relay_timers([zone3_pickup, faster], %{key => %{2 => 0.5, 3 => 0.2}})
+
+      assert trip.component_id == 9
+      assert_in_delta advance, 0.1, 1.0e-9
+
+      # Zone 2's 0.5 duty is gone — the impedance left it. Zone 3 never
+      # dropped out, so it timed on from 0.2 against its own 1.50 s delay.
+      assert Map.keys(duty[key]) == [3]
+      assert_in_delta duty[key][3], 0.2 + 0.1 / delays[3], 1.0e-9
+    end
+  end
+
+  # ===========================================================================
+  # CAS-19: the grid-following ceiling reads each unit's OWN set point
+  # ===========================================================================
+
+  describe "the grid-following availability ceiling" do
+    # An inverter's ceiling is `min(P_set, V·Imax)` in per-unit of RATING, so
+    # what the current limit costs a unit depends on how loaded it is.
+    defp farm(id, bus_id, nameplate, dispatched) do
+      %{
+        id: id,
+        bus_id: bus_id,
+        fuel_type: "SUN",
+        p_max_mw: dispatched,
+        capacity_factor: 1.0,
+        p_dispatch_mw: dispatched,
+        p_nameplate_mw: nameplate
+      }
+    end
+
+    test "a partly loaded farm loses nothing to a sag its current limit clears" do
+      # REVIEW CAS-19. `Protection.gfl_derate/3` defaults `:p_set_pu` to 1.0 —
+      # every inverter flat out — and the cascade took that default for the
+      # whole fleet. A 100 MW farm dispatched at 20 MW sits at 0.20 pu, and its
+      # 1.2 pu current limit does not bind until the terminal voltage falls
+      # below 0.167 pu. Charged the flat-out derate at 0.60 pu it lost 5.6 MW
+      # of its 20 — generation that never existed, landing in the deficit and
+      # driving UFLS.
+      partial = farm(1, 10, 100.0, 20.0)
+
+      assert %{1 => fraction} = Cascade.gfl_availability([partial], %{10 => 0.60})
+      assert fraction == 1.0
+      assert_in_delta 20.0 * fraction, 20.0, 1.0e-9
+
+      # The fleet-wide default is what it was being charged instead.
+      assert %{1 => flat_out} = Protection.gfl_derate([partial], %{10 => 0.60})
+      assert_in_delta flat_out, 0.72, 1.0e-9
+    end
+
+    test "a flat-out farm still derates, and the ceiling is unchanged for it" do
+      # The ceiling is real; it was the SET POINT that was wrong. A unit that
+      # genuinely is at nameplate gets exactly the same answer as before.
+      full = farm(1, 10, 100.0, 100.0)
+
+      assert %{1 => fraction} = Cascade.gfl_availability([full], %{10 => 0.60})
+      assert_in_delta fraction, 0.72, 1.0e-9
+      assert fraction == Protection.gfl_derate([full], %{10 => 0.60})[1]
+    end
+
+    test "each unit is asked with its own set point, not the fleet's" do
+      # The whole point of the per-unit form: one map, three different answers
+      # off one bus voltage.
+      # At 0.60 pu the current ceiling is V·Imax = 0.72 pu of rating. The
+      # 0.20 pu unit is nowhere near it, the 0.90 pu unit is held down to it,
+      # and the flat-out unit is held down to it too.
+      fleet = [farm(1, 10, 100.0, 20.0), farm(2, 10, 100.0, 90.0), farm(3, 10, 100.0, 100.0)]
+
+      gfl = Cascade.gfl_availability(fleet, %{10 => 0.60})
+
+      assert gfl[1] == 1.0
+      assert_in_delta gfl[2], 0.72 / 0.9, 1.0e-9
+      assert_in_delta gfl[3], 0.72, 1.0e-9
+
+      # Deliverable MW is `min(P_set, V·Imax)` times the rating, so both
+      # derated units land on the same 72 MW ceiling from different set points.
+      assert_in_delta 20.0 * gfl[1], 20.0, 1.0e-9
+      assert_in_delta 90.0 * gfl[2], 72.0, 1.0e-9
+      assert_in_delta 100.0 * gfl[3], 72.0, 1.0e-9
+    end
+
+    test "a synchronous machine has no ceiling of this kind and is simply absent" do
+      coal = %{
+        id: 9,
+        bus_id: 10,
+        fuel_type: "COL",
+        p_max_mw: 50.0,
+        capacity_factor: 1.0,
+        p_dispatch_mw: 50.0,
+        p_nameplate_mw: 500.0
+      }
+
+      assert Cascade.gfl_availability([coal], %{10 => 0.60}) == %{}
+    end
+
+    test "a unit with no rating to divide by keeps the flat-out assumption" do
+      # The conservative reading of a missing nameplate: assume it is loaded.
+      unrated = %{id: 1, bus_id: 10, fuel_type: "SUN", p_max_mw: 0.0, capacity_factor: 1.0}
+
+      assert %{1 => fraction} = Cascade.gfl_availability([unrated], %{10 => 0.60})
+      assert_in_delta fraction, 0.72, 1.0e-9
+    end
+  end
+
+  # ===========================================================================
+  # CAS-24: the alarm high-water mark across a split
+  # ===========================================================================
+
+  describe "the voltage alarm high-water mark" do
+    # Two mirrored sagging radials joined by a tie. The whole island alarms
+    # once, on a high-water mark that is an ABSOLUTE bus count.
+    defp tied_radials do
+      %{
+        buses: [bus(1, bus_type: 3), bus(2), bus(3), bus(4)],
+        lines: [
+          line(1, 1, 2, x_pu: 0.25),
+          line(2, 2, 3, x_pu: 0.02),
+          line(3, 3, 4, x_pu: 0.25)
+        ],
+        transformers: [],
+        generators: [generator(1, 1, p_max_mw: 95.0), generator(2, 3, p_max_mw: 95.0)],
+        loads: [load(1, 2, 100.0, 45.0), load(2, 4, 100.0, 45.0)]
+      }
+    end
+
+    test "a fragment can alarm again after a split" do
+      # REVIEW CAS-24. The mark is a count of BUSES over the island it was
+      # measured on, and it was inherited untouched. A fragment holding a
+      # parent's count it cannot reach — the slack bus in this half is held at
+      # 1.0 pu, so one undervoltage bus is all it can ever show — is silenced
+      # for the rest of the session however far its voltage falls. Measured
+      # before the fix: zero new alarms after the split.
+      {whole, _} = run(tied_radials())
+
+      before = events(whole, "voltage_violation")
+      assert length(before) > 0, "expected the intact island to alarm"
+      assert [%{voltage_alarm: {seen_low, _high}}] = whole.island_states
+      assert seen_low > 0
+
+      {split, _} = Cascade.trip_line(whole, 2)
+
+      assert length(split.island_states) == 2, "expected the tie trip to split the island"
+
+      after_split = events(split, "voltage_violation") -- before
+      assert length(after_split) > 0, "the fragment must be able to alarm on its own bus count"
+
+      # Every alarm the fragments raised is about a fragment, not the parent.
+      for event <- after_split do
+        assert event.details.bus_count < 4
+      end
+    end
+
+    test "the split resets the mark rather than scaling it" do
+      # The mark is not apportioned like the frequency state's cumulative
+      # megawatts: a count has no share to take. It restarts, and the first
+      # measurement on the new island sets it.
+      {whole, _} = run(tied_radials())
+      {split, _} = Cascade.trip_line(whole, 2)
+
+      for record <- split.island_states, record.voltage_alarm != nil do
+        {low, high} = record.voltage_alarm
+        assert low + high <= MapSet.size(record.buses)
+      end
     end
   end
 

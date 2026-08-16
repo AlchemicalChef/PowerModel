@@ -1195,7 +1195,13 @@ defmodule PowerModel.Failure.CascadeTest do
         state
         | simulated_time: now_s,
           island_states: [
-            %{buses: island, frequency_state: nil, exposure: [], deficit_since_s: 0.0}
+            %{
+              buses: island,
+              frequency_state: nil,
+              exposure: [],
+              deficit_since_s: 0.0,
+              reserve_delivered: %{}
+            }
           ]
       }
     end

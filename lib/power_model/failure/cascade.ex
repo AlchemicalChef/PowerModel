@@ -495,6 +495,14 @@ defmodule PowerModel.Failure.Cascade do
   # `inherit_record/4`); only the frequency state's cumulative megawatts are
   # apportioned by load share.
   #
+  #   :reserve_delivered  per-unit ramp ledger, `%{id => %{secondary: mw,
+  #                     tertiary: mw}}` — what each machine has already put on
+  #                     the system under the CURRENT deficit clock. It is
+  #                     cleared with that clock (`update_deficit_clock/3`) and
+  #                     rebased with it (`begin_cascade_event/1`), because a
+  #                     ramp budget outliving its clock is charged against an
+  #                     origin that no longer exists. See `Reserves.allocate/4`.
+  #
   #   :agc              `PowerModel.Controls.AGC` state — the island's
   #                     closed-loop secondary controller
   #   :mean_frequency_hz  the mean frequency of the LAST segment, which is
@@ -513,6 +521,7 @@ defmodule PowerModel.Failure.Cascade do
       frequency_state: nil,
       exposure: [],
       deficit_since_s: deficit_since_s,
+      reserve_delivered: %{},
       ac_voltage: nil,
       ac_failed: nil,
       gen_voltage_state: Protection.fresh_voltage_state(),
@@ -678,6 +687,12 @@ defmodule PowerModel.Failure.Cascade do
       # TIMERS above do — they are per-bus and per-machine facts, and losing
       # them would hand every relay back the exposure it had already spent.
       |> Map.put(:ac_voltage, nil)
+      # The alarm high-water mark goes with it, and for the same reason: it is
+      # an absolute BUS COUNT over the island it was measured on. Inherited by
+      # a smaller fragment it is a threshold that fragment can never reach —
+      # four undervoltage buses carried into a three-bus island silence the
+      # alarm permanently, however far the voltage falls (REVIEW CAS-24).
+      |> Map.put(:voltage_alarm, nil)
     end
   end
 
@@ -1153,12 +1168,14 @@ defmodule PowerModel.Failure.Cascade do
   # The per-island deficit clocks are rebased rather than cleared: an island
   # still holding a deficit keeps holding it, but it has been holding it since
   # the start of THIS cascade event, because that is where the clock now is.
+  # The ramp ledger is measured against that clock, so it restarts with it —
+  # the two halves of one accounting cannot have different origins.
   defp begin_cascade_event(state) do
     records =
       Enum.map(state.island_states, fn record ->
         case record.deficit_since_s do
-          nil -> record
-          _ -> %{record | deficit_since_s: 0.0}
+          nil -> %{record | reserve_delivered: %{}}
+          _ -> %{record | deficit_since_s: 0.0, reserve_delivered: %{}}
         end
       end)
 
@@ -1189,6 +1206,28 @@ defmodule PowerModel.Failure.Cascade do
   @doc """
   Run cascade loop until stable or max steps reached.
   Yields each step result for streaming via callback.
+
+  ## The returned list is authoritative; the callback stream is not
+
+  `callback` is invoked once per step AS THAT STEP COMPLETES, which means it
+  cannot see anything decided after the last step ran. Exactly one thing is:
+  `:budget_exhausted` fires INSTEAD of a step, so it is stamped onto the last
+  step result on the way out (see `termination/1`) and the consumer that
+  already received that frame never learns of it. A callback consumer watching
+  a truncated run therefore sees a final frame saying `termination: nil` —
+  "still running" — and no further frames, which is indistinguishable from a
+  run still in flight.
+
+  The returned `{state, step_results}` carries the stamp, so a consumer that
+  needs the termination reason MUST read it from there. That is what
+  `PowerModel.Engine.SimulationServer` does: it broadcasts the returned list,
+  not the callback stream, and its `cascade_done` payload reads
+  `termination/1` off the final state.
+
+  No synthetic terminal frame is emitted to close the gap, deliberately: the
+  step results are counted and indexed by consumers (the UI scrubs by step
+  index), and a frame that corresponds to no step would put the stream's own
+  numbering at odds with the list's.
   """
   def run_cascade(state, callback \\ nil) do
     {state, step_results} = do_cascade(state, [], callback)
@@ -1217,9 +1256,16 @@ defmodule PowerModel.Failure.Cascade do
   `outcome/1` to `:unknown` for the reason stated here: nothing downstream of
   the failed solve is trustworthy, and a balance is downstream.
 
-  The same value is on the last element of the step-result list (each earlier
-  step carries `nil`, meaning "still running"), so a consumer that only sees
-  the stream can read it there.
+  The same value is on the last element of the step-result LIST (each earlier
+  step carries `nil`, meaning "still running"), so a consumer holding only the
+  list can read it there.
+
+  It is NOT on the last frame a `run_cascade/2` callback receives when the
+  cause is `:budget_exhausted`. That clause fires instead of a step, so there
+  is no step left to invoke the callback with, and the stamp lands only on the
+  already-delivered list element. A streaming consumer that must distinguish a
+  truncated run from one still in flight has to read the returned list — see
+  `run_cascade/2` for why no synthetic terminal frame is emitted instead.
   """
   @spec termination(%__MODULE__{}) :: :settled | :budget_exhausted | :solve_failed | nil
   def termination(%__MODULE__{termination: cause}), do: cause
@@ -1305,22 +1351,27 @@ defmodule PowerModel.Failure.Cascade do
         {[], island_gens}
       end
 
-    {state, remaining} = apply_sustained_reserves(state, deficit_mw, ba_gens, elapsed_s)
-    {state, _remaining} = apply_sustained_reserves(state, remaining, other_gens, elapsed_s)
+    {state, remaining} =
+      apply_sustained_reserves(state, deficit_mw, ba_gens, elapsed_s, island_bus_set)
+
+    {state, _remaining} =
+      apply_sustained_reserves(state, remaining, other_gens, elapsed_s, island_bus_set)
 
     state
   end
 
   # Raise `gens` by as much sustained (secondary + tertiary) reserve as the
   # clock allows. Returns `{state, remaining_deficit}`.
-  defp apply_sustained_reserves(state, deficit_mw, gens, elapsed_s)
+  defp apply_sustained_reserves(state, deficit_mw, gens, elapsed_s, island_bus_set)
 
-  defp apply_sustained_reserves(state, deficit_mw, [], _elapsed_s), do: {state, deficit_mw}
-
-  defp apply_sustained_reserves(state, deficit_mw, _gens, _elapsed_s) when deficit_mw <= 0.5,
+  defp apply_sustained_reserves(state, deficit_mw, [], _elapsed_s, _island),
     do: {state, deficit_mw}
 
-  defp apply_sustained_reserves(state, deficit_mw, gens, elapsed_s) do
+  defp apply_sustained_reserves(state, deficit_mw, _gens, _elapsed_s, _island)
+       when deficit_mw <= 0.5,
+       do: {state, deficit_mw}
+
+  defp apply_sustained_reserves(state, deficit_mw, gens, elapsed_s, island_bus_set) do
     units = Enum.map(gens, &sustained_unit_of(state, &1))
 
     # TERTIARY ONLY. AGC owns the secondary tier island-wide, inside the step's
@@ -1333,8 +1384,16 @@ defmodule PowerModel.Failure.Cascade do
     # An empty AGC increment map is how `Reserves.allocate/4` is told that:
     # every unit's secondary capability is the MW AGC dispatched to it, which
     # is zero, so the tier is saturated at zero and tertiary is reached
-    # immediately. The clock still bounds tertiary, unchanged.
-    alloc = Reserves.allocate(units, deficit_mw, elapsed_s, secondary: {:agc, %{}})
+    # immediately. The clock still bounds tertiary — net of what the island's
+    # ledger says these machines already ramped under the same clock, which is
+    # what stops the step's three allocations handing out three ramps.
+    ledger = island_reserve_ledger(state, island_bus_set)
+
+    alloc =
+      Reserves.allocate(units, deficit_mw, elapsed_s,
+        secondary: {:agc, %{}},
+        delivered: ledger
+      )
 
     dispatch =
       Enum.reduce(units, state.dispatch, fn unit, d ->
@@ -1344,7 +1403,46 @@ defmodule PowerModel.Failure.Cascade do
         end
       end)
 
-    {%{state | dispatch: dispatch}, deficit_mw - alloc.secondary_mw - alloc.tertiary_mw}
+    state =
+      %{state | dispatch: dispatch}
+      |> update_island_records(island_bus_set, &record_reserve_delivery(&1, alloc))
+
+    {state, deficit_mw - alloc.secondary_mw - alloc.tertiary_mw}
+  end
+
+  # The ramp ledger of the island containing these buses (empty when the island
+  # has no record — an island the cascade has never evaluated has no clock to
+  # measure a ledger against either; see `elapsed_since_deficit/2`).
+  defp island_reserve_ledger(state, island_bus_set) do
+    case island_record_for(state, island_bus_set) do
+      %{reserve_delivered: delivered} -> delivered
+      _ -> %{}
+    end
+  end
+
+  defp update_island_records(state, island_bus_set, fun) do
+    records =
+      Enum.map(state.island_states, fn record ->
+        if MapSet.disjoint?(record.buses, island_bus_set), do: record, else: fun.(record)
+      end)
+
+    %{state | island_states: records}
+  end
+
+  # Add one allocation's per-tier megawatts to the island's ramp ledger. The
+  # two tiers are kept apart because they draw on DISJOINT windows of the same
+  # ramp (`Reserves.allocate/4`): folding them together would let a unit that
+  # spent its secondary window deny itself its tertiary one.
+  defp record_reserve_delivery(record, alloc) do
+    delivered =
+      [{:secondary, alloc.secondary_by_unit}, {:tertiary, alloc.tertiary_by_unit}]
+      |> Enum.reduce(record.reserve_delivered, fn {tier, by_unit}, ledger ->
+        Enum.reduce(by_unit, ledger, fn {id, mw}, ledger ->
+          Map.update(ledger, id, %{tier => mw}, &Map.update(&1, tier, mw, fn m -> m + mw end))
+        end)
+      end)
+
+    %{record | reserve_delivered: delivered}
   end
 
   # One generator at its sustained operating point, read from the state's
@@ -1479,7 +1577,7 @@ defmodule PowerModel.Failure.Cascade do
         conductor_state: island_step.conductor,
         conductor_at_s: state.simulated_time,
         voltage_layer: island_step.voltage_layer,
-        frequency_nadir_hz: min(state.frequency_nadir_hz, step_nadir_hz(island_step.records))
+        frequency_nadir_hz: min(state.frequency_nadir_hz, island_step.nadir_hz)
     }
 
     # Facilities on dead-island buses lose power (water + datacenters)
@@ -1721,18 +1819,6 @@ defmodule PowerModel.Failure.Cascade do
   defp island_frequency_hz(%{frequency_state: %{frequency: hz}}) when is_number(hz), do: hz
   defp island_frequency_hz(_record), do: @nominal_frequency_hz
 
-  # The worst frequency any island touched during this step. The segment
-  # ENDPOINT alone would miss it: the exposure window holds the trajectory the
-  # swing model actually integrated, and the dip inside it is what armed the
-  # UFLS stages and tripped the legacy rooftop fleet.
-  defp step_nadir_hz(records) do
-    Enum.reduce(records, @nominal_frequency_hz, fn record, worst ->
-      Enum.reduce(record.exposure, min(worst, island_frequency_hz(record)), fn point, acc ->
-        min(acc, point.frequency)
-      end)
-    end)
-  end
-
   defp agc_summary(state) do
     for record <- state.island_states, record.agc != nil do
       Map.put(AGC.summary(record.agc), :island_id, island_id(record))
@@ -1847,24 +1933,22 @@ defmodule PowerModel.Failure.Cascade do
   defp mark_deficit_clock(state, island_bus_set, sustained_deficit) do
     now = state.simulated_time
 
-    records =
-      Enum.map(state.island_states, fn record ->
-        if MapSet.disjoint?(record.buses, island_bus_set) do
-          record
-        else
-          update_deficit_clock(record, sustained_deficit, now)
-        end
-      end)
-
-    %{state | island_states: records}
+    update_island_records(
+      state,
+      island_bus_set,
+      &update_deficit_clock(&1, sustained_deficit, now)
+    )
   end
 
   defp update_deficit_clock(record, sustained_deficit, now) when sustained_deficit > 0.5 do
     %{record | deficit_since_s: record.deficit_since_s || now}
   end
 
+  # The gap closed, so the clock stops — and the ramp ledger measured against
+  # it goes with it. Keeping the ledger would charge the NEXT deficit for
+  # megawatts a machine ramped answering a different one.
   defp update_deficit_clock(record, _sustained_deficit, _now) do
-    %{record | deficit_since_s: nil}
+    %{record | deficit_since_s: nil, reserve_delivered: %{}}
   end
 
   defp sustained_mw_of(state, generator) do
@@ -1949,6 +2033,7 @@ defmodule PowerModel.Failure.Cascade do
       btm: btm_context(state),
       records: [],
       frequency_advance_s: 0.0,
+      nadir_hz: @nominal_frequency_hz,
       conductor: state.conductor_state || %{},
       voltage_layer: state.voltage_layer || fresh_voltage_layer()
     }
@@ -1990,6 +2075,7 @@ defmodule PowerModel.Failure.Cascade do
       acc
       |> black_out_island(island_loads)
       |> put_record(fresh_island_record(island))
+      |> note_nadir(island_frequency_hz(record))
     else
       live_island(
         %{
@@ -2039,6 +2125,20 @@ defmodule PowerModel.Failure.Cascade do
 
   defp put_record(acc, record), do: %{acc | records: [record | acc.records]}
 
+  # The worst frequency any island touched during THIS step, folded in where
+  # the trajectory that produced it is still in hand.
+  #
+  # Reading it back off the records afterwards cannot work, and for two
+  # independent reasons. An island that DIES is replaced by a fresh record, so
+  # the trajectory that killed it — the only place a collapse's real nadir
+  # exists — is gone before anything could read it, and a total blackout
+  # rendered 60.00 Hz (REVIEW CAS-20). And `record.exposure` is the 180 s
+  # PRC-024 window, so the first step of the NEXT cascade event would re-read
+  # the previous event's dip as its own (REVIEW CAS-21), defeating the rebase
+  # `begin_cascade_event/1` performs precisely to stop that.
+  defp note_nadir(acc, nil), do: acc
+  defp note_nadir(acc, hz), do: %{acc | nadir_hz: min(acc.nadir_hz, hz)}
+
   # One live island, start to finish. `env` carries the island's slice of the
   # network; `record` its persistent frequency and voltage state.
   defp live_island(env, record, acc, ctx) do
@@ -2063,6 +2163,7 @@ defmodule PowerModel.Failure.Cascade do
       |> black_out_island(env.loads)
       |> add_trips(voltage_events)
       |> put_record(fresh_island_record(env.island))
+      |> note_nadir(island_frequency_hz(record))
     else
       live_island_frequency(env, record, acc, ctx, voltage, gfl, voltage_events)
     end
@@ -2089,7 +2190,12 @@ defmodule PowerModel.Failure.Cascade do
     {record, agc_deltas} = step_agc(record, units, load_mw, ctx)
 
     alloc =
-      Reserves.allocate(units, max(deficit_mw, 0.0), elapsed_s, secondary: {:agc, agc_deltas})
+      Reserves.allocate(units, max(deficit_mw, 0.0), elapsed_s,
+        secondary: {:agc, agc_deltas},
+        delivered: record.reserve_delivered
+      )
+
+    record = record_reserve_delivery(record, alloc)
 
     raised =
       Enum.map(units, fn unit ->
@@ -2182,14 +2288,18 @@ defmodule PowerModel.Failure.Cascade do
       # The island lost every machine it had — the frequency feedback loop
       # closing on itself. What is left is a blackout, not a deficit: there is
       # nothing to shed against and nothing to solve. The segment it died in
-      # still happened, so it still moves the clock.
-      {advance_s, _state, _exposure, _mean} = settle_segment(trajectory, eval_state, [])
+      # still happened, so it still moves the clock — and it is the ONLY place
+      # the collapse's frequency exists, so its nadir is folded in before the
+      # record carrying it is thrown away.
+      {advance_s, _state, _exposure, _mean, segment_nadir_hz} =
+        settle_segment(trajectory, eval_state, [])
 
       acc
       |> black_out_island(env.loads)
       |> add_trips(events)
       |> put_record(fresh_island_record(env.island))
       |> Map.update!(:frequency_advance_s, &max(&1, advance_s))
+      |> note_nadir(segment_nadir_hz)
     else
       settle_island(env, record, acc, ctx, %{
         survivors: survivors,
@@ -2336,18 +2446,18 @@ defmodule PowerModel.Failure.Cascade do
 
     frequency_state = credit_shed(frequency_state, record.frequency_state, frequency_shed_mw)
 
-    {advance_s, frequency_state, exposure, mean_hz} =
+    {advance_s, frequency_state, exposure, mean_hz, segment_nadir_hz} =
       settle_segment(trajectory, frequency_state, record.exposure)
 
-    record = %{
-      record
-      | frequency_state: frequency_state,
-        exposure: exposure,
-        mean_frequency_hz: mean_hz || record.mean_frequency_hz,
-        evaluated_at_s: ctx.now,
-        deficit_since_s:
-          update_deficit_clock(record, served_mw - available_sustained, ctx.now).deficit_since_s
-    }
+    record =
+      %{
+        record
+        | frequency_state: frequency_state,
+          exposure: exposure,
+          mean_frequency_hz: mean_hz || record.mean_frequency_hz,
+          evaluated_at_s: ctx.now
+      }
+      |> update_deficit_clock(served_mw - available_sustained, ctx.now)
 
     acc =
       %{
@@ -2359,6 +2469,7 @@ defmodule PowerModel.Failure.Cascade do
           frequency_advance_s: max(acc.frequency_advance_s, advance_s)
       }
       |> add_trips(step.events ++ shed_events)
+      |> note_nadir(segment_nadir_hz)
 
     solve_island_flows(%{env | loads: island_loads}, solver_gens, record, acc, ctx)
   end
@@ -2682,12 +2793,18 @@ defmodule PowerModel.Failure.Cascade do
   # section). A trajectory that settles after 4 s of a 30 s window advances
   # the clock 4 s, and the island's own frequency clock is rewound with it so
   # the two never drift apart.
-  # Returns `{advance_s, state, exposure, mean_hz}`. The mean is the segment's
-  # own average frequency over the interval it actually took, which is what the
-  # island's AGC measures on the next segment — BAL-003's "value B" reading,
-  # for the same reason: one sample of an oscillating trajectory is not the
-  # frequency the controller is answering.
-  defp settle_segment(nil, state, exposure), do: {0.0, state, exposure, nil}
+  # Returns `{advance_s, state, exposure, mean_hz, nadir_hz}`. The mean is the
+  # segment's own average frequency over the interval it actually took, which
+  # is what the island's AGC measures on the next segment — BAL-003's "value B"
+  # reading, for the same reason: one sample of an oscillating trajectory is
+  # not the frequency the controller is answering.
+  #
+  # The nadir is over the SAME trimmed interval, for the same reason the clock
+  # is: a dip in the part of the window the segment never reached did not
+  # happen. It is returned here rather than recovered from `exposure` because
+  # this is the last point at which the segment is distinguishable from the
+  # 180 s of history the exposure window carries (REVIEW CAS-21).
+  defp settle_segment(nil, state, exposure), do: {0.0, state, exposure, nil, nil}
 
   defp settle_segment(trajectory, state, exposure) do
     started_at = hd(trajectory).time
@@ -2697,7 +2814,7 @@ defmodule PowerModel.Failure.Cascade do
     mean_hz = Frequency.mean_frequency(trimmed, started_at, settled_at)
 
     {settled_at - started_at, %{state | time: settled_at}, accumulate_exposure(exposure, trimmed),
-     mean_hz}
+     mean_hz, Frequency.nadir(trimmed)}
   end
 
   # The earliest time from which the trajectory never moves again: every later
@@ -2925,7 +3042,7 @@ defmodule PowerModel.Failure.Cascade do
     # EIA-930 fuel-anchored pool, so derating those changes the island's
     # generation without changing any measured fuel target — physically right
     # and invisible to fuel-mix TV distance. A cascade is not a TV measurement.
-    gfl = Protection.gfl_derate(dispatched, voltage.vm)
+    gfl = gfl_availability(dispatched, voltage.vm)
 
     {env, acc, record, btm_events} = voltage_btm_trip(env, acc, record, voltage)
 
@@ -2933,6 +3050,35 @@ defmodule PowerModel.Failure.Cascade do
       voltage_gen_trips(env, acc, record, dispatched, voltage)
 
     {env, acc, record, btm_events ++ gen_events, gfl}
+  end
+
+  @doc false
+  # The grid-following availability ceiling for a dispatched fleet, as
+  # `%{generator_id => fraction}`.
+  #
+  # `Protection.gfl_derate/3` takes ONE `:p_set_pu` for the whole list, and its
+  # default is 1.0 — every inverter flat out. That default is wrong for almost
+  # every unit the cascade actually holds: the ceiling is `min(P_set, V·Imax)`
+  # in per-unit of RATING, so a 100 MW farm dispatched at 20 MW sits at 0.20 pu
+  # and its 1.2 pu current limit does not bind until the terminal voltage falls
+  # below 0.167 pu. Charging it the flat-out derate at 0.60 pu took 5.6 MW of
+  # the 20 MW away — generation that never existed to lose, landing in the
+  # deficit and driving UFLS (REVIEW CAS-19). So each unit is asked with its
+  # OWN set point, which `apply_dispatch/2` has already put on the map.
+  def gfl_availability(dispatched, vm_by_bus) do
+    Enum.reduce(dispatched, %{}, fn gen, acc ->
+      Map.merge(acc, Protection.gfl_derate([gen], vm_by_bus, p_set_pu: gfl_set_point_pu(gen)))
+    end)
+  end
+
+  # The unit's operating point as a fraction of its rating. A unit with no
+  # rating to divide by falls back to the flat-out assumption, which is the
+  # conservative reading of a missing nameplate.
+  defp gfl_set_point_pu(gen) do
+    nameplate = Map.get(gen, :p_nameplate_mw) || Map.get(gen, :p_max_mw) || 0.0
+    dispatched = Map.get(gen, :p_dispatch_mw) || Map.get(gen, :p_max_mw) || 0.0
+
+    if nameplate > 0.0, do: max(dispatched, 0.0) / nameplate, else: 1.0
   end
 
   # IEEE 1547 voltage trips on the behind-the-meter fleet — the actual Blue Cut
@@ -3478,52 +3624,114 @@ defmodule PowerModel.Failure.Cascade do
   # (integral of dt / current curve time), not elapsed seconds. A branch absent
   # from `timed_overloads` is dropped here: thermal overload and Zone 3 both use
   # an instantaneous reset when their respective condition clears.
-  defp advance_relay_timers([], _relay_duty), do: {nil, 0.0, %{}}
+  #
+  # A DISTANCE element is the exception, and carries a map of `zone => duty`
+  # rather than one accumulator. A real relay runs its zone timers IN PARALLEL:
+  # an apparent impedance walking inward starts the faster zone's timer without
+  # stopping the slower ones it is still inside, so a worsening fault can only
+  # trip SOONER. Keyed by zone (the cause string) instead, the inward walk lost
+  # the duty it had accrued and tripped LATER than standing still would have —
+  # zone 3 at 0.9 duty plus a zone 2 restart took 1.75 s where a static zone 3
+  # fault took 1.50 s (REVIEW CAS-23).
+  @doc false
+  def advance_relay_timers(timed_overloads, relay_duty)
 
-  defp advance_relay_timers(timed_overloads, relay_duty) do
-    overloads_with_remaining =
-      Enum.map(timed_overloads, fn trip ->
-        key = relay_key(trip)
-        duty = Map.get(relay_duty, key, 0.0)
-        {trip, remaining_trip_time(trip.trip_time_s, duty)}
-      end)
+  def advance_relay_timers([], _relay_duty), do: {nil, 0.0, %{}}
 
-    finite_overloads =
-      Enum.reject(overloads_with_remaining, fn {_trip, remaining} -> remaining == :infinity end)
+  def advance_relay_timers(timed_overloads, relay_duty) do
+    asserted = Enum.map(timed_overloads, &assert_relay(&1, relay_duty))
 
-    case finite_overloads do
+    case Enum.reject(asserted, &(&1.remaining == :infinity)) do
       [] ->
-        retained_duty =
-          Map.new(overloads_with_remaining, fn {trip, _remaining} ->
-            key = relay_key(trip)
-            {key, Map.get(relay_duty, key, 0.0)}
-          end)
+        {nil, 0.0, Map.new(asserted, &{&1.key, &1.duty})}
 
-        {nil, 0.0, retained_duty}
-
-      _ ->
-        {fastest, time_advance_s} =
-          Enum.min_by(finite_overloads, fn {_trip, remaining} -> remaining end)
+      finite ->
+        fastest = Enum.min_by(finite, & &1.remaining)
+        time_advance_s = fastest.remaining
 
         advanced_duty =
-          Map.new(overloads_with_remaining, fn {trip, _remaining} ->
-            key = relay_key(trip)
-            current_duty = Map.get(relay_duty, key, 0.0)
-            {key, accrue_relay_duty(current_duty, time_advance_s, trip.trip_time_s)}
+          Map.new(asserted, fn relay ->
+            {relay.key, accrue_relay_duty(relay.duty, time_advance_s, relay.trip.trip_time_s)}
           end)
 
-        fastest_key = relay_key(fastest)
+        if relay_operated?(Map.fetch!(advanced_duty, fastest.key)) do
+          retained_duty = drop_tripped_relay_duty(advanced_duty, fastest.trip)
 
-        if Map.fetch!(advanced_duty, fastest_key) >= 1.0 - 1.0e-9 do
-          retained_duty = drop_tripped_relay_duty(advanced_duty, fastest)
-          {Map.delete(fastest, :trip_time_s), time_advance_s, retained_duty}
+          trip =
+            fastest.trip
+            |> Map.delete(:trip_time_s)
+            |> note_operating_zone(fastest.zone)
+
+          {trip, time_advance_s, retained_duty}
         else
           {nil, time_advance_s, advanced_duty}
         end
     end
   end
 
+  # One relay's asserted state this step: the duty it carries into the step
+  # (a float, or `zone => duty` for a distance element), how much wall clock it
+  # still needs, and — where the question means anything — which zone element
+  # will get there first.
+  defp assert_relay(trip, relay_duty) do
+    key = relay_key(trip)
+    duty = pick_up(trip, Map.get(relay_duty, key))
+    {remaining, zone} = relay_remaining(trip, duty)
+
+    %{trip: trip, key: key, duty: duty, remaining: remaining, zone: zone}
+  end
+
+  # Which timers this step's measurement leaves running. A distance pickup at
+  # zone N is also inside every LARGER zone, so those keep timing from where
+  # they were; the inner zones it has dropped out of reset, which is what a
+  # definite-time element does when its condition clears.
+  defp pick_up(%{failure_cause: "distance_zone" <> _} = trip, prior) do
+    zone = trip.details.zone
+
+    (prior || %{})
+    |> Map.filter(fn {z, _duty} -> z >= zone end)
+    |> Map.put_new(zone, 0.0)
+  end
+
+  defp pick_up(_trip, prior), do: prior || 0.0
+
+  defp relay_remaining(_trip, duty) when is_map(duty) do
+    duty
+    |> Enum.map(fn {zone, d} -> {remaining_trip_time(zone_delay_s(zone), d), zone} end)
+    |> Enum.min()
+  end
+
+  defp relay_remaining(trip, duty), do: {remaining_trip_time(trip.trip_time_s, duty), nil}
+
+  defp zone_delay_s(zone), do: Map.get(Protection.distance_settings().delays_s, zone, :infinity)
+
+  defp relay_operated?(duty) when is_map(duty),
+    do: Enum.any?(duty, fn {_zone, d} -> relay_operated?(d) end)
+
+  defp relay_operated?(duty), do: duty >= 1.0 - 1.0e-9
+
+  # Which zone element actually operated. It is not always the zone the
+  # measurement picked up in: a zone 3 timer started two steps ago can expire
+  # while the impedance now sits in zone 2, which is the whole point of running
+  # the timers in parallel. `details.zone` keeps its meaning — the zone this
+  # step's impedance is inside, which is still true — and the element that
+  # finished is named beside it rather than overwriting it.
+  defp note_operating_zone(trip, nil), do: trip
+
+  defp note_operating_zone(%{details: details} = trip, zone) do
+    if Map.get(details, :zone) == zone,
+      do: trip,
+      else: %{trip | details: Map.put(details, :operating_zone, zone)}
+  end
+
   @doc false
+  # Distance elements share ONE key per branch: their zone timers live in
+  # parallel inside the value (see `advance_relay_timers/2`), so keying by zone
+  # would make a worsening fault restart from zero. Every other protection keys
+  # by cause, which is what keeps thermal and Zone 3 duty on one branch apart.
+  def relay_key(%{failure_cause: "distance_zone" <> _} = trip),
+    do: {:distance, trip.component_type, trip.component_id}
+
   def relay_key(trip), do: {trip.failure_cause, trip.component_type, trip.component_id}
 
   # Conductor thermal carries its progress in the TEMPERATURE, not in the duty
@@ -3534,6 +3742,13 @@ defmodule PowerModel.Failure.Cascade do
   # advance equals the remaining time.
   defp reset_thermal_duty(relay_duty) do
     Map.reject(relay_duty, fn {{cause, _type, _id}, _duty} -> cause == "conductor_thermal" end)
+  end
+
+  # A distance element's zones each accrue against their OWN definite-time
+  # delay, so the trip time the measurement reported (the picked-up zone's) is
+  # not what any of them integrates against.
+  defp accrue_relay_duty(duty, delta_s, _trip_time_s) when is_map(duty) do
+    Map.new(duty, fn {zone, d} -> {zone, accrue_relay_duty(d, delta_s, zone_delay_s(zone))} end)
   end
 
   defp accrue_relay_duty(duty, _delta_s, :infinity), do: duty

@@ -499,4 +499,165 @@ defmodule PowerModel.Failure.CascadeFrequencyTest do
       assert advance < 30.0
     end
   end
+
+  # ===========================================================================
+  # CAS-20 / CAS-21: what the reported nadir is a statement about
+  # ===========================================================================
+
+  describe "the reported frequency nadir" do
+    defp reported_nadir(steps), do: steps |> List.last() |> get_in([:frequency, :nadir_hz])
+
+    test "an island that COLLAPSES reports the frequency it collapsed through" do
+      # REVIEW CAS-20. The three island-death paths replace the record with a
+      # fresh one, so a nadir read back off the survivors afterwards has
+      # nothing left to read: a total blackout rendered 60.00/60.00 Hz, which
+      # is precisely the misreading the frequency contract exists to prevent.
+      #
+      # Four machines at one bus carrying 330 MW. Losing the 200 MW unit opens
+      # a hole the three 60 MW coal units cannot hold; they hit the 57 Hz band,
+      # trip on under-frequency, and take the island with them.
+      snapshot = %{
+        buses: [bus(1, 3), bus(2)],
+        lines: [line(1, 1, 2)],
+        transformers: [],
+        generators: [
+          gen(1, 1, 200.0),
+          gen(2, 1, 60.0, "COL"),
+          gen(3, 1, 60.0, "COL"),
+          gen(4, 1, 60.0, "COL")
+        ],
+        loads: [load(1, 2, 330.0)]
+      }
+
+      {state, steps} = snapshot |> Cascade.init() |> Cascade.trip_generator(1)
+
+      # The island really did die: everything blacked out, no survivors.
+      assert Cascade.balance(state).blackout_load_mw > 0.0
+      assert Enum.all?(state.island_states, &is_nil(&1.frequency_state))
+      assert Enum.all?(state.island_states, &(&1.exposure == []))
+
+      # And the collapse is REPORTED, on every step's payload and on the state.
+      assert reported_nadir(steps) < 59.0
+      assert state.frequency_nadir_hz < 59.0
+
+      # The under-frequency trips that killed it agree with the number: the
+      # machines left in the 57 Hz band, so the nadir has to be at or below it.
+      band =
+        state.events
+        |> Enum.filter(&(&1.failure_cause == "underfrequency_trip"))
+        |> Enum.map(& &1.details.band_hz)
+        |> Enum.min()
+
+      assert state.frequency_nadir_hz <= band
+    end
+
+    test "a new cascade event reports its OWN dip, not the previous event's" do
+      # REVIEW CAS-21. `begin_cascade_event/1` rebases the nadir floor, but the
+      # island's exposure window keeps 180 s of history, so a nadir recovered
+      # from that window handed event 2 event 1's dip. Measured: a 3 MW trip
+      # "reaching" 59.16 Hz.
+      snapshot = %{
+        buses: [bus(1, 3), bus(2)],
+        lines: [line(1, 1, 2)],
+        transformers: [],
+        generators: [gen(1, 1, 280.0), gen(2, 1, 40.0), gen(3, 1, 40.0), gen(4, 1, 4.0)],
+        loads: [load(1, 2, 300.0)]
+      }
+
+      state = Cascade.init(snapshot)
+
+      {after_big, big_steps} = Cascade.trip_generator(state, 2)
+      big_nadir = reported_nadir(big_steps)
+
+      # Event 1 is a real excursion, and the island climbs well back out of it
+      # before event 2 starts.
+      assert big_nadir < 59.5
+      assert [%{frequency_state: %{frequency: recovered}}] = after_big.island_states
+      assert recovered > big_nadir + 0.5
+
+      # Event 2 loses a 4 MW machine off a recovered island. Its own dip is
+      # shallow, and that is what it must report.
+      {after_tiny, tiny_steps} = Cascade.trip_generator(after_big, 4)
+      tiny_nadir = reported_nadir(tiny_steps)
+
+      assert tiny_nadir > big_nadir
+      assert tiny_nadir > 59.5
+      assert after_tiny.frequency_nadir_hz == tiny_nadir
+
+      # The old dip is still IN the exposure window — this is not a test that
+      # the history was thrown away, it is a test that the nadir stopped
+      # reading it.
+      assert after_tiny.island_states
+             |> Enum.flat_map(& &1.exposure)
+             |> Enum.map(& &1.frequency)
+             |> Enum.min() <= big_nadir
+    end
+
+    test "the rebase floor still holds: the nadir never reads above the frequency" do
+      # The other half of the rebase contract. An island already sitting below
+      # 60 Hz when a new event starts must not have its nadir reset to 60.00,
+      # which would report a dip shallower than the frequency the same payload
+      # calls current.
+      snapshot = %{
+        buses: [bus(1, 3), bus(2)],
+        lines: [line(1, 1, 2)],
+        transformers: [],
+        generators: [gen(1, 1, 600.0, "COL"), gen(2, 1, 600.0, "COL")],
+        loads: [load(1, 2, 1000.0)]
+      }
+
+      {first, _} = snapshot |> Cascade.init() |> Cascade.trip_generator(1)
+      {second, steps} = Cascade.trip_generator(first, 2)
+
+      for step <- steps do
+        assert step.frequency.nadir_hz <= step.frequency.f_hz + 1.0e-9
+      end
+
+      assert second.frequency_nadir_hz <= 60.0
+    end
+  end
+
+  # ===========================================================================
+  # CAS-22: one clock, one ramp
+  # ===========================================================================
+
+  describe "the reserve ramp ledger" do
+    test "a step's repeated allocations share one ramp, and the ledger says so" do
+      # REVIEW CAS-22. The cascade allocates up to three times per island per
+      # step against the SAME deficit clock. Each allocation used to be handed
+      # the whole elapsed ramp, so a slow fleet delivered up to 3x what it can
+      # physically move. The island's ledger is what the tiers now net against.
+      {state, _} = fleet_island("BIT") |> Cascade.init() |> Cascade.trip_generator(1)
+
+      assert [record] = state.island_states
+      assert is_map(record.reserve_delivered)
+
+      # Whatever any unit was credited with, it cannot exceed what its
+      # technology could ramp over the clock the island actually holds.
+      elapsed =
+        case record.deficit_since_s do
+          nil -> 0.0
+          opened -> max(state.simulated_time - opened, 0.0)
+        end
+
+      for {id, tiers} <- record.reserve_delivered do
+        unit = Enum.find(state.generators, &(&1.id == id))
+        ramp = PowerModel.Solver.Frequency.secondary_ramp_mw_per_min(unit)
+
+        assert Map.get(tiers, :secondary, 0.0) + Map.get(tiers, :tertiary, 0.0) <=
+                 ramp * elapsed / 60.0 + 1.0e-6
+      end
+    end
+
+    test "the ledger is cleared with the clock it is measured against" do
+      # A ramp budget that outlives its `elapsed_s` origin is charged against a
+      # clock that no longer exists, so the ledger goes when the deficit closes
+      # and again when a new cascade event rebases the clock to zero.
+      {state, _} = fleet_island("WAT") |> Cascade.init() |> Cascade.trip_generator(1)
+
+      for record <- state.island_states, record.deficit_since_s == nil do
+        assert record.reserve_delivered == %{}
+      end
+    end
+  end
 end

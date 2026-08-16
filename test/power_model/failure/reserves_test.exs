@@ -258,4 +258,131 @@ defmodule PowerModel.Failure.ReservesTest do
       assert_in_delta later.tertiary_capability_mw, 460.0, 1.0e-9
     end
   end
+
+  # ===========================================================================
+  # CAS-22: the ramp ledger
+  # ===========================================================================
+
+  describe "the ramp ledger" do
+    # One coal machine: 1,000 MW nameplate at 100 MW, so 900 MW of headroom
+    # and a 20 MW/min secondary ramp. At 660 s the tertiary tier has had
+    # exactly 60 s past its start-up delay, which is 20 MW of ramp.
+    defp slow_unit, do: unit(1, "COL", 1000.0, 100.0)
+
+    defp note(ledger, alloc) do
+      [{:secondary, alloc.secondary_by_unit}, {:tertiary, alloc.tertiary_by_unit}]
+      |> Enum.reduce(ledger, fn {tier, by_unit}, ledger ->
+        Enum.reduce(by_unit, ledger, fn {id, mw}, ledger ->
+          Map.update(ledger, id, %{tier => mw}, &Map.update(&1, tier, mw, fn m -> m + mw end))
+        end)
+      end)
+    end
+
+    defp raise_unit(u, mw),
+      do: %{u | p_dispatch_mw: u.p_dispatch_mw + mw, p_max_mw: u.p_max_mw + mw}
+
+    test "repeated allocations at ONE clock hand out one ramp between them" do
+      # The CAS-22 repro. The cascade makes up to three allocations per island
+      # per step against the same `elapsed_s`. Raising the unit between them
+      # moves the HEADROOM bound and nothing moved the ramp bound, so a
+      # 20 MW/min machine delivered 60 MW of a 20 MW budget and UFLS
+      # under-fired for it.
+      assert_in_delta Reserves.tertiary_capability_mw(slow_unit(), 660.0, 0.0), 20.0, 1.0e-9
+
+      {allocs, _unit, _ledger} =
+        Enum.reduce(1..3, {[], slow_unit(), %{}}, fn _i, {allocs, u, ledger} ->
+          taken = Enum.sum(Enum.map(allocs, & &1.tertiary_mw))
+
+          alloc =
+            Reserves.allocate([u], 900.0 - taken, 660.0,
+              secondary: {:agc, %{}},
+              delivered: ledger
+            )
+
+          {allocs ++ [alloc], raise_unit(u, alloc.tertiary_mw), note(ledger, alloc)}
+        end)
+
+      delivered = Enum.map(allocs, & &1.tertiary_mw)
+
+      assert_in_delta Enum.sum(delivered), 20.0, 1.0e-9
+
+      # The first call takes the whole budget; the two that follow get nothing
+      # because there is nothing left of it.
+      assert [first, second, third] = delivered
+      assert_in_delta first, 20.0, 1.0e-9
+      assert_in_delta second, 0.0, 1.0e-9
+      assert_in_delta third, 0.0, 1.0e-9
+    end
+
+    test "the budget reopens as the clock runs on, net of what was spent" do
+      # The ledger is a subtraction from the ramp, not a latch: 120 s past the
+      # start-up delay is 40 MW of budget, of which 20 MW is already on the
+      # system, so the next allocation gets exactly the other 20 MW.
+      spent = %{1 => %{tertiary: 20.0}}
+
+      later =
+        Reserves.allocate([raise_unit(slow_unit(), 20.0)], 900.0, 720.0,
+          secondary: {:agc, %{}},
+          delivered: spent
+        )
+
+      assert_in_delta later.tertiary_mw, 20.0, 1.0e-9
+    end
+
+    test "the two tiers keep separate ledgers, because their windows are disjoint" do
+      # Secondary covers the first 600 s of the ramp and tertiary everything
+      # past 600 s, so their sum is `ramp(elapsed)` exactly once. A unit that
+      # spent its whole secondary window must still get its tertiary one.
+      spent_secondary = %{1 => %{secondary: 200.0}}
+
+      alloc =
+        Reserves.allocate([slow_unit()], 900.0, 660.0,
+          secondary: {:agc, %{}},
+          delivered: spent_secondary
+        )
+
+      assert_in_delta alloc.tertiary_capability_mw, 20.0, 1.0e-9
+
+      # And on the clock tier, a spent secondary budget does bind its own tier.
+      assert_in_delta Reserves.secondary_capability_mw(slow_unit(), 600.0, :clock, 200.0),
+                      0.0,
+                      1.0e-9
+    end
+
+    test "an absent ledger is a unit that has delivered nothing" do
+      # Every existing caller passes no ledger, and one call in isolation was
+      # never wrong — the bound only breaks across repeated calls.
+      bare = Reserves.allocate([slow_unit()], 900.0, 660.0, secondary: {:agc, %{}})
+
+      empty =
+        Reserves.allocate([slow_unit()], 900.0, 660.0, secondary: {:agc, %{}}, delivered: %{})
+
+      assert bare.tertiary_mw == empty.tertiary_mw
+      assert_in_delta bare.tertiary_mw, 20.0, 1.0e-9
+    end
+
+    test "the ledger cannot bind the `:infinity` clock, which has no budget to spend" do
+      # `:infinity` is the "this is not an event" case the initial operating
+      # point is balanced with; there is no elapsed-time budget there to
+      # subtract from.
+      alloc =
+        Reserves.allocate([slow_unit()], 900.0, :infinity,
+          delivered: %{1 => %{secondary: 500.0, tertiary: 500.0}}
+        )
+
+      assert_in_delta alloc.secondary_mw + alloc.tertiary_mw, 900.0, 1.0e-9
+    end
+
+    test "the per-tier allocation is reported so a caller can keep a ledger at all" do
+      alloc = Reserves.allocate([slow_unit()], 900.0, 1500.0)
+
+      assert_in_delta Map.get(alloc.secondary_by_unit, 1, 0.0), alloc.secondary_mw, 1.0e-9
+      assert_in_delta Map.get(alloc.tertiary_by_unit, 1, 0.0), alloc.tertiary_mw, 1.0e-9
+
+      assert_in_delta Map.get(alloc.sustained_by_unit, 1, 0.0),
+                      Map.get(alloc.secondary_by_unit, 1, 0.0) +
+                        Map.get(alloc.tertiary_by_unit, 1, 0.0),
+                      1.0e-9
+    end
+  end
 end
