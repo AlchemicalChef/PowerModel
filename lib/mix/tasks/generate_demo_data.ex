@@ -9,6 +9,13 @@ defmodule Mix.Tasks.PowerModel.GenerateDemoData do
   (which the boot-time `GridExport.ensure_exported/1` guard would then treat
   as legitimate). Pass `--force` to intentionally overwrite the real path.
 
+  UI-M18: `--force` output is now TRANSIENT wherever a database is reachable.
+  These files are synthetic, so they carry no content tag, and the boot guard
+  rebuilds an untagged export from the database. Writing a tag here would
+  certify synthetic files as matching a database they were not derived from,
+  which is the exact lie the tag exists to prevent. For a lasting demo, serve
+  `grid_data_demo/` rather than overwriting the real path.
+
   ## Usage
 
       mix power_model.generate_demo_data           # writes grid_data_demo/

@@ -153,6 +153,9 @@ test("showCascadeStep replays by array position with repeated server step number
   m.applyDCResults({ stressed_line_ids: [3], line_loading: { 3: 62 } });
   // Cascade B after a new manual trip: server step counter reset to 1
   m.applyCascadeStep({ step: 1, tripped_generator_ids: [10] });
+  // Scrubbing is only offered on a settled timeline (UI-M19), so the run has
+  // to be over before any of the replays below.
+  m.endCascade(false);
 
   assert.equal(m.cascadeHistory.length, 3);
   assert.equal(m.cascadeHistory[0].step, m.cascadeHistory[2].step, "step numbers repeat across cascades");
@@ -174,6 +177,61 @@ test("showCascadeStep replays by array position with repeated server step number
   m.showCascadeStep(2);
   assert.equal(m.dataStore.getGeneratorData()[0].state, 3);
   assert.equal(lineById(m, 3).state, 1, "settled classification still present at the end");
+});
+
+// UI-M19: rewinding a RUNNING cascade dropped every trip mark from the frames
+// the scrub skipped — permanently, because the settled dc_update repaints flow
+// classes and never STATE_TRIPPED. The scrub is refused instead.
+test("a scrub during a live cascade is refused and leaves the map untouched", () => {
+  const m = loadedManager();
+  m.applyCascadeStep({ step: 1, tripped_line_ids: [1] });
+  m.applyCascadeStep({ step: 2, tripped_line_ids: [2] });
+  m.applyCascadeStep({ step: 3, tripped_line_ids: [3] });
+
+  const versionBefore = m.stateVersion;
+  assert.equal(m.showCascadeStep(0), false, "the scrub reports that it refused");
+  assert.equal(m.stateVersion, versionBefore, "a refused scrub mutates nothing");
+  assert.equal(lineById(m, 2).state, 3, "no rewind: step 2's trip mark stands");
+  assert.equal(lineById(m, 3).state, 3, "no rewind: step 3's trip mark stands");
+
+  // The cascade continues and settles; every trip is still on the map.
+  m.applyCascadeStep({ step: 4, tripped_generator_ids: [10] });
+  m.applyDCResults({});
+  m.endCascade(false);
+
+  for (const id of [1, 2, 3]) {
+    assert.equal(lineById(m, id).state, 3, `line ${id} tripped on the settled map`);
+  }
+  assert.equal(m.dataStore.getGeneratorData()[0].state, 3, "the last frame's trip too");
+});
+
+// UI-M21: cascade mode is what the server said, not a function of how many
+// frames are in history. Reviewing a finished cascade used to re-arm it —
+// vignette, ghosting and forced layers, with no exit but Reset.
+test("scrubbing a finished cascade never re-enters cascade mode", () => {
+  const m = loadedManager();
+  const activeChanges = [];
+  m.onCascadeActiveChange = (a) => activeChanges.push(a);
+
+  m.applyCascadeStep({ step: 1, tripped_line_ids: [1] });
+  m.applyCascadeStep({ step: 2, tripped_line_ids: [2] });
+  m.applyDCResults({ stressed_line_ids: [3] });
+  m.endCascade(false);
+
+  assert.equal(m.showCascadeStep(1), true, "a settled timeline is scrubbable");
+  assert.equal(m.cascadeActive, false, "reviewing is not cascading");
+  m.showCascadeStep(0);
+  assert.equal(m.cascadeActive, false, "still not cascading");
+  assert.deepEqual(activeChanges, [true, false], "one arm, one disarm");
+
+  // The replay itself still works.
+  assert.equal(lineById(m, 1).state, 3);
+  assert.equal(lineById(m, 2).state, 0, "position 0 excludes the later frame");
+
+  // A NEW cascade re-arms normally.
+  m.applyCascadeStep({ step: 1, tripped_generator_ids: [10] });
+  assert.equal(m.cascadeActive, true);
+  assert.deepEqual(activeChanges, [true, false, true]);
 });
 
 // UI-H2 / contract #3: dc_update line_loading consumption.
@@ -306,9 +364,10 @@ test("state-mutating entry points bump stateVersion monotonically", () => {
   seen.push(m.stateVersion);
   m.applyDCResults({});
   seen.push(m.stateVersion);
-  m.showCascadeStep(0);
-  seen.push(m.stateVersion);
   m.endCascade(true);
+  seen.push(m.stateVersion);
+  // After the run settles — a live scrub is refused and mutates nothing.
+  m.showCascadeStep(0);
   seen.push(m.stateVersion);
   m.resetToBaseline();
   seen.push(m.stateVersion);
@@ -400,6 +459,7 @@ test("ac_overlay replaces the alarm set and replays when scrubbing", () => {
     },
   };
   m.applyACResults(acPayload);
+  m.endCascade(true);
 
   let cells = drawable(m);
   assert.equal(cells.length, 2, "one sagging cell and one Ferranti cell");

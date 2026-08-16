@@ -472,12 +472,7 @@ defmodule PowerModel.Grid do
   # endpoint buses.
 
   def export_generators do
-    from(g in Generator,
-      join: b in Bus,
-      on: g.bus_id == b.id,
-      where:
-        g.status == "in_service" and not is_nil(g.coordinates) and
-          not is_nil(b.coordinates) and not is_nil(b.interconnection_id),
+    from([g, b] in export_generators_query(),
       select: %{
         id: g.id,
         coordinates: g.coordinates,
@@ -489,19 +484,21 @@ defmodule PowerModel.Grid do
     |> Repo.all()
   end
 
-  def export_transmission_lines do
-    from(tl in TransmissionLine,
-      join: fb in Bus,
-      on: tl.from_bus_id == fb.id,
-      join: tb in Bus,
-      on: tl.to_bus_id == tb.id,
+  # The filter alone, with no select, so the row COUNT can be taken from the
+  # same predicate the export uses (UI-M18). A count query that restated the
+  # filter would drift from it the first time either changed.
+  defp export_generators_query do
+    from(g in Generator,
+      join: b in Bus,
+      on: g.bus_id == b.id,
       where:
-        tl.status == "in_service" and
-          tl.from_bus_id != tl.to_bus_id and
-          (is_nil(tl.line_type) or tl.line_type != "dc") and
-          not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
-          not is_nil(fb.interconnection_id) and
-          fb.interconnection_id == tb.interconnection_id,
+        g.status == "in_service" and not is_nil(g.coordinates) and
+          not is_nil(b.coordinates) and not is_nil(b.interconnection_id)
+    )
+  end
+
+  def export_transmission_lines do
+    from([tl, fb, tb] in export_transmission_lines_query(),
       select: %{
         id: tl.id,
         geometry: tl.geometry,
@@ -515,6 +512,22 @@ defmodule PowerModel.Grid do
     )
     |> Repo.all()
     |> Enum.map(&with_endpoint_geometry/1)
+  end
+
+  defp export_transmission_lines_query do
+    from(tl in TransmissionLine,
+      join: fb in Bus,
+      on: tl.from_bus_id == fb.id,
+      join: tb in Bus,
+      on: tl.to_bus_id == tb.id,
+      where:
+        tl.status == "in_service" and
+          tl.from_bus_id != tl.to_bus_id and
+          (is_nil(tl.line_type) or tl.line_type != "dc") and
+          not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
+          not is_nil(fb.interconnection_id) and
+          fb.interconnection_id == tb.interconnection_id
+    )
   end
 
   # Synthetic ties (and any other geometry-less line) get a straight 2-point
@@ -540,9 +553,7 @@ defmodule PowerModel.Grid do
   end
 
   def export_substations do
-    # DAT-12: substations without coordinates would render at Null Island.
-    from(s in Substation,
-      where: s.status == "in_service" and not is_nil(s.coordinates),
+    from(s in export_substations_query(),
       select: %{
         id: s.id,
         coordinates: s.coordinates,
@@ -551,6 +562,11 @@ defmodule PowerModel.Grid do
       }
     )
     |> Repo.all()
+  end
+
+  # DAT-12: substations without coordinates would render at Null Island.
+  defp export_substations_query do
+    from(s in Substation, where: s.status == "in_service" and not is_nil(s.coordinates))
   end
 
   # Water Facilities
@@ -563,8 +579,7 @@ defmodule PowerModel.Grid do
   end
 
   def export_water_facilities do
-    from(w in WaterFacility,
-      where: w.status == "active",
+    from(w in export_water_facilities_query(),
       select: %{
         id: w.id,
         coordinates: w.coordinates,
@@ -577,6 +592,10 @@ defmodule PowerModel.Grid do
       }
     )
     |> Repo.all()
+  end
+
+  defp export_water_facilities_query do
+    from(w in WaterFacility, where: w.status == "active")
   end
 
   @doc """
@@ -597,6 +616,12 @@ defmodule PowerModel.Grid do
   substation channel.
   """
   def export_bus_loads do
+    Repo.all(export_bus_loads_query())
+  end
+
+  # Grouped, so its "record count" is the number of GROUPS, not of rows --
+  # the signature counts it through a subquery for that reason.
+  defp export_bus_loads_query do
     from(l in Load,
       join: b in Bus,
       on: l.bus_id == b.id,
@@ -604,24 +629,10 @@ defmodule PowerModel.Grid do
       group_by: [b.id, b.coordinates],
       select: %{bus_id: b.id, coordinates: b.coordinates, demand_mw: sum(l.p_mw)}
     )
-    |> Repo.all()
   end
 
   def export_transformers do
-    # Positioned at their from-bus (transformers join two voltage levels at
-    # the same physical substation). Filters mirror in_service_transformers/1
-    # (DAT-2) so every exported transformer is simulatable.
-    from(t in Transformer,
-      join: fb in Bus,
-      on: t.from_bus_id == fb.id,
-      join: tb in Bus,
-      on: t.to_bus_id == tb.id,
-      where:
-        t.status == "in_service" and
-          t.from_bus_id != t.to_bus_id and
-          not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
-          not is_nil(fb.interconnection_id) and
-          fb.interconnection_id == tb.interconnection_id,
+    from([t, fb, _tb] in export_transformers_query(),
       select: %{
         id: t.id,
         coordinates: fb.coordinates,
@@ -633,9 +644,26 @@ defmodule PowerModel.Grid do
     |> Repo.all()
   end
 
+  # Positioned at their from-bus (transformers join two voltage levels at the
+  # same physical substation). Filters mirror in_service_transformers/1
+  # (DAT-2) so every exported transformer is simulatable.
+  defp export_transformers_query do
+    from(t in Transformer,
+      join: fb in Bus,
+      on: t.from_bus_id == fb.id,
+      join: tb in Bus,
+      on: t.to_bus_id == tb.id,
+      where:
+        t.status == "in_service" and
+          t.from_bus_id != t.to_bus_id and
+          not is_nil(fb.coordinates) and not is_nil(tb.coordinates) and
+          not is_nil(fb.interconnection_id) and
+          fb.interconnection_id == tb.interconnection_id
+    )
+  end
+
   def export_datacenters do
-    from(d in Datacenter,
-      where: d.status == "active",
+    from(d in export_datacenters_query(),
       select: %{
         id: d.id,
         coordinates: d.coordinates,
@@ -647,6 +675,73 @@ defmodule PowerModel.Grid do
       }
     )
     |> Repo.all()
+  end
+
+  defp export_datacenters_query do
+    from(d in Datacenter, where: d.status == "active")
+  end
+
+  # The source tables the map exports are derived from. `updated_at` is read
+  # across the WHOLE table, not the exported subset: a row leaving the export
+  # (a status flip, a bus losing its interconnection) already moves the count,
+  # while a row changing IN PLACE — a re-allocated demand, a re-rated line —
+  # moves nothing else.
+  @export_source_tables [
+    buses: Bus,
+    loads: Load,
+    generators: Generator,
+    transmission_lines: TransmissionLine,
+    transformers: Transformer,
+    substations: Substation,
+    water_facilities: WaterFacility,
+    datacenters: Datacenter
+  ]
+
+  @doc """
+  A content tag for the map exports: what the export queries would produce
+  now, cheaply enough to compute at every boot.
+
+  `GridExport.ensure_exported/1` compares this with the tag stored beside the
+  exported files and regenerates on a mismatch. Before it existed, the boot
+  check could only see FORMAT (a non-empty file with the right magic), so a
+  re-ingest left the map serving the previous topology indefinitely — measured
+  at 13,290 in-service lines the browser could neither draw nor repaint, and a
+  demand overlay from before the load reallocation (UI-M18).
+
+  Two halves, because neither alone is enough:
+
+    * **exported counts** move when a row enters or leaves the export — the
+      status flips and coordinate/interconnection changes that bulk
+      `update_all` writes make without touching `updated_at`;
+    * **`max(updated_at)` per source table** moves when an exported row
+      changes in place, which the counts cannot see.
+
+  The counts come from the export queries' own predicates (shared, not
+  restated) so the tag cannot drift from what the export would write.
+
+  Blind spot, stated so it is not mistaken for a guarantee: a bulk
+  `update_all` that rewrites an exported VALUE without touching `updated_at`
+  and without changing any count is invisible here. Every ingestion path that
+  does that today runs alongside changeset writes that do move a timestamp.
+  """
+  def export_signature do
+    %{
+      counts: %{
+        generators: Repo.aggregate(export_generators_query(), :count),
+        transmission_lines: Repo.aggregate(export_transmission_lines_query(), :count),
+        substations: Repo.aggregate(export_substations_query(), :count),
+        transformers: Repo.aggregate(export_transformers_query(), :count),
+        bus_loads: Repo.aggregate(subquery(export_bus_loads_query()), :count),
+        water_facilities: Repo.aggregate(export_water_facilities_query(), :count),
+        datacenters: Repo.aggregate(export_datacenters_query(), :count)
+      },
+      updated_at:
+        Map.new(@export_source_tables, fn {name, schema} -> {name, max_updated_at(schema)} end)
+    }
+  end
+
+  defp max_updated_at(schema) do
+    Repo.one(from(r in schema, select: max(r.updated_at)))
   end
 
   # Private helpers

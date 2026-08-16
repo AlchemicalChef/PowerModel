@@ -21,15 +21,42 @@ defmodule PowerModel.GridExport do
   # yields coordinates out of misaligned bytes rather than an error.
   @bus_loads_magic <<"BLD", 2>>
 
+  # manifest.bin, the export set's CONTENT tag (UI-M18):
+  #
+  #   header: "GDM" tag, version u8
+  #   body:   term_to_binary(PowerModel.Grid.export_signature/0)
+  #
+  # Same self-identifying-header discipline as bus_loads.bin above, and for
+  # the same reason: a file from an older layout must announce itself rather
+  # than decode into a plausible-looking wrong answer. The body is a term
+  # rather than a fixed struct so a mismatch can be LOGGED with both sides —
+  # "why did it regenerate" is the first question a cold start raises.
+  #
+  # The tag is written LAST by run/1, so an export that crashed part-way is
+  # not certified current by a manifest it never earned.
+  @manifest_magic <<"GDM", 1>>
+  @manifest_file "manifest.bin"
+
   @doc """
-  Regenerate the map data files at application boot when they are missing
-  or empty.
+  Regenerate the map data files at application boot when they are missing,
+  empty, in an old layout, or no longer match the database.
 
   Fly machines get a fresh image filesystem on every cold start, so the
   DB-derived exports must be rebuilt; locally and on warm restarts the files
   exist and this is a no-op. DAT-7: an export produced before ingestion ran
   (0 records) is treated the same as a missing one, so a stale empty file
-  can never permanently blank the map. Never crashes the supervision tree.
+  can never permanently blank the map.
+
+  UI-M18: the first three checks are about FORMAT and cannot see the database
+  move underneath a perfectly well-formed export. After a re-ingest the map
+  served 13,290 fewer in-service lines than the DB had — trips the browser
+  could neither draw nor repaint — and a demand overlay from before the load
+  reallocation, with nothing in the system able to notice. The content tag
+  closes that: see `PowerModel.Grid.export_signature/0` for what it covers
+  and what it does not.
+
+  Never crashes the supervision tree. A database that cannot answer the
+  signature query leaves the existing export alone rather than blanking it.
   """
   def ensure_exported(dir \\ nil) do
     dir = dir || Application.app_dir(:power_model, "priv/static/grid_data")
@@ -44,13 +71,96 @@ defmodule PowerModel.GridExport do
         run(dir)
 
       true ->
-        :ok
+        ensure_current_content(dir)
     end
   rescue
     e -> Logger.warning("grid_data export at boot failed: #{Exception.message(e)}")
   catch
     kind, reason -> Logger.warning("grid_data export at boot failed: #{kind} #{inspect(reason)}")
   end
+
+  defp ensure_current_content(dir) do
+    if Application.get_env(:power_model, :skip_repo, false) do
+      # No database to compare against (the test boot, and any release started
+      # without one). The format checks above already passed, so the files
+      # stand: an instance that cannot read the DB has no basis for calling
+      # them stale.
+      :ok
+    else
+      compare_content(dir)
+    end
+  end
+
+  defp compare_content(dir) do
+    signature = PowerModel.Grid.export_signature()
+
+    case read_manifest(dir) do
+      {:ok, ^signature} ->
+        :ok
+
+      {:ok, stored} ->
+        Logger.info(
+          "grid_data exports no longer match the database; regenerating " <>
+            "(#{describe_drift(stored, signature)})"
+        )
+
+        run(dir)
+
+      :error ->
+        Logger.info("grid_data exports carry no content tag; regenerating")
+        run(dir)
+    end
+  end
+
+  defp read_manifest(dir) do
+    with {:ok, @manifest_magic <> body} <- File.read(Path.join(dir, @manifest_file)),
+         {:ok, term} <- safe_term(body) do
+      {:ok, term}
+    else
+      _ -> :error
+    end
+  end
+
+  defp safe_term(body) do
+    {:ok, :erlang.binary_to_term(body, [:safe])}
+  rescue
+    _ -> :error
+  end
+
+  @doc """
+  Write the content tag for the export set currently in `dir`.
+
+  Public so a test that hand-writes marker export files can give them a
+  GENUINE tag instead of the check being weakened to let untagged files pass.
+  """
+  def write_manifest(dir) do
+    File.write!(
+      Path.join(dir, @manifest_file),
+      @manifest_magic <> :erlang.term_to_binary(PowerModel.Grid.export_signature())
+    )
+  end
+
+  # Names only the parts that moved: on a cold start this line is the whole
+  # explanation of why the machine spent 30 s re-exporting.
+  defp describe_drift(stored, current) do
+    [
+      drift_pairs("count", stored[:counts], current[:counts]),
+      drift_pairs("updated", stored[:updated_at], current[:updated_at])
+    ]
+    |> List.flatten()
+    |> case do
+      [] -> "no field differs; tag layout changed"
+      diffs -> Enum.join(diffs, ", ")
+    end
+  end
+
+  defp drift_pairs(label, stored, current) when is_map(stored) and is_map(current) do
+    for {key, now} <- Enum.sort(current), Map.get(stored, key) != now do
+      "#{key} #{label} #{inspect(Map.get(stored, key))} -> #{inspect(now)}"
+    end
+  end
+
+  defp drift_pairs(label, _stored, _current), do: ["#{label}s absent from the stored tag"]
 
   # A usable export exists and holds at least one record (the leading u32 is
   # the record count).
@@ -82,6 +192,10 @@ defmodule PowerModel.GridExport do
     export_bus_loads(output_dir)
     export_water_facilities(output_dir)
     export_datacenters(output_dir)
+
+    # Last, and only on the success path: a manifest written before the files
+    # would certify a half-finished export as current (UI-M18).
+    write_manifest(output_dir)
 
     IO.puts("Grid data exported to #{output_dir}/")
     :ok

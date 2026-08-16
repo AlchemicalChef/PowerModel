@@ -30,6 +30,13 @@ export class MapManager {
     this.viewMode = "voltage_level";
     this.cascadeHistory = [];
     this.cascadeActive = false;
+    // UI-M21: whether the SERVER has said this cascade is over ("cascade_done").
+    // Cascade mode is a fact the server reports, and it used to be re-derived
+    // from `cascadeHistory.length` inside showCascadeStep — so reviewing a
+    // finished cascade re-armed cascade mode (vignette, ghosting, forced
+    // layers) with no exit but Reset, because no second cascade_done was ever
+    // coming.
+    this.cascadeEnded = false;
     this.showWaterFacilities = false;
     this.showDatacenters = false;
     this.showDemandDensity = false;
@@ -427,14 +434,22 @@ export class MapManager {
     this.applyDCResults(data);
   }
 
+  // The single writer of `cascadeActive`, so the callback fires exactly on
+  // transitions and every entry point agrees on what "in cascade mode" means.
+  _setCascadeActive(next) {
+    if (next === this.cascadeActive) return;
+    this.cascadeActive = next;
+    if (this.onCascadeActiveChange) this.onCascadeActiveChange(next);
+  }
+
   applyCascadeStep(data) {
     this.stateVersion++;
     this.cascadeHistory.push(data);
 
-    if (!this.cascadeActive) {
-      this.cascadeActive = true;
-      if (this.onCascadeActiveChange) this.onCascadeActiveChange(true);
-    }
+    // A frame is a live cascade by definition: a new one after a finished run
+    // re-arms cascade mode.
+    this.cascadeEnded = false;
+    this._setCascadeActive(true);
 
     // The cascade forces the water layer visible for impacted facilities;
     // fetch the (lazy) dataset the first time an impact actually appears.
@@ -451,10 +466,8 @@ export class MapManager {
   // mode — vignette, ghosting, forced layers — but KEEP the final
   // classification marks on the map.
   endCascade(_stable) {
-    if (this.cascadeActive) {
-      this.cascadeActive = false;
-      if (this.onCascadeActiveChange) this.onCascadeActiveChange(false);
-    }
+    this.cascadeEnded = true;
+    this._setCascadeActive(false);
     this.stateVersion++;
     this._updateLayers();
   }
@@ -529,11 +542,10 @@ export class MapManager {
     this.dataStore.resetAllStates();
     this.dataStore.resetLineLoading();
     this.cascadeHistory = [];
-
-    if (this.cascadeActive) {
-      this.cascadeActive = false;
-      if (this.onCascadeActiveChange) this.onCascadeActiveChange(false);
-    }
+    // Nothing to review and nothing running: the next frame starts a cascade
+    // from scratch rather than reviving the one that was just cleared.
+    this.cascadeEnded = false;
+    this._setCascadeActive(false);
 
     this._updateLayers();
   }
@@ -573,7 +585,20 @@ export class MapManager {
     this._updateLayers();
   }
 
+  // Replay a finished cascade up to `position`. Returns false when the scrub
+  // was refused (see below), true when the map was rewound.
   showCascadeStep(position) {
+    // UI-M19: a RUNNING cascade may not be rewound. The replay below resets
+    // every component state and re-applies frames 0..position; the frames
+    // after `position` are skipped, and the live frames that arrive next are
+    // applied on top of that truncated map. Their trip marks are then gone for
+    // the rest of the session — the settled dc_update repaints flow classes
+    // but never STATE_TRIPPED, which only cascade frames carry. Scrubbing a
+    // timeline that is still being appended to is also of no use to the
+    // viewer: the next frame snaps the map forward again within a second. The
+    // timeline's buttons are disabled while `active` for the same reason.
+    if (this.cascadeActive) return false;
+
     // Reset and replay THROUGH the clicked frame (inclusive), indexing
     // cascadeHistory by ARRAY POSITION (contract #4). Server step numbers
     // reset at every manual trip and can repeat across cascades in one
@@ -583,11 +608,13 @@ export class MapManager {
     // the last frame agrees with the settled view.
     this.stateVersion++;
     this.dataStore.resetAllStates();
-    const shouldBeActive = position >= 0 && this.cascadeHistory.length > 0;
-    if (shouldBeActive !== this.cascadeActive) {
-      this.cascadeActive = shouldBeActive;
-      if (this.onCascadeActiveChange) this.onCascadeActiveChange(shouldBeActive);
-    }
+    // UI-M21: restore the server-reported flag rather than deriving activity
+    // from the history length. A finished cascade stays finished however far
+    // back the viewer scrubs; a negative position (nothing replayed) leaves
+    // cascade mode the same way it always did.
+    this._setCascadeActive(
+      !this.cascadeEnded && position >= 0 && this.cascadeHistory.length > 0
+    );
     for (let i = 0; i <= position && i < this.cascadeHistory.length; i++) {
       const frame = this.cascadeHistory[i];
       this._applyCascadeData(frame);
@@ -596,6 +623,7 @@ export class MapManager {
       }
     }
     this._updateLayers();
+    return true;
   }
 
   destroy() {

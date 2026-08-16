@@ -114,6 +114,34 @@ defmodule PowerModelWeb.GridLiveN1ScreeningTest do
 
   defp assigns(view), do: :sys.get_state(view.pid).socket.assigns
 
+  # A component trip, in the cascade_step shape the engine broadcasts.
+  defp trip_step do
+    %{
+      step: 1,
+      simulated_time: 0.5,
+      islands: 1,
+      trips: [],
+      tripped_line_ids: [7],
+      tripped_transformer_ids: [],
+      tripped_generator_ids: [],
+      trip_count: 1,
+      balance: nil
+    }
+  end
+
+  # The shape ContingencyScreening.run/2 answers, as screen_snapshot/1
+  # augments it. Used where the sweep itself is not what is under test.
+  defp fake_screen do
+    %{
+      ranked: [
+        %{branch: {:line, 42}, category: :thermal, mw_at_risk: 120.0, max_loading_pct: 133.0}
+      ],
+      summary: %{thermal: 1, island_splits: 0, clean: 5, screened: 6, elapsed_ms: 900},
+      base: %{overloaded: 2, max_loading_pct: 118.0, monitored: 6},
+      scope: %{islands: 1, buses_screened: 10, buses_total: 10}
+    }
+  end
+
   @terminal_statuses [:stable, :stable_shed, :unstable, :collapsed, :truncated, :solve_failed]
 
   defp enter_n1_mode(view) do
@@ -293,6 +321,102 @@ defmodule PowerModelWeb.GridLiveN1ScreeningTest do
 
       assert await(fn -> has_element?(view, "#n1-stale-banner") end, 5_000)
       assert render(element(view, "#n1-stale-banner")) =~ "Advisory"
+    end
+
+    # UI-M20: a sweep launched BEFORE a trip and reporting AFTER it used to
+    # clear the advisory the trip had just raised, presenting a pre-trip
+    # linearisation as the current picture.
+    @tag timeout: 120_000
+    test "a screen reporting after a trip does not clear the banner", %{conn: conn} do
+      build_meshed_island("N1-Mesh6", -110.0)
+
+      {:ok, view, _html} = live(conn, "/")
+      enter_n1_mode(view)
+      run_screen(view)
+      refute assigns(view).n1_stale
+
+      # A trip lands while a (second) sweep is notionally in flight.
+      send(view.pid, {:simulation_cascade_step, trip_step()})
+      assert await(fn -> assigns(view).n1_stale end, 5_000)
+
+      # The sweep now reports. It was computed against the pre-trip network.
+      send(view.pid, {:n1_screening_done, {:ok, assigns(view).n1_result}})
+      _ = render(view)
+
+      assert assigns(view).n1_stale, "the advisory must survive the pre-trip result"
+      assert has_element?(view, "#n1-stale-banner")
+    end
+
+    # The epoch half of the same guarantee, on its own: no flag was ever set,
+    # and the result is still recognised as older than the engine's state.
+    test "a result whose snapshot predates the engine's epoch is advisory", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      enter_n1_mode(view)
+
+      # The engine reports it is on epoch 2 (two accepted trips / resets).
+      send(view.pid, {:simulation_cascade_done, %{epoch: 2, stable: true, reason: :settled}})
+      _ = render(view)
+      refute assigns(view).n1_stale, "a cascade_done alone raises no advisory"
+
+      # A sweep whose snapshot was taken at epoch 1 now reports.
+      send(view.pid, {:n1_screening_done, {:ok, Map.put(fake_screen(), :epoch, 1)}})
+      _ = render(view)
+
+      assert assigns(view).n1_stale, "an older epoch is advisory on its own"
+      assert has_element?(view, "#n1-stale-banner")
+    end
+
+    test "a result taken at the engine's current epoch is not advisory", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      enter_n1_mode(view)
+
+      send(view.pid, {:simulation_cascade_done, %{epoch: 2, stable: true, reason: :settled}})
+      send(view.pid, {:n1_screening_done, {:ok, Map.put(fake_screen(), :epoch, 2)}})
+      _ = render(view)
+
+      refute assigns(view).n1_stale
+      refute has_element?(view, "#n1-stale-banner")
+    end
+  end
+
+  describe "screening re-entrancy and cancellation (UI-M23 / UI-M20)" do
+    test "a second click does not launch a second sweep", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      hang_sim_server(assigns(view).sim_id)
+      enter_n1_mode(view)
+
+      view |> element("#run-n1-screen-btn") |> render_click()
+      assert_receive {:screening_task, first_pid}, 10_000
+      ref = assigns(view).n1_task
+
+      # The button is disabled while scanning; this is the click that raced
+      # the re-render. It used to spawn a second full sweep (240 s of national
+      # CPU), orphan the first monitor, and let the older result win.
+      render_hook(view, "run_n1_screening", %{})
+      refute_receive {:screening_task, _second_pid}, 300
+
+      assert assigns(view).n1_task == ref, "the first task is still the armed one"
+      assert Process.alive?(first_pid)
+    end
+
+    test "reset cancels an in-flight sweep so it cannot repopulate the panel", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      hang_sim_server(assigns(view).sim_id)
+      enter_n1_mode(view)
+
+      view |> element("#run-n1-screen-btn") |> render_click()
+      assert_receive {:screening_task, task_pid}, 10_000
+      assert assigns(view).n1_task != nil
+
+      render_hook(view, "reset_simulation", %{})
+
+      assert assigns(view).n1_task == nil, "the monitor is dropped"
+      assert assigns(view).n1_deadline == nil, "the deadline is cancelled"
+      refute assigns(view).n1_screening, "the button is not left at Scanning..."
+      assert await(fn -> not Process.alive?(task_pid) end, 2_000), "the sweep is stopped"
+
+      # Even a result that had already been queued is dropped.
+      refute assigns(view).n1_result
     end
   end
 

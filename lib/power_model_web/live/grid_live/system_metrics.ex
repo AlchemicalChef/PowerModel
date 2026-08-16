@@ -133,7 +133,15 @@ defmodule PowerModelWeb.GridLive.SystemMetrics do
 
   defp freq_sparkline(assigns) do
     ~H"""
-    <svg id="freq-sparkline" class="freq-spark" viewBox="0 0 120 28" preserveAspectRatio="none">
+    <svg
+      id="freq-sparkline"
+      class="freq-spark"
+      viewBox="0 0 120 28"
+      preserveAspectRatio="none"
+      role="img"
+      aria-labelledby="freq-sparkline-title"
+    >
+      <title id="freq-sparkline-title">{@trace.label}</title>
       <line
         x1="0"
         x2="120"
@@ -189,8 +197,19 @@ defmodule PowerModelWeb.GridLive.SystemMetrics do
     %{
       points: points,
       nominal_y: Float.round(@spark_h - (60.0 - lo) / span * @spark_h, 1),
-      stroke: spark_stroke(Enum.min(values))
+      stroke: spark_stroke(Enum.min(values)),
+      # UI-L16: the trace's accessible name. A polyline says nothing to a
+      # screen reader, and the two numbers it is drawn to communicate -- where
+      # the system is now and how far it dipped -- are exactly what the name
+      # has to carry.
+      label: spark_label(values)
     }
+  end
+
+  defp spark_label(values) do
+    now = :erlang.float_to_binary(List.last(values), decimals: 2)
+    low = :erlang.float_to_binary(Enum.min(values), decimals: 2)
+    "Frequency trace over #{length(values)} steps: now #{now} Hz, lowest #{low} Hz"
   end
 
   defp spark_stroke(min_hz) when min_hz >= 59.95, do: "#2ecc71"

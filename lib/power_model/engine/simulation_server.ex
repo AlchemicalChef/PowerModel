@@ -362,7 +362,9 @@ defmodule PowerModel.Engine.SimulationServer do
     }
 
     send(self(), :initial_solve)
-    broadcast(state.sim_id, "reset", %{})
+    # The epoch the session is now on: without it a screen taken after the
+    # reset compares against the pre-reset generation and reads as stale.
+    broadcast(state.sim_id, "reset", %{epoch: state.epoch})
     {:noreply, state}
   end
 
@@ -406,28 +408,39 @@ defmodule PowerModel.Engine.SimulationServer do
     # Run DC on final state
     state = %{state | cascade_state: final_cascade}
 
-    case solve_dc_from_cascade(state) do
-      {:ok, solution} ->
-        broadcast(state.sim_id, "dc_update", solution_payload(solution, state))
-        state = %{state | dc_solution: solution}
+    # The settled repaint. A failure here is not fatal to the session: the
+    # cascade itself completed, and the last successful solution stands as the
+    # map's flow classification.
+    state =
+      case solve_dc_from_cascade(state) do
+        {:ok, solution} ->
+          broadcast(state.sim_id, "dc_update", solution_payload(solution, state))
+          %{state | dc_solution: solution}
 
-        # UIW-4: the voltage picture comes from the cascade's own per-island
-        # AC solves, not from a second whole-grid FDPF. Sent BEFORE
-        # cascade_done so the terminal status the UI settles on is the
-        # cascade's, not "AC solved".
-        broadcast_voltage_overlay(state, step_results)
+        _ ->
+          state
+      end
 
-        broadcast(state.sim_id, "cascade_done", cascade_done_payload(step_results, final_cascade))
+    # UIW-4: the voltage picture comes from the cascade's own per-island AC
+    # solves, not from a second whole-grid FDPF. Sent BEFORE cascade_done so
+    # the terminal status the UI settles on is the cascade's, not "AC solved".
+    #
+    # UI-L15: and sent whether or not the repaint above succeeded. The
+    # cascade's converged per-island AC is independent of that final solve,
+    # and :solve_failed is exactly when the operator most needs the voltage
+    # picture -- suppressing it there withheld the one product still known to
+    # be trustworthy. The DC classification lists that ride along are then the
+    # last successful ones; with no successful solve at all there are no flow
+    # classes to preserve and the lists are legitimately absent.
+    broadcast_voltage_overlay(state, step_results)
 
-        {:reply, {:ok, step_results}, state}
+    broadcast(
+      state.sim_id,
+      "cascade_done",
+      cascade_done_payload(step_results, final_cascade, state)
+    )
 
-      _ ->
-        # Final repaint failed, but the cascade itself completed -- the UI
-        # must still leave its "cascading" state.
-        broadcast(state.sim_id, "cascade_done", cascade_done_payload(step_results, final_cascade))
-
-        {:reply, {:ok, step_results}, state}
-    end
+    {:reply, {:ok, step_results}, state}
   end
 
   @component_trip_types ~w(transmission_line transformer generator)
@@ -464,8 +477,17 @@ defmodule PowerModel.Engine.SimulationServer do
   #   :agc                 the final per-island secondary-control summaries,
   #                        read off the last step result so this module does
   #                        not re-derive what the cascade already published.
-  defp cascade_done_payload(step_results, final_cascade) do
+  #   :epoch               the server's topology generation AFTER this cascade.
+  #                        Bumped by every accepted trip and by `reset`, and
+  #                        stamped on `screening_snapshot/1` for exactly the
+  #                        same reason it is stamped here: an N-1 sweep, like
+  #                        an AC refinement, is a statement about the epoch it
+  #                        was computed at, and a consumer with no way to learn
+  #                        the current one can only present a pre-trip
+  #                        linearisation as current (UI-M20).
+  defp cascade_done_payload(step_results, final_cascade, state) do
     %{
+      epoch: state.epoch,
       steps: length(step_results),
       stable: final_cascade.stable,
       total_events: length(final_cascade.events),
@@ -593,7 +615,12 @@ defmodule PowerModel.Engine.SimulationServer do
   # solve covering a subset of islands may never speak for the grid, and this
   # channel covers whatever subset the cascade reached -- typically none of the
   # main island at real demand.
-  defp broadcast_voltage_overlay(state, step_results) do
+  #
+  # `state.dc_solution` is the LAST SUCCESSFUL solve, which is the whole point
+  # on the UI-L15 path: a failed post-cascade repaint leaves the previous
+  # classification standing and this overlay rides on it.
+  @doc false
+  def broadcast_voltage_overlay(state, step_results) do
     case voltage_overlay_payload(step_results) do
       nil ->
         :ok

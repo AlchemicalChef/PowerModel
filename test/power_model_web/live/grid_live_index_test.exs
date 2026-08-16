@@ -67,6 +67,36 @@ defmodule PowerModelWeb.GridLiveIndexTest do
     %{interconnection: ic, line: line}
   end
 
+  defp assigns(view), do: :sys.get_state(view.pid).socket.assigns
+
+  # Occupies the sim server's registry slot with a process that ACCEPTS the
+  # trip call and never replies, pinning the LiveView in its "cascade running"
+  # state for as long as the test needs. Reports each call back to the test so
+  # a SECOND injection is observable.
+  defp hang_sim_server(sim_id) do
+    test_pid = self()
+
+    spawn_link(fn ->
+      {:ok, _} = Registry.register(PowerModel.SimulationRegistry, sim_id, nil)
+      send(test_pid, :fake_server_up)
+      hang_loop(test_pid)
+    end)
+
+    assert_receive :fake_server_up
+    :ok
+  end
+
+  defp hang_loop(test_pid) do
+    receive do
+      {:"$gen_call", _from, {:trip_branch, id}} ->
+        send(test_pid, {:trip_call, id})
+        hang_loop(test_pid)
+
+      _other ->
+        hang_loop(test_pid)
+    end
+  end
+
   defp status(view) do
     view
     |> render()
@@ -141,6 +171,44 @@ defmodule PowerModelWeb.GridLiveIndexTest do
 
       render_hook(view, "scrub_timeline", %{"step" => "junk"})
       refute_push_event(view, "show_cascade_step", %{step: _})
+    end
+  end
+
+  describe "injection re-entrancy (UI-M22)" do
+    # The window this closes is the one where the FIRST cascade is still
+    # running, so the test pins the server inside the trip call rather than
+    # racing a two-bus cascade that settles in milliseconds.
+    test "a second click during a running cascade is ignored", %{conn: conn} do
+      %{line: line} = build_island("M22-Island", -104.0)
+      {:ok, view, _html} = live(conn, "/")
+
+      hang_sim_server(assigns(view).sim_id)
+
+      params = %{"type" => "transmission_line", "id" => Integer.to_string(line.id)}
+      render_hook(view, "inject_failure", params)
+
+      assert_receive {:trip_call, _id}, 5_000
+      assert assigns(view).cascade_active
+      assert status(view) == "solving"
+
+      # Double-click. The second injection used to start its own trip task,
+      # orphan the first monitor, and land {:error, :already_tripped} in the
+      # middle of the running cascade -- captioning it "Already tripped" and
+      # flipping cascade_active back to false, with the button offered again.
+      render_hook(view, "inject_failure", params)
+
+      refute_receive {:trip_call, _id}, 300
+      assert assigns(view).cascade_active, "the running cascade must not be cancelled"
+      assert status(view) == "solving"
+    end
+
+    test "a trip_rejected with no injection in flight is ignored", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+
+      send(view.pid, {:trip_rejected, :already_tripped, "transmission_line", 7})
+      _ = render(view)
+
+      assert status(view) == "idle", "a leftover rejection must not caption the current state"
     end
   end
 

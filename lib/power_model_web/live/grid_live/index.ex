@@ -66,9 +66,14 @@ defmodule PowerModelWeb.GridLive.Index do
       |> assign(:utilization, nil)
       |> assign(:sim_server, nil)
       |> assign(:server_scope, nil)
+      # UI-M20: the server's topology generation, learned from the payloads
+      # that carry it (cascade_done, reset). `nil` means "no information" --
+      # a fresh or restarted server, where an N-1 result has nothing to be
+      # stale against and the staleness flag alone governs.
+      |> assign(:sim_epoch, nil)
       |> assign(:trip_task, nil)
       |> assign(:reset_task, nil)
-      |> assign(:n1_task, nil)
+      |> assign_n1_task(:reset)
       |> assign_n1(:reset)
 
     {:ok, socket, layout: {PowerModelWeb.Layouts, :grid}}
@@ -117,35 +122,15 @@ defmodule PowerModelWeb.GridLive.Index do
 
   def handle_event("inject_failure", %{"type" => type, "id" => id}, socket)
       when type in ["transmission_line", "generator", "transformer"] do
-    # UI-H1: raw client id -- validate, ignore garbage instead of crashing
-    case parse_int(id) do
-      nil ->
-        {:noreply, socket}
-
-      component_id ->
-        # CAS-5 / UI-C3: a failed server start must surface as an error
-        # state, not an eternal spinner.
-        case ensure_sim_server_for(socket, {type, component_id}) do
-          {:ok, socket} ->
-            socket =
-              socket
-              |> assign(:cascade_active, true)
-              |> put_status(:solving)
-              # UI-M2: each injection is a new disturbance; the nadir
-              # tracking starts fresh at nominal frequency.
-              |> update(:system_metrics, &rearm_frequency/1)
-              # UIW-3: the LODF screen was computed for the pre-trip
-              # injection vector, so it is advisory the instant a component
-              # leaves the network.
-              |> assign(:n1_stale, true)
-              |> start_trip_task(type, component_id)
-
-            {:noreply, socket}
-
-          {:error, reason, socket} ->
-            Logger.error("simulation server start failed: #{inspect(reason)}")
-            {:noreply, fail_simulation(socket)}
-        end
+    # UI-M22: one injection at a time. A second click while the first cascade
+    # is still running orphaned the first trip's monitor, and the second call's
+    # {:error, :already_tripped} reply landed MID-CASCADE -- flipping
+    # cascade_active back to false and captioning a running cascade "Already
+    # tripped", with the inject button offered again on top of it.
+    if socket.assigns.cascade_active do
+      {:noreply, socket}
+    else
+      inject_failure(socket, type, id)
     end
   end
 
@@ -181,6 +166,10 @@ defmodule PowerModelWeb.GridLive.Index do
       |> assign(:selected_component, nil)
       |> put_status(:resetting)
       |> assign(:system_metrics, initial_metrics())
+      # UI-M20: an in-flight sweep must not repopulate the panel after the
+      # reset cleared it -- it is a linearisation about a network the user
+      # has just asked to be rebuilt.
+      |> assign_n1_task(:cancel)
       |> assign_n1(:reset)
       |> push_event("reset_grid", %{})
       |> push_event("deselect_highlight", %{})
@@ -209,15 +198,24 @@ defmodule PowerModelWeb.GridLive.Index do
   end
 
   def handle_event("run_n1_screening", _params, socket) do
-    send(self(), :run_n1_screening)
+    # UI-M23: one sweep at a time. Two fast clicks used to launch two full
+    # sweeps (240 s of national CPU each), orphan the first task's monitor,
+    # and let whichever finished last overwrite the other -- which can be the
+    # OLDER ranking. The button is disabled while `@screening`, so this only
+    # fires on a click that raced the re-render.
+    if socket.assigns.n1_screening or socket.assigns.n1_task do
+      {:noreply, socket}
+    else
+      send(self(), :run_n1_screening)
 
-    socket =
-      socket
-      |> assign(:n1_screening, true)
-      |> assign(:n1_error, false)
-      |> assign(:n1_hint, n1_hint(socket.assigns.interconnection))
+      socket =
+        socket
+        |> assign(:n1_screening, true)
+        |> assign(:n1_error, false)
+        |> assign(:n1_hint, n1_hint(socket.assigns.interconnection))
 
-    {:noreply, socket}
+      {:noreply, socket}
+    end
   end
 
   def handle_event("scrub_timeline", %{"step" => step}, socket) do
@@ -406,6 +404,7 @@ defmodule PowerModelWeb.GridLive.Index do
     socket =
       socket
       |> assign(:cascade_active, false)
+      |> track_sim_epoch(payload)
       |> put_status(status, note)
       |> update(:system_metrics, fn m ->
         m
@@ -423,12 +422,13 @@ defmodule PowerModelWeb.GridLive.Index do
     {:noreply, socket}
   end
 
-  def handle_info({:simulation_reset, _payload}, socket) do
+  def handle_info({:simulation_reset, payload}, socket) do
     socket =
       socket
       |> assign(:cascade_steps, [])
       |> assign_cascade_events(:reset)
       |> assign(:cascade_active, false)
+      |> track_sim_epoch(payload)
       |> put_status(:idle)
       |> assign(:system_metrics, initial_metrics())
       |> assign_n1(:reset)
@@ -440,42 +440,25 @@ defmodule PowerModelWeb.GridLive.Index do
   end
 
   def handle_info(:run_n1_screening, socket) do
-    sim_id = socket.assigns.sim_id
-    # self() inside the Task closure would be the Task's pid, not this LiveView
-    lv = self()
-    interconnection = socket.assigns.interconnection
-    hour = socket.assigns.selected_hour
-    budget = n1_budget_ms(interconnection)
-
-    # UI-M11: the screening task is monitored and deadlined -- a dead or hung
-    # task must never leave the button stuck at "Scanning...".
-    {:ok, task_pid} =
-      Task.start(fn ->
-        result =
-          try do
-            with {:ok, _pid} <- ensure_sim_server(sim_id, interconnection, hour) do
-              sim_id |> SimulationServer.screening_snapshot() |> screen_snapshot()
-            end
-          catch
-            :exit, reason -> {:error, reason}
-          end
-
-        send(lv, {:n1_screening_done, result})
-      end)
-
-    ref = Process.monitor(task_pid)
-    Process.send_after(self(), {:n1_screening_timeout, ref}, budget)
-
-    {:noreply, assign(socket, :n1_task, ref)}
+    # UI-M23: the second of two queued launches -- the first is already
+    # running, and spawning another would orphan its monitor.
+    if socket.assigns.n1_task do
+      {:noreply, socket}
+    else
+      launch_n1_screening(socket)
+    end
   end
 
   def handle_info({:trip_rejected, reason, _type, _id}, socket) do
-    socket =
-      socket
-      |> assign(:cascade_active, false)
-      |> put_status(reason)
-
-    {:noreply, socket}
+    # UI-M22: a rejection belongs to an injection this view is still waiting
+    # on. With no trip task in flight it is a leftover from a run that has
+    # already ended, and applying it would caption the current state with an
+    # old one's verdict.
+    if socket.assigns.trip_task do
+      {:noreply, socket |> assign(:cascade_active, false) |> put_status(reason)}
+    else
+      {:noreply, socket}
+    end
   end
 
   # CAS-5 / UI-C3: the trip task hit a server crash or unexpected error --
@@ -504,7 +487,7 @@ defmodule PowerModelWeb.GridLive.Index do
   end
 
   def handle_info({:n1_screening_done, result}, socket) do
-    socket = assign(socket, :n1_task, nil)
+    socket = assign_n1_task(socket, :reset)
 
     case result do
       {:ok, screen} ->
@@ -522,7 +505,7 @@ defmodule PowerModelWeb.GridLive.Index do
         "N-1 screening timed out after #{n1_budget_ms(socket.assigns.interconnection)}ms"
       )
 
-      {:noreply, socket |> assign(:n1_task, nil) |> assign_n1(:error)}
+      {:noreply, socket |> assign_n1_task(:cancel) |> assign_n1(:error)}
     else
       {:noreply, socket}
     end
@@ -554,7 +537,7 @@ defmodule PowerModelWeb.GridLive.Index do
         end
 
       socket.assigns.n1_task == ref ->
-        socket = assign(socket, :n1_task, nil)
+        socket = assign_n1_task(socket, :reset)
 
         if reason == :normal do
           {:noreply, socket}
@@ -571,6 +554,69 @@ defmodule PowerModelWeb.GridLive.Index do
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   # Private
+
+  defp inject_failure(socket, type, id) do
+    # UI-H1: raw client id -- validate, ignore garbage instead of crashing
+    case parse_int(id) do
+      nil ->
+        {:noreply, socket}
+
+      component_id ->
+        # CAS-5 / UI-C3: a failed server start must surface as an error
+        # state, not an eternal spinner.
+        case ensure_sim_server_for(socket, {type, component_id}) do
+          {:ok, socket} ->
+            socket =
+              socket
+              |> assign(:cascade_active, true)
+              |> put_status(:solving)
+              # UI-M2: each injection is a new disturbance; the nadir
+              # tracking starts fresh at nominal frequency.
+              |> update(:system_metrics, &rearm_frequency/1)
+              # UIW-3: the LODF screen was computed for the pre-trip
+              # injection vector, so it is advisory the instant a component
+              # leaves the network.
+              |> assign(:n1_stale, true)
+              |> start_trip_task(type, component_id)
+
+            {:noreply, socket}
+
+          {:error, reason, socket} ->
+            Logger.error("simulation server start failed: #{inspect(reason)}")
+            {:noreply, fail_simulation(socket)}
+        end
+    end
+  end
+
+  defp launch_n1_screening(socket) do
+    sim_id = socket.assigns.sim_id
+    # self() inside the Task closure would be the Task's pid, not this LiveView
+    lv = self()
+    interconnection = socket.assigns.interconnection
+    hour = socket.assigns.selected_hour
+    budget = n1_budget_ms(interconnection)
+
+    # UI-M11: the screening task is monitored and deadlined -- a dead or hung
+    # task must never leave the button stuck at "Scanning...".
+    {:ok, task_pid} =
+      Task.start(fn ->
+        result =
+          try do
+            with {:ok, _pid} <- ensure_sim_server(sim_id, interconnection, hour) do
+              sim_id |> SimulationServer.screening_snapshot() |> screen_snapshot()
+            end
+          catch
+            :exit, reason -> {:error, reason}
+          end
+
+        send(lv, {:n1_screening_done, result})
+      end)
+
+    ref = Process.monitor(task_pid)
+    deadline = Process.send_after(self(), {:n1_screening_timeout, ref}, budget)
+
+    {:noreply, assign_n1_task(socket, {:running, ref, task_pid, deadline})}
+  end
 
   # UI-H1: only "all" or a positive integer are meaningful interconnection
   # scopes; anything else (crafted URLs) falls back to "all" instead of
@@ -636,6 +682,11 @@ defmodule PowerModelWeb.GridLive.Index do
       hour: socket.assigns.selected_hour
     ]
 
+    # A newly started server counts from epoch zero, and this session has no
+    # way to know where an already-started one is -- either way the epochs it
+    # remembers belong to a different server (UI-M20).
+    socket = assign(socket, :sim_epoch, nil)
+
     case DynamicSupervisor.start_child(PowerModel.SimulationSupervisor, {SimulationServer, opts}) do
       {:ok, pid} ->
         {:ok, socket |> assign(:server_scope, scope) |> monitor_sim_server(pid)}
@@ -696,10 +747,16 @@ defmodule PowerModelWeb.GridLive.Index do
       socket
       |> assign(:sim_server, nil)
       |> assign(:server_scope, nil)
+      # The epoch counter belonged to the server that just died; the next one
+      # starts from zero and nothing may be compared across them.
+      |> assign(:sim_epoch, nil)
       |> assign(:cascade_steps, [])
       |> assign_cascade_events(:reset)
       |> assign(:cascade_active, false)
       |> assign(:system_metrics, initial_metrics())
+      # UI-M20: a sweep still running against the dead server's snapshot must
+      # not repopulate the panel the reset below just cleared.
+      |> assign_n1_task(:cancel)
       |> assign_n1(:reset)
       |> push_event("reset_grid", %{})
 
@@ -835,7 +892,13 @@ defmodule PowerModelWeb.GridLive.Index do
         # tuple has to come off here or the panel renders a two-element list.
         with {:ok, screen} <- result do
           {:ok,
-           Map.put(screen, :scope, %{
+           screen
+           # UI-M20: the topology generation this ranking describes. The
+           # session compares it with the epoch the engine has reached, so a
+           # sweep that reports after a trip is presented as advisory instead
+           # of as the current picture.
+           |> Map.put(:epoch, session[:epoch])
+           |> Map.put(:scope, %{
              # Dead islands count: an islanded fragment with no generator is
              # still part of the network the user is looking at, and leaving
              # it out of the denominator would overstate the coverage.
@@ -848,6 +911,56 @@ defmodule PowerModelWeb.GridLive.Index do
   end
 
   def screen_snapshot(_session), do: {:error, :no_snapshot}
+
+  # The in-flight sweep's three handles, moved together so none can be left
+  # behind: the monitor ref (also the deadline's identity), the task pid, and
+  # the deadline timer.
+  #
+  #   :reset   the task is gone or was never armed -- drop the handles.
+  #   :cancel  the task is still running and its answer is no longer wanted.
+  #            Killing it is safe: `screening_snapshot/1` is a read and the
+  #            sweep has no side effects on the server.
+  defp assign_n1_task(socket, mode) when mode in [:reset, :cancel] do
+    task_pid = socket.assigns[:n1_task_pid]
+
+    if ref = socket.assigns[:n1_task], do: Process.demonitor(ref, [:flush])
+    if timer = socket.assigns[:n1_deadline], do: Process.cancel_timer(timer)
+
+    socket =
+      socket
+      |> assign(:n1_task, nil)
+      |> assign(:n1_task_pid, nil)
+      |> assign(:n1_deadline, nil)
+
+    if mode == :cancel do
+      if task_pid, do: Process.exit(task_pid, :kill)
+      # The kill stops a result being SENT; a result already in this mailbox
+      # would still be delivered after the cancel and repopulate the panel the
+      # caller just cleared. Drop those too -- they rank a network that no
+      # longer exists (UI-M20).
+      flush_n1_results()
+      # Nothing is running and nothing will report: the button must not be
+      # left at "Scanning..." waiting for a result that was cancelled.
+      assign(socket, :n1_screening, false)
+    else
+      socket
+    end
+  end
+
+  defp assign_n1_task(socket, {:running, ref, pid, deadline}) do
+    socket
+    |> assign(:n1_task, ref)
+    |> assign(:n1_task_pid, pid)
+    |> assign(:n1_deadline, deadline)
+  end
+
+  defp flush_n1_results do
+    receive do
+      {:n1_screening_done, _result} -> flush_n1_results()
+    after
+      0 -> :ok
+    end
+  end
 
   defp assign_n1(socket, :reset) do
     socket
@@ -870,8 +983,38 @@ defmodule PowerModelWeb.GridLive.Index do
     |> assign(:n1_screening, false)
     |> assign(:n1_error, false)
     |> assign(:n1_result, screen)
-    |> assign(:n1_stale, false)
+    # UI-M20: this used to clear staleness unconditionally, so a sweep that
+    # reported AFTER a mid-sweep trip erased the advisory that trip had just
+    # raised -- presenting a pre-trip LODF linearisation as current. Both
+    # halves are needed: the flag catches an invalidation this view saw and
+    # the engine has not finished reporting, and the epoch catches a result
+    # whose snapshot predates a change the flag no longer remembers.
+    |> assign(
+      :n1_stale,
+      socket.assigns.n1_stale or screen_stale?(screen, socket.assigns.sim_epoch)
+    )
     |> assign(:n1_hint, nil)
+  end
+
+  # `<`, not `!=`: a sweep may legitimately be NEWER than the last epoch this
+  # view has been told about (the snapshot is taken inside the task, and
+  # `cascade_done` is what delivers the epoch). Only an older one is stale.
+  # Either side unknown means no claim -- a fresh or restarted server has no
+  # epoch history to compare against, and the flag alone governs there.
+  defp screen_stale?(%{epoch: screen_epoch}, sim_epoch)
+       when is_integer(screen_epoch) and is_integer(sim_epoch),
+       do: screen_epoch < sim_epoch
+
+  defp screen_stale?(_screen, _sim_epoch), do: false
+
+  # UI-M20: the engine's topology generation, as reported by the payloads that
+  # carry it. A payload from a server that predates the field leaves the last
+  # known value alone rather than blanking it -- absence is no information.
+  defp track_sim_epoch(socket, payload) do
+    case payload[:epoch] do
+      epoch when is_integer(epoch) -> assign(socket, :sim_epoch, epoch)
+      _ -> socket
+    end
   end
 
   # UI-M3: only component trips count toward the Tripped metric
@@ -1038,7 +1181,13 @@ defmodule PowerModelWeb.GridLive.Index do
       [] -> :ok
     end
 
-    assign(socket, :server_scope, nil)
+    # A sweep still running against the server being torn down would come back
+    # as a :noproc error and put the panel in its failure state for what is an
+    # ordinary hour change (UI-M20).
+    socket
+    |> assign_n1_task(:cancel)
+    |> assign(:sim_epoch, nil)
+    |> assign(:server_scope, nil)
   end
 
   defp resolve_interconnection({"transmission_line", line_id}) do
@@ -1343,11 +1492,22 @@ defmodule PowerModelWeb.GridLive.Index do
         <button phx-click="util_peak_day" class="util-peak-btn">Peak day</button>
       </div>
 
+      <%!-- UI-L16: the stats below carry the same numbers in text, but the
+            chart itself still needs a name rather than announcing as a bare
+            graphic. --%>
       <svg
         viewBox={"0 0 #{chart_w()} #{chart_h()}"}
         class="util-chart"
         preserveAspectRatio="xMidYMid meet"
+        role="img"
+        aria-labelledby="util-chart-title"
       >
+        <title id="util-chart-title">
+          Hourly demand against modeled capacity per interconnection, {Calendar.strftime(
+            @utilization.date,
+            "%b %d %Y"
+          )} UTC
+        </title>
         <%!-- horizontal gridlines at quarter intervals --%>
         <%= for frac <- [0.25, 0.5, 0.75, 1.0] do %>
           <line
@@ -1523,6 +1683,7 @@ defmodule PowerModelWeb.GridLive.Index do
     socket
     |> assign(:cascade_events, [])
     |> assign(:cascade_event_total, 0)
+    |> assign(:cascade_events_omitted, 0)
   end
 
   defp assign_cascade_events(socket, {:step, payload}) do
@@ -1541,8 +1702,18 @@ defmodule PowerModelWeb.GridLive.Index do
     # the former (UI-2's contract note).
     total = socket.assigns.cascade_event_total + (payload[:trip_count] || length(trips))
 
+    # UI-L17: the server itemises at most 200 non-shed events per step
+    # (`panel_trips/2`) and reports how many it withheld. That number was
+    # computed, shipped and read by nothing, so the cap was invisible: the
+    # feed's shortfall against the total read as a scroll limit when part of
+    # it is data the browser never received. The cap reserves a slot for the
+    # first event of every CAUSE, so no mechanism is hidden -- only further
+    # instances of causes already shown.
+    omitted = socket.assigns.cascade_events_omitted + (payload[:trips_omitted] || 0)
+
     socket
     |> assign(:cascade_events, feed)
     |> assign(:cascade_event_total, total)
+    |> assign(:cascade_events_omitted, omitted)
   end
 end

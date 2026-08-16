@@ -133,8 +133,15 @@
   color: #ccc;
 }
 
-.timeline-step:hover {
+.timeline-step:hover:not(:disabled) {
   background: rgba(70, 70, 100, 0.8);
+}
+
+/* UI-M19: the timeline is not scrubbable while the cascade is still running
+   — the client refuses the rewind, so the control must not look clickable. */
+.timeline-step:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 
 .timeline-step.active {
@@ -443,6 +450,9 @@
 .cause-badge { font-size: 9px; padding: 1px 6px; border-radius: 3px; background: rgba(100, 100, 120, 0.3); color: #aaa; text-transform: uppercase; letter-spacing: 0.3px; }
 .affected-step { font-size: 9px; color: #666; }
 .affected-overflow { text-align: center; padding: 8px; color: #666; font-size: 11px; }
+/* UI-L17: events the server never sent (the per-step itemisation cap), as
+   distinct from older events still reachable by scrolling. */
+.affected-omitted { color: #8a7a4a; }
 
 /* Failure Controls Panel */
 .failure-controls {

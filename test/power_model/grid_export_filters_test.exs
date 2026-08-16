@@ -175,6 +175,105 @@ defmodule PowerModel.GridExportFiltersTest do
     end
   end
 
+  # UI-M18: the tag is only useful if its counts are the counts the export
+  # would actually write. They share the queries' predicates rather than
+  # restating them, and this pins that they still agree on a fixture built to
+  # exercise every export filter.
+  describe "Grid.export_signature/0" do
+    test "each count equals what the matching export query returns",
+         %{ic: ic, b1: b1, b2: b2} do
+      ghost = Repo.insert!(%Bus{bus_type: 1, base_kv: 138.0, interconnection_id: ic.id})
+      unmapped = insert_bus(nil, -91.0, 36.0)
+
+      # In the export
+      Repo.insert!(%TransmissionLine{
+        voltage_kv: 138.0,
+        from_bus_id: b1.id,
+        to_bus_id: b2.id,
+        x_pu: 0.1,
+        status: "in_service"
+      })
+
+      Repo.insert!(%Generator{
+        p_max_mw: 100.0,
+        bus_id: b1.id,
+        status: "in_service",
+        coordinates: point(-90.0, 35.0)
+      })
+
+      Repo.insert!(%Load{p_mw: 40.0, q_mvar: 10.0, bus_id: b1.id, status: "in_service"})
+
+      Repo.insert!(%Transformer{
+        from_bus_id: b1.id,
+        to_bus_id: b2.id,
+        rated_mva: 300.0,
+        x_pu: 0.08,
+        status: "in_service"
+      })
+
+      Repo.insert!(%Substation{
+        name: "Sig",
+        status: "in_service",
+        coordinates: point(-90.0, 35.0)
+      })
+
+      Repo.insert!(%Datacenter{
+        name: "SigDC",
+        facility_type: "colocation",
+        power_mw: 5.0,
+        coordinates: point(-90.0, 35.0),
+        status: "active",
+        bus_id: b1.id
+      })
+
+      # Filtered OUT by one predicate each: no coordinates, no
+      # interconnection, out of service, self-loop.
+      Repo.insert!(%TransmissionLine{
+        voltage_kv: 138.0,
+        from_bus_id: b1.id,
+        to_bus_id: ghost.id,
+        x_pu: 0.1,
+        status: "in_service"
+      })
+
+      Repo.insert!(%TransmissionLine{
+        voltage_kv: 138.0,
+        from_bus_id: unmapped.id,
+        to_bus_id: b2.id,
+        x_pu: 0.1,
+        status: "in_service"
+      })
+
+      Repo.insert!(%TransmissionLine{
+        voltage_kv: 138.0,
+        from_bus_id: b1.id,
+        to_bus_id: b1.id,
+        x_pu: 0.1,
+        status: "in_service"
+      })
+
+      Repo.insert!(%Generator{p_max_mw: 50.0, bus_id: b1.id, status: "retired"})
+      Repo.insert!(%Load{p_mw: 5.0, q_mvar: 1.0, bus_id: ghost.id, status: "in_service"})
+      Repo.insert!(%Substation{name: "NoCoords", status: "in_service"})
+
+      counts = Grid.export_signature().counts
+
+      assert counts.transmission_lines == length(Grid.export_transmission_lines())
+      assert counts.generators == length(Grid.export_generators())
+      assert counts.substations == length(Grid.export_substations())
+      assert counts.transformers == length(Grid.export_transformers())
+      assert counts.bus_loads == length(Grid.export_bus_loads())
+      assert counts.water_facilities == length(Grid.export_water_facilities())
+      assert counts.datacenters == length(Grid.export_datacenters())
+
+      # Not a vacuous agreement: the filters really did drop rows.
+      assert counts.transmission_lines == 1
+      assert counts.generators == 1
+      assert counts.substations == 1
+      assert counts.bus_loads == 1
+    end
+  end
+
   describe "GridExport.ensure_exported/1 (DAT-7)" do
     setup %{b1: b1, b2: b2} do
       Repo.insert!(%TransmissionLine{
@@ -206,14 +305,85 @@ defmodule PowerModel.GridExportFiltersTest do
       assert count == 1
     end
 
-    test "leaves a populated export alone", %{dir: dir} do
+    test "leaves a populated, current export alone", %{dir: dir} do
       marker = <<7::unsigned-little-32, 1, 2, 3>>
       File.write!(Path.join(dir, "transmission.bin"), marker)
       File.write!(Path.join(dir, "bus_loads.bin"), <<"BLD", 2, 0::unsigned-little-32>>)
+      # UI-M18: the marker files stand in for a real export, so they need a
+      # real content tag. Writing one is the honest way to say "this export
+      # matches the database" -- the alternative, letting untagged files pass,
+      # would disable the check this test now shares a module with.
+      GridExport.write_manifest(dir)
 
       GridExport.ensure_exported(dir)
 
       assert File.read!(Path.join(dir, "transmission.bin")) == marker
+    end
+
+    test "an untagged export is regenerated once, then left alone", %{dir: dir} do
+      File.write!(Path.join(dir, "transmission.bin"), <<7::unsigned-little-32, 1, 2, 3>>)
+      File.write!(Path.join(dir, "bus_loads.bin"), <<"BLD", 2, 0::unsigned-little-32>>)
+
+      GridExport.ensure_exported(dir)
+      assert File.exists?(Path.join(dir, "manifest.bin"))
+
+      # And the fresh export certifies itself: a second boot is a no-op, not
+      # a rebuild loop.
+      marker = <<9::unsigned-little-32, 4, 5, 6>>
+      File.write!(Path.join(dir, "transmission.bin"), marker)
+      GridExport.ensure_exported(dir)
+
+      assert File.read!(Path.join(dir, "transmission.bin")) == marker
+    end
+
+    # UI-M18: the check used to see FORMAT only, so a re-ingest left the map
+    # serving the previous topology indefinitely.
+    test "regenerates when a row enters the exported set", %{dir: dir, b1: b1, b2: b2} do
+      GridExport.run(dir)
+      marker = <<7::unsigned-little-32, 1, 2, 3>>
+      File.write!(Path.join(dir, "transmission.bin"), marker)
+
+      Repo.insert!(%TransmissionLine{
+        voltage_kv: 230.0,
+        from_bus_id: b2.id,
+        to_bus_id: b1.id,
+        x_pu: 0.2,
+        geometry: %Geo.LineString{coordinates: [{-89.9, 35.1}, {-90.0, 35.0}], srid: 4326},
+        status: "in_service"
+      })
+
+      GridExport.ensure_exported(dir)
+
+      assert <<count::unsigned-little-32, _::binary>> =
+               File.read!(Path.join(dir, "transmission.bin"))
+
+      assert count == 2, "the new line reached the map"
+    end
+
+    # The counts alone cannot see this: the row stays in the export and only
+    # its VALUES changed, which is what a demand reallocation looks like.
+    test "regenerates when an exported row changes in place", %{dir: dir, b1: b1} do
+      load = Repo.insert!(%Load{p_mw: 40.0, q_mvar: 10.0, bus_id: b1.id, status: "in_service"})
+
+      GridExport.run(dir)
+      marker = <<7::unsigned-little-32, 1, 2, 3>>
+      File.write!(Path.join(dir, "transmission.bin"), marker)
+
+      Repo.update_all(
+        from(l in Load, where: l.id == ^load.id),
+        set: [p_mw: 95.0, updated_at: NaiveDateTime.add(load.updated_at, 60, :second)]
+      )
+
+      GridExport.ensure_exported(dir)
+
+      refute File.read!(Path.join(dir, "transmission.bin")) == marker,
+             "an in-place edit to an exported value must move the content tag"
+
+      assert <<"BLD", 2, 1::unsigned-little-32, _bus::unsigned-little-32, _lon::float-little-32,
+               _lat::float-little-32, mw::float-little-32>> =
+               File.read!(Path.join(dir, "bus_loads.bin"))
+
+      assert_in_delta mw, 95.0, 1.0e-4
     end
 
     # UIW-2: a bus_loads.bin from before the bus-id layout parses as garbage

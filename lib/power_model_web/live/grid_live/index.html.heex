@@ -76,7 +76,16 @@
       </form>
     <% end %>
 
-    <div class="solver-badge" id="solver-badge" data-status={@solver_status}>
+    <%!-- UI-L16: the badge is the only place a solver/cascade state
+         transition is reported, and every one of them (Collapsed, step
+         budget, solve failed) was silent to a screen reader. --%>
+    <div
+      class="solver-badge"
+      id="solver-badge"
+      data-status={@solver_status}
+      role="status"
+      aria-live="polite"
+    >
       <span class={"status-dot " <> solver_status_class(@solver_status)}></span>
       <span>{solver_status_text(@solver_status)}</span>
       <%!-- The caveat the headline could not carry: a collapse that was cut
@@ -126,6 +135,7 @@
       id="affected-list"
       events={@cascade_events}
       total={@cascade_event_total}
+      omitted={@cascade_events_omitted}
     />
   <% end %>
 

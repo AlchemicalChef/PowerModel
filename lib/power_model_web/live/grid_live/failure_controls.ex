@@ -81,15 +81,20 @@ defmodule PowerModelWeb.GridLive.FailureControls do
           <p :if={@screening and @hint} class="control-hint n1-hint" id="n1-screen-hint">{@hint}</p>
         </div>
 
+        <%!-- UI-L16: a failed sweep and a ranking gone advisory are both
+              statements the reader has to act on, so they are alerts; the
+              result itself is a polite status. The banner keeps its own live
+              region because it appears and disappears independently of the
+              result around it (a trip flips it while the ranking stands). --%>
         <%= if @screen_error do %>
-          <div class="violation-summary" id="n1-screen-error">
+          <div class="violation-summary" id="n1-screen-error" role="alert">
             <span class="violation-text">Screening failed — run again</span>
           </div>
         <% end %>
 
         <%= if @screen do %>
-          <div class="n1-result" id="n1-result">
-            <div :if={@stale} class="n1-stale" id="n1-stale-banner">
+          <div class="n1-result" id="n1-result" role="status" aria-live="polite">
+            <div :if={@stale} class="n1-stale" id="n1-stale-banner" role="alert">
               Advisory — the network changed since this screen. Re-run.
             </div>
 

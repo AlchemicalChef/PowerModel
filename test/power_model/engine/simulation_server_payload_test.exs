@@ -242,6 +242,61 @@ defmodule PowerModel.Engine.SimulationServerPayloadTest do
     end
   end
 
+  # UI-L15: the overlay used to be broadcast only from the SUCCESS branch of
+  # the post-cascade DC solve, so :solve_failed -- the state in which the
+  # operator most needs the voltage picture -- suppressed it entirely. The
+  # cascade's per-island AC is independent of that final solve.
+  describe "UI-L15: the overlay survives a failed post-cascade solve" do
+    setup do
+      sim_id = "overlay_test_#{System.unique_integer([:positive])}"
+      Phoenix.PubSub.subscribe(PowerModel.PubSub, "simulation:#{sim_id}")
+      %{sim_id: sim_id, steps: [overlay_step(1, [island(1, %{1 => 0.82}, [1], [])])]}
+    end
+
+    test "with no successful solve behind it, the overlay still goes out",
+         %{sim_id: sim_id, steps: steps} do
+      state = %SimulationServer{sim_id: sim_id, dc_solution: nil, base_mva: 100.0}
+
+      SimulationServer.broadcast_voltage_overlay(state, steps)
+
+      assert_receive {:simulation_ac_update, payload}, 1_000
+      assert payload.partial_ac == true
+      assert payload.ac_overlay.island_count == 1
+
+      # No solve has ever succeeded, so there are no flow classes to preserve;
+      # the client's DC painter clears what it has and applies nothing.
+      refute Map.has_key?(payload, :overloaded_line_ids)
+    end
+
+    test "the classification lists ride along from the LAST successful solve",
+         %{sim_id: sim_id, steps: steps} do
+      previous = %PowerModel.Solver.Solution{
+        converged: true,
+        iterations: 3,
+        max_mismatch: 1.0e-8,
+        line_flows: %{{:line, 7} => %{loading_pct: 140.0}},
+        total_gen_mw: 100.0,
+        total_load_mw: 100.0,
+        total_loss_mw: 0.0
+      }
+
+      state = %SimulationServer{
+        sim_id: sim_id,
+        dc_solution: previous,
+        base_mva: 100.0,
+        base_line_categories: %{},
+        base_line_loading: %{}
+      }
+
+      SimulationServer.broadcast_voltage_overlay(state, steps)
+
+      assert_receive {:simulation_ac_update, payload}, 1_000
+      assert payload.ac_overlay.island_count == 1
+      assert payload.overloaded_line_ids == [7], "the previous classification is preserved"
+      assert payload.line_loading == %{7 => 140.0}
+    end
+  end
+
   describe "shed_bus_ids/2" do
     test "resolves shed loads to their buses, deduplicated" do
       # Three loads, two of them on the same bus: the map paints buses, so the

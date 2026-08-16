@@ -53,8 +53,17 @@ defmodule PowerModelWeb.GridLive.AffectedList do
           </div>
         </div>
 
+        <%!-- UI-L17: the shortfall between the feed and the total is two
+              different things, and reading the second as the first is the
+              mistake worth preventing. Most of it is older events, still in
+              the session and reachable by scrolling. The `omitted` part is
+              events the server never sent at all -- the 200-per-step
+              itemisation cap -- so no amount of scrolling reaches them. The
+              cap reserves a slot for the first event of every cause, so
+              every mechanism that fired is still represented. --%>
         <div :if={@total > visible()} class="affected-overflow">
-          + {@total - visible()} more
+          + {@total - visible()} more<span :if={@omitted > 0} class="affected-omitted">
+            · {@omitted} not itemised</span>
         </div>
       </div>
     </div>
