@@ -224,6 +224,27 @@ L ≈ multi-week.
 >   share zero entries with a balanced control). Needs a dispatch-side fix
 >   before Eastern screening numbers mean anything.
 
+> **STATUS 2026-08-16: Wave 3a LANDED** (voltage ride-through + AGC, both mined
+> from the absorbed pre-reset history and standards-verified rather than
+> copied). Measured:
+> - **PRC-024 voltage envelopes** (cumulative band timers per the standard's own
+>   Curve Details — opposite of UVLS drop-out semantics) + **IEEE 1547 BTM
+>   voltage trips** (the actual Blue Cut mechanism; 2003 legacy vs 2018 Cat III
+>   modern, cause-tagged into the conservation identity's btm_tripped term) +
+>   **GFL current-ceiling derate** (min(1, V·1.2/P_set), knee derived not set).
+>   Voltage state is intensive: splits conserve timers exactly.
+> - **AGC closed-loop secondary** (controls/agc.ex, Cohn B = β from the machine
+>   table): ERCOT N-1 now RESTORES 60.00 Hz in 1.8 min (BAL-002 allows 15) and
+>   releases all 1,037.7 MW of governor deployment — primary reserve
+>   replenished, which the open-loop clock tier never gave back. AGC dispatched
+>   1,376.1 MW vs the 1,375 MW trip. β gate pinned to keep measuring the
+>   open-loop model (with-AGC β doubles to 620 as secondary MW enters the value
+>   window — in band, but a different quantity).
+> - Wave 3b (cascade wiring) contracts settled: BTM-voltage-trips-then-UVLS
+>   ordering; mark_tripped guard between the two Blue Cut halves; AGC owns the
+>   secondary tier island-wide, redispatch keeps tertiary; protection layers
+>   read FDPF voltages only, never DC.
+
 > **Salvage note (2026-08-15):** the absorbed pre-reset history (tip `159e900`,
 > retrievable via `git show 159e900:<path>` — do NOT use `origin/master`, which
 > now points at current work; the richer harmonics-era `lib.rs` is blob
