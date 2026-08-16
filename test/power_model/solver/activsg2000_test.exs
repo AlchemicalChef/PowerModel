@@ -27,10 +27,15 @@ defmodule PowerModel.Solver.ACTIVSg2000Test do
   `:complementary` policy (release when the voltage says the limit should not
   bind, with a latch bounding type changes) satisfies complementarity at all
   392 generator buses and lands on a DIFFERENT, defensible fixed point —
-  losses 0.335% off the reference and bus 1070 at its setpoint. Under
+  losses 0.308% off the reference and bus 1070 at its setpoint. Under
   `:matpower` we reproduce the reference's release rule: 191 of 195 switched
-  buses agree bus-for-bus, losses land at 0.0151% and angles at 3.3e-3 rad,
+  buses agree bus-for-bus, losses land at 0.0134% and angles at 3.4e-3 rad,
   inside the IEEE-14/118 contract values, unrelaxed.
+
+  (Both loss figures improved slightly — 0.335% and 0.0151% before — when the
+  reactance floor dropped to 1.0e-5 and stopped inflating three of this case's
+  branches. The switching SET is unchanged: 195 buses demoted under either
+  floor, same buses.)
 
   The Vm contract of 0.5% cannot hold, for a second, narrower rule difference
   (traced 2026-08-15): MATPOWER and PYPOWER enforce reactive limits PER
@@ -40,7 +45,7 @@ defmodule PowerModel.Solver.ACTIVSg2000Test do
   bus sits 1.06% below its setpoint. This solver enforces the aggregate
   station limit, which is what an actual plant controller does. The
   consequence is local and measured: 34 of 2000 buses exceed 0.5%, worst
-  1.0707% at bus 4126 (a load bus two hops from 4192), mean 0.0602%, decaying
+  1.0707% at bus 4126 (a load bus two hops from 4192), mean 0.0587%, decaying
   monotonically with distance from the seven multi-generator buses where the
   rules differ. The Vm test below asserts that shape rather than a blanket
   tolerance; `fdpf_test.exs` asserts the complementarity property the
@@ -325,8 +330,10 @@ defmodule PowerModel.Solver.ACTIVSg2000Test do
       # moduledoc. Asserting the SHAPE of the known rule-difference residual
       # (worst / mean / count over #{@vm_tolerance_pct}%) regresses harder than
       # one tolerance: a Y-bus or injection bug moves the mean, a switching
-      # regression moves the count. Measured 2026-08-15: worst 1.0707% at bus
-      # 4126, mean 0.0602%, 34 of 2000 over 0.5%. The structural direction
+      # regression moves the count. Measured 2026-08-16 at the 1.0e-5 reactance
+      # floor: worst 1.0707% at bus 4126, mean 0.0587%, 34 of 2000 over 0.5%
+      # (the worst bus and the count are identical at the old 1.0e-3 floor;
+      # only the mean moved, 0.0602% -> 0.0587%). The structural direction
       # assertions (reference-only switches are all multi-generator buses)
       # live in fdpf_test.exs.
       pcts =

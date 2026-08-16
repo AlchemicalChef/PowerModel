@@ -454,10 +454,16 @@ defmodule PowerModel.Solver.FDPFTest do
       # voltages carry its own residue (smallest genuine switch, bus 5444, is
       # only 2.3e-4 pu off), so it does need one.
       #
-      # Applying our tolerance to both sides made the comparison a knife edge:
-      # bus 6257 sits 9.7e-5 pu off setpoint here and 2.9e-4 in the reference,
-      # and a modeling change as small as un-flooring three branch reactances
-      # was enough to move it across a 1.0e-4 cut and change these counts.
+      # Applying our tolerance to both sides made the comparison a knife edge.
+      # Bus 6257 sits 9.7e-5 pu off setpoint here and 2.9e-4 in the reference.
+      # MEASURED against the old 1.0e-3 reactance floor: the floor moved that
+      # bus by 6.3e-6 pu, from 1.035e-4 to 9.7e-5 — across a 1.0e-4 cut it was
+      # already sitting 3% above. Under the exact test the demoted SET is
+      # bit-identical at both floors (195 buses, empty symmetric difference);
+      # only the 1.0e-4 measurement of it changed. Re-baselining the counts
+      # would have recorded a measurement artifact as a switching result, and
+      # would have put a single-generator bus into `ref_only`, contradicting
+      # the multi-generator property the next test exists to assert.
       demoted? = fn vm, id -> vm != Map.fetch!(setpoints, id) end
       off? = fn vm, id -> abs(vm - Map.fetch!(setpoints, id)) > 1.0e-4 end
 
@@ -534,10 +540,16 @@ defmodule PowerModel.Solver.FDPFTest do
       # voltages carry its own residue (smallest genuine switch, bus 5444, is
       # only 2.3e-4 pu off), so it does need one.
       #
-      # Applying our tolerance to both sides made the comparison a knife edge:
-      # bus 6257 sits 9.7e-5 pu off setpoint here and 2.9e-4 in the reference,
-      # and a modeling change as small as un-flooring three branch reactances
-      # was enough to move it across a 1.0e-4 cut and change these counts.
+      # Applying our tolerance to both sides made the comparison a knife edge.
+      # Bus 6257 sits 9.7e-5 pu off setpoint here and 2.9e-4 in the reference.
+      # MEASURED against the old 1.0e-3 reactance floor: the floor moved that
+      # bus by 6.3e-6 pu, from 1.035e-4 to 9.7e-5 — across a 1.0e-4 cut it was
+      # already sitting 3% above. Under the exact test the demoted SET is
+      # bit-identical at both floors (195 buses, empty symmetric difference);
+      # only the 1.0e-4 measurement of it changed. Re-baselining the counts
+      # would have recorded a measurement artifact as a switching result, and
+      # would have put a single-generator bus into `ref_only`, contradicting
+      # the multi-generator property the next test exists to assert.
       demoted? = fn vm, id -> vm != Map.fetch!(setpoints, id) end
       off? = fn vm, id -> abs(vm - Map.fetch!(setpoints, id)) > 1.0e-4 end
 
