@@ -167,6 +167,30 @@ defmodule PowerModel.Failure.Cascade do
   moving. An island parked at 59.35 Hz will not eventually trip its fleet the
   way PRC-024 says it should. Closing that means a notion of time passing with
   nothing happening, which this cascade does not have.
+
+  ## What a step result carries
+
+  Each element of the list `run_cascade/2` returns (and each value handed to
+  its callback) is a map with `step`, `simulated_time`, `islands`, `trips`,
+  `water_facility_ids`, `datacenter_ids`, `solution`, `balance` and
+  `voltage_layer`, plus four keys describing the state the step left the
+  system in:
+
+    * `frequency` — `%{f_hz:, nadir_hz:}`. `f_hz` is the island frequencies
+      weighted by the load each island is actually carrying; `nadir_hz` is the
+      worst frequency any island reached in this cascade event. Reporting the
+      nadir as the current frequency is a specific and tempting bug: a settled
+      cascade IS back at 60.00 Hz, and the dip is what it shed on the way.
+    * `agc` — one `PowerModel.Controls.AGC.summary/1` per island that has a
+      secondary controller, each tagged with `island_id` (the island's lowest
+      bus id). Islands without a controller are omitted.
+    * `voltage_overlay` — the AC voltage products of the islands whose FDPF
+      solve CONVERGED, and nothing about the islands whose did not. This
+      channel is structurally partial (`nil` is the common case at real
+      demand — see "The voltage layer") and must never be merged into a
+      whole-grid metric or averaged with DC results.
+    * `termination` — `nil` while the cascade is still running, and on the
+      final step the reason it stopped. See `termination/1`.
   """
 
   require Logger
@@ -232,6 +256,13 @@ defmodule PowerModel.Failure.Cascade do
   @voltage_alarm_low_pu 0.85
   @voltage_alarm_high_pu 1.15
 
+  # The band the OVERLAY reports a bus as violating in, which is the operator
+  # display band and deliberately tighter than the alarm band above: the alarm
+  # exists to raise one event per island when things are badly wrong, the
+  # overlay exists to colour every bus a converged island has a voltage for.
+  @overlay_undervoltage_pu 0.9
+  @overlay_overvoltage_pu 1.1
+
   defstruct [
     :buses,
     :lines,
@@ -265,6 +296,18 @@ defmodule PowerModel.Failure.Cascade do
     :btm_by_bus,
     :btm_tripped_buses,
     :btm_tripped_mw,
+    # Why this cascade STOPPED, machine-readable, and `nil` while it is still
+    # running: `:settled` (nothing left to trip), `:budget_exhausted` (the
+    # @max_steps clause — a TRUNCATED run, never a settled equilibrium) or
+    # `:solve_failed` (an island's numerical solve failed and the run is
+    # terminal). Callers presenting a final state must distinguish these:
+    # `stable: false` alone cannot tell a collapse from a truncation.
+    :termination,
+    # Worst instantaneous frequency any island has reached in THIS cascade
+    # event, in Hz. Rebased at each manual trip to where the system already
+    # sits (see `begin_cascade_event/1`), so it can never read above the
+    # current frequency.
+    frequency_nadir_hz: @nominal_frequency_hz,
     relay_duty: %{},
     # One record per island of the CURRENT topology — see `island_record/0`.
     island_states: [],
@@ -397,7 +440,9 @@ defmodule PowerModel.Failure.Cascade do
       primary_reserve: %{},
       conductor_state: %{},
       conductor_at_s: 0.0,
-      voltage_layer: fresh_voltage_layer()
+      voltage_layer: fresh_voltage_layer(),
+      termination: nil,
+      frequency_nadir_hz: @nominal_frequency_hz
     }
   end
 
@@ -1019,8 +1064,22 @@ defmodule PowerModel.Failure.Cascade do
         simulated_time: 0.0,
         relay_duty: %{},
         stable: false,
+        termination: nil,
+        frequency_nadir_hz: current_frequency_floor_hz(records),
         island_states: records
     }
+  end
+
+  # The nadir is a per-cascade-event quantity, but the islands' frequency state
+  # is NOT: an island already sitting at 59.5 Hz keeps sitting there across a
+  # new manual trip. Rebasing to where the system already is (rather than to
+  # 60.0) keeps the reported nadir from ever reading ABOVE the frequency the
+  # same payload reports as current.
+  defp current_frequency_floor_hz(records) do
+    records
+    |> Enum.map(&island_frequency_hz/1)
+    |> Enum.min(fn -> @nominal_frequency_hz end)
+    |> min(@nominal_frequency_hz)
   end
 
   @doc """
@@ -1032,6 +1091,29 @@ defmodule PowerModel.Failure.Cascade do
     log_voltage_layer(state)
     {state, step_results}
   end
+
+  @doc """
+  Why the cascade stopped, as an atom. Always non-`nil` on a state returned by
+  `run_cascade/2` (and therefore by `trip_line/2`, `trip_transformer/2` and
+  `trip_generator/2` whenever they accepted the trip).
+
+    * `:settled` — a step produced no trips of any kind. This is the only
+      value that means the final state is an equilibrium.
+    * `:budget_exhausted` — the per-cascade `@max_steps` budget ran out with
+      trips still pending. The run is TRUNCATED: whatever it was doing, it was
+      still doing it. Presenting this as a settled collapse is the false-10x
+      hazard the step budget's kill-switch note warns about.
+    * `:solve_failed` — an island's power flow failed numerically and the run
+      is terminal. Nothing downstream of the failed solve is trustworthy.
+
+  `stable` alone cannot distinguish the last two: both leave it `false`.
+
+  The same value is on the last element of the step-result list (each earlier
+  step carries `nil`, meaning "still running"), so a consumer that only sees
+  the stream can read it there.
+  """
+  @spec termination(%__MODULE__{}) :: :settled | :budget_exhausted | :solve_failed | nil
+  def termination(%__MODULE__{termination: cause}), do: cause
 
   # ONE line per cascade, never one per island per step. A national snapshot
   # runs thousands of island-solves in a single cascade and OTP's logger
@@ -1234,8 +1316,17 @@ defmodule PowerModel.Failure.Cascade do
       details: %{max_steps: @max_steps, simulated_time: state.simulated_time}
     }
 
-    {%{state | stable: false, events: [exhausted_event | state.events]},
-     Enum.reverse(step_results)}
+    # The budget clause emits no step of its own — it fires INSTEAD of a step —
+    # so the run's last step is stamped with the reason on the way out. Without
+    # this the returned stream ends on a step still saying `termination: nil`
+    # and a consumer watching only the stream could never tell a truncated run
+    # from one still in flight.
+    {%{
+       state
+       | stable: false,
+         termination: :budget_exhausted,
+         events: [exhausted_event | state.events]
+     }, step_results |> stamp_termination(:budget_exhausted) |> Enum.reverse()}
   end
 
   defp do_cascade(state, step_results, callback) do
@@ -1278,7 +1369,8 @@ defmodule PowerModel.Failure.Cascade do
         btm_trip_breakdown: btm.breakdown,
         conductor_state: island_step.conductor,
         conductor_at_s: state.simulated_time,
-        voltage_layer: island_step.voltage_layer
+        voltage_layer: island_step.voltage_layer,
+        frequency_nadir_hz: min(state.frequency_nadir_hz, step_nadir_hz(island_step.records))
     }
 
     # Facilities on dead-island buses lose power (water + datacenters)
@@ -1322,17 +1414,21 @@ defmodule PowerModel.Failure.Cascade do
           affected_datacenters: MapSet.union(state.affected_datacenters, newly_affected_dcs)
       }
 
-      step_result = %{
-        step: state.step,
-        simulated_time: state.simulated_time,
-        islands: length(islands),
-        trips: facility_trips,
-        water_facility_ids: MapSet.to_list(state.affected_water_facilities),
-        datacenter_ids: MapSet.to_list(state.affected_datacenters),
-        solution: island_results,
-        balance: balance(state),
-        voltage_layer: state.voltage_layer
-      }
+      state = %{state | termination: :settled}
+
+      step_result =
+        %{
+          step: state.step,
+          simulated_time: state.simulated_time,
+          islands: length(islands),
+          trips: facility_trips,
+          water_facility_ids: MapSet.to_list(state.affected_water_facilities),
+          datacenter_ids: MapSet.to_list(state.affected_datacenters),
+          solution: island_results,
+          balance: balance(state),
+          voltage_layer: state.voltage_layer
+        }
+        |> Map.merge(step_contract(state))
 
       if callback, do: callback.(step_result)
 
@@ -1399,29 +1495,42 @@ defmodule PowerModel.Failure.Cascade do
           affected_datacenters: MapSet.union(state.affected_datacenters, newly_affected_dcs)
       }
 
-      step_result = %{
-        step: state.step,
-        simulated_time: state.simulated_time,
-        islands: length(islands),
-        trips: all_trips_this_step,
-        water_facility_ids: MapSet.to_list(state.affected_water_facilities),
-        datacenter_ids: MapSet.to_list(state.affected_datacenters),
-        solution: island_results,
-        balance: balance(state),
-        voltage_layer: state.voltage_layer
-      }
+      # Why this step is or is not the last one, decided BEFORE the payload is
+      # built so the step result can carry it. `nil` means the loop continues.
+      termination =
+        cond do
+          island_solve_failed? -> :solve_failed
+          Enum.empty?(thermal_trips) and Enum.empty?(non_thermal_trips) -> :settled
+          true -> nil
+        end
+
+      state = %{state | termination: termination}
+
+      step_result =
+        %{
+          step: state.step,
+          simulated_time: state.simulated_time,
+          islands: length(islands),
+          trips: all_trips_this_step,
+          water_facility_ids: MapSet.to_list(state.affected_water_facilities),
+          datacenter_ids: MapSet.to_list(state.affected_datacenters),
+          solution: island_results,
+          balance: balance(state),
+          voltage_layer: state.voltage_layer
+        }
+        |> Map.merge(step_contract(state))
 
       if callback, do: callback.(step_result)
       step_results = [step_result | step_results]
 
-      cond do
-        island_solve_failed? ->
+      case termination do
+        :solve_failed ->
           {%{state | stable: false}, Enum.reverse(step_results)}
 
-        Enum.empty?(thermal_trips) and Enum.empty?(non_thermal_trips) ->
+        :settled ->
           {%{state | stable: true}, Enum.reverse(step_results)}
 
-        true ->
+        nil ->
           # Apply thermal trip
           state = apply_trips(state, thermal_trips)
 
@@ -1432,6 +1541,136 @@ defmodule PowerModel.Failure.Cascade do
       end
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # The step-result payload contract
+  # ---------------------------------------------------------------------------
+  #
+  # Four quantities the engine already computes per step and used to drop on
+  # the floor. All four are ADDITIVE keys — nothing already in a step result
+  # changed shape or meaning:
+  #
+  #   :frequency        `%{f_hz:, nadir_hz:}`. Both are needed, and reporting
+  #                     one as the other is the bug this closes: a settled
+  #                     cascade is back at 60.00 Hz, and the dip on the way
+  #                     there is the entire story of what it shed.
+  #   :agc              one `PowerModel.Controls.AGC.summary/1` per island that
+  #                     HAS a secondary controller, tagged with the island id.
+  #                     Islands without one are omitted rather than reported as
+  #                     zeros, which would be indistinguishable from a
+  #                     controller that has run out of reserve.
+  #   :voltage_overlay  the AC voltage products of the islands that CONVERGED.
+  #                     Explicitly PARTIAL — `record.ac_voltage` is written
+  #                     only from a converged FDPF solution (`record_ac_layer/3`
+  #                     is its sole writer), and `nil` is the common case at
+  #                     real demand — so this channel covers the islands AC
+  #                     reached and says nothing whatever about the rest. It
+  #                     must never be merged into a whole-grid metric.
+  #   :termination      `state.termination`; see the struct field.
+  defp step_contract(state) do
+    %{
+      frequency: frequency_summary(state),
+      agc: agc_summary(state),
+      voltage_overlay: voltage_overlay(state),
+      termination: state.termination
+    }
+  end
+
+  # Stamp the reason onto the most recent step of the REVERSED accumulator.
+  # Only the budget clause needs this: it fires instead of a step rather than
+  # inside one, so it has no step result of its own to write the reason into.
+  defp stamp_termination([], _cause), do: []
+
+  defp stamp_termination([latest | rest], cause),
+    do: [Map.put(latest, :termination, cause) | rest]
+
+  # Load-weighted, because an island's frequency is a statement about the load
+  # base its swing equation was integrated against: a dead three-bus fragment
+  # at 57 Hz must not drag the reported system frequency down beside an intact
+  # interconnection carrying 40 GW.
+  defp frequency_summary(state) do
+    load_by_bus =
+      Enum.reduce(state.loads, %{}, fn load, acc ->
+        Map.update(acc, load.bus_id, load.p_mw, &(&1 + load.p_mw))
+      end)
+
+    {weighted, total_mw} =
+      Enum.reduce(state.island_states, {0.0, 0.0}, fn record, {weighted, total_mw} ->
+        mw = island_load_mw(record, load_by_bus)
+        {weighted + mw * island_frequency_hz(record), total_mw + mw}
+      end)
+
+    f_hz = if total_mw > 0.0, do: weighted / total_mw, else: @nominal_frequency_hz
+
+    %{f_hz: f_hz, nadir_hz: state.frequency_nadir_hz}
+  end
+
+  defp island_load_mw(record, load_by_bus) do
+    Enum.reduce(record.buses, 0.0, fn bus_id, acc -> acc + Map.get(load_by_bus, bus_id, 0.0) end)
+  end
+
+  defp island_frequency_hz(%{frequency_state: %{frequency: hz}}) when is_number(hz), do: hz
+  defp island_frequency_hz(_record), do: @nominal_frequency_hz
+
+  # The worst frequency any island touched during this step. The segment
+  # ENDPOINT alone would miss it: the exposure window holds the trajectory the
+  # swing model actually integrated, and the dip inside it is what armed the
+  # UFLS stages and tripped the legacy rooftop fleet.
+  defp step_nadir_hz(records) do
+    Enum.reduce(records, @nominal_frequency_hz, fn record, worst ->
+      Enum.reduce(record.exposure, min(worst, island_frequency_hz(record)), fn point, acc ->
+        min(acc, point.frequency)
+      end)
+    end)
+  end
+
+  defp agc_summary(state) do
+    for record <- state.island_states, record.agc != nil do
+      Map.put(AGC.summary(record.agc), :island_id, island_id(record))
+    end
+  end
+
+  defp voltage_overlay(state) do
+    islands =
+      state.island_states
+      |> Enum.map(&overlay_island/1)
+      |> Enum.reject(&is_nil/1)
+
+    %{
+      islands: islands,
+      covered_bus_count: Enum.sum(Enum.map(islands, & &1.bus_count)),
+      undervoltage_bus_ids: Enum.flat_map(islands, & &1.undervoltage_bus_ids),
+      overvoltage_bus_ids: Enum.flat_map(islands, & &1.overvoltage_bus_ids)
+    }
+  end
+
+  # The `:warm_start` half of `ac_voltage` is deliberately NOT carried: it is a
+  # whole FDPF solution kept for the next solve, not a product for a consumer.
+  defp overlay_island(%{ac_voltage: %{vm_by_bus: vm, at_s: at}} = record) when map_size(vm) > 0 do
+    {under, over} =
+      Enum.reduce(vm, {[], []}, fn {bus_id, vm_pu}, {under, over} ->
+        cond do
+          vm_pu < @overlay_undervoltage_pu -> {[bus_id | under], over}
+          vm_pu > @overlay_overvoltage_pu -> {under, [bus_id | over]}
+          true -> {under, over}
+        end
+      end)
+
+    %{
+      island_id: island_id(record),
+      at_s: at,
+      bus_count: map_size(vm),
+      vm_by_bus: vm,
+      undervoltage_bus_ids: under,
+      overvoltage_bus_ids: over
+    }
+  end
+
+  defp overlay_island(_record), do: nil
+
+  # An island's stable identifier is its lowest bus id — the same rule
+  # `island_solve_failure_event/3` and `voltage_alarm_event/3` already report.
+  defp island_id(record), do: Enum.min(record.buses, fn -> nil end)
 
   # After a line/component trips, recompute generation-load balance PER ISLAND
   # and rebalance within each: deficits raise ramp-limited reserves, SURPLUSES
@@ -3189,6 +3428,19 @@ defmodule PowerModel.Failure.Cascade do
   end
 
   defp accrue_relay_duty(duty, _delta_s, :infinity), do: duty
+
+  # A zero trip time is a relay that has ALREADY fully operated, not one that
+  # operates infinitely fast: `Protection.conductor_trip_time_s/3` returns 0.0
+  # for a conductor that is at or above its emergency temperature, which is the
+  # remaining time to a limit it has already reached. Duty is that progress, so
+  # it is 1.0 — and the caller's `>= 1.0` branch then trips the branch on this
+  # step with a zero clock advance, which is the physical answer.
+  #
+  # This clause MUST precede the general one below: `delta_s / 0.0` raises
+  # ArithmeticError, and an at-limit conductor is reachable at ordinary demand
+  # (a 531%-of-rate-A line at the default hour reaches it on the first step).
+  defp accrue_relay_duty(_duty, _delta_s, trip_time_s) when trip_time_s <= 0.0, do: 1.0
+
   defp accrue_relay_duty(duty, delta_s, trip_time_s), do: min(duty + delta_s / trip_time_s, 1.0)
 
   defp drop_tripped_relay_duty(relay_duty, tripped) do

@@ -1677,4 +1677,227 @@ defmodule PowerModel.Failure.CascadeTest do
       end
     end
   end
+
+  # ===========================================================================
+  # At-limit conductors (UIW-1)
+  # ===========================================================================
+
+  describe "conductors already at their emergency temperature" do
+    # A conductor at or above its emergency limit has a REMAINING trip time of
+    # zero (`Protection.conductor_trip_time_s/3`), which is the only zero any
+    # protection in this module produces. It used to divide the step's clock
+    # advance by it.
+    defp at_limit_thermal_state do
+      %{
+        temp_c: 105.0,
+        steady_state_c: 105.0,
+        loading_fraction: 3.0,
+        elapsed_s: 0.0
+      }
+    end
+
+    # An overloaded radial line whose conductor is already past 100 °C, with
+    # the base-case exclusions cleared so the thermal mechanism is allowed to
+    # see it at all. Generation matches load exactly, so no island opens a
+    # deficit and the frequency chain contributes no clock advance — leaving
+    # the relay advance as the step's whole simulated time.
+    defp at_limit_conductor_state(extra_lines \\ []) do
+      buses = [bus(1, bus_type: 3), bus(2)]
+      lines = [line(1, 1, 2, rating_a_mva: 30.0, x_pu: 0.1) | extra_lines]
+      gens = [generator(1, 1, p_max_mw: 100.0)]
+      loads = [load(1, 2, p_mw: 100.0)]
+
+      make_snapshot(buses, lines, [], gens, loads)
+      |> Cascade.init()
+      |> Map.put(:base_overloaded, MapSet.new())
+      |> Map.put(:base_line_loading, %{})
+      |> Map.put(:conductor_state, %{{:line, 1} => at_limit_thermal_state()})
+    end
+
+    test "trip on the step they are found, with no clock advance and no raise" do
+      state = at_limit_conductor_state()
+
+      {final_state, step_results} = Cascade.run_cascade(state)
+
+      first_step = hd(step_results)
+
+      conductor_trip =
+        Enum.find(first_step.trips, &(&1.failure_cause == "conductor_thermal"))
+
+      assert conductor_trip, "an at-limit conductor must trip, not crash the cascade"
+      assert conductor_trip.component_type == "transmission_line"
+      assert conductor_trip.component_id == 1
+      assert conductor_trip.details.trip_time_s == 0.0
+      assert conductor_trip.details.temp_c >= 100.0
+
+      # A relay that has already fully operated operates NOW: the step it trips
+      # on advances the cascade clock by nothing.
+      assert first_step.simulated_time == 0.0
+      assert MapSet.member?(final_state.tripped_lines, 1)
+    end
+
+    test "do not consume a concurrent relay's operating progress" do
+      # Line 2 is timing on its own inverse-time curve and is already half
+      # operated. The zero-length step that trips line 1 must leave that half
+      # exactly where it is: `duty + 0.0 / trip_time` is still `duty`, and a
+      # guard that credited the at-limit relay's progress to every concurrent
+      # relay would trip line 2 in the same instant.
+      state =
+        at_limit_conductor_state([line(2, 1, 2, rating_a_mva: 35.0, x_pu: 0.1)])
+        |> Map.put(:relay_duty, %{{"thermal_overload", "transmission_line", 2} => 0.5})
+
+      {final_state, step_results} = Cascade.run_cascade(state)
+
+      [first_step | later_steps] = step_results
+
+      assert Enum.any?(first_step.trips, &(&1.failure_cause == "conductor_thermal"))
+      assert first_step.simulated_time == 0.0
+
+      refute Enum.any?(
+               first_step.trips,
+               &(&1.failure_cause == "thermal_overload" and &1.component_id == 2)
+             )
+
+      second_trip_step =
+        Enum.find(later_steps, fn step ->
+          Enum.any?(
+            step.trips,
+            &(&1.failure_cause == "thermal_overload" and &1.component_id == 2)
+          )
+        end)
+
+      assert second_trip_step, "line 2 must still trip on its own curve"
+
+      second_trip =
+        Enum.find(
+          second_trip_step.trips,
+          &(&1.failure_cause == "thermal_overload" and &1.component_id == 2)
+        )
+
+      # Half the curve was already spent, so half of it is left.
+      assert_in_delta second_trip_step.simulated_time,
+                      second_trip.details.trip_time_s * 0.5,
+                      1.0e-6
+
+      assert MapSet.member?(final_state.tripped_lines, 2)
+    end
+  end
+
+  # ===========================================================================
+  # Step-result payload contract
+  # ===========================================================================
+
+  describe "step result contract" do
+    test "every step carries frequency, agc, voltage_overlay and termination" do
+      state = Cascade.init(three_bus_snapshot())
+
+      {final_state, step_results} = Cascade.run_cascade(state)
+
+      assert step_results != []
+
+      for step <- step_results do
+        assert %{f_hz: f_hz, nadir_hz: nadir_hz} = step.frequency
+        assert is_float(f_hz)
+        assert is_float(nadir_hz)
+
+        # The nadir is the worst frequency reached, so it can never read above
+        # the frequency the same payload reports as current.
+        assert nadir_hz <= f_hz + 1.0e-9
+
+        assert is_list(step.agc)
+
+        assert %{
+                 islands: islands,
+                 covered_bus_count: covered,
+                 undervoltage_bus_ids: under,
+                 overvoltage_bus_ids: over
+               } = step.voltage_overlay
+
+        assert is_list(islands)
+        assert is_integer(covered)
+        assert is_list(under)
+        assert is_list(over)
+      end
+
+      # A cascade that settles says so, on the last step and on the state.
+      assert Cascade.termination(final_state) == :settled
+      assert List.last(step_results).termination == :settled
+      assert final_state.stable
+
+      # Only the last step is terminal; the rest are still running.
+      for step <- Enum.drop(step_results, -1) do
+        assert step.termination == nil
+      end
+    end
+
+    test "the contract keys are additive: nothing existing changed shape" do
+      state = Cascade.init(three_bus_snapshot())
+      {_final_state, [step | _]} = Cascade.run_cascade(state)
+
+      for key <- [
+            :step,
+            :simulated_time,
+            :islands,
+            :trips,
+            :water_facility_ids,
+            :datacenter_ids,
+            :solution,
+            :balance,
+            :voltage_layer
+          ] do
+        assert Map.has_key?(step, key), "existing payload key #{inspect(key)} went missing"
+      end
+
+      assert is_list(step.trips)
+      assert %{original_load_mw: _, served_load_mw: _} = step.balance
+      assert %{islands_ac: _, islands_dc_only: _} = step.voltage_layer
+    end
+
+    test "a truncated cascade is distinguishable from a settled one" do
+      state = Cascade.init(three_bus_snapshot())
+      exhausted = %{state | step: 50}
+
+      {final_state, step_results} = Cascade.run_cascade(exhausted)
+
+      # The budget clause fires INSTEAD of a step, so with no steps run there
+      # is nothing to stamp — but the state still says why it stopped.
+      assert step_results == []
+      refute final_state.stable
+      assert Cascade.termination(final_state) == :budget_exhausted
+    end
+
+    test "budget exhaustion stamps the reason onto the run's last step" do
+      # A cascade that genuinely runs out of budget mid-run: the at-limit
+      # conductor fixture keeps producing trips, and the budget is spent one
+      # step short of settling.
+      state = %{at_limit_conductor_state() | step: 49}
+
+      {final_state, step_results} = Cascade.run_cascade(state)
+
+      assert Cascade.termination(final_state) == :budget_exhausted
+      refute final_state.stable
+
+      assert [only_step] = step_results
+      assert only_step.termination == :budget_exhausted
+    end
+
+    test "each island with a secondary controller reports one AGC summary" do
+      state = Cascade.init(three_bus_snapshot())
+      {_final_state, step_results} = Cascade.run_cascade(state)
+
+      summaries = Enum.flat_map(step_results, & &1.agc)
+
+      for summary <- summaries do
+        assert %{
+                 island_id: island_id,
+                 ace_mw: _,
+                 dispatched_mw: _,
+                 reserve_remaining_mw: _,
+                 saturated?: _
+               } = summary
+
+        assert is_integer(island_id)
+      end
+    end
+  end
 end
