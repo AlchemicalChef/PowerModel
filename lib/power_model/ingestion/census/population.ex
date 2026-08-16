@@ -15,6 +15,17 @@ defmodule PowerModel.Ingestion.Census.Population do
   county definitions change between vintages (e.g. Connecticut's 2022 switch
   from 8 counties to 9 planning regions), and keeping stale FIPS alongside
   their replacements double-counts population in the load weights.
+
+  ## What this table does NOT have
+
+  A boundary. The Gazetteer publishes an interior POINT per county and nothing
+  else, and no tract or block-group file is vendored, so
+  `PowerModel.Ingestion.LoadEstimator` cannot spread a county's population over
+  its polygon directly. It infers the county's extent from the spacing of
+  neighbouring interior points instead — counties tile the country without
+  gaps, so that spacing measures local county size. `counties/0` is the reader
+  that feeds it; the calibration of the inference is documented at
+  `LoadEstimator.spread_radii/1`.
   """
 
   NimbleCSV.define(CensusPopParser, separator: ",", escape: "\"")
@@ -103,6 +114,22 @@ defmodule PowerModel.Ingestion.Census.Population do
     end
 
     {:ok, length(rows)}
+  end
+
+  @doc """
+  `[%{id, fips, population, lon, lat}]` for every ingested county with a
+  centroid — the input to the load allocator's spatial spread.
+  """
+  def counties do
+    from(c in CountyPopulation,
+      where: not is_nil(c.coordinates),
+      select: %{id: c.id, fips: c.fips, population: c.population, coordinates: c.coordinates}
+    )
+    |> Repo.all()
+    |> Enum.map(fn c ->
+      %Geo.Point{coordinates: {lon, lat}} = c.coordinates
+      c |> Map.delete(:coordinates) |> Map.merge(%{lon: lon, lat: lat})
+    end)
   end
 
   defp single_match(glob) do

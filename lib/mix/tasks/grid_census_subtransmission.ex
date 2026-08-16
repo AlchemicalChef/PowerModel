@@ -36,6 +36,17 @@ defmodule Mix.Tasks.Grid.Census do
   `Mix.Tasks.Grid.Census.Stranding`, which this task delegates to; its
   `--graph`, `--headroom` and `--limit` options are parsed here.
 
+  ## load_placement
+
+      mix grid.census load_placement
+
+  Every rule `PowerModel.Ingestion.LoadEstimator` applies when it places load,
+  scored on the network as it stands: unservable buses, radials above 200 MW,
+  load over a branch's rating or over a bus's capability, load below the
+  60 kV load-serving floor, and yards holding their county's share once per
+  voltage level. Documented in `Mix.Tasks.Grid.Census.LoadPlacement`, which
+  this task delegates to. Note it defaults to `--graph main-island`, not `db`.
+
   ### Options
 
       --interconnection NAME     restrict to one interconnection (repeatable)
@@ -74,9 +85,11 @@ defmodule Mix.Tasks.Grid.Census do
     headroom: :float
   ]
 
-  # `stranding` lives in Mix.Tasks.Grid.Census.Stranding (LIN13-B, DR-4); this
-  # task is the front door for both so the CLI reads as one census family.
-  @censuses ~w(subtransmission stranding)
+  # `stranding` lives in Mix.Tasks.Grid.Census.Stranding (LIN13-B, DR-4) and
+  # `load_placement` in Mix.Tasks.Grid.Census.LoadPlacement (TOPO-2, DR-5);
+  # this task is the front door for all of them so the CLI reads as one census
+  # family.
+  @censuses ~w(subtransmission stranding load_placement)
 
   @default_threshold 1.25
   @default_max_kv 100.0
@@ -140,6 +153,7 @@ defmodule Mix.Tasks.Grid.Census do
   tasks can assert on the numbers rather than on formatted output.
   """
   def report("stranding", opts), do: Mix.Tasks.Grid.Census.Stranding.report(opts)
+  def report("load_placement", opts), do: Mix.Tasks.Grid.Census.LoadPlacement.report(opts)
 
   def report("subtransmission", opts) do
     hour = parse_hour(opts[:hour]) || Demand.latest_demand_hour()
@@ -267,6 +281,9 @@ defmodule Mix.Tasks.Grid.Census do
 
   defp render_text(%{census: "stranding"} = report),
     do: Mix.Tasks.Grid.Census.Stranding.render_text(report)
+
+  defp render_text(%{census: "load_placement"} = report),
+    do: Mix.Tasks.Grid.Census.LoadPlacement.render_text(report)
 
   defp render_text(report) do
     limit = @default_limit
