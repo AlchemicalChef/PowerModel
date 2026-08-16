@@ -18,12 +18,19 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   reach a row that already had values, so improvements shipped in code never
   appeared in the network being simulated.
 
-  Rows from imported cases (`@imported_sources`) are never touched. Those
-  arrive with parameters from their own source — the SyntheticUSA MATPOWER
-  component carries internally consistent impedances, and the international
-  ties carry hand-curated ones — and neither has the geometry this estimator
-  would need to re-derive them. Recomputing them would replace real data with
-  a class-table guess against a default length.
+  Rows authored outside this estimator (`@externally_authored_sources`) are
+  never touched. Those arrive with parameters from their own source — the
+  SyntheticUSA MATPOWER component carries internally consistent impedances, the
+  international ties carry hand-curated ones, and the `connectivity_repair`
+  joints carry the measured joint distance `BusMapper` welded them at — and
+  none has the geometry this estimator would need to re-derive them.
+  Recomputing them would replace real data with a class-table guess against a
+  default length.
+
+  That exclusion is load-bearing, not cosmetic: the predicate below matches on
+  `params_version < @params_version`, and every one of the 5,628
+  `connectivity_repair` rows sits at version 0. Drop the source from the list
+  and the next estimator run overwrites all of them.
 
   ## How a rating is built
 
@@ -81,6 +88,19 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
 
   @base_mva 100.0
 
+  # Smallest reactance this estimator will WRITE. It must equal
+  # `PowerModel.Solver.YBus.x_floor/0` — whichever of the two is larger is the
+  # one the network actually feels, so a write-time clamp above the solver's
+  # floor silently becomes the binding floor and no amount of lowering the
+  # solver's does anything (SOL12-SCALE). At the old 1.0e-4 the clamp inflated
+  # the reactance of every very short EHV jumper it wrote by up to 8x (line
+  # 39444, 500 kV: recipe 1.2e-5, stored 1.0e-4).
+  #
+  # Not shared as a compile-time reference to YBus: ingestion should not
+  # trigger a recompile of the whole solver tree. The two are pinned equal by
+  # test/power_model/solver/branch_normalization_test.exs instead.
+  @x_write_floor 1.0e-5
+
   # ---------------------------------------------------------------------------
   # Loadability (ROADMAP item 10)
   # ---------------------------------------------------------------------------
@@ -99,6 +119,26 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   # The loadability cap applies ABOVE this voltage only -- see the moduledoc
   # for why sub-300 kV ratings stay flat.
   @ehv_min_kv 300.0
+
+  # Low-voltage (sub-transmission) rating class, ROADMAP item 8 re-scope.
+  #
+  # The class table bottoms out at 69 kV and `lookup_line_params/1` picks the
+  # CLOSEST class, so every line below it -- 1,957 in-service rows spanning
+  # 3 to 49 kV -- inherited the 69 kV thermal rating. A 33 kV line therefore
+  # read as good for 116 MVA, and a genuine 60 MW overload on it was invisible
+  # to every overload screen in the simulator (ROADMAP8-NOOP).
+  #
+  # A rating is an ampacity, not a per-unit quantity: at a fixed conductor and
+  # a fixed thermal limit, MVA = sqrt(3) x kV x I scales LINEARLY with voltage.
+  # The 69 kV class's 130 MVA implies ~1,090 A, so the same construction is
+  # good for 65 MVA at 34.5 kV and 26 MVA at 13.8 kV. Scaling as kV^2 (the
+  # per-unit impedance base) would be the wrong physics.
+  #
+  # Only the RATING scales. Per-km ohms are a property of the construction,
+  # not the voltage, so the impedance stays on the 69 kV class row and no
+  # stored `x_pu` moves because of this: the large per-unit reactances these
+  # lines carry come from the small z_base (kV^2/100) and are correct.
+  @lv_rating_reference_kv 69.0
 
   # St. Clair curve: line loadability as a multiple of SIL versus length, for a
   # strong terminal system under the classic criteria (5% voltage drop, ~35
@@ -132,16 +172,28 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   #   1 = class-table impedance + emergency rating tiers
   #   2 = physical EHV resistance, St. Clair loadability cap above 300 kV,
   #       ambient derate moved from resistance onto the rating (ROADMAP item 10)
+  #   3 = write-time reactance clamp aligned to the solver floor
+  #       (@x_write_floor), sub-transmission ratings scaled by voltage
+  #       (@lv_rating_reference_kv)
   #
   # Version 2 changes what rate A MEANS, so rows a version-1 estimator already
   # stamped have to be revisited — without the bump they would read as current
   # and keep an uncapped, underated rating forever, which is the exact failure
-  # mode (REVIEW DAT-18) that versioning exists to prevent.
-  @params_version 2
+  # mode (REVIEW DAT-18) that versioning exists to prevent. Version 3 changes
+  # both a written reactance and a written rating, so the same argument applies.
+  @params_version 3
 
-  # Sources whose parameters come from the imported case, not from this
-  # estimator. See the moduledoc.
-  @imported_sources ~w(matpower international)
+  # Sources whose parameters are authored somewhere other than this estimator.
+  # See the moduledoc.
+  #
+  # `connectivity_repair` is on this list for a reason worth keeping: those
+  # rows are written by `Ingestion.BusMapper` with the real (very short) joint
+  # distance, which puts 5,628 of them below this estimator's own write-time
+  # clamp (smallest 2.5e-5 pu). They are stamped params_version 0, so before
+  # they were listed here the recompute predicate below matched every one of
+  # them and a single estimator run would have silently replaced every repaired
+  # impedance with a class-table guess.
+  @externally_authored_sources ~w(matpower international connectivity_repair)
 
   # Default ambient temperature for summer derating (Celsius)
   @default_ambient_temp_c 35.0
@@ -163,6 +215,8 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   def run do
     estimate_line_parameters()
     estimate_generator_q_limits()
+    # After the line pass: the reactors are sized from the b_pu it just wrote.
+    synthesize_line_end_reactors()
   end
 
   @doc "Version of the line parameter recipe; rows stamped lower are recomputed."
@@ -185,7 +239,7 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
       from(tl in TransmissionLine,
         where:
           (is_nil(tl.r_pu) or is_nil(tl.x_pu) or tl.params_version < @params_version) and
-            (is_nil(tl.source) or tl.source not in @imported_sources),
+            (is_nil(tl.source) or tl.source not in @externally_authored_sources),
         preload: [:from_bus, :to_bus]
       )
       |> Repo.all()
@@ -242,7 +296,7 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
 
     %{
       r_pu: r_per_km * length_km / (z_base * n_circuits),
-      x_pu: max(x_per_km * length_km / (z_base * n_circuits), 0.0001),
+      x_pu: max(x_per_km * length_km / (z_base * n_circuits), @x_write_floor),
       b_pu: b_per_km * 1.0e-6 * length_km * z_base * n_circuits,
       rating_a_mva: rating_a,
       rating_b_mva: Ratings.rate_b_from_a(rating_a),
@@ -260,10 +314,16 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   St. Clair loadability: an EHV line long enough to be angle- or
   voltage-limited cannot deliver its conductors' thermal rating however cool
   the day is, which is why the stability cap is NOT derated for ambient.
+
+  Below #{trunc(@lv_rating_reference_kv)} kV the class thermal rating is scaled
+  linearly by voltage (`low_voltage_thermal_mva/2`) so sub-transmission stops
+  inheriting the 69 kV class's ampacity-times-69-kV rating.
   """
   def rating_a_mva(voltage_kv, length_km, ambient_temp \\ @default_ambient_temp_c) do
     {_r, _x, _b, thermal_mva, _circuits} = lookup_line_params(voltage_kv)
-    thermal = thermal_mva * ambient_rating_derate(ambient_temp)
+
+    thermal =
+      low_voltage_thermal_mva(thermal_mva, voltage_kv) * ambient_rating_derate(ambient_temp)
 
     case sil_mw(voltage_kv) do
       nil -> thermal
@@ -284,6 +344,20 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   end
 
   def sil_mw(_), do: nil
+
+  @doc """
+  The class thermal rating scaled down for a sub-transmission voltage.
+
+  Constant-ampacity scaling: `thermal x kV / #{trunc(@lv_rating_reference_kv)}`
+  below the lowest class in the table, and the class value unchanged at or
+  above it. See `@lv_rating_reference_kv` for why this is linear and why it
+  touches only the rating.
+  """
+  def low_voltage_thermal_mva(thermal_mva, voltage_kv)
+      when is_number(voltage_kv) and voltage_kv > 0.0 and voltage_kv < @lv_rating_reference_kv,
+      do: thermal_mva * voltage_kv / @lv_rating_reference_kv
+
+  def low_voltage_thermal_mva(thermal_mva, _voltage_kv), do: thermal_mva
 
   @doc """
   St. Clair loadability for a line of `length_km`, as a multiple of SIL.
@@ -338,6 +412,175 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
         end)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Line-end shunt reactors (LIN13-C)
+  # ---------------------------------------------------------------------------
+
+  # Reactors are synthesized at or above this voltage. Below it, line charging
+  # is small enough that utilities compensate at the substation (if at all),
+  # not with dedicated line-end reactors.
+  @reactor_min_kv 230.0
+
+  # Fraction of a line's total charging absorbed by its two end reactors, by
+  # voltage class (closest class wins, as everywhere else here). WECC EHV
+  # practice is roughly half to two thirds of charging on 500 kV, tapering off
+  # toward 230 kV where compensation is the exception rather than the rule.
+  @reactor_compensation %{
+    230 => 0.4,
+    345 => 0.5,
+    500 => 0.6,
+    765 => 0.6
+  }
+
+  # Cases that ship their own shunt data. Synthesizing on top of them would
+  # double-count. `international` and `connectivity_repair` rows are excluded
+  # by the `b_pu > 0` predicate already (NULL and 0.0 respectively), so this
+  # list only has to name the imported cases.
+  @reactor_excluded_sources ~w(matpower)
+
+  @doc """
+  Synthesize line-end shunt reactors on EHV buses and write them to
+  `buses.bs_mvar`.
+
+  Every in-service AC line at or above #{trunc(@reactor_min_kv)} kV gets a
+  reactor at each terminal absorbing `K` of the charging that terminal injects:
+
+      bs_mvar(bus) = sum over EHV lines at that bus of  -K/2 x b_pu x 100
+
+  `b_pu x 100` is the line's total charging in MVAr at 1.0 pu, half of it at
+  each end in the pi model, so `-K/2 x b_pu x 100` per terminal absorbs exactly
+  the fraction `K` of it.
+
+  WHY THIS EXISTS: the network models line charging correctly (per-km values
+  match published typicals to three digits) but modeled ZERO compensation
+  anywhere — `bs_mvar` was 0.0 on all 89,969 buses. Western alone injects
+  44.3 GVAr of charging into a network whose only reactive sinks are generator
+  `q_min`, which is why its light-load AC solutions push thousands of buses
+  above 1.1 pu (LIN13-C). Real EHV systems absorb roughly half their charging
+  in line-end reactors; this pass supplies the missing half.
+
+  OWNERSHIP: this pass owns NEGATIVE `bs_mvar`. It writes the full computed
+  value (it does not accumulate), so re-running it — or running it with a
+  different `K` — converges on the same answer, and a bus that no longer
+  terminates an EHV line has its synthesized reactor cleared. Capacitor banks
+  (`bs_mvar > 0`) are never touched. If measured reactor data is ever ingested,
+  gate this pass rather than letting it overwrite.
+
+  Options:
+  - `:compensation` — `%{class_kv => K}` map overriding `@reactor_compensation`
+
+  Returns a summary map.
+  """
+  def synthesize_line_end_reactors(opts \\ []) do
+    compensation = Keyword.get(opts, :compensation, @reactor_compensation)
+
+    lines =
+      from(tl in TransmissionLine,
+        where:
+          tl.status == "in_service" and tl.voltage_kv >= @reactor_min_kv and
+            not is_nil(tl.b_pu) and tl.b_pu > 0.0 and
+            not is_nil(tl.from_bus_id) and not is_nil(tl.to_bus_id) and
+            (is_nil(tl.line_type) or tl.line_type != "dc") and
+            (is_nil(tl.source) or tl.source not in @reactor_excluded_sources),
+        select: {tl.voltage_kv, tl.b_pu, tl.from_bus_id, tl.to_bus_id}
+      )
+      |> Repo.all()
+
+    excluded_buses =
+      from(b in Bus, where: b.source in @reactor_excluded_sources, select: b.id)
+      |> Repo.all()
+      |> MapSet.new()
+
+    per_bus =
+      lines
+      |> Enum.reduce(%{}, fn {voltage_kv, b_pu, from_id, to_id}, acc ->
+        mvar = line_end_reactor_mvar(voltage_kv, b_pu, compensation)
+
+        acc
+        |> Map.update(from_id, mvar, &(&1 + mvar))
+        |> Map.update(to_id, mvar, &(&1 + mvar))
+      end)
+      |> Map.reject(fn {bus_id, _} -> MapSet.member?(excluded_buses, bus_id) end)
+
+    {bus_ids, mvars} = Enum.unzip(Map.to_list(per_bus))
+
+    if bus_ids == [] do
+      # No qualifying lines at all (an empty or non-EHV database). Returning
+      # early rather than running the statements below matters: the stale-
+      # reactor cleanup is "every reactor NOT in this set", which with an empty
+      # set would clear every reactor in the table.
+      %{lines: length(lines), buses: 0, written: 0, cleared: 0, mvar: 0.0}
+    else
+      write_reactors(lines, per_bus, bus_ids, mvars)
+    end
+  end
+
+  defp write_reactors(lines, per_bus, bus_ids, mvars) do
+    # One statement, not one per bus: this touches thousands of rows and the
+    # per-row changeset path made the pass the slowest thing in the ingest.
+    %{num_rows: written} =
+      Repo.query!(
+        """
+        UPDATE buses AS b SET bs_mvar = v.bs, updated_at = now()
+        FROM (SELECT unnest($1::bigint[]) AS id, unnest($2::float8[]) AS bs) AS v
+        WHERE b.id = v.id AND b.bs_mvar IS DISTINCT FROM v.bs
+        """,
+        [bus_ids, mvars]
+      )
+
+    # Buses that carry a synthesized reactor but no longer terminate a
+    # qualifying line — otherwise a re-ingest that drops or downgrades a line
+    # leaves its reactor behind forever.
+    %{num_rows: cleared} =
+      Repo.query!(
+        """
+        UPDATE buses SET bs_mvar = 0.0, updated_at = now()
+        WHERE bs_mvar < 0.0 AND NOT (id = ANY($1::bigint[]))
+        """,
+        [bus_ids]
+      )
+
+    %{
+      lines: length(lines),
+      buses: map_size(per_bus),
+      written: written,
+      cleared: cleared,
+      mvar: Enum.sum(mvars)
+    }
+  end
+
+  @doc """
+  Reactor MVAr for ONE terminal of a line, given its voltage and total
+  charging susceptance in per unit.
+
+  Negative by construction (a reactor absorbs). `b_pu x 100` is the line's
+  total charging at 1.0 pu and half of it sits at each end, so `-K/2 x b_pu x
+  100` absorbs the fraction `K` of what this terminal injects.
+  """
+  def line_end_reactor_mvar(voltage_kv, b_pu, compensation \\ @reactor_compensation)
+
+  def line_end_reactor_mvar(voltage_kv, b_pu, compensation) when is_number(b_pu) do
+    -terminal_compensation(voltage_kv, compensation) / 2.0 * b_pu * @base_mva
+  end
+
+  def line_end_reactor_mvar(_voltage_kv, _b_pu, _compensation), do: 0.0
+
+  @doc """
+  Compensation fraction `K` for a voltage, from the closest class in the
+  reactor table.
+  """
+  def terminal_compensation(voltage_kv, compensation \\ @reactor_compensation)
+
+  def terminal_compensation(voltage_kv, compensation) when is_number(voltage_kv) do
+    closest = compensation |> Map.keys() |> Enum.min_by(&abs(&1 - voltage_kv))
+    Map.fetch!(compensation, closest)
+  end
+
+  def terminal_compensation(_, _), do: 0.0
+
+  @doc "Default per-class reactor compensation fractions."
+  def reactor_compensation, do: @reactor_compensation
 
   @doc "Estimate reactive power limits for generators"
   def estimate_generator_q_limits do

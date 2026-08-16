@@ -176,11 +176,32 @@ defmodule PowerModel.Solver.YBus do
   # Shared with the DC and AC flow-reporting paths: guards division by zero
   # for zero-impedance branches while preserving the sign of legitimate
   # negative reactances (3-winding transformer star-point branches).
-  @x_floor 1.0e-3
+  #
+  # 1.0e-5 pu, not the 1.0e-3 this used to be. At 1.0e-3 the floor stopped
+  # being a division guard and became a modeling change: it inflated the
+  # reactance of 15,941 in-service lines (17% of the network), MEASURED at up
+  # to 177 MW of per-branch DC flow error and enough to flip 16 branches'
+  # overload flag at 115-230 kV. The invariance probe is the proof — DC flow
+  # distribution is invariant under uniform scaling of every x, so solving the
+  # same operating point with all reactances x1000 (lifting them clear of the
+  # floor) and differencing the flows isolates the floor's error exactly.
+  #
+  # The smallest reactance any real branch carries is 2.5e-5 pu, so 1.0e-5
+  # floors nothing physical while still keeping 1/x finite for a genuinely
+  # zero-impedance branch. `Ingestion.ParameterEstimator` clamps at the same
+  # value when it WRITES x: a larger write-time clamp silently becomes the
+  # binding floor no matter what this one says.
+  @x_floor 1.0e-5
   @doc false
   def effective_reactance(x) when is_number(x) and (x >= @x_floor or x <= -@x_floor), do: x
   def effective_reactance(x) when is_number(x) and x < 0.0, do: -@x_floor
   def effective_reactance(_), do: @x_floor
+
+  @doc """
+  The reactance magnitude below which `effective_reactance/1` substitutes a
+  floor. Exposed so the ingestion write-time clamp can be asserted equal to it.
+  """
+  def x_floor, do: @x_floor
 
   defp effective_tap_ratio(t) when is_number(t) and t > 0.0, do: t
   defp effective_tap_ratio(_), do: 1.0

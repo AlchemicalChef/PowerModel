@@ -447,12 +447,24 @@ defmodule PowerModel.Solver.FDPFTest do
 
       setpoints = Map.new(snapshot.buses, &{&1.id, &1.vm_pu})
       gen_buses = MapSet.new(snapshot.generators, & &1.bus_id)
+      # Two predicates, because the two sides are not measured the same way.
+      # A bus this solver still regulates is pinned EXACTLY at its setpoint —
+      # 197 of the 392 generator buses come back bit-equal — so "was it
+      # demoted" needs no tolerance on our side. The reference's converged
+      # voltages carry its own residue (smallest genuine switch, bus 5444, is
+      # only 2.3e-4 pu off), so it does need one.
+      #
+      # Applying our tolerance to both sides made the comparison a knife edge:
+      # bus 6257 sits 9.7e-5 pu off setpoint here and 2.9e-4 in the reference,
+      # and a modeling change as small as un-flooring three branch reactances
+      # was enough to move it across a 1.0e-4 cut and change these counts.
+      demoted? = fn vm, id -> vm != Map.fetch!(setpoints, id) end
       off? = fn vm, id -> abs(vm - Map.fetch!(setpoints, id)) > 1.0e-4 end
 
       mine =
         sol.bus_ids
         |> Enum.zip(sol.vm_pu)
-        |> Enum.filter(fn {id, vm} -> MapSet.member?(gen_buses, id) and off?.(vm, id) end)
+        |> Enum.filter(fn {id, vm} -> MapSet.member?(gen_buses, id) and demoted?.(vm, id) end)
         |> MapSet.new(&elem(&1, 0))
 
       theirs =
@@ -515,12 +527,24 @@ defmodule PowerModel.Solver.FDPFTest do
       setpoints = Map.new(snapshot.buses, &{&1.id, &1.vm_pu})
       gens_by_bus = Enum.group_by(snapshot.generators, & &1.bus_id)
       gen_buses = MapSet.new(Map.keys(gens_by_bus))
+      # Two predicates, because the two sides are not measured the same way.
+      # A bus this solver still regulates is pinned EXACTLY at its setpoint —
+      # 197 of the 392 generator buses come back bit-equal — so "was it
+      # demoted" needs no tolerance on our side. The reference's converged
+      # voltages carry its own residue (smallest genuine switch, bus 5444, is
+      # only 2.3e-4 pu off), so it does need one.
+      #
+      # Applying our tolerance to both sides made the comparison a knife edge:
+      # bus 6257 sits 9.7e-5 pu off setpoint here and 2.9e-4 in the reference,
+      # and a modeling change as small as un-flooring three branch reactances
+      # was enough to move it across a 1.0e-4 cut and change these counts.
+      demoted? = fn vm, id -> vm != Map.fetch!(setpoints, id) end
       off? = fn vm, id -> abs(vm - Map.fetch!(setpoints, id)) > 1.0e-4 end
 
       mine =
         sol.bus_ids
         |> Enum.zip(sol.vm_pu)
-        |> Enum.filter(fn {id, vm} -> MapSet.member?(gen_buses, id) and off?.(vm, id) end)
+        |> Enum.filter(fn {id, vm} -> MapSet.member?(gen_buses, id) and demoted?.(vm, id) end)
         |> MapSet.new(&elem(&1, 0))
 
       theirs =

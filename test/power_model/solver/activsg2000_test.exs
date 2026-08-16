@@ -54,7 +54,7 @@ defmodule PowerModel.Solver.ACTIVSg2000Test do
 
   use ExUnit.Case, async: true
 
-  alias PowerModel.Solver.{DCPowerFlow, FDPF, Solution}
+  alias PowerModel.Solver.{DCPowerFlow, FDPF, Solution, YBus}
   alias PowerModel.Test.MATPOWER
 
   @moduletag :ieee
@@ -62,16 +62,22 @@ defmodule PowerModel.Solver.ACTIVSg2000Test do
   @case_path "test/fixtures/matpower/case_ACTIVSg2000.m"
   @reference_path "test/fixtures/matpower/case_ACTIVSg2000_reference.json"
 
-  # DC angles agree with the reference to 1.9e-3 rad, and that residual is
-  # fully accounted for: `YBus.effective_reactance/1` floors |x| at 1.0e-3 pu,
-  # while three branches in this case have a true x of 7.0e-4 to 8.8e-4 pu.
-  # Re-running the reference with the same floor applied reproduces the
-  # deviation to three significant figures (0.108 deg worst bus, 0.033 deg
-  # mean), so nothing else is contributing. The tolerance admits that artifact
-  # with a small margin and nothing larger; if the floor is ever lowered, this
-  # should be tightened toward the IEEE-118 value of 1.0e-5 rad.
-  @dc_angle_tolerance_rad 5.0e-3
-  @dc_angle_mean_tolerance_rad 1.0e-3
+  # DC angles agree with the reference to the last digit the reference prints.
+  #
+  # This case used to deviate by 1.9e-3 rad (0.108 deg worst bus, 0.033 deg
+  # mean), and `YBus.effective_reactance/1`'s 1.0e-3 pu floor was the sole
+  # cause: three branches here carry a true x of 7.0e-4, 7.3e-4 and 8.8e-4 pu,
+  # and the floor inflated all three. With the floor at 1.0e-5 the whole
+  # deviation is gone — MEASURED worst 8.7e-9 rad, mean 4.4e-9 rad, and the
+  # reference stores `va_deg` to six decimals, so ±5e-7 deg (±8.7e-9 rad) IS
+  # its quantization. There is nothing left to attribute.
+  #
+  # The tolerances are therefore round-off gates, roughly 11x the reference's
+  # own printed resolution, well inside the IEEE-118 contract value of
+  # 1.0e-5 rad. A modeling change that reintroduces any physical deviation
+  # will fail them immediately.
+  @dc_angle_tolerance_rad 1.0e-7
+  @dc_angle_mean_tolerance_rad 5.0e-8
 
   # Contract tolerances for the skipped AC block, matching IEEE-14 and IEEE-118.
   @vm_tolerance_pct 0.5
@@ -222,18 +228,22 @@ defmodule PowerModel.Solver.ACTIVSg2000Test do
       assert dev < @dc_angle_tolerance_rad,
              "worst DC angle deviation at bus #{bus_id}: got #{actual} rad, " <>
                "reference #{expected} rad (#{dev} rad off, " <>
-               "tolerance #{@dc_angle_tolerance_rad}). Expected residual from the " <>
-               "1.0e-3 pu reactance floor is 1.9e-3 rad; anything larger is new."
+               "tolerance #{@dc_angle_tolerance_rad}). With the reactance floor " <>
+               "at 1.0e-5 pu this case has no modeling residual left — the only " <>
+               "admissible deviation is the reference's own 8.7e-9 rad rounding."
     end
 
-    test "the reactance-floor residual stays confined to a few buses", %{
+    test "no reactance-floor residual survives on the three sub-milli-pu branches", %{
       solution: sol,
-      reference: ref
+      reference: ref,
+      snapshot: snap
     } do
-      # The floor perturbs three branches, so the deviation stays concentrated:
-      # the network-wide mean is 5.8e-4 rad against a 1.9e-3 rad worst bus. A
-      # modeling change that shifted every bus would move the mean too, which
-      # the worst-bus assertion above on its own would not distinguish.
+      # The floor used to inflate exactly three branches (x = 7.0e-4, 7.3e-4,
+      # 8.8e-4 pu) and that showed up as a mean deviation of 5.8e-4 rad against
+      # a 1.9e-3 rad worst bus — concentrated, but network-wide in the mean.
+      # Both are now at round-off, which is the direct evidence that the floor
+      # was the sole contributor. Asserting the MEAN as well as the worst bus
+      # is what distinguishes "one bus got lucky" from "the residual is gone".
       devs = deviations(sol, sol.va_rad, ref["dc"]["buses"], &deg_to_rad(&1["va_deg"]))
       mean = mean_deviation(devs)
       {bus_id, _actual, _expected, worst_dev} = worst(devs)
@@ -241,7 +251,17 @@ defmodule PowerModel.Solver.ACTIVSg2000Test do
       assert mean < @dc_angle_mean_tolerance_rad,
              "mean DC angle deviation #{mean} rad exceeds " <>
                "#{@dc_angle_mean_tolerance_rad} rad (worst bus #{bus_id} at " <>
-               "#{worst_dev} rad) — the deviation is no longer localized"
+               "#{worst_dev} rad) — a modeling residual has reappeared"
+
+      # Pin the premise: exactly three branches sit below the old 1.0e-3 floor
+      # and none below the current one. If the case ever gains a branch under
+      # the live floor, this test stops being evidence about the floor and
+      # should be re-derived rather than re-tuned.
+      reactances = Enum.map(snap.lines, &abs(&1.x_pu))
+
+      assert Enum.count(reactances, &(&1 < 1.0e-3)) == 3
+      assert Enum.count(reactances, &(&1 < YBus.x_floor())) == 0
+      assert_in_delta Enum.min(reactances), 7.0e-4, 1.0e-12
     end
 
     test "no NaN angles or flows", %{solution: sol} do
