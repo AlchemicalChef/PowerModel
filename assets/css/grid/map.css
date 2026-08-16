@@ -386,9 +386,15 @@
   border: 1px solid rgba(150, 150, 170, 0.4);
 }
 
-/* ─── Cascade Active Mode ─── */
+/* ─── Cascade Impact View ───
+   Two classes, deliberately separate. `cascade-impact` means "a failure
+   picture is on this map" and survives the run settling, because the settled
+   state is the one worth studying. `cascade-active` means "it is still
+   happening" and carries only the affordances that would LIE once it stops —
+   the pulsing alarm bar, and the extra vignette weight that reads as alarm
+   rather than as focus. */
 
-.grid-container.cascade-active .grid-map::after {
+.grid-container.cascade-impact .grid-map::after {
   content: "";
   position: absolute;
   inset: 0;
@@ -399,19 +405,36 @@
     transparent 40%,
     rgba(10, 0, 0, 0.35) 100%
   );
-  animation: cascade-vignette-in 800ms ease-out both;
+  /* Review weight. Held on opacity rather than on the gradient stops so the
+     step down at settle animates instead of snapping. */
+  opacity: 0.6;
+  /* No fill-mode: a forwards-filled animation would pin opacity and beat the
+     transition below, freezing the vignette at its live weight. Unfilled, the
+     keyframe only supplies the 0 it fades up FROM. */
+  animation: cascade-vignette-in 800ms ease-out;
+  transition: opacity 600ms ease;
+}
+
+/* Live weight — after the impact rule so it wins while both classes are on. */
+.grid-container.cascade-active .grid-map::after {
+  opacity: 1;
 }
 
 @keyframes cascade-vignette-in {
   from { opacity: 0; }
-  to { opacity: 1; }
+}
+
+.grid-container.cascade-impact .grid-map {
+  box-shadow: inset 0 0 80px rgba(180, 30, 20, 0.05);
+  transition: box-shadow 600ms ease;
 }
 
 .grid-container.cascade-active .grid-map {
   box-shadow: inset 0 0 80px rgba(180, 30, 20, 0.08);
 }
 
-/* Cascade warning indicator */
+/* Cascade warning indicator — LIVE only: a bar still pulsing over a settled
+   result would claim the grid is going down right now. */
 .grid-container.cascade-active::before {
   content: "";
   position: absolute;

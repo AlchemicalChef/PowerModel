@@ -64,6 +64,8 @@ function bareManager() {
   m.viewMode = "voltage_level";
   m.cascadeHistory = [];
   m.cascadeActive = false;
+  m.cascadeEnded = false;
+  m._impactViewOn = false;
   m.showWaterFacilities = false;
   m.showDatacenters = false;
   m.showDemandDensity = false;
@@ -232,6 +234,157 @@ test("scrubbing a finished cascade never re-enters cascade mode", () => {
   m.applyCascadeStep({ step: 1, tripped_generator_ids: [10] });
   assert.equal(m.cascadeActive, true);
   assert.deepEqual(activeChanges, [true, false, true]);
+});
+
+// The impact view must OUTLIVE the run. Reported by the user: "when i trip
+// something it shows the stages at first then it shows everything so i can't
+// see the impact visually". The trip marks were never lost — a tripped line
+// still paints red through the final classification — but at 1px with no glow
+// among ~99k fully-lit lines, "still painted" and "invisible" are the same.
+test("the impact view survives cascade_done and the final classification", () => {
+  const m = loadedManager();
+  const impact = [];
+  m.onImpactViewChange = (on) => impact.push(on);
+
+  m.applyCascadeStep({ step: 1, tripped_line_ids: [1], tripped_generator_ids: [10] });
+  m.applyCascadeStep({ step: 2, overloaded_line_ids: [2] });
+  assert.equal(m._impactView(), true);
+  assert.deepEqual(impact, [true]);
+
+  // The real settle sequence: dc_update, then ac_update, then cascade_done.
+  m.applyDCResults({ stressed_line_ids: [3] });
+  m.applyACResults({
+    partial_ac: true,
+    stressed_line_ids: [3],
+    ac_overlay: { partial: true, island_count: 0, islands: [] },
+  });
+  m.endCascade(true);
+
+  assert.equal(m.cascadeActive, false, "the run is over");
+  assert.equal(m._impactView(), true, "but its impact is still on the map");
+  assert.deepEqual(impact, [true], "the impact view never turned off");
+
+  // And the marks it is there to show are still painted.
+  assert.equal(lineById(m, 1).state, 3, "tripped line still marked");
+  assert.equal(m.dataStore.getGeneratorData()[0].state, 3, "tripped generator still marked");
+  assert.equal(lineById(m, 3).state, 1, "settled classification on top");
+});
+
+test("Reset Grid is what returns the map to full brightness", () => {
+  const m = loadedManager();
+  const impact = [];
+  m.onImpactViewChange = (on) => impact.push(on);
+
+  m.applyCascadeStep({ step: 1, tripped_line_ids: [1] });
+  m.endCascade(true);
+  assert.equal(m._impactView(), true);
+
+  m.resetToBaseline();
+  assert.equal(m._impactView(), false, "reset leaves the impact view");
+  assert.equal(m.cascadeEnded, false);
+  assert.deepEqual(impact, [true, false]);
+  assert.equal(lineById(m, 1).state, 0);
+});
+
+test("a new trip moves review -> live without passing through full brightness", () => {
+  const m = loadedManager();
+  const impact = [];
+  const active = [];
+  m.onImpactViewChange = (on) => impact.push(on);
+  m.onCascadeActiveChange = (a) => active.push(a);
+
+  m.applyCascadeStep({ step: 1, tripped_line_ids: [1] });
+  m.endCascade(true);
+  m.applyCascadeStep({ step: 1, tripped_line_ids: [2] });
+
+  assert.equal(m.cascadeActive, true, "the new run is live");
+  assert.equal(m._impactView(), true);
+  // Liveness flapped; the impact view never did, so the map never flashed
+  // back to full brightness between the two runs.
+  assert.deepEqual(active, [true, false, true]);
+  assert.deepEqual(impact, [true], "one transition for the whole session");
+});
+
+// A cascade_done with nothing behind it (a failed server start pushes one)
+// must not ghost the entire network with nothing to look at.
+test("a cascade_done with no frames does not enter the impact view", () => {
+  const m = loadedManager();
+  const impact = [];
+  m.onImpactViewChange = (on) => impact.push(on);
+
+  m.endCascade(false);
+
+  assert.equal(m._impactView(), false);
+  assert.deepEqual(impact, []);
+});
+
+// The flag is only worth having if it reaches the GPU. This drives the real
+// _updateLayers through the real layer factories and reads back the deck.gl
+// layer set, which is the thing the user actually sees.
+test("after settle the map still renders the ghost/affected split, not the flat network", () => {
+  const m = loadedManager();
+  let layers = [];
+  delete m._updateLayers; // use the real one
+  m.map = {
+    getZoom: () => 9,
+    getBounds: () => ({
+      getWest: () => -180,
+      getSouth: () => -90,
+      getEast: () => 180,
+      getNorth: () => 90,
+    }),
+  };
+  m.deckOverlay = { setProps: (p) => (layers = p.layers) };
+
+  const ids = () => layers.map((l) => l.id);
+
+  m.applyCascadeStep({ step: 1, tripped_line_ids: [1] });
+  assert.ok(ids().includes("transmission-ghost"), "unaffected lines ghosted while live");
+  assert.ok(ids().includes("transmission-affected"));
+  assert.ok(ids().includes("transmission-glow"), "tripped lines glow while live");
+
+  m.applyDCResults({ stressed_line_ids: [2] });
+  m.applyACResults({
+    partial_ac: true,
+    stressed_line_ids: [2],
+    ac_overlay: { partial: true, island_count: 0, islands: [] },
+  });
+  m.endCascade(true);
+
+  assert.ok(
+    ids().includes("transmission-ghost"),
+    "REGRESSION: unaffected lines went back to full brightness at settle"
+  );
+  assert.ok(ids().includes("transmission-affected"), "the failure stays emphasised");
+  assert.ok(ids().includes("transmission-glow"), "and keeps its glow");
+  assert.ok(
+    !ids().includes("transmission-lines"),
+    "the flat full-brightness layer must not be what replaces it"
+  );
+
+  // Reset is the exit: the flat network comes back and the split goes away.
+  m.resetToBaseline();
+  assert.ok(ids().includes("transmission-lines"));
+  assert.ok(!ids().includes("transmission-ghost"));
+});
+
+// UI-M21 composes with this: scrubbing a finished cascade stays OUT of the
+// live state but keeps the review dimming that makes the frame readable.
+test("scrubbing in review keeps the impact view and stays out of live", () => {
+  const m = loadedManager();
+  const impact = [];
+  m.onImpactViewChange = (on) => impact.push(on);
+
+  m.applyCascadeStep({ step: 1, tripped_line_ids: [1] });
+  m.applyCascadeStep({ step: 2, tripped_line_ids: [2] });
+  m.endCascade(false);
+
+  m.showCascadeStep(0);
+  assert.equal(m.cascadeActive, false, "reviewing is not cascading");
+  assert.equal(m._impactView(), true, "but the dimming stays");
+  assert.deepEqual(impact, [true]);
+  assert.equal(lineById(m, 1).state, 3);
+  assert.equal(lineById(m, 2).state, 0);
 });
 
 // UI-H2 / contract #3: dc_update line_loading consumption.

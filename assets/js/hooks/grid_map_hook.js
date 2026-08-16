@@ -44,8 +44,8 @@ const GridMapHook = {
       this.mapManager.applyCascadeStep(data);
     });
 
-    // Cascade finished (contract #2): leave cascade mode (ghosting,
-    // vignette, forced layers) but keep the final classification on the map.
+    // Cascade finished (contract #2): leave the LIVE state but stay in the
+    // impact view, so the failure picture survives for the operator to read.
     this.handleEvent("cascade_done", (data) => {
       this.mapManager.endCascade(data && data.stable);
     });
@@ -82,12 +82,22 @@ const GridMapHook = {
       this.mapManager.setSelectedComponent(null, null);
     });
 
-    // Toggle cascade-active CSS class on the grid container
+    // Two classes, because they answer different questions. `cascade-active`
+    // is LIVENESS -- it drives the pulsing alarm bar, and a bar that kept
+    // pulsing over a settled result would claim the grid is still failing.
+    // `cascade-impact` is "there is a failure picture on this map", which
+    // outlives the run and carries the vignette.
+    const container = () =>
+      this.el.closest(".grid-container") || this.el.parentElement;
+
     this.mapManager.onCascadeActiveChange = (active) => {
-      const gridContainer = this.el.closest(".grid-container") || this.el.parentElement;
-      if (gridContainer) {
-        gridContainer.classList.toggle("cascade-active", active);
-      }
+      const el = container();
+      if (el) el.classList.toggle("cascade-active", active);
+    };
+
+    this.mapManager.onImpactViewChange = (on) => {
+      const el = container();
+      if (el) el.classList.toggle("cascade-impact", on);
     };
 
     // Wire JS -> server events

@@ -37,6 +37,9 @@ export class MapManager {
     // layers) with no exit but Reset, because no second cascade_done was ever
     // coming.
     this.cascadeEnded = false;
+    // Whether the impact view is currently on, so onImpactViewChange fires on
+    // transitions rather than on every repaint.
+    this._impactViewOn = false;
     this.showWaterFacilities = false;
     this.showDatacenters = false;
     this.showDemandDensity = false;
@@ -56,6 +59,10 @@ export class MapManager {
     this.onComponentClick = null;
     this.onViewportChange = null;
     this.onCascadeActiveChange = null;
+    // Separate from onCascadeActiveChange: "a cascade is RUNNING" and "the
+    // impact of a cascade is on the map" are different facts, and only the
+    // first should drive live affordances (the pulsing alarm bar).
+    this.onImpactViewChange = null;
     this.selectedComponent = null; // { type, id }
     this.map = null;
     this.deckOverlay = null;
@@ -218,7 +225,10 @@ export class MapManager {
       };
     }
 
-    const ca = this.cascadeActive;
+    // Every layer's emphasis decision reads the IMPACT view, not liveness:
+    // ghosting, ghost-shrink, forced-visible impacted infrastructure. A
+    // settled cascade is still a cascade to look at.
+    const ca = this._impactView();
 
     // Demand-density hexbin overlay (drawn first = beneath the network) so
     // the line/generator geometry stays legible on top of it.
@@ -442,14 +452,50 @@ export class MapManager {
     if (this.onCascadeActiveChange) this.onCascadeActiveChange(next);
   }
 
+  // Is the impact picture on? — unaffected components ghosted, affected ones
+  // emphasised with glow and boosted width, impacted water/datacenters/
+  // substations forced visible.
+  //
+  // This is what makes a cascade legible, and it used to be tied to
+  // `cascadeActive` alone: the moment the run settled, the ghost layer was
+  // replaced by the ordinary full-brightness network and the impact was
+  // erased at exactly the moment the operator wanted to study it. The trip
+  // marks were never lost — a tripped line still paints red through the final
+  // classification — but at 1px with no glow, among ~99k fully-lit lines,
+  // "still painted" and "invisible" are the same thing.
+  //
+  // So the view outlives the run: it stays until Reset Grid or the next trip.
+  // `cascadeHistory.length` is the guard for a cascade_done that carries no
+  // impact at all (a failed server start pushes one), which would otherwise
+  // ghost the entire network with nothing to look at.
+  _impactView() {
+    // Boolean(), not the bare `||` chain: `undefined && x` is `undefined`, and
+    // this value is compared with === against the last one and handed to
+    // classList.toggle, both of which need a real boolean.
+    return Boolean(
+      this.cascadeActive || (this.cascadeEnded && this.cascadeHistory.length > 0)
+    );
+  }
+
+  // Fires onImpactViewChange on transitions only. Called after every mutation
+  // of the two flags it is computed from.
+  _syncImpactView() {
+    const on = this._impactView();
+    if (on === this._impactViewOn) return;
+    this._impactViewOn = on;
+    if (this.onImpactViewChange) this.onImpactViewChange(on);
+  }
+
   applyCascadeStep(data) {
     this.stateVersion++;
     this.cascadeHistory.push(data);
 
     // A frame is a live cascade by definition: a new one after a finished run
-    // re-arms cascade mode.
+    // re-arms cascade mode. The previous run's review view gives way to this
+    // one's live view without ever passing through full brightness.
     this.cascadeEnded = false;
     this._setCascadeActive(true);
+    this._syncImpactView();
 
     // The cascade forces the water layer visible for impacted facilities;
     // fetch the (lazy) dataset the first time an impact actually appears.
@@ -462,12 +508,15 @@ export class MapManager {
     this._updateLayers();
   }
 
-  // Cascade finished (server "cascade_done", contract #2): leave cascade
-  // mode — vignette, ghosting, forced layers — but KEEP the final
-  // classification marks on the map.
+  // Cascade finished (server "cascade_done", contract #2): leave the LIVE
+  // state — the pulsing alarm bar, the timeline's progress affordance — and
+  // enter review. The impact picture stays exactly as it was: ghosted
+  // context, emphasised failures, and the final classification on top of
+  // them. Reset Grid or the next trip is what clears it.
   endCascade(_stable) {
     this.cascadeEnded = true;
     this._setCascadeActive(false);
+    this._syncImpactView();
     this.stateVersion++;
     this._updateLayers();
   }
@@ -543,9 +592,12 @@ export class MapManager {
     this.dataStore.resetLineLoading();
     this.cascadeHistory = [];
     // Nothing to review and nothing running: the next frame starts a cascade
-    // from scratch rather than reviving the one that was just cleared.
+    // from scratch rather than reviving the one that was just cleared. This
+    // is the one exit from the review view that returns the map to full
+    // brightness.
     this.cascadeEnded = false;
     this._setCascadeActive(false);
+    this._syncImpactView();
 
     this._updateLayers();
   }
@@ -615,6 +667,10 @@ export class MapManager {
     this._setCascadeActive(
       !this.cascadeEnded && position >= 0 && this.cascadeHistory.length > 0
     );
+    // Reviewing a step keeps the review view: the ghosting is what makes the
+    // replayed frame readable, and it is the same view the scrub was started
+    // from.
+    this._syncImpactView();
     for (let i = 0; i <= position && i < this.cascadeHistory.length; i++) {
       const frame = this.cascadeHistory[i];
       this._applyCascadeData(frame);
