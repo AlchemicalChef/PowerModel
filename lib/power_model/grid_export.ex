@@ -9,6 +9,18 @@ defmodule PowerModel.GridExport do
 
   require Logger
 
+  # bus_loads.bin, the map's only bus-level position index:
+  #
+  #   header: "BLD" tag, version u8, record count u32 (little-endian)
+  #   record: bus_id u32, lon f32, lat f32, demand_mw f32
+  #
+  # v1 carried the three floats and no bus id, so nothing bus-level — a step's
+  # `bus_voltage`, a cascade's `ac_overlay` — could be placed on the map
+  # (UIW-2). The tag exists because a v1 and a v2 file are otherwise
+  # indistinguishable (both open with a plausible u32) and a v1 file read as v2
+  # yields coordinates out of misaligned bytes rather than an error.
+  @bus_loads_magic <<"BLD", 2>>
+
   @doc """
   Regenerate the map data files at application boot when they are missing
   or empty.
@@ -22,11 +34,17 @@ defmodule PowerModel.GridExport do
   def ensure_exported(dir \\ nil) do
     dir = dir || Application.app_dir(:power_model, "priv/static/grid_data")
 
-    if usable_export?(Path.join(dir, "transmission.bin")) do
-      :ok
-    else
-      Logger.info("grid_data exports missing or empty; regenerating from database")
-      run(dir)
+    cond do
+      not usable_export?(Path.join(dir, "transmission.bin")) ->
+        Logger.info("grid_data exports missing or empty; regenerating from database")
+        run(dir)
+
+      not current_bus_loads?(Path.join(dir, "bus_loads.bin")) ->
+        Logger.info("grid_data bus_loads.bin predates the bus-id layout; regenerating")
+        run(dir)
+
+      true ->
+        :ok
     end
   rescue
     e -> Logger.warning("grid_data export at boot failed: #{Exception.message(e)}")
@@ -39,6 +57,16 @@ defmodule PowerModel.GridExport do
   defp usable_export?(path) do
     case File.read(path) do
       {:ok, <<count::unsigned-little-32, _rest::binary>>} -> count > 0
+      _ -> false
+    end
+  end
+
+  # A v1 bus_loads.bin (no tag, no bus id) parses as garbage under the current
+  # reader, and no other file in the export set would trigger a rebuild — so a
+  # boot that finds a usable transmission.bin has to check this one too.
+  defp current_bus_loads?(path) do
+    case File.open(path, [:read, :binary], &IO.binread(&1, byte_size(@bus_loads_magic))) do
+      {:ok, @bus_loads_magic} -> true
       _ -> false
     end
   end
@@ -137,19 +165,22 @@ defmodule PowerModel.GridExport do
     IO.puts("  substations.bin: #{count} records, #{byte_size(binary)} bytes")
   end
 
-  # Per-bus demand points for the H3 hexbin overlay. Aggregation into H3
-  # cells happens client-side (h3-js) so resolution can follow zoom.
+  # Per-bus points for the H3 hexbin overlays (demand density, voltage depth);
+  # layout at @bus_loads_magic. Aggregation into H3 cells happens client-side
+  # (h3-js) so resolution can follow zoom.
   defp export_bus_loads(dir) do
     loads = PowerModel.Grid.export_bus_loads()
     count = length(loads)
 
     binary =
-      <<count::unsigned-little-32>> <>
+      @bus_loads_magic <>
+        <<count::unsigned-little-32>> <>
         Enum.reduce(loads, <<>>, fn l, acc ->
           {lon, lat} = extract_coords(l.coordinates)
 
           acc <>
             <<
+              l.bus_id::unsigned-little-32,
               lon::float-little-32,
               lat::float-little-32,
               l.demand_mw || 0.0::float-little-32

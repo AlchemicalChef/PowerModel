@@ -78,10 +78,6 @@ const GridMapHook = {
       this.mapManager.showCascadeStep(data.step);
     });
 
-    this.handleEvent("update_lod", (data) => {
-      this.mapManager.updateLOD(data.zoom, data.bounds);
-    });
-
     this.handleEvent("deselect_highlight", () => {
       this.mapManager.setSelectedComponent(null, null);
     });

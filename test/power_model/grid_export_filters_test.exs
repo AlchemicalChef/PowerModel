@@ -209,10 +209,83 @@ defmodule PowerModel.GridExportFiltersTest do
     test "leaves a populated export alone", %{dir: dir} do
       marker = <<7::unsigned-little-32, 1, 2, 3>>
       File.write!(Path.join(dir, "transmission.bin"), marker)
+      File.write!(Path.join(dir, "bus_loads.bin"), <<"BLD", 2, 0::unsigned-little-32>>)
 
       GridExport.ensure_exported(dir)
 
       assert File.read!(Path.join(dir, "transmission.bin")) == marker
+    end
+
+    # UIW-2: a bus_loads.bin from before the bus-id layout parses as garbage
+    # under the current reader, and nothing else in the export set would
+    # trigger a rebuild on a boot that finds transmission.bin populated.
+    test "regenerates when bus_loads.bin predates the bus-id layout", %{dir: dir} do
+      File.write!(Path.join(dir, "transmission.bin"), <<7::unsigned-little-32, 1, 2, 3>>)
+      # v1: bare count, then three floats per record — no tag, no bus id.
+      File.write!(Path.join(dir, "bus_loads.bin"), <<1::unsigned-little-32, 0::96>>)
+
+      GridExport.ensure_exported(dir)
+
+      assert <<"BLD", 2, _rest::binary>> = File.read!(Path.join(dir, "bus_loads.bin"))
+    end
+  end
+
+  describe "bus_loads.bin bus-id channel (UIW-2)" do
+    test "each record carries its bus id, and the ids round-trip", %{b1: b1, b2: b2} do
+      # Two rows on one bus (a unique index keeps them distinct by load_type):
+      # both are real consumption and both belong in the bus total.
+      Repo.insert!(%Load{
+        bus_id: b1.id,
+        p_mw: 40.0,
+        q_mvar: 0.0,
+        load_type: "constant_power",
+        status: "in_service"
+      })
+
+      Repo.insert!(%Load{
+        bus_id: b1.id,
+        p_mw: 25.0,
+        q_mvar: 0.0,
+        load_type: "datacenter",
+        status: "in_service"
+      })
+
+      Repo.insert!(%Load{bus_id: b2.id, p_mw: 10.0, q_mvar: 0.0, status: "in_service"})
+
+      dir =
+        Path.join(
+          System.tmp_dir!(),
+          "grid_export_bus_loads_#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      GridExport.run(dir)
+
+      assert <<"BLD", 2, count::unsigned-little-32, records::binary>> =
+               File.read!(Path.join(dir, "bus_loads.bin"))
+
+      assert count == 2
+      assert byte_size(records) == count * 16
+
+      parsed =
+        for <<bus_id::unsigned-little-32, lon::float-little-32, lat::float-little-32,
+              mw::float-little-32 <- records>>,
+            into: %{},
+            do: {bus_id, {lon, lat, mw}}
+
+      # The bus id is the join key for every bus-level cascade product; without
+      # it nothing on the map can be placed.
+      assert Map.keys(parsed) |> Enum.sort() == Enum.sort([b1.id, b2.id])
+
+      {lon, lat, mw} = parsed[b1.id]
+      assert_in_delta lon, -90.0, 1.0e-4
+      assert_in_delta lat, 35.0, 1.0e-4
+      assert_in_delta mw, 65.0, 1.0e-4, "both loads on a bus are summed"
+
+      {_, _, mw2} = parsed[b2.id]
+      assert_in_delta mw2, 10.0, 1.0e-4
     end
   end
 

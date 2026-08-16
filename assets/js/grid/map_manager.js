@@ -8,6 +8,7 @@ import { createWaterFacilitiesLayer } from "./layers/water_facilities_layer";
 import { createDatacentersLayer } from "./layers/datacenters_layer";
 import { createTransformersLayer } from "./layers/transformers_layer";
 import { createDemandDensityLayer } from "./layers/demand_density_layer";
+import { createVoltageOverlayLayer } from "./layers/voltage_overlay_layer";
 import { COLOR_SCALES } from "./color_scales";
 import { ViewportTracker } from "./viewport_tracker";
 
@@ -88,11 +89,19 @@ export class MapManager {
 
     // Zoom LOD and label culling are computed client-side from the viewport
     // (no server round trip); the server is still informed so it can adapt
-    // payloads. The tracker debounces and filters insignificant moves.
-    this.viewportTracker = new ViewportTracker(this.map, (zoom, bounds) => {
-      this._updateLayers();
-      if (this.onViewportChange) this.onViewportChange(zoom, bounds);
-    });
+    // payloads, but it must not echo back — a server-triggered rebuild made
+    // every debounced pan rebuild ~90k line paths TWICE (UIW-8). The tracker
+    // debounces and filters insignificant moves.
+    this.viewportTracker = new ViewportTracker(this.map, (zoom, bounds) =>
+      this._onViewportMove(zoom, bounds)
+    );
+  }
+
+  // One debounced viewport move: rebuild locally, then tell the server. The
+  // rebuild count per notification is exactly one and must stay there.
+  _onViewportMove(zoom, bounds) {
+    this._updateLayers();
+    if (this.onViewportChange) this.onViewportChange(zoom, bounds);
   }
 
   // One-time, dismissable error banner inside the map container
@@ -213,6 +222,14 @@ export class MapManager {
         !this.showDemandDensity,
         this.stateVersion
       )
+    );
+
+    // Voltage-depth hexbins and shed-bus marks, also beneath the network and
+    // above the demand hexbins: the two rarely coexist (demand density is a
+    // baseline view, voltage depth only exists during/after a cascade) and
+    // when they do, the failure surface is the one to read.
+    layers.push(
+      ...createVoltageOverlayLayer(this.dataStore, zoom, this.stateVersion)
     );
 
     // Transmission lines (always visible, filtered by zoom)
@@ -386,16 +403,27 @@ export class MapManager {
     if (data.line_loading) {
       this.dataStore.applyLineLoading(data.line_loading);
     }
+
+    // The end-of-cascade voltage overlay (UIW-2/UIW-4) rides on the same
+    // payload as the DC lists. Consuming it HERE rather than in
+    // applyACResults is what makes scrubbing agree with the live view: this
+    // payload is also stored as __finalClassification on the last cascade
+    // frame, so showCascadeStep replays the overlay through the same path.
+    if (data.ac_overlay) {
+      this.dataStore.applyVoltageOverlay(data.ac_overlay);
+    }
   }
 
   applyACResults(data) {
-    // AC refinement carries the same line-classification lists as DC --
-    // apply them, plus substation-level voltage violations when present.
-    if (data.voltage_violation_substation_ids) {
-      const subMap = {};
-      for (const id of data.voltage_violation_substation_ids) subMap[id] = 1;
-      this.dataStore.applySubstationStateMap(subMap);
-    }
+    // The AC channel carries partial, per-island voltages plus the DC
+    // classification lists ridden along unchanged (an overlay without them
+    // would blank the map the dc_update just painted, because the DC painter
+    // clears every flow state before applying what it is given).
+    //
+    // It replaced a substation-level voltage-violation channel that no server
+    // ever produced. Bus ids are NOT substation ids — independently allocated
+    // integer spaces — so nothing bus-level may be routed back through
+    // applySubstationStateMap.
     this.applyDCResults(data);
   }
 
@@ -482,6 +510,18 @@ export class MapManager {
     if (data.datacenter_ids && data.datacenter_ids.length > 0) {
       this.dataStore.applyDatacenterState(data.datacenter_ids, 3);
     }
+
+    // Bus-level failure surface (UIW-2). Both keys are omitted entirely when
+    // the step has nothing to say — an absent key means NO INFORMATION, not
+    // "no violations", so the previous overlay stands rather than being
+    // cleared. A step's bus_voltage is the violating set only; the full
+    // magnitude map arrives once per cascade on the AC channel.
+    if (data.bus_voltage) {
+      this.dataStore.applyBusVoltage(data.bus_voltage);
+    }
+    if (data.shed_bus_ids) {
+      this.dataStore.applyShedBusIds(data.shed_bus_ids);
+    }
   }
 
   resetToBaseline() {
@@ -555,10 +595,6 @@ export class MapManager {
         this._applyDCClassification(frame.__finalClassification);
       }
     }
-    this._updateLayers();
-  }
-
-  updateLOD(zoom, bounds) {
     this._updateLayers();
   }
 
