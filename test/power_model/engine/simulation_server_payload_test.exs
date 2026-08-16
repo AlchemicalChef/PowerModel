@@ -242,12 +242,69 @@ defmodule PowerModel.Engine.SimulationServerPayloadTest do
     end
   end
 
+  describe "shed_bus_ids/2" do
+    test "resolves shed loads to their buses, deduplicated" do
+      # Three loads, two of them on the same bus: the map paints buses, so the
+      # shared bus must appear once.
+      trips = [shed_event(1, 1.0), shed_event(2, 1.0), shed_event(3, 1.0)]
+      bus_by_load = %{1 => 500, 2 => 500, 3 => 501}
+
+      assert SimulationServer.shed_bus_ids(trips, bus_by_load) == [500, 501]
+    end
+
+    test "covers every shed cause, including uvls_shed and island_blackout" do
+      trips = [
+        shed_event(1, 1.0, cause: "ufls_shed"),
+        shed_event(2, 1.0, cause: "uvls_shed"),
+        %{
+          component_type: "load",
+          component_id: 3,
+          failure_cause: "island_blackout",
+          details: %{lost_mw: 5.0}
+        }
+      ]
+
+      buses = SimulationServer.shed_bus_ids(trips, %{1 => 10, 2 => 11, 3 => 12})
+
+      assert Enum.sort(buses) == [10, 11, 12]
+    end
+
+    test "a step that shed nothing yields [], so the key is omitted" do
+      trips = [component_event(1, "thermal_overload"), component_event(2, "distance_zone3")]
+
+      assert SimulationServer.shed_bus_ids(trips, %{1 => 10, 2 => 11}) == []
+      assert SimulationServer.shed_bus_ids([], %{}) == []
+    end
+
+    test "a non-load event whose id collides with a load id does not mark that bus" do
+      # Load, generator and line ids are separate id spaces. A generator
+      # tripping on frequency must never paint load 1's bus as shed.
+      trips = [
+        %{
+          component_type: "generator",
+          component_id: 1,
+          failure_cause: "ufls_shed",
+          details: %{}
+        }
+      ]
+
+      assert SimulationServer.shed_bus_ids(trips, %{1 => 500}) == []
+    end
+
+    test "a shed load missing from the map is dropped rather than nil-marked" do
+      trips = [shed_event(1, 1.0), shed_event(99, 1.0)]
+
+      assert SimulationServer.shed_bus_ids(trips, %{1 => 500}) == [500]
+    end
+  end
+
   describe "UIW-4: client_step_payload/1" do
     test "drops exactly the four channels no browser reads, and nothing else" do
       payload = %{
         step: 1,
         trips: [component_event(1, "thermal_overload")],
         shed_ids: [1, 2, 3],
+        shed_bus_ids: [500, 501],
         water_facility_trips: [%{id: 1}],
         datacenter_trips: [%{id: 2}],
         tripped_line_ids: [7],
@@ -260,14 +317,24 @@ defmodule PowerModel.Engine.SimulationServerPayloadTest do
       slim = SimulationServer.client_step_payload(payload)
 
       assert Map.keys(slim) |> Enum.sort() ==
-               ~w(balance datacenter_ids step tripped_line_ids voltage_layer
-                  water_facility_ids)a
+               ~w(balance datacenter_ids shed_bus_ids step tripped_line_ids
+                  voltage_layer water_facility_ids)a
 
-      # The id channels the map actually paints from must survive.
+      # The id channels the map actually paints from must survive. shed_bus_ids
+      # in particular REPLACES the dropped load-id channel -- dropping it too
+      # would leave the shed marks with no producer at all.
+      assert slim.shed_bus_ids == [500, 501]
       assert slim.tripped_line_ids == [7]
       assert slim.water_facility_ids == [1]
       assert slim.datacenter_ids == [2]
       assert slim.voltage_layer == %{islands_ac: 1}
+    end
+
+    test "the load-id shed channel is dropped while the bus-id one survives" do
+      slim = SimulationServer.client_step_payload(%{shed_ids: [1, 2], shed_bus_ids: [500]})
+
+      refute Map.has_key?(slim, :shed_ids)
+      assert slim.shed_bus_ids == [500]
     end
   end
 
@@ -391,7 +458,7 @@ defmodule PowerModel.Engine.SimulationServerBroadcastTest do
     # UIW-3's absence rule: the injected failure has no voltage layer, no
     # frequency trajectory and no AGC, so it advertises none of them. This is
     # what keeps a steady-state payload byte-identical to the pre-UI-2 shape.
-    for key <- [:voltage_layer, :frequency, :agc, :bus_voltage, :trips_omitted] do
+    for key <- [:voltage_layer, :frequency, :agc, :bus_voltage, :trips_omitted, :shed_bus_ids] do
       refute Map.has_key?(payload, key), "step 0 must not carry #{key}"
     end
 
@@ -435,6 +502,39 @@ defmodule PowerModel.Engine.SimulationServerBroadcastTest do
       # `trip_count` is the truth; `trips` is the panel view and may be shorter.
       assert payload.trip_count == length(engine.trips || [])
       assert length(payload.trips) <= payload.trip_count
+    end
+  end
+
+  test "a step that sheds load carries the buses that lost it", %{sim_id: sim_id, big_gen: gen} do
+    assert {:ok, engine_steps} = SimulationServer.trip_generator(sim_id, gen.id)
+
+    load_buses =
+      Repo.all(from(l in Load, where: l.status == "in_service", select: l.bus_id))
+      |> MapSet.new()
+
+    shed_steps =
+      Enum.filter(engine_steps, fn step ->
+        Enum.any?(step.trips || [], &(&1.component_type == "load"))
+      end)
+
+    # Guard against a vacuous pass: if the fixture stopped shedding, the
+    # comprehension below would assert nothing at all.
+    assert shed_steps != [], "fixture produced no load-shed step; this test would be vacuous"
+
+    payloads = Map.new(drain_steps(), &{&1.step, &1})
+
+    for engine <- shed_steps, payload = payloads[engine.step], payload != nil do
+      buses = Map.get(payload, :shed_bus_ids, [])
+
+      assert buses != [], "step #{engine.step} shed load but carried no shed_bus_ids"
+      assert buses == Enum.uniq(buses), "shed_bus_ids must be deduplicated"
+
+      # Every id must be a real load-carrying bus: the map paints these
+      # directly, and a load id leaking through would mark the wrong bus.
+      for bus_id <- buses do
+        assert MapSet.member?(load_buses, bus_id),
+               "#{bus_id} is not a bus that carries load"
+      end
     end
   end
 

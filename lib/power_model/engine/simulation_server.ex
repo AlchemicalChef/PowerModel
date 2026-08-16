@@ -855,6 +855,8 @@ defmodule PowerModel.Engine.SimulationServer do
       |> Enum.filter(&(&1.failure_cause in @shed_causes))
       |> Enum.map(& &1.component_id)
 
+    bus_by_load = bus_by_load(state)
+
     # Critical-infrastructure impacts (water facilities, datacenters)
     water_facility_trips = Enum.filter(trips, &(&1.component_type == "water_facility"))
     water_facility_ids = Map.get(step, :water_facility_ids, [])
@@ -882,7 +884,7 @@ defmodule PowerModel.Engine.SimulationServer do
         end
       )
 
-    {panel_trips, trips_omitted} = panel_trips(trips, bus_by_load(state))
+    {panel_trips, trips_omitted} = panel_trips(trips, bus_by_load)
 
     %{
       step: step.step,
@@ -927,6 +929,7 @@ defmodule PowerModel.Engine.SimulationServer do
       balance: Map.get(step, :balance)
     }
     |> put_present(:trips_omitted, if(trips_omitted > 0, do: trips_omitted))
+    |> put_present(:shed_bus_ids, shed_bus_ids(trips, bus_by_load))
     |> put_present(:voltage_layer, Map.get(step, :voltage_layer))
     |> put_present(:frequency, Map.get(step, :frequency))
     |> put_present(:agc, Map.get(step, :agc))
@@ -1070,6 +1073,28 @@ defmodule PowerModel.Engine.SimulationServer do
     Map.new(state.cascade_state.loads, &{&1.id, &1.bus_id})
   end
 
+  @doc """
+  The BUSES that lost demand this step, deduplicated.
+
+  The map paints buses, not loads, and `:shed_ids` carries LOAD ids and is
+  dropped before the client sees it — so without this the shed marks had no
+  producer at all. One bus commonly carries several loads, so this is
+  materially smaller than the load-id channel it replaces on the wire.
+
+  Resolved only from `component_type: "load"` events, deliberately: load,
+  generator and line ids are separate id spaces with colliding integers, so a
+  non-load event whose `component_id` happened to match a load id would
+  otherwise mark that load's bus. `:shed_ids` keeps its looser filter for
+  compatibility — it has no consumers and is dropped at the client seam.
+  """
+  def shed_bus_ids(trips, bus_by_load) do
+    trips
+    |> Enum.filter(&(&1.component_type == "load" and &1.failure_cause in @shed_causes))
+    |> Enum.map(&Map.get(bus_by_load, &1.component_id))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
   # UFLS/UVLS report what they took as `shed_mw`; an island blackout reports it
   # as `lost_mw`. Both are MW of demand removed at this step.
   defp shed_event_mw(%{details: %{} = details}) do
@@ -1080,6 +1105,10 @@ defmodule PowerModel.Engine.SimulationServer do
 
   @doc """
   The `cascade_step` payload with the channels no browser reads removed.
+
+  `:shed_bus_ids` is NOT dropped: it is the map's shed channel and replaces the
+  load-id channel below. Adding a key here that the map paints from would blank
+  the shed marks.
 
   `:trips`, `:water_facility_trips`, `:datacenter_trips` and `:shed_ids` exist
   for the LiveView, which builds the Affected panel and the frequency metric
