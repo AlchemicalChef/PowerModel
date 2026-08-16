@@ -651,8 +651,10 @@ broken, while `Ingestion.Validation`'s balance screen still reproduces the OLD n
 (BPAT 0/4,417, MISO 5/4,389, CISO 611/2,473) on the same DB — observed in the 2026-08-16
 re-ingest validate run. Same nominal formula (NG − (D+TI)); suspect a sign/column
 divergence (raw vs Adjusted, or TI orientation) in validation.ex's SQL vs Demand's.
-Reconcile to ONE identity implementation both call; until then the validate WARN text
-overstates the broken set.
+RESOLVED 2026-08-16 with ENE-23 — and the recorded root cause was WRONG: not sign or
+column, but TOLERANCE (Demand screened at 5% relative, Validation at 1% — the entirety of
+the MISO discrepancy). One implementation now (Demand.identity_closure_by_ba/0, on the
+fuel sum dispatch actually places); Validation's own tolerance knobs deleted.
 **ENE-18 (DATA CAVEAT) [RE-MEASURED 2026-08-16]** EIA-930's own identity NG − (D+TI)
 fails for BPAT alone in the current DB: 0 of 4,417 hours close at 5% tolerance, mean
 residual −4,317 MW (sd 725). The previously-recorded MISO and CISO are no longer broken
@@ -754,121 +756,144 @@ scenario; clean bills recorded in the session log. Conservation identity survive
 adversarial cascades designed to break it; the Blue Cut guard proved exactly disjoint;
 reactor signs verified end-to-end; the NIF error contract verified at all 12 call sites.
 
-**CAS-20 (HIGH) [OPEN]** Collapsed islands report nadir 60.00 Hz: the three island-death
+**CAS-20 (FIXED 2026-08-16)** Collapsed islands report nadir 60.00 Hz: the three island-death
 paths (cascade.ex ~:1992/:2065/:2191) replace the record with fresh_island_record and
 DISCARD the trajectory that killed the island; step_nadir_hz reads the survivors. A total
 blackout renders 60.00/60.00 — the misreading the frequency contract exists to prevent.
 Fix: accumulate nadir where trajectories are produced (solve_islands_timed accumulator).
-**CAS-21 (MED) [OPEN]** Nadir leaks across cascade events: begin_cascade_event rebases the
+**CAS-21 (FIXED 2026-08-16)** Nadir leaks across cascade events: begin_cascade_event rebases the
 floor but record.exposure keeps 180 s of history, so the next event's step 1 re-reads the
 old dip (measured: a 3 MW trip "reaching" 59.16 Hz). Same fix as CAS-20.
-**CAS-22 (MED) [OPEN]** Clock-ramped reserve tiers re-grant the full elapsed-time ramp on
+**CAS-22 (FIXED 2026-08-16)** (per-tier delivered ledger on the island record) Clock-ramped reserve tiers re-grant the full elapsed-time ramp on
 every allocate/4 call; the cascade calls up to 3x per island per step — a slow fleet
 delivers up to 3x its own ramp past 600 s and UFLS under-fires (measured 60 MW from a
 20 MW/min unit). Fix: per-unit delivered-under-this-clock tracking fed as already_mw.
-**CAS-23 (LOW-MED) [OPEN]** Distance-relay duty is keyed by zone cause, so a branch whose
+**CAS-23 (FIXED 2026-08-16)** (per-zone timers; worsening faults trip sooner) Distance-relay duty is keyed by zone cause, so a branch whose
 apparent impedance walks inward loses accrued duty and trips LATER than a static fault
 (zone3 0.9 duty + zone2 restart = 1.75 s vs 1.50 s). Real relays run zone timers in
 parallel. Fix: key distance duty {:distance, type, id} with per-zone timers in the value.
-**CAS-24 (LOW) [OPEN]** voltage_alarm (absolute bus-count high-water) is inherited
+**CAS-24 (FIXED 2026-08-16)** voltage_alarm (absolute bus-count high-water) is inherited
 untouched across splits, so the smaller fragment can never re-alarm. Reset it alongside
 ac_voltage in inherit_record's non-equal branch.
-**CAS-25 (LOW, latent) [OPEN]** :budget_exhausted never reaches a callback-stream
+**CAS-25 (DOCUMENTED 2026-08-16)** (list authoritative; synthetic frame would desync step indexing) :budget_exhausted never reaches a callback-stream
 consumer (the budget clause fires INSTEAD of a step; the stamp lands only on the returned
 list). Latent: SimulationServer broadcasts the list. Document or emit a final callback.
 **CAS-19 re-rated LOW → MED**: the fleet-wide p_set_pu default measured as PHANTOM
 generation loss (a 20 MW-dispatched farm at 0.60 pu loses 5.6 MW that lands in the
 deficit and drives UFLS) — biases cascades toward collapse, not just bookkeeping.
 
-**SOL-14 (HIGH) [OPEN]** FDPF's dense-NR fallback is a cliff: measured 5.2 s / 120.4 s /
+**SOL-14 (FIXED 2026-08-16)** (cutoff 300 by boundary measurement; Solution.solver stamp; hard_failure window widening documented as intended) FDPF's dense-NR fallback is a cliff: measured 5.2 s / 120.4 s /
 340.8 s at 306/933/1,318 buses (all converged:false — same answer the 0.25 s refusal
 gives), 1.4 GB peak at 1,318, O(n^3) to ~67 min at the 3,000-bus cutoff. Fires on real
 islands (LIN-13 makes non-convergence the NORMAL case) inside the 120 s trip timeout.
 Fix: cutoff → ~300 and stamp the Solution with the producing solver.
-**SOL-15 (MED) [OPEN]** solve_jacobian_gauss (newton_raphson.ex:1047) is the uncapped
+**SOL-15 (FIXED 2026-08-16)** solve_jacobian_gauss (newton_raphson.ex:1047) is the uncapped
 twin of the gaussian_solve SOL-4 capped — reached when native LU fails on exactly the
 ill-conditioned islands SOL-14 sends there; extrapolates to ~47 h at cutoff size. Cap it.
-**SOL-16 (MED) [OPEN]** screen_n2 reports a FAILED pair solve as :clean
+**SOL-16 (FIXED 2026-08-16)** (the :clean mislabel was latent — every pair draws from pre-solved seed columns; the reachable worker-crash arm is tested; the {:error,_} arm of evaluate_pair is correct but unreachable via the public API — not dead code) screen_n2 reports a FAILED pair solve as :clean
 (contingency_screening.ex:448) and lacks sweep/3's {:exit,_} clause — contradicting the
 module's own no-partial-results contract. Propagate and abort like screen/2.
-**SOL-17 (MED, latent) [OPEN]** LODF.flows/1 error path silently returns BASE flows as
+**SOL-17 (FIXED 2026-08-16)** LODF.flows/1 error path silently returns BASE flows as
 post-outage flows (lodf.ex:300) — contradicts the module's "never silently degraded"
 promise. No callers yet; fix the return shape before one appears. needs_refactorize?/1
 is likewise wired to nothing.
-**SOL-18 (LOW) [OPEN]** Stale invariants: lodf.ex:68 still says ±1e-3 floor; parameter_
+**SOL-18 (FIXED 2026-08-16)** (parameter_estimator's text was wrong on BOTH numbers: 4,485 repair rows at v0 / min |x| 1.2e-5 above the clamp — exclusion load-bearing for length-correctness, not clamping) Stale invariants: lodf.ex:68 still says ±1e-3 floor; parameter_
 estimator.ex:31 still claims repair rows at v0/below-clamp; newton_raphson.ex:551's
 "where n^2 is affordable" contradicts SOL-14's measurements.
-**SOL-19 (LOW) [OPEN]** bus.vm_pu dot-access (newton_raphson.ex:477) — the SOL-5 pattern,
+**SOL-19 (FIXED 2026-08-16)** bus.vm_pu dot-access (newton_raphson.ex:477) — the SOL-5 pattern,
 ten lines above the comment documenting the opposite rule; raises on plain-map buses
 (unreachable in production, bites tests/fixtures). bus_type at :410/:430/:476 same.
-**SOL-20 (LOW) [OPEN]** YBus's "floors nothing physical" claim is false by two lines: two
+**SOL-20 (FIXED 2026-08-16)** (the two branches named and derived: 765 kV jumpers at 100/184 m, floor inflates 2.1x/1.1x) YBus's "floors nothing physical" claim is false by two lines: two
 sub-200 m 765 kV jumpers sit exactly at the 1e-5 write floor. Reword or lower the pair.
 Also for the record: ZERO bus_type=3 rows exist DB-wide — every solver derives slack from
 the largest-generator tiebreak (measured stable, but the slack moves when that unit trips);
 zero capacitor banks exist, so B'' has never seen a diagonal-weakening shunt.
 
-**DAT-25 (HIGH, fresh-DB) [OPEN]** Generation-only BA rows (demand_mw NULL — created by
+**DAT-25 (FIXED 2026-08-16)** (the specified fix was incomplete — interconnection_demand_for_date/1 has its own query; both filtered) Generation-only BA rows (demand_mw NULL — created by
 DR-1's form930 fix + migration on the NEXT demand ingest; 0 exist in dev today) crash
 Demand.interconnection_demand_for_date/1 and scale_loads_to_national/2 (nil arithmetic);
 the first is called unconditionally by the dashboard. Fix: not is_nil(demand_mw) in
 demand_at/1 (the nil-tolerant readers key on absence already).
-**DAT-26 (HIGH, fresh-DB) [OPEN]** full_pipeline runs map_buses (stage 7) before
+**DAT-26 (FIXED 2026-08-16)** (line-pass-only moved — the full move would have silently synthesized zero reactors; remap stage added) full_pipeline runs map_buses (stage 7) before
 estimate_parameters (stage 9), so DR-4's capability-ranked placement sees rating_a_mva
 nil→0 on lines (87.8% of capability at generator buses; 6,433 buses / 632.9 GW have zero
 transformer capacity) and falls through to the pre-DR-4 nearest-any-level rule; the
 repairing remap_stranded_generators has NO pipeline caller (migration 150003 only). Fix:
 reorder + add a remap stage after repair_connectivity.
-**DAT-27 (MED-HIGH) [OPEN]** Migration 20260816150000's down/0 raises FK violation 23503:
+**DAT-27 (FIXED 2026-08-16)** (down nulls generators + refuses on un-nullable referents; verify via Migration.Runner in-process, NEVER Ecto.Migrator against dev — see the 2026-08-16 incident note) Migration 20260816150000's down/0 raises FK violation 23503:
 150003 later moved 102 generators onto the synthetic buses it deletes, and 150003's own
 down is :ok. Executed in a rolled-back transaction. Fix: null generator bus_ids first, or
 refuse with the map_buses pointer like 150002/150003.
-**ENE-23 (MED) [OPEN]** The ENE20-C identity screen tests ba_demand_hourly.net_generation
+**ENE-23 (FIXED 2026-08-16)** (single implementation on the fuel sum; screened set now BPAT+WALC; Western −255.9 MW, in gate; Eastern/ERCOT exactly 0.0) The ENE20-C identity screen tests ba_demand_hourly.net_generation
 while dispatch places ba_fuel_hour fuel columns — a different series. WALC: NG closes
 0.995 but fuel-sum closes 0.313, over-dispatched +20.7% of own demand on 69% of hours,
 invisible to the screen; national fuel-sum runs +2,202 MW (+0.5%) above the D+TI anchor.
 Fix: screen on sum(ba_fuel_hour) — the same one-query change as reconciling ENE-22.
 ENE-22 ADDENDUM: the dispatch correction's ORIENTATION is confirmed correct (BPAT's NG and
 fuel-sum residuals agree to 2 MW); ENE-22 lives entirely in validation.ex's screen.
-**DAT-28 (MED) [OPEN]** priv/topology_baseline.json records only counts/connectivity — no
+**DAT-28 (FIXED 2026-08-16)** (stranded nameplate, zero-capability buses, deg-1 load share in the baseline) priv/topology_baseline.json records only counts/connectivity — no
 placement, capability, stranding or load-distribution metric — so DAT-26's degradation
 passes the pipeline's final gate clean. Also enshrines buses_without_ba=2701: DAT-23's
 fix will fail the gate and needs --update-baseline in the same change.
-**ENE-24 (LOW) [OPEN]** Storage duty cycle mixes share-scaled (dispatch-hour) and
+**ENE-24 (FIXED 2026-08-16)** (worse than logged: share 0.5 broke SOC conservation by −8,747 MWh/day) Storage duty cycle mixes share-scaled (dispatch-hour) and
 unscaled (other 23 h) series in day_shape/cap_to_measurement; grows with (1−share), worst
 on fragmented interconnections. Pass the share into Storage.profile/2.
 
-**UI-M18 (HIGH) [REMEDIED-OPS, CODE OPEN]** ensure_exported checks FORMAT only (count>0,
+**UI-M18 (FIXED 2026-08-16)** (manifest.bin content tag, counts + max(updated_at), written last; caught live drift on first run) ensure_exported checks FORMAT only (count>0,
 BLD tag) and cannot see the DB moved: after the re-ingest the map served 13,290 fewer
 in-service lines than the DB (silently unpaintable trips) and pre-DR-5 demand hexbins.
 Export regenerated 2026-08-16 (ops); code fix: content tag (row counts / max updated_at)
 in the header, compared at boot.
-**UI-M19 (HIGH) [OPEN]** Scrubbing during a LIVE cascade permanently desyncs the map:
+**UI-M19 (FIXED 2026-08-16)** (scrub refused while live — replay only ever runs against a settled timeline) Scrubbing during a LIVE cascade permanently desyncs the map:
 showCascadeStep rewinds and replays 0..position, later-arriving frames apply on top, the
 skipped frames' trip marks are gone for the session (executed JS repro); the final
 dc_update restores flow classes but never STATE_TRIPPED. Fix: replay full history on next
 live frame, or disable scrub while cascadeActive.
-**UI-M20 (HIGH) [OPEN]** assign_n1({:result,...}) sets n1_stale: false unconditionally —
+**UI-M20 (FIXED 2026-08-16)** (epoch on results, < comparison, task cancel/drain on reset/DOWN/hour-change) assign_n1({:result,...}) sets n1_stale: false unconditionally —
 a sweep completing after a mid-sweep trip ERASES the advisory banner that trip raised,
 presenting a pre-trip LODF linearisation as current (executed LiveView repro). The engine
 already stamps :epoch on screening_snapshot for exactly this; index.ex never reads it.
 Also: reset/DOWN clear n1_result but not n1_task, so an in-flight sweep repopulates after
 reset. Fix: carry epoch into the result and OR into staleness.
-**UI-M21 (MED) [OPEN]** Post-cascade scrubbing re-enters cascade mode (vignette, ghost,
+**UI-M21 (FIXED 2026-08-16)** Post-cascade scrubbing re-enters cascade mode (vignette, ghost,
 forced layers) with no exit except Reset — shouldBeActive derives from history length,
 and no second cascade_done is coming. Track ended-ness explicitly.
-**UI-M22 (MED) [OPEN]** inject_failure has no re-entrancy guard: double-click orphans the
+**UI-M22 (FIXED 2026-08-16)** inject_failure has no re-entrancy guard: double-click orphans the
 first trip monitor and the second's {:error, :already_tripped} reply sets
 cascade_active: false MID-CASCADE (badge "Already tripped", button re-offered). One-line
 guard + ignore stale trip_rejected.
-**UI-M23 (MED) [OPEN]** run_n1_screening has no re-entrancy guard: two fast clicks = two
+**UI-M23 (FIXED 2026-08-16)** run_n1_screening has no re-entrancy guard: two fast clicks = two
 full sweeps (240 s national CPU each), first task orphaned, older result can overwrite
 newer. One-line guard.
-**UI-L15 (LOW) [OPEN]** A failed post-cascade DC solve suppresses the voltage overlay
+**UI-L15 (FIXED 2026-08-16)** A failed post-cascade DC solve suppresses the voltage overlay
 broadcast entirely (simulation_server.ex ~:427) — :solve_failed is exactly when the
 operator most needs the voltage picture, and the cascade's converged per-island AC is
 independent of that final solve. Hoist the broadcast.
-**UI-L16 (LOW) [OPEN]** Zero aria-live/role=status in the grid UI: every status
+**UI-L16 (FIXED 2026-08-16)** Zero aria-live/role=status in the grid UI: every status
 transition added this round (Collapsed, step-budget, solve-failed, N-1 states, banners)
 is silent to screen readers; the sparkline SVG has no accessible name.
-**UI-L17 (LOW) [OPEN]** :trips_omitted is computed, shipped, and read by nothing — the
+**UI-L17 (FIXED 2026-08-16)** (surfaced: '+N more · M not itemised') :trips_omitted is computed, shipped, and read by nothing — the
 200-trip itemisation cap is never surfaced. Render it or drop it from the client payload.
+
+### Fix-wave residue (2026-08-16)
+
+**SOL-21 (LOW) [OPEN]** DCPowerFlow.find_slack_index/3 (dc_power_flow.ex:248) has the
+SOL-19 dot-access pattern (`&1.bus_type == 3`) — raises KeyError on keyless plain-map
+buses. Found by fix-solver's regression test; out of its stamp-only DC scope.
+**DAT-29 (LOW) [OPEN]** BADemandHour.changeset still validate_required(:demand_mw) while
+Form930 inserts NULL-demand rows via insert_all — schema and ingest disagree; bites the
+next changeset-path writer. Found at DAT-25.
+**CAS-19(b) [STILL OPEN, deliberate]** AGC records commanded not delivered — needs the
+delivered-feedback path from the allocate result done whole; explicitly not half-fixed.
+**ENE-20 RE-BASELINE NEEDED**: the recorded reference-hour numbers (Eastern −0.07%,
+ERCOT +1.55%) no longer reproduce on the current tree (+0.76% / +1.66%) — measured
+invariant under every fix-wave change, so the drift belongs to the DR-4/DR-5 remaps plus
+dev-DB movement (incl. the 2026-08-16 migration incident: dev is functionally consistent
+but not bit-identical; +10 synthetic buses, +24 NULL endpoints). Still inside all gates;
+re-measure and re-record when next touched.
+**Notes for the record (fix-solver, confirmed by query):** no bus in the DB is marked
+slack (bus_type=3 count 0) — all three solvers fall through to the largest-generator
+tiebreak, stable in measurement but the slack MOVES when that unit trips, which is a
+cascade scenario, not a hypothetical. And zero capacitor banks exist (all 7,222 shunts
+are reactors, diagonal-STRENGTHENING) — the first capacitor bank ingested is the first
+real test of B'' conditioning.
