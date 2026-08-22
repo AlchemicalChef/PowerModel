@@ -9,6 +9,11 @@ defmodule PowerModel.Solver.QLimitTest do
 
   defp snapshot(q_max_mvar) do
     %{
+      # Analytic case: the assertion is that the PV bus's own reactive LOAD is
+      # counted against q_max, so that load has to arrive at the solver exactly
+      # as written. Distribution compensation would net part of it away and
+      # this would be testing a different number.
+      load_compensation: 0.0,
       buses: [
         %{id: 1, bus_type: 3, base_kv: 138.0, vm_pu: 1.0, va_rad: 0.0},
         %{id: 2, bus_type: 2, base_kv: 138.0, vm_pu: @pv_setpoint, va_rad: 0.0}

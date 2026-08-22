@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-16T10:54:33Z",
+  "generated_at": "2026-08-22T21:16:09Z",
   "metrics": {
     "bus_count": 93093,
     "buses_without_ba": 3124,
@@ -13,8 +13,8 @@
         "component_count": 176,
         "connected_bus_count": 6284,
         "connected_fraction": 0.9607,
-        "degree_1_load_mw": 4791,
-        "degree_1_load_share": 0.0536,
+        "degree_1_load_mw": 4107,
+        "degree_1_load_share": 0.0458,
         "geolocated_bus_count": 6541,
         "largest_component_bus_count": 5748,
         "largest_component_fraction": 0.8788
@@ -23,8 +23,8 @@
         "component_count": 896,
         "connected_bus_count": 63096,
         "connected_fraction": 0.9405,
-        "degree_1_load_mw": 110581,
-        "degree_1_load_share": 0.139,
+        "degree_1_load_mw": 106683,
+        "degree_1_load_share": 0.1342,
         "geolocated_bus_count": 67085,
         "largest_component_bus_count": 59826,
         "largest_component_fraction": 0.8918
@@ -33,8 +33,8 @@
         "component_count": 275,
         "connected_bus_count": 18450,
         "connected_fraction": 0.9478,
-        "degree_1_load_mw": 31781,
-        "degree_1_load_share": 0.1254,
+        "degree_1_load_mw": 31656,
+        "degree_1_load_share": 0.1246,
         "geolocated_bus_count": 19467,
         "largest_component_bus_count": 17517,
         "largest_component_fraction": 0.8998
@@ -45,7 +45,7 @@
     "lines_unmapped_endpoints": 4691,
     "self_loop_lines": 0,
     "self_loop_transformers": 0,
-    "stranded_nameplate_mw": 99792,
+    "stranded_nameplate_mw": 99641,
     "transformer_count": 14376,
     "transformers_unmapped_endpoints": 0,
     "zero_capability_generator_buses": 804

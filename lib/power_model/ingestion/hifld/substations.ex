@@ -405,8 +405,18 @@ defmodule PowerModel.Ingestion.HIFLD.Substations do
   defp apply_augmented_levels(voltages_by_substation) do
     ids = Map.keys(voltages_by_substation)
 
+    # OSM-sourced yards are excluded IN CODE, not by run order: the lines
+    # feeding this pass include the TOPO-1 restored circuits, whose voltage
+    # was itself inferred from the yards — merging that echo into a yard the
+    # OSM wave gave a real voltage would overwrite evidence with a guess
+    # (ROADMAP item 24 ordering constraint).
     updates =
-      from(s in Substation, where: s.id in ^ids, select: {s.id, s.voltage_levels})
+      from(s in Substation,
+        where:
+          s.id in ^ids and
+            (is_nil(s.voltage_source) or not like(s.voltage_source, "osm%")),
+        select: {s.id, s.voltage_levels}
+      )
       |> Repo.all()
       |> Enum.flat_map(fn {id, stored} ->
         stored = stored || []

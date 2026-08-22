@@ -1,0 +1,44 @@
+{
+  "metadata": {
+    "license": "ODbL 1.0, (c) OpenStreetMap contributors",
+    "date_pin": "2026-08-18T00:00:00Z",
+    "element_count": 5,
+    "note": "hand-built mini fixture in the fetch script's output shape: one multi-level way, one node, one named way, one traction-only way (dropped), one centerless node (dropped)"
+  },
+  "elements": [
+    {
+      "type": "node",
+      "id": 3492005001,
+      "lat": 40.1005,
+      "lon": -82.9001,
+      "tags": { "power": "substation", "voltage": "69000" }
+    },
+    {
+      "type": "node",
+      "id": 88888888,
+      "tags": { "power": "substation", "voltage": "138000" }
+    },
+    {
+      "type": "way",
+      "id": 23025800,
+      "center": { "lat": 39.4, "lon": -84.45 },
+      "tags": {
+        "power": "substation",
+        "name": "Port Union Substation",
+        "voltage": "345000;138000;138000;12470"
+      }
+    },
+    {
+      "type": "way",
+      "id": 44100200,
+      "center": { "lat": 40.5309, "lon": -80.6304 },
+      "tags": { "power": "substation", "name": "Sammis Substation", "voltage": "138000" }
+    },
+    {
+      "type": "way",
+      "id": 99999999,
+      "center": { "lat": 41.0, "lon": -81.0 },
+      "tags": { "power": "substation", "voltage": "750", "name": "Rail Traction Sub" }
+    }
+  ]
+}

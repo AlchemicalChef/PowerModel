@@ -35,6 +35,14 @@ defmodule Mix.Tasks.Grid.Census.LoadPlacement do
       transformer ratings, never stored ones: `BusMapper.resize_transformers_to_through_load/0`
       sizes banks from the load on them, so a cap read off stored ratings is
       one the misplacement has already paid for.
+    * **over what their voltage class delivers** — buses above the delivery
+      ceiling of their own class (`LoadEstimator.class_ceiling/1`). Connected
+      capability counts a yard's circuits, and a circuit in plus a circuit out
+      is transfer rather than delivery, so a bus can sit inside the capability
+      cap above and still hold more than its banks could ever step down. This
+      section is the tighter of the two and the one that bounds a single
+      substation.
+
     * **transformer-fed above bank** — the same test for buses with no line of
       their own, against their banks alone (TOPO-6).
     * **below the load-serving floor** — load on buses under 60 kV.
@@ -43,6 +51,13 @@ defmodule Mix.Tasks.Grid.Census.LoadPlacement do
       county centroid, and every level of a yard stands at the same point, so a
       yard drew its county share once per level: SCE's GALE held 214.45 MW on
       its 115 kV bus and 214.45 MW again on its 33 kV bus.
+
+      Read this one through its `flat_only` count. A yard whose duplicate MW is
+      all flat is not the duplication bug: a datacenter interconnected at the
+      yard's transmission level while the county's ordinary share is served
+      from its distribution level is two different loads on two levels, which
+      is what a substation of that size does. Only a yard carrying the SAME
+      county share twice is the defect this section was built to catch.
     * **degree-1 load share** — the share of served load behind a single
       branch, per interconnection. The wave gate is 15%.
 
@@ -158,6 +173,8 @@ defmodule Mix.Tasks.Grid.Census.LoadPlacement do
       total_over_branch_rating_flat_only: flat_only(sections, :over_branch_rating),
       total_over_capability: count(sections, :over_capability),
       total_over_capability_flat_only: flat_only(sections, :over_capability),
+      total_over_class_ceiling: count(sections, :over_class_ceiling),
+      total_over_class_ceiling_flat_only: flat_only(sections, :over_class_ceiling),
       total_transformer_fed: count(sections, :transformer_fed),
       total_below_load_floor_mw: round1(sum(sections, & &1.below_load_floor.mw)),
       total_split_yards: count(sections, :split_yards),
@@ -199,6 +216,7 @@ defmodule Mix.Tasks.Grid.Census.LoadPlacement do
           flat_mw: Map.get(flat, bus.id, 0.0),
           capability_mva: cap.capability_mva,
           cap_mw: cap.cap_mw,
+          class_cap_mw: cap.class_cap_mw,
           bank_mva: cap.bank_mva,
           line_mva: cap.line_mva,
           single_branch_mva: Map.get(single, bus.id),
@@ -224,6 +242,7 @@ defmodule Mix.Tasks.Grid.Census.LoadPlacement do
               &1.load_mw > &1.single_branch_mva)
         ),
       over_capability: section(rows, &(&1.load_mw > &1.cap_mw + 1.0e-6)),
+      over_class_ceiling: section(rows, &(&1.load_mw > &1.class_cap_mw + 1.0e-6)),
       transformer_fed:
         section(rows, &(&1.line_degree == 0 and &1.load_mw > 0.8 * &1.bank_mva + 1.0e-6)),
       below_load_floor: section(rows, &(&1.base_kv < @min_load_kv and &1.load_mw > 0.0)),
@@ -428,6 +447,7 @@ defmodule Mix.Tasks.Grid.Census.LoadPlacement do
 
       render_section("over their single branch's rating", section.over_branch_rating, limit)
       render_section("over 0.8 x connected capability", section.over_capability, limit)
+      render_section("over what their voltage class delivers", section.over_class_ceiling, limit)
       render_section("transformer-fed above 0.8 x bank", section.transformer_fed, limit)
 
       render_section(
@@ -461,6 +481,11 @@ defmodule Mix.Tasks.Grid.Census.LoadPlacement do
     IO.puts(
       "TOTAL buses over 0.8 x capability: #{report.total_over_capability} " <>
         "(#{report.total_over_capability_flat_only} flat-only)"
+    )
+
+    IO.puts(
+      "TOTAL buses over their class's delivery ceiling: #{report.total_over_class_ceiling} " <>
+        "(#{report.total_over_class_ceiling_flat_only} flat-only)"
     )
 
     IO.puts("TOTAL transformer-fed above 0.8 x bank: #{report.total_transformer_fed}")

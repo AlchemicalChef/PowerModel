@@ -43,13 +43,24 @@ npm-debug.log
 
 # Bulk source datasets (downloaded, not versioned — see README/mix tasks
 # for sources: EIA-860, EPA eGRID, EIA-930 grid monitor bulk files).
-/data/
+#
+# `/data/*` rather than `/data/`: git does not descend into an excluded
+# DIRECTORY, so a `!data/vendored/…` negation below cannot re-include anything
+# while the parent is excluded wholesale. PROVENANCE.md only escaped that
+# because it was already tracked, and gitignore does not apply to tracked
+# files — a new file next to it would have been silently dropped.
+/data/*
+!/data/vendored/
 
 # Generated map exports (rebuild with: mix power_model.export_grid_data)
 /priv/static/grid_data/
 
 data/vendored/*
 !data/vendored/PROVENANCE.md
+# Not bulk source data: the record of which rows we CHANGED and their prior
+# values. The raw snapshots beside it are re-fetchable from PROVENANCE.md, this
+# is not — losing it loses the ability to reverse the corrections.
+!data/vendored/osm_corridor_corrections_2026-08-18.json
 
 # Byte-compiled helper scripts (scripts/*.py)
 __pycache__/

@@ -53,3 +53,59 @@ re-fetchable and verifiable.
   are per-yard keys, not placeholders — see `PowerModel.Ingestion.HIFLD.Names`.
 - `test/fixtures/hifld/substations_mini.geojson` is the 51 yards named by the committed
   25-line fixture, plus two all-sentinel-voltage rows.
+
+# OpenStreetMap snapshots — © OpenStreetMap contributors, ODbL 1.0
+
+NOT public domain, unlike everything above. OSM data is licensed under the Open
+Database License 1.0 (https://opendatacommons.org/licenses/odbl/1-0/). Voltage
+attributes derived from these files and written into the database make the database a
+derivative under ODbL: if the database or a database-substantial product of it is
+publicly distributed, share-alike and attribution obligations attach to the
+OSM-derived portion. That portion is kept extractable by construction — every
+OSM-sourced row carries `voltage_source` ('osm_corridor', 'osm_matched',
+'osm_line_inferred', 'osm_rederived') and the `osm_substation_matches` table holds the
+per-yard evidence; nulling those markers removes every OSM-derived datum while
+`source` (HIFLD) remains the provenance of rows, geometry and endpoints.
+
+## osm_corridor_{nm,ut,tx}_2026-08-18.json + osm_corridor_corrections_2026-08-18.json
+- Source: Overpass API, https://overpass-api.de/api/interpreter, date-pinned attic
+  query `[date:"2026-08-18T00:00:00Z"]` — exactly re-runnable. Query shape:
+  `(way[power=line]; way[power=minor_line]; node/way/relation[power=substation];
+  node/way[power=plant];) out tags geom;` over three corridor bboxes (S,W,N,E):
+  NM 33.55,-103.9,34.4,-103.05; UT 37.05,-113.85,37.85,-112.85;
+  TX 32.15,-102.15,33.3,-100.75.
+- osm_corridor_nm: 473,731 B, sha256 3320c350663dfae7483e38547978b260b5d4e77e8fe650a9289120960f4a664f
+- osm_corridor_ut: 905,324 B, sha256 852735c326311e899a5da66b521b73c072edac8816457d3a5507ef25efe1dd56
+- osm_corridor_tx: 1,306,302 B, sha256 2d7c3ebf677da2b8468c490ea8fa51dde2af8b36f9b0f82cf5111f069ff4fe78
+- osm_corridor_corrections: 19,128 B, sha256
+  0be205717cd4d9e2cf35269ef749482fbef67b7363669dc574226ac7241a605c. This file IS
+  committed (gitignore exception): it records the 17 corrected `transmission_lines`
+  rows (prior voltage/impedance values, OSM way ids, per-row reasons) and is the
+  attribution + reversibility record; the three raw pulls are re-fetchable from the
+  date pin and stay unversioned like the HIFLD snapshots.
+- Written to DB 2026-08-19: 17 voltage-class corrections, `voltage_source='osm_corridor'`.
+
+## osm_substations_2026-08-18.json
+- Source: Overpass API, full-US pull in 14 regional tiles, power=substation with
+  voltage tags. 58,766 elements, 14.4 MB.
+- sha256: 8c79f5fa84434c3a0b1329a5d14f4700cd4d82266bd8e05e3257e8dad54a5109
+- Fetched 2026-08-18 (ET evening); oldest per-tile `timestamp_osm_base`:
+  2026-06-01T08:52:28Z — the attic pin that reproduces the pull.
+- Deviation from the scoped attic plan: attic queries measured ~8x slower on
+  2026-08-18 and timed out on region tiles, so this pull ran LIVE with each
+  response's `timestamp_osm_base` recorded in the file metadata; an attic re-fetch
+  pinned to the oldest recorded timestamp reproduces it, and the sha256 above is the
+  primary pin (same convention as the HIFLD snapshots). Transient 429/504s recovered
+  by retry + mirror rotation.
+- Feeds `PowerModel.Ingestion.OSM.Substations` → matcher → voltage backfill of
+  voltage-blind yards (`voltage_source='osm_matched'`).
+
+## osm_line_voltages_2026-08-18.json
+- Source: Overpass API, per-yard around-queries on the 6,066 yards left unmatched by
+  the substation pass; power=line/minor_line ways with voltage tags within 120 m.
+  3,844 ways, 9.9 MB. Queried-yard list embedded in file metadata.
+- sha256: 511c4a1d8c57be8df7ff7a2fd76c074b016aa135c3494abc6194e07a117d32a4
+- Fetched 2026-08-18 (ET evening); oldest per-batch `timestamp_osm_base`:
+  2026-06-24T06:53:00Z — the attic pin that reproduces the pull.
+- Feeds the line-inference fallback (`voltage_source='osm_line_inferred'`) and the
+  restored-circuit class re-derivation (`voltage_source='osm_rederived'`).

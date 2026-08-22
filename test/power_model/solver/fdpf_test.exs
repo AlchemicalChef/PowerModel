@@ -19,7 +19,7 @@ defmodule PowerModel.Solver.FDPFTest do
 
   use ExUnit.Case, async: true
 
-  alias PowerModel.Solver.{FDPF, NewtonRaphson, Solution}
+  alias PowerModel.Solver.{DCPowerFlow, FDPF, NewtonRaphson, Solution}
   alias PowerModel.Test.MATPOWER
 
   @base_mva 100.0
@@ -146,7 +146,10 @@ defmodule PowerModel.Solver.FDPFTest do
       lines: Enum.map(@ieee14_lines, &Map.merge(&1, %{voltage_kv: 132.0, rating_a_mva: 200.0})),
       transformers: @ieee14_transformers,
       generators: @ieee14_generators,
-      loads: @ieee14_loads
+      loads: @ieee14_loads,
+      # Published case: @ieee14_loads are the IEEE-14 Pd/Qd, already net at the
+      # transmission bus. See PowerModel.Test.MATPOWER for the same stamp.
+      load_compensation: 0.0
     }
   end
 
@@ -216,6 +219,33 @@ defmodule PowerModel.Solver.FDPFTest do
     }
   end
 
+  # A ring too big for the dense fallback, loaded far past what its branches
+  # can carry, so the voltage profile collapses onto the solver's floor.
+  defp collapsing_ring do
+    n = FDPF.dense_nr_fallback_max_buses() + 50
+    base = ring(n)
+
+    %{
+      base
+      | loads: Enum.map(base.loads, &%{&1 | p_mw: &1.p_mw * 60.0, q_mvar: &1.q_mvar * 60.0}),
+        generators: Enum.map(base.generators, &%{&1 | p_max_mw: &1.p_max_mw * 60.0})
+    }
+  end
+
+  defp shift_ids(snapshot, off) do
+    %{
+      snapshot
+      | buses: Enum.map(snapshot.buses, &%{&1 | id: &1.id + off}),
+        lines:
+          Enum.map(
+            snapshot.lines,
+            &%{&1 | id: &1.id + off, from_bus_id: &1.from_bus_id + off, to_bus_id: &1.to_bus_id + off}
+          ),
+        generators: Enum.map(snapshot.generators, &%{&1 | id: &1.id + off, bus_id: &1.bus_id + off}),
+        loads: Enum.map(snapshot.loads, &%{&1 | id: &1.id + off, bus_id: &1.bus_id + off})
+    }
+  end
+
   defp two_bus(p_mw, q_mvar) do
     %{
       buses: [
@@ -245,7 +275,11 @@ defmodule PowerModel.Solver.FDPFTest do
           q_min_mvar: -999.0
         }
       ],
-      loads: [%{id: 1, bus_id: 2, p_mw: p_mw, q_mvar: q_mvar}]
+      loads: [%{id: 1, bus_id: 2, p_mw: p_mw, q_mvar: q_mvar}],
+      # Analytic case: the closed form below is solved for exactly this Q, so
+      # synthesized distribution compensation would be comparing the solver
+      # against the wrong problem.
+      load_compensation: 0.0
     }
   end
 
@@ -369,6 +403,73 @@ defmodule PowerModel.Solver.FDPFTest do
       refute sol.converged
       assert sol.total_loss_mw == 0.0
       assert sol.mismatch_mw == nil
+    end
+  end
+
+  describe "voltage-floor telemetry" do
+    # These cases must stay ABOVE `dense_nr_fallback_max_buses`. Below it a
+    # failed FDPF is retried densely and the solution handed back is Newton's,
+    # which has no floor and correctly reports none — so a small fixture would
+    # be testing the fallback, not the census.
+    test "a solve driven past the nose names the buses it left on the floor" do
+      {:ok, sol} = FDPF.solve(collapsing_ring(), fdpf_opts(max_iterations: 60))
+
+      refute sol.converged
+      assert sol.solver == :fdpf, "a dense retry would carry no floor census"
+      assert sol.vm_floor_pu == 0.5
+      assert sol.vm_floor_count > 0
+
+      # The point of reporting it: a bus the clamp holds at the floor cannot
+      # satisfy its own Q row, so these are the buses whose data explains the
+      # failure — not merely the buses that happen to be lowest.
+      vm = Map.new(Enum.zip(sol.bus_ids, sol.vm_pu))
+
+      for id <- sol.vm_floor_bus_ids do
+        assert Map.fetch!(vm, id) <= sol.vm_floor_pu
+      end
+
+      assert length(sol.vm_floor_bus_ids) == sol.vm_floor_count
+    end
+
+    test "a healthy solve reports an empty floor, not a missing one" do
+      {:ok, sol} = FDPF.solve(two_bus(20.0, 10.0), fdpf_opts())
+
+      assert sol.converged
+      assert sol.vm_floor_bus_ids == []
+      assert sol.vm_floor_count == 0
+    end
+
+    test "the census survives the island merge" do
+      # A caller reading only the merged solution would otherwise be told
+      # nothing hit the floor at all.
+      a = collapsing_ring()
+      b = shift_ids(a, 100_000)
+
+      both = %{
+        buses: a.buses ++ b.buses,
+        lines: a.lines ++ b.lines,
+        transformers: [],
+        generators: a.generators ++ b.generators,
+        loads: a.loads ++ b.loads
+      }
+
+      sol = FDPF.solve_islands(both, fdpf_opts(max_iterations: 60))
+
+      refute sol.converged
+      assert sol.n_islands_solved == 2
+
+      {:ok, one} = FDPF.solve(a, fdpf_opts(max_iterations: 60))
+      assert sol.vm_floor_count == 2 * one.vm_floor_count
+      assert length(sol.vm_floor_bus_ids) == sol.vm_floor_count
+    end
+
+    test "a DC solution reports no census rather than an empty one" do
+      # nil and [] are different answers: "this solver has no floor" must not
+      # read as "checked, nothing on it".
+      sol = DCPowerFlow.solve(ring(50), base_mva: @base_mva)
+
+      assert sol.vm_floor_bus_ids == nil
+      assert sol.vm_floor_count == nil
     end
   end
 

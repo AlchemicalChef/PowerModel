@@ -23,6 +23,12 @@ defmodule PowerModel.Grid.TransmissionLine do
     field :status, :string, default: "in_service"
     field :source, :string
     field :source_id, :string
+    # Where a non-HIFLD voltage class came from: nil for HIFLD-carried or
+    # yard-inferred values, "osm_corridor" (corridor-way evidence) or
+    # "osm_rederived" (restored circuit re-derived from OSM-backed yards).
+    # Keeps the OSM-derived subset extractable under ODbL, like the same
+    # column on substations.
+    field :voltage_source, :string
     field :line_type, :string
     field :owner, :string
     field :sub_1, :string
@@ -50,6 +56,7 @@ defmodule PowerModel.Grid.TransmissionLine do
     :status,
     :source,
     :source_id,
+    :voltage_source,
     :from_bus_id,
     :to_bus_id,
     :line_type,

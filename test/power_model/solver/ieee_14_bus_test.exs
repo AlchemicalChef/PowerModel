@@ -323,7 +323,11 @@ defmodule PowerModel.Solver.IEEE14BusTest do
       lines: @lines,
       transformers: @transformers,
       generators: @generators,
-      loads: @loads
+      loads: @loads,
+      # Published case: @loads are the IEEE-14 Pd/Qd, already the NET demand at
+      # each transmission bus. Synthesized distribution compensation belongs to
+      # our own estimated network, not here.
+      load_compensation: 0.0
     }
   end
 

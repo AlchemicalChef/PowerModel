@@ -86,6 +86,7 @@ defmodule PowerModel.Solver.Partition do
   def merge_solutions(solutions, base_mva) do
     largest = Enum.max_by(solutions, &length(&1.bus_ids))
     mismatch_values = Enum.map(solutions, & &1.mismatch_mw)
+    floor_ids = merged_floor_ids(solutions)
 
     {mismatch_mw, mismatch_abs_mw} =
       if Enum.any?(mismatch_values, &is_nil/1) do
@@ -113,8 +114,21 @@ defmodule PowerModel.Solver.Partition do
       mismatch_abs_mw: mismatch_abs_mw,
       n_islands_solved: length(solutions),
       dead_load_mw: sum_field(solutions, :dead_load_mw),
-      dead_bus_count: Enum.reduce(solutions, 0, fn s, acc -> acc + (s.dead_bus_count || 0) end)
+      dead_bus_count: Enum.reduce(solutions, 0, fn s, acc -> acc + (s.dead_bus_count || 0) end),
+      vm_floor_bus_ids: floor_ids,
+      vm_floor_count: floor_ids && length(floor_ids),
+      vm_floor_pu: Enum.find_value(solutions, & &1.vm_floor_pu)
     }
+  end
+
+  # Floor-clamped buses across the merge. `nil` (no floor reported) and `[]` (a
+  # floor reported with no bus on it) are different answers, so a merge where no
+  # island ran a floored solver stays nil rather than collapsing to an empty
+  # list that would read as "checked, none found".
+  defp merged_floor_ids(solutions) do
+    if Enum.any?(solutions, &is_list(&1.vm_floor_bus_ids)) do
+      Enum.flat_map(solutions, &(&1.vm_floor_bus_ids || []))
+    end
   end
 
   defp sum_field(solutions, field) do

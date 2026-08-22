@@ -160,6 +160,10 @@ defmodule PowerModel.Solver.FDPF do
   @vm_floor 0.5
   @vm_ceiling 1.5
 
+  # The clamp writes @vm_floor exactly, but a bus can also be driven to within
+  # rounding of it without the clamp ever firing, and both are the same finding.
+  @vm_floor_epsilon 1.0e-9
+
   @doc """
   Solve every electrically separate island in a snapshot and merge the results.
 
@@ -734,7 +738,30 @@ defmodule PowerModel.Solver.FDPF do
   # so every solution this module assembles itself is re-stamped. Solutions
   # that came back FROM a fallback are deliberately left alone: `:dense_nr` on
   # an island above `@dense_nr_max_buses` is the record that FDPF failed there.
-  defp stamp(solution), do: %{solution | solver: :fdpf}
+  # Every FDPF solution leaves through here, converged or not, so this is where
+  # the floor census belongs. Reading it off the finished voltage vector rather
+  # than accumulating it inside `q_half_step/4` is deliberate: a bus that
+  # touched @vm_floor mid-solve and climbed back off it is not the pathology —
+  # a bus still sitting on the floor when the iteration stopped is, because the
+  # clamp pins its |V| while its Q mismatch goes on asking for a lower one, and
+  # that row can then never be satisfied (REVIEW: the Eastern residual is
+  # concentrated on exactly these buses). Keeping it out of the loop also keeps
+  # the promise that the telemetry costs the solve nothing.
+  defp stamp(solution) do
+    floor_ids =
+      solution.bus_ids
+      |> Enum.zip(solution.vm_pu)
+      |> Enum.filter(fn {_id, v} -> v <= @vm_floor + @vm_floor_epsilon end)
+      |> Enum.map(&elem(&1, 0))
+
+    %{
+      solution
+      | solver: :fdpf,
+        vm_floor_bus_ids: floor_ids,
+        vm_floor_count: length(floor_ids),
+        vm_floor_pu: @vm_floor
+    }
+  end
 
   defp effective_tap_ratio(t) when is_number(t) and t > 0.0, do: t
   defp effective_tap_ratio(_), do: 1.0

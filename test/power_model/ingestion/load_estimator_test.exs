@@ -7,14 +7,17 @@ defmodule PowerModel.Ingestion.LoadEstimatorTest do
   alias PowerModel.Grid.{Bus, Generator, Load, Transformer, TransmissionLine, WaterFacility}
   alias PowerModel.Ingestion.LoadEstimator
 
-  # Two 138 kV yards far apart: one in a "metro" (big county population
+  # Two 500 kV yards far apart: one in a "metro" (big county population
   # nearby), one in the "desert" (no population), tied by a line big enough
   # that the capability cap never binds. The county spread radius with a single
   # county in the table is the 120 km ceiling, so 2.5 radii reach the metro bus
   # and nowhere near the desert one.
+  #
+  # 500 kV because 765 MW is what these fixtures put on the metro bus, and the
+  # class ceiling says no 138 kV yard delivers that.
   setup do
-    metro_bus = bus(1, 138.0, {-112.0, 33.5})
-    desert_bus = bus(2, 138.0, {-105.0, 40.0})
+    metro_bus = bus(1, 500.0, {-112.0, 33.5})
+    desert_bus = bus(2, 500.0, {-105.0, 40.0})
     line(metro_bus, desert_bus, 5000.0)
 
     # 1000 MW capacity at the desert bus -> target load 850 MW total. Under
@@ -255,11 +258,17 @@ defmodule PowerModel.Ingestion.LoadEstimatorTest do
 
       county("04013", 4_000_000, {-112.05, 33.45})
 
-      assert {:ok, 3} = LoadEstimator.run()
+      caps = LoadEstimator.capability(LoadEstimator.network())
 
       # 0.8 x (its own 100 MVA line + the 200 MVA class standard for a 138 kV
       # bank), not 0.8 x the stored 4000 MVA.
-      assert_in_delta load_at(low.id), 240.0, 0.1
+      assert_in_delta caps[low.id].cap_mw, 240.0, 0.1
+
+      assert {:ok, 3} = LoadEstimator.run()
+
+      # What it actually takes is the tighter of the two rules: 240 MW of
+      # branch, 50 MW of 69 kV delivery.
+      assert_in_delta load_at(low.id), 50.0, 0.1
     end
 
     test "a bank is held to what reaches its far terminal", %{metro_bus: metro_bus} do
@@ -277,6 +286,103 @@ defmodule PowerModel.Ingestion.LoadEstimatorTest do
       assert {:ok, 3} = LoadEstimator.run()
 
       assert_in_delta load_at(low.id), 0.8 * 55.0, 0.1
+    end
+  end
+
+  describe "class ceiling" do
+    test "circuits passing through a yard are transfer, not delivery", %{
+      metro_bus: metro_bus,
+      desert_bus: desert_bus
+    } do
+      # Mesa's bus 76087 exactly: two big 69 kV circuits, one in and one out,
+      # summed into 186 MW of "capability" on a yard whose banks step down at
+      # 20-30 MVA a piece. It held 208.7 MW and would not solve.
+      hub = bus(10, 69.0, {-112.03, 33.47})
+      line(hub, metro_bus, 300.0)
+      line(hub, desert_bus, 300.0)
+
+      county("04013", 4_000_000, {-112.05, 33.45})
+
+      caps = LoadEstimator.capability(LoadEstimator.network())
+      assert_in_delta caps[hub.id].cap_mw, 480.0, 0.1
+      assert_in_delta caps[hub.id].delivery_cap_mw, 50.0, 0.1
+
+      assert {:ok, 3} = LoadEstimator.run()
+
+      assert_in_delta load_at(hub.id), 50.0, 0.1
+      assert_in_delta total_load(), 850.0, 1.0
+    end
+
+    test "MW another placer already committed is not offered twice", %{metro_bus: metro_bus} do
+      # Datacenter rows are written by Grid.map_datacenters_to_grid/0 and held
+      # FLAT by Demand.scale_loads/3, so they are the bus's load at every hour
+      # and the estimator may only fill what is left.
+      small = bus(5, 138.0, {-112.04, 33.46})
+      line(small, metro_bus, 100.0)
+
+      Repo.insert!(%Load{
+        bus_id: small.id,
+        p_mw: 60.0,
+        q_mvar: 19.7,
+        load_type: "datacenter",
+        status: "in_service"
+      })
+
+      county("04013", 4_000_000, {-112.05, 33.45})
+
+      assert {:ok, 3} = LoadEstimator.run()
+
+      # 0.8 x its 100 MVA line is 80 MW, of which the campus holds 60.
+      assert_in_delta load_at(small.id), 20.0, 0.1
+    end
+
+    test "water facility MW is reserved out of the ceiling, not stacked on top", %{
+      metro_bus: metro_bus
+    } do
+      # reapply_water_facility_loads/0 merges the plant into the SAME row this
+      # allocation writes, and it runs after the caps. Three 69 kV buses sat at
+      # 51-54 MW against a 50 MW ceiling because the cap held the spread and
+      # the treatment plant went on afterwards.
+      hub = bus(10, 69.0, {-112.03, 33.47})
+      line(hub, metro_bus, 300.0)
+
+      Repo.insert!(%WaterFacility{
+        name: "Big Treatment Plant",
+        facility_type: "treatment",
+        coordinates: %Geo.Point{coordinates: {-112.03, 33.47}, srid: 4326},
+        status: "active",
+        power_consumption_mw: 12.0,
+        bus_id: hub.id
+      })
+
+      county("04013", 4_000_000, {-112.05, 33.45})
+
+      assert {:ok, 3} = LoadEstimator.run()
+
+      # 38 MW of spread plus the 12 MW plant, not 50 plus 12.
+      assert_in_delta load_at(hub.id), 50.0, 0.1
+    end
+
+    test "a bus whose ceiling is spoken for drops out of the candidate set", %{
+      metro_bus: metro_bus
+    } do
+      small = bus(5, 138.0, {-112.04, 33.46})
+      line(small, metro_bus, 500.0)
+
+      Repo.insert!(%Load{
+        bus_id: small.id,
+        p_mw: 150.0,
+        q_mvar: 49.3,
+        load_type: "datacenter",
+        status: "in_service"
+      })
+
+      county("04013", 4_000_000, {-112.05, 33.45})
+
+      assert {:ok, 2} = LoadEstimator.run()
+
+      assert load_at(small.id) == nil
+      assert_in_delta total_load(), 850.0, 1.0
     end
   end
 

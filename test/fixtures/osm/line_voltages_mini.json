@@ -1,0 +1,43 @@
+{
+  "metadata": {
+    "license": "ODbL 1.0, (c) OpenStreetMap contributors",
+    "date_pin": "2026-08-18T00:00:00Z",
+    "radius_m": 120,
+    "note": "hand-built mini fixture: one grid way (kept), one 16.7 Hz traction way (dropped), one distribution-voltage way (dropped), one single-node way (dropped)"
+  },
+  "elements": [
+    {
+      "type": "way",
+      "id": 501,
+      "tags": { "power": "line", "voltage": "138000" },
+      "geometry": [
+        { "lat": 40.0008, "lon": -83.01 },
+        { "lat": 40.0008, "lon": -82.99 }
+      ]
+    },
+    {
+      "type": "way",
+      "id": 502,
+      "tags": { "power": "line", "voltage": "25000", "frequency": "16.7" },
+      "geometry": [
+        { "lat": 40.001, "lon": -83.01 },
+        { "lat": 40.001, "lon": -82.99 }
+      ]
+    },
+    {
+      "type": "way",
+      "id": 503,
+      "tags": { "power": "minor_line", "voltage": "12470" },
+      "geometry": [
+        { "lat": 40.002, "lon": -83.01 },
+        { "lat": 40.002, "lon": -82.99 }
+      ]
+    },
+    {
+      "type": "way",
+      "id": 504,
+      "tags": { "power": "line", "voltage": "138000" },
+      "geometry": [{ "lat": 40.003, "lon": -83.01 }]
+    }
+  ]
+}

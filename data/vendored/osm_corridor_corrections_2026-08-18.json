@@ -1,0 +1,520 @@
+{
+  "mode": "apply",
+  "rows": [
+    {
+      "new": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.0677342136809958,
+        "r_pu": 0.02558848072393175,
+        "b_pu": 0.0009212037704081923,
+        "length_km": 7.1662798074493566,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "reason": "no OSM 138.0 kV way on the route (best 0.14); endpoint yards [[69.0], [69.0]] corroborate 69.0 kV (strong)",
+      "old": {
+        "voltage_kv": 138.0,
+        "rating_a_mva": 223.60679774997897,
+        "x_pu": 0.015052047484665737,
+        "r_pu": 0.0028222589033748257,
+        "b_pu": 0.004094238979591967,
+        "length_km": 7.1662798074493566,
+        "rating_b_mva": 257.1478174124758,
+        "rating_c_mva": 301.8691769624716,
+        "params_version": 3
+      },
+      "line_id": 66416,
+      "island": "Western",
+      "confidence": "strong",
+      "osm_way": 1337621642,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.031065468685434375,
+        "r_pu": 0.011735843725608543,
+        "b_pu": 0.0004224988425686712,
+        "length_km": 3.286726586918957,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "reason": "no OSM 138.0 kV way on the route (best 0.16); endpoint yards [[69.0], [69.0]] corroborate 69.0 kV (strong)",
+      "old": {
+        "voltage_kv": 138.0,
+        "rating_a_mva": 223.60679774997897,
+        "x_pu": 0.006903437485652084,
+        "r_pu": 0.0012943945285597655,
+        "b_pu": 0.0018777726336385383,
+        "length_km": 3.286726586918957,
+        "rating_b_mva": 257.1478174124758,
+        "rating_c_mva": 301.8691769624716,
+        "params_version": 3
+      },
+      "line_id": 66425,
+      "island": "Western",
+      "confidence": "strong",
+      "osm_way": 613593661,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.036989698781455436,
+        "r_pu": 0.013973886206327609,
+        "b_pu": 0.0005030699868196817,
+        "length_km": 3.9135101310779845,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "reason": "no OSM 46.0 kV way on the route (best 0.00); endpoint yards [[], [69.0]] corroborate 69.0 kV (single-ended)",
+      "old": {
+        "voltage_kv": 46.0,
+        "rating_a_mva": 77.51702321999271,
+        "x_pu": 0.08322682225827473,
+        "r_pu": 0.03144124396423712,
+        "b_pu": 0.0002235866608087474,
+        "length_km": 3.9135101310779845,
+        "rating_b_mva": 89.14457670299161,
+        "rating_c_mva": 104.64798134699016,
+        "params_version": 3
+      },
+      "line_id": 66436,
+      "island": "Western",
+      "confidence": "single-ended",
+      "osm_way": 1337621553,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.03154902157939154,
+        "r_pu": 0.011918519263325692,
+        "b_pu": 0.00042907529374300746,
+        "length_km": 3.3378864830996244,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "reason": "no OSM 138.0 kV way on the route (best 0.00); endpoint yards [[69.0], []] corroborate 69.0 kV (single-ended)",
+      "old": {
+        "voltage_kv": 138.0,
+        "rating_a_mva": 223.60679774997897,
+        "x_pu": 0.007010893684309231,
+        "r_pu": 0.0013145425658079807,
+        "b_pu": 0.0019070013055244776,
+        "length_km": 3.3378864830996244,
+        "rating_b_mva": 257.1478174124758,
+        "rating_c_mva": 301.8691769624716,
+        "params_version": 3
+      },
+      "line_id": 67214,
+      "island": "Western",
+      "confidence": "single-ended",
+      "osm_way": 1337621691,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.3068656900804628,
+        "r_pu": 0.11592703847484152,
+        "b_pu": 0.00417345703668141,
+        "length_km": 32.46639001051297,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "reason": "no OSM 115.0 kV way on the route (best 0.00); endpoint yards [[69.0, 34.5], [69.0]] corroborate 69.0 kV (strong)",
+      "old": {
+        "voltage_kv": 115.0,
+        "rating_a_mva": 178.88543819998318,
+        "x_pu": 0.1031068718670355,
+        "r_pu": 0.024549255206437026,
+        "b_pu": 0.012451672228781985,
+        "length_km": 32.46639001051297,
+        "rating_b_mva": 205.71825392998065,
+        "rating_c_mva": 241.4953415699773,
+        "params_version": 3
+      },
+      "line_id": 67217,
+      "island": "Western",
+      "confidence": "strong",
+      "osm_way": 174719847,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 138.0,
+        "rating_a_mva": 223.60679774997897,
+        "x_pu": 0.07923492028704518,
+        "r_pu": 0.014856547553820971,
+        "b_pu": 0.021552330306861694,
+        "length_km": 37.72374554866221,
+        "rating_b_mva": 257.1478174124758,
+        "rating_c_mva": 301.8691769624716,
+        "params_version": 3
+      },
+      "reason": "no OSM 115.0 kV way on the route (best 0.00); endpoint yards [[230.0, 138.0], [138.0]] corroborate 138.0 kV (strong)",
+      "old": {
+        "voltage_kv": 115.0,
+        "rating_a_mva": 178.88543819998318,
+        "x_pu": 0.1198031994740123,
+        "r_pu": 0.028524571303336264,
+        "b_pu": 0.014467999511550672,
+        "length_km": 37.72374554866221,
+        "rating_b_mva": 205.71825392998065,
+        "rating_c_mva": 241.4953415699773,
+        "params_version": 3
+      },
+      "line_id": 67230,
+      "island": "Western",
+      "confidence": "strong",
+      "osm_way": 10106734,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 138.0,
+        "rating_a_mva": 223.60679774997897,
+        "x_pu": 0.03280800848553065,
+        "r_pu": 0.006151501591036997,
+        "b_pu": 0.0089239571773266,
+        "length_km": 15.619892839961143,
+        "rating_b_mva": 257.1478174124758,
+        "rating_c_mva": 301.8691769624716,
+        "params_version": 3
+      },
+      "reason": "no OSM 115.0 kV way on the route (best 0.00); endpoint yards [[138.0], [138.0]] corroborate 138.0 kV (strong)",
+      "old": {
+        "voltage_kv": 115.0,
+        "rating_a_mva": 178.88543819998318,
+        "x_pu": 0.04960570883012234,
+        "r_pu": 0.011810883054791034,
+        "b_pu": 0.005990619401446096,
+        "length_km": 15.619892839961143,
+        "rating_b_mva": 205.71825392998065,
+        "rating_c_mva": 241.4953415699773,
+        "params_version": 3
+      },
+      "line_id": 67233,
+      "island": "Western",
+      "confidence": "strong",
+      "osm_way": 702210713,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 138.0,
+        "rating_a_mva": 223.60679774997897,
+        "x_pu": 0.0069140475368590585,
+        "r_pu": 0.0012963839131610731,
+        "b_pu": 0.001880658625412835,
+        "length_km": 3.2917780322985974,
+        "rating_b_mva": 257.1478174124758,
+        "rating_c_mva": 301.8691769624716,
+        "params_version": 3
+      },
+      "reason": "no OSM 115.0 kV way on the route (best 0.00); endpoint yards [[230.0, 138.0], [138.0]] corroborate 138.0 kV (strong)",
+      "old": {
+        "voltage_kv": 115.0,
+        "rating_a_mva": 178.88543819998318,
+        "x_pu": 0.010454039875730896,
+        "r_pu": 0.002489057113269261,
+        "b_pu": 0.0012624791698373195,
+        "length_km": 3.2917780322985974,
+        "rating_b_mva": 205.71825392998065,
+        "rating_c_mva": 241.4953415699773,
+        "params_version": 3
+      },
+      "line_id": 67234,
+      "island": "Western",
+      "confidence": "strong",
+      "osm_way": 1338543189,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 138.0,
+        "rating_a_mva": 223.60679774997897,
+        "x_pu": 0.025416465111451875,
+        "r_pu": 0.004765587208397226,
+        "b_pu": 0.006913417080882696,
+        "length_km": 12.100779039562235,
+        "rating_b_mva": 257.1478174124758,
+        "rating_c_mva": 301.8691769624716,
+        "params_version": 3
+      },
+      "reason": "no OSM 69.0 kV way on the route (best 0.00); endpoint yards [[138.0], [138.0]] corroborate 138.0 kV (strong)",
+      "old": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.11437409300153342,
+        "r_pu": 0.043207990689468186,
+        "b_pu": 0.0015555188431986067,
+        "length_km": 12.100779039562235,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "line_id": 67240,
+      "island": "Western",
+      "confidence": "strong",
+      "osm_way": 1252006989,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 138.0,
+        "rating_a_mva": 223.60679774997897,
+        "x_pu": 0.10047995610396805,
+        "r_pu": 0.018839991769494007,
+        "b_pu": 0.027331095876999986,
+        "length_km": 47.83850710109918,
+        "rating_b_mva": 257.1478174124758,
+        "rating_c_mva": 301.8691769624716,
+        "params_version": 3
+      },
+      "reason": "no OSM 69.0 kV way on the route (best 0.00); endpoint yards [[138.0, 34.5], [345.0, 138.0]] corroborate 138.0 kV (strong)",
+      "old": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.4521598024678562,
+        "r_pu": 0.17081592537674567,
+        "b_pu": 0.006149496572324997,
+        "length_km": 47.83850710109918,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "line_id": 72357,
+      "island": "ERCOT",
+      "confidence": "strong",
+      "osm_way": 467959356,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 138.0,
+        "rating_a_mva": 223.60679774997897,
+        "x_pu": 0.04982779105953054,
+        "r_pu": 0.009342710823661978,
+        "b_pu": 0.013553430829309166,
+        "length_km": 23.723011323442492,
+        "rating_b_mva": 257.1478174124758,
+        "rating_c_mva": 301.8691769624716,
+        "params_version": 3
+      },
+      "reason": "no OSM 69.0 kV way on the route (best 0.05); endpoint yards [[138.0, 34.5], []] corroborate 138.0 kV (single-ended)",
+      "old": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.22422505976788745,
+        "r_pu": 0.08470724480120193,
+        "b_pu": 0.0030495219365945622,
+        "length_km": 23.723011323442492,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "line_id": 72363,
+      "island": "ERCOT",
+      "confidence": "single-ended",
+      "osm_way": 467959347,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.19220274327653994,
+        "r_pu": 0.07260992523780398,
+        "b_pu": 0.0026140097030287602,
+        "length_km": 20.335050238657924,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "reason": "no OSM 46.0 kV way on the route (best 0.00); endpoint yards [[69.0], [69.0]] corroborate 69.0 kV (strong)",
+      "old": {
+        "voltage_kv": 46.0,
+        "rating_a_mva": 77.51702321999271,
+        "x_pu": 0.43245617237221484,
+        "r_pu": 0.16337233178505894,
+        "b_pu": 0.0011617820902350045,
+        "length_km": 20.335050238657924,
+        "rating_b_mva": 89.14457670299161,
+        "rating_c_mva": 104.64798134699016,
+        "params_version": 3
+      },
+      "line_id": 72914,
+      "island": "ERCOT",
+      "confidence": "strong",
+      "osm_way": 629294248,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.04670480487528789,
+        "r_pu": 0.017644037397330985,
+        "b_pu": 0.0006351980780337244,
+        "length_km": 4.9413683558054595,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "reason": "no OSM 33.0 kV way on the route (best 0.00); endpoint yards [[], [69.0]] corroborate 69.0 kV (single-ended)",
+      "old": {
+        "voltage_kv": 33.0,
+        "rating_a_mva": 55.61003839695129,
+        "x_pu": 0.20418877503328342,
+        "r_pu": 0.07713798167924042,
+        "b_pu": 0.00014529105376574793,
+        "length_km": 4.9413683558054595,
+        "rating_b_mva": 63.95154415649398,
+        "rating_c_mva": 75.07355183588425,
+        "params_version": 3
+      },
+      "line_id": 73687,
+      "island": "Eastern",
+      "confidence": "single-ended",
+      "osm_way": 370283010,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.12403861386291622,
+        "r_pu": 0.046859031903768354,
+        "b_pu": 0.0016869589614617994,
+        "length_km": 13.123285346696536,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "reason": "no OSM 115.0 kV way on the route (best 0.21); endpoint yards [[], [115.0, 69.0, 12.5]] corroborate 69.0 kV (single-ended)",
+      "old": {
+        "voltage_kv": 115.0,
+        "rating_a_mva": 178.88543819998318,
+        "x_pu": 0.04167697425793985,
+        "r_pu": 0.009923089109033298,
+        "b_pu": 0.005033108012591788,
+        "length_km": 13.123285346696536,
+        "rating_b_mva": 205.71825392998065,
+        "rating_c_mva": 241.4953415699773,
+        "params_version": 3
+      },
+      "line_id": 74015,
+      "island": "Eastern",
+      "confidence": "single-ended",
+      "osm_way": 365646050,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 138.0,
+        "rating_a_mva": 223.60679774997897,
+        "x_pu": 0.020435495144138355,
+        "r_pu": 0.003831655339525941,
+        "b_pu": 0.005558566093525158,
+        "length_km": 9.72933923812427,
+        "rating_b_mva": 257.1478174124758,
+        "rating_c_mva": 301.8691769624716,
+        "params_version": 3
+      },
+      "reason": "no OSM 69.0 kV way on the route (best 0.38); endpoint yards [[138.0], [138.0, 69.0]] corroborate 138.0 kV (strong)",
+      "old": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.09195972814862259,
+        "r_pu": 0.0347403417450352,
+        "b_pu": 0.0012506773710431606,
+        "length_km": 9.72933923812427,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "line_id": 74543,
+      "island": "ERCOT",
+      "confidence": "strong",
+      "osm_way": 458321312,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 138.0,
+        "rating_a_mva": 223.60679774997897,
+        "x_pu": 0.058947037227374814,
+        "r_pu": 0.011052569480132775,
+        "b_pu": 0.01603391550509291,
+        "length_km": 28.064684423953146,
+        "rating_b_mva": 257.1478174124758,
+        "rating_c_mva": 301.8691769624716,
+        "params_version": 3
+      },
+      "reason": "no OSM 69.0 kV way on the route (best 0.07); endpoint yards [[138.0], [138.0, 69.0]] corroborate 138.0 kV (strong)",
+      "old": {
+        "voltage_kv": 69.0,
+        "rating_a_mva": 116.27553482998906,
+        "x_pu": 0.26526166752318664,
+        "r_pu": 0.10020996328653718,
+        "b_pu": 0.0036076309886459053,
+        "length_km": 28.064684423953146,
+        "rating_b_mva": 133.7168650544874,
+        "rating_c_mva": 156.97197202048523,
+        "params_version": 3
+      },
+      "line_id": 76590,
+      "island": "ERCOT",
+      "confidence": "strong",
+      "osm_way": 20992117,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    },
+    {
+      "new": {
+        "voltage_kv": 115.0,
+        "rating_a_mva": 178.88543819998318,
+        "x_pu": 0.03643457956321254,
+        "r_pu": 0.008674899896002985,
+        "b_pu": 0.004400011699507735,
+        "length_km": 11.472555112463947,
+        "rating_b_mva": 205.71825392998065,
+        "rating_c_mva": 241.4953415699773,
+        "params_version": 3
+      },
+      "reason": "no OSM 138.0 kV way on the route (best 0.00); endpoint yards [[230.0, 115.0], [115.0, 69.0, 23.0]] corroborate 115.0 kV (strong)",
+      "old": {
+        "voltage_kv": 138.0,
+        "rating_a_mva": 223.60679774997897,
+        "x_pu": 0.024096944155563845,
+        "r_pu": 0.004518177029168222,
+        "b_pu": 0.0065545001868529025,
+        "length_km": 11.472555112463947,
+        "rating_b_mva": 257.1478174124758,
+        "rating_c_mva": 301.8691769624716,
+        "params_version": 3
+      },
+      "line_id": 82775,
+      "island": "ERCOT",
+      "confidence": "strong",
+      "osm_way": 285035296,
+      "osm_source": "OpenStreetMap via Overpass API, date-pinned 2026-08-18T00:00:00Z (ODbL 1.0)"
+    }
+  ],
+  "wave": "vc-corridor voltage-class corrections",
+  "applied_at": "2026-08-19T01:34:12.296354Z",
+  "attribution": "\u00a9 OpenStreetMap contributors, ODbL 1.0 \u2014 Overpass API, date-pinned 2026-08-18T00:00:00Z",
+  "inverse_note": "to revert a row: write its `old` fields back (params_version included) and set voltage_source = NULL. voltage_source='osm_corridor' was stamped after this file was written, so it does not appear in the `old` maps; NULL is its prior value for all 17 rows, the column having been created empty by AddOsmVoltageEvidence.",
+  "db_marker": "transmission_lines.voltage_source = 'osm_corridor' on all 17 rows; source stays 'hifld'"
+}

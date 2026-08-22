@@ -44,6 +44,15 @@ defmodule PowerModel.Ingestion.LoadEstimator do
       redistributed to the rest of the county. A bus cannot draw more than its
       branches can deliver, and 19 buses were doing exactly that.
 
+    * **At most what a substation of its VOLTAGE CLASS delivers**
+      (`@class_ceiling_mw`), less whatever another placer has already committed
+      there (datacenter rows and water facility MW — see
+      `committed_load_by_bus/0`). Connected capability counts a yard's
+      circuits, and a circuit in and a circuit out is transfer, not delivery:
+      two 116 MVA 69 kV lines through Mesa's bus 76087 read as 186 MW of cap on
+      a bus whose banks step down at 20-30 MVA a piece. 586 buses held more
+      baseline MW than their class delivers, 513 of them at 69 kV.
+
     * **A known balancing authority**, whenever the database has any. These
       values are spatial WEIGHTS: `Demand.scale_loads/3` rescales each BA to
       its measured demand, and a bus outside every BA is never rescaled, so
@@ -80,11 +89,17 @@ defmodule PowerModel.Ingestion.LoadEstimator do
   Within that kernel a bus's weight is its **load-serving capability**
   (`@serving_capability_mva`), not one vote per bus. Utilities build
   substations where demand is, so a yard's share of the local load follows its
-  share of the local capability, and it is the same quantity the cap is set
-  from — a bus binds exactly when its county's demand density passes 0.8 of
+  share of the local capability, and it is the same quantity the branch cap is
+  set from — a bus binds exactly when its county's demand density passes 0.8 of
   local capability, wherever it stands. One vote per bus instead put 22-23% of
   Eastern's and Western's load on degree-1 buses, which hold 9% of the
   candidate capability between them.
+
+  The class ceiling deliberately does NOT enter the weight. Weighting by
+  `min(capability, class ceiling)` compresses a 100 MVA degree-1 spur and a
+  500 MVA meshed yard from 100:400 into 50:150, which is most of the way back
+  to one vote per bus: measured, it took the degree-1 share of served load to
+  20.8% in Western and 18.2% in Eastern against a 15% gate. Only the cap moves.
 
   Overflow from a capped bus is redistributed **within the same county**, not
   nationally, so the reallocation stays local and bus->BA demand attribution
@@ -100,6 +115,10 @@ defmodule PowerModel.Ingestion.LoadEstimator do
   alias PowerModel.Ingestion.BusMapper
   alias PowerModel.Ingestion.Census.Population
 
+  # The stored `q_mvar` is the LOAD's own reactive demand at this power factor,
+  # not the reactive power the transmission bus ends up seeing: what reaches the
+  # bus is whatever `Solver.LoadModel` makes of the row, and any distribution
+  # compensation modelled there sits between the two.
   @power_factor 0.95
   # ~0.3287
   @q_ratio :math.tan(:math.acos(@power_factor))
@@ -111,6 +130,41 @@ defmodule PowerModel.Ingestion.LoadEstimator do
 
   # Share of a bus's connected capability its load may occupy.
   @cap_fraction 0.8
+
+  # The most load one substation of a given class ordinarily DELIVERS, in MW at
+  # the 0.95 pf above (so the banks behind it see ceiling / 0.95 MVA).
+  #
+  # A bus's branches are transfer capacity, not delivery capacity: two 116 MVA
+  # 69 kV circuits through a yard are one circuit in and one out, and summing
+  # them says a 69 kV bus may serve 186 MW. Load leaves the network through the
+  # yard's step-down banks, so it is the banks that fix the ceiling. Standard
+  # three-phase units come in the ANSI/IEEE C57.12.00 preferred series
+  # (12/16/20, 20/26.7/33.3, 30/40/50, 50/66.7/83.3 MVA ONAN/ONAF/ONAF), and a
+  # delivery yard carries two or three of them with the largest out for N-1:
+  #
+  #     < 46 kV    2 x 12/16 MVA           ->   25 MW
+  #     46-99      2-3 x 20/26.7 MVA       ->   50 MW  (69 kV distribution)
+  #     100-160    3 x 50/66.7 MVA         ->  150 MW  (115/138 kV)
+  #     161-229    3 x 83.3 MVA            ->  250 MW
+  #     230-344    2-3 x 150-200 MVA       ->  400 MW
+  #     345-499    3 x 250 MVA             ->  750 MW
+  #     >= 500     2 x 500-750 MVA         -> 1000 MW
+  #
+  # Only the 46-99 and 100-160 rows bind on the ingested network; the rest are
+  # guard rails against a future spread putting a city on one 500 kV bus.
+  #
+  # This is NOT the transformer class table in `BusMapper`: that one rates a
+  # yard's INTERTIE banks by high-side class (100 MVA below 138 kV), which is a
+  # transmission figure and three to five times a 69 kV delivery bank.
+  @class_ceiling_mw [
+    {500.0, 1000.0},
+    {345.0, 750.0},
+    {230.0, 400.0},
+    {161.0, 250.0},
+    {100.0, 150.0},
+    {46.0, 50.0},
+    {0.0, 25.0}
+  ]
 
   # Kernel cut-off, in county radii.
   @spread_radii 2.5
@@ -265,6 +319,7 @@ defmodule PowerModel.Ingestion.LoadEstimator do
   def candidates do
     network = network()
     caps = capability(network)
+    occupied = committed_load_by_bus()
 
     # A weight on a bus with no balancing authority is not a weight: nothing
     # ever rescales it, so `Demand.scale_loads/3` ships it into every snapshot
@@ -276,7 +331,7 @@ defmodule PowerModel.Ingestion.LoadEstimator do
     network.buses
     |> Enum.filter(fn bus ->
       bus.bus_type == 1 and bus.base_kv >= @min_load_kv and not is_nil(bus.lon) and
-        Map.has_key?(caps, bus.id) and caps[bus.id].cap_mw > 0.0 and
+        Map.has_key?(caps, bus.id) and headroom(caps[bus.id], occupied, bus.id) > 0.0 and
         (not ba_known? or not is_nil(bus.balancing_authority_id))
     end)
     |> Enum.group_by(&yard_key/1)
@@ -286,13 +341,14 @@ defmodule PowerModel.Ingestion.LoadEstimator do
     |> Enum.map(fn {_yard, buses} ->
       bus = yard_candidate(buses, caps)
       cap = Map.fetch!(caps, bus.id)
+      free = headroom(cap, occupied, bus.id)
 
       %{
         id: bus.id,
         lon: bus.lon,
         lat: bus.lat,
         base_kv: bus.base_kv,
-        cap_mw: cap.cap_mw,
+        cap_mw: free,
         capability_mva: cap.capability_mva,
         serving_weight: min(cap.capability_mva, @serving_capability_mva),
         degree: cap.degree,
@@ -300,6 +356,50 @@ defmodule PowerModel.Ingestion.LoadEstimator do
       }
     end)
     |> Enum.sort_by(& &1.id)
+  end
+
+  # What the estimator may still place here: the delivery cap less the MW some
+  # other placer has already committed.
+  defp headroom(cap, occupied, bus_id) do
+    max(cap.delivery_cap_mw - Map.get(occupied, bus_id, 0.0), 0.0)
+  end
+
+  # MW on a bus that this allocation does not get to choose, and that lands
+  # there whatever the spread decides. Both terms arrive AFTER the caps are
+  # applied, so a cap that ignores them is a cap the bus exceeds by exactly
+  # their size.
+  #
+  #   * Datacenter rows (`Grid.map_datacenters_to_grid/0`), which
+  #     `Demand.scale_loads/3` holds FLAT — a 400 MW campus is 400 MW at every
+  #     hour, so a bus carrying one has no room left for a share of its county.
+  #
+  #   * Water facility MW, which `reapply_water_facility_loads/0` merges INTO
+  #     the constant_power row written here once the spread is done. Three
+  #     69 kV buses sat at 51-54 MW against a 50 MW ceiling on exactly this:
+  #     the cap held the spread and the treatment plant went on top of it.
+  #
+  # A database whose datacenters are not mapped yet has an empty map and the
+  # ceiling stands alone.
+  defp committed_load_by_bus do
+    flat =
+      from(l in Load,
+        where: l.status == "in_service" and l.load_type != "constant_power",
+        group_by: l.bus_id,
+        select: {l.bus_id, sum(l.p_mw)}
+      )
+      |> Repo.all(timeout: :infinity)
+
+    water =
+      from(w in PowerModel.Grid.WaterFacility,
+        where: w.status == "active" and not is_nil(w.bus_id) and w.power_consumption_mw > 0.0,
+        group_by: w.bus_id,
+        select: {w.bus_id, sum(w.power_consumption_mw)}
+      )
+      |> Repo.all(timeout: :infinity)
+
+    Enum.reduce(flat ++ water, %{}, fn {bus_id, mw}, acc ->
+      Map.update(acc, bus_id, (mw || 0.0) * 1.0, &(&1 + (mw || 0.0) * 1.0))
+    end)
   end
 
   # The yard's lowest level that is part of the network — has a LINE of its
@@ -318,26 +418,46 @@ defmodule PowerModel.Ingestion.LoadEstimator do
     Enum.min_by(if(networked == [], do: buses, else: networked), &{&1.base_kv, &1.id})
   end
 
-  # A bus carries no substation FK; the owning yard is read off the source_id
-  # BusMapper writes ("<substation id>_<kV>kV"). Buses without one — synthetic
-  # and international — stand alone.
-  defp yard_key(%{source: "substation", source_id: source_id}) when is_binary(source_id) do
+  @doc """
+  Which substation yard a bus belongs to.
+
+  A bus carries no substation FK; the owning yard is read off the source_id
+  `BusMapper` writes ("<substation id>_<kV>kV"). Buses without one — synthetic
+  and international — stand alone.
+
+  Public so every placer that has to consolidate a yard's levels shares one
+  definition of what a yard is: placing per LEVEL instead of per yard is how a
+  substation collects its share once for each voltage it happens to record.
+  """
+  def yard_key(%{source: "substation", source_id: source_id}) when is_binary(source_id) do
     case Integer.parse(source_id) do
       {id, "_" <> _} -> {:substation, id}
       _ -> {:source_id, source_id}
     end
   end
 
-  defp yard_key(%{id: id}), do: {:bus, id}
+  def yard_key(%{id: id}), do: {:bus, id}
 
   @doc """
-  `%{bus_id => %{cap_mw, capability_mva, line_mva, bank_mva, degree, line_degree}}`
-  for a network of `%{buses:, lines:, transformers:}`.
+  The most load a substation of `base_kv` ordinarily delivers, in MW.
+  """
+  def class_ceiling(base_kv) do
+    {_kv, mw} = Enum.find(@class_ceiling_mw, fn {kv, _mw} -> base_kv >= kv end)
+    mw
+  end
+
+  @doc """
+  `%{bus_id => %{cap_mw, delivery_cap_mw, class_cap_mw, capability_mva, line_mva,
+  bank_mva, degree, line_degree}}` for a network of `%{buses:, lines:, transformers:}`.
 
   Capability is the summed rating of the bus's branches, with **class-standard**
   transformer ratings rather than stored ones — see the module doc on anchoring
-  — and the cap is `#{@cap_fraction}` of it. A bus with no line of its own is
+  — and `cap_mw` is `#{@cap_fraction}` of it. A bus with no line of its own is
   additionally held to what reaches the far terminals of its banks.
+
+  `delivery_cap_mw` is what the allocator spends: the branch cap AND the class
+  ceiling, whichever is smaller. `cap_mw` stays the branch cap alone so the
+  census section named after it keeps measuring the same thing.
   """
   def capability(network) do
     {line_mva, line_degree} = incidence(network.lines, fn line -> line.rating_a_mva || 0.0 end)
@@ -371,9 +491,13 @@ defmodule PowerModel.Ingestion.LoadEstimator do
           min(bank, Map.get(bank_supply, bus.id, 0.0))
         end
 
+      class_cap = class_ceiling(bus.base_kv)
+
       {bus.id,
        %{
          cap_mw: @cap_fraction * capability,
+         class_cap_mw: class_cap,
+         delivery_cap_mw: min(@cap_fraction * capability, class_cap),
          capability_mva: capability,
          line_mva: lines,
          bank_mva: bank,
@@ -521,16 +645,22 @@ defmodule PowerModel.Ingestion.LoadEstimator do
     # proportion to serving capability, like everything else here.
     uniform_mw = (1.0 - @population_weight) * target_mw
     population_mw = @population_weight * target_mw
-    total_weight = candidates |> Enum.map(& &1.serving_weight) |> Enum.sum()
 
     total_pop = counties |> Enum.map(& &1.population) |> Enum.sum()
 
     caps = Map.new(candidates, &{&1.id, &1.cap_mw})
 
-    base =
-      Map.new(candidates, fn c ->
-        {c.id, min(uniform_mw * c.serving_weight / total_weight, c.cap_mw)}
-      end)
+    # Water-filled, not one clipped pass. A single `min(share, cap)` drops the
+    # clipped MW on the floor: the national floor is 3.1 MW a bus and no cap
+    # comes near it, but a small candidate set makes it reachable and a
+    # baseline that shrinks silently moves every BA share.
+    {base, floor_residual} =
+      fill_fixed(
+        Enum.map(candidates, &{&1.id, &1.serving_weight}),
+        uniform_mw,
+        Map.new(candidates, &{&1.id, 0.0}),
+        caps
+      )
 
     demands =
       Enum.map(counties, fn county ->
@@ -549,7 +679,7 @@ defmodule PowerModel.Ingestion.LoadEstimator do
       candidates: length(candidates),
       capped_buses:
         Enum.count(allocation, fn {id, mw} -> mw >= Map.fetch!(caps, id) - 1.0e-6 end),
-      residual_mw: residual,
+      residual_mw: residual + floor_residual,
       floor_mw: uniform_mw
     }
 

@@ -22,6 +22,7 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       mix power_model.ingest demand [/path/to/eia930/]   # EIA-930 hourly demand profiles
       mix power_model.ingest population [/path/to/census/]  # county population (load weights)
       mix power_model.ingest btm_solar [/path/to/eia861/]   # EIA-861 rooftop PV on buses
+      mix power_model.ingest osm_voltage [--apply]    # OSM voltage backfill (ROADMAP 24)
       mix power_model.ingest validate [--update-baseline] # ingest-time validation gates
       mix power_model.ingest full_pipeline    # runs EVERY documented step in order
 
@@ -121,6 +122,9 @@ defmodule Mix.Tasks.PowerModel.Ingest do
         Mix.shell().info("Merging terminating-line voltages into substation levels...")
         result = PowerModel.Ingestion.HIFLD.Substations.augment_voltage_levels_from_lines()
         Mix.shell().info("Done: #{inspect(result)}")
+
+      ["osm_voltage" | flags] ->
+        run_osm_voltage(flags)
 
       ["hvdc_ties"] ->
         Mix.shell().info("Upserting curated HVDC ties...")
@@ -261,6 +265,7 @@ defmodule Mix.Tasks.PowerModel.Ingest do
           mix power_model.ingest egrid <path>
           mix power_model.ingest map_buses
           mix power_model.ingest augment_levels
+          mix power_model.ingest osm_voltage [--apply] [--snapshot <path>] [--line-snapshot <path>]
           mix power_model.ingest hvdc_ties
           mix power_model.ingest connectivity_repair
           mix power_model.ingest estimate_parameters
@@ -421,13 +426,21 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       # geometry, and only then its endpoint buses — and every line it owns
       # (HIFLD; matpower/international/connectivity_repair are externally
       # authored) carries geometry, so it never reaches the endpoints. Its two
-      # siblings stay where they are: `synthesize_line_end_reactors` selects on
+      # siblings stay where they are: `synthesize_bus_shunts` selects on
       # `from_bus_id`/`to_bus_id` being non-null and would find nothing here.
       {"Estimating line parameters (before bus mapping ranks on them)",
        fn -> PowerModel.Ingestion.ParameterEstimator.estimate_line_parameters() end},
       {"Mapping components to buses", fn -> PowerModel.Ingestion.map_buses() end},
       {"Creating international connections",
        fn -> PowerModel.Ingestion.ingest_international_connections() end},
+      # ROADMAP item 24: OSM voltage backfill runs AFTER map_buses (it
+      # retargets the blind yards' default buses, and the in-map_buses
+      # augmentation pass is code-guarded against overwriting osm% rows) and
+      # BEFORE the electrical-parameter pass below, which is what prices the
+      # params_version-0 stamp the re-derived circuits carry. Raises with
+      # fetch instructions when the vendored ODbL snapshots are absent, like
+      # the vendored-HIFLD stages above.
+      {"OSM voltage backfill (ROADMAP 24)", fn -> run_osm_voltage(["--apply"]) end},
       # Version-stamped, so the line pass above is not repeated: what runs here
       # is generator Q limits and the line-end reactors, which need endpoints.
       {"Estimating electrical parameters", fn -> PowerModel.Ingestion.estimate_parameters() end},
@@ -439,13 +452,23 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       {"Ingesting EIA-930 demand (data/)", fn -> PowerModel.Ingestion.ingest_demand("data") end},
       {"Ingesting Census county population (data/)",
        fn -> PowerModel.Ingestion.ingest_population("data") end},
+      # The datacenter placer ANCHORS campuses; the load estimator yields
+      # around those anchors under the per-class ceilings, so mapping must
+      # precede estimation on a fresh build (it used to run after, which
+      # violated the ceilings). The `reallocate/0` call makes the stage
+      # self-correcting on an existing database too — cheap and idempotent.
+      {"Ingesting curated datacenters", fn -> PowerModel.Ingestion.ingest_datacenters() end},
+      {"Mapping datacenters to grid buses",
+       fn ->
+         result = PowerModel.Grid.map_datacenters_to_grid()
+         PowerModel.Ingestion.LoadEstimator.reallocate()
+         result
+       end},
       {"Estimating loads", fn -> PowerModel.Ingestion.estimate_loads() end},
       {"Ingesting San Diego water infrastructure",
        fn -> PowerModel.Ingestion.Water.SanDiego.ingest() end},
       {"Mapping water facilities to grid buses",
        fn -> PowerModel.Grid.map_water_facilities_to_grid() end},
-      {"Ingesting curated datacenters", fn -> PowerModel.Ingestion.ingest_datacenters() end},
-      {"Mapping datacenters to grid buses", fn -> PowerModel.Grid.map_datacenters_to_grid() end},
       {"Cleanup: re-mapping synthetic components", fn -> PowerModel.Ingestion.Cleanup.run() end},
       # ROADMAP item 12: runs after cleanup, so it sees the endpoints the
       # 50 km last-resort search recovered and joins only what is still apart.
@@ -467,10 +490,61 @@ defmodule Mix.Tasks.PowerModel.Ingest do
       # and connectivity repair leave behind, not the one estimate_loads saw.
       {"Ingesting EIA-861 behind-the-meter solar (data/)",
        fn -> PowerModel.Ingestion.EIA.Form861.run("data") end},
+      # Bus shunt plant is synthesized from the FINAL line set and the FINAL
+      # loads table, so it runs after every stage that can move either. The
+      # earlier "Estimating electrical parameters" call also runs it, but at
+      # that point the loads table is still empty and connectivity repair has
+      # not added its lines, so it can only place reactors; the pass recomputes
+      # both components from scratch, so this run supersedes that one instead
+      # of adding to it.
+      {"Synthesizing bus shunt compensation",
+       fn -> PowerModel.Ingestion.ParameterEstimator.synthesize_bus_shunts() end},
       # ROADMAP Phase 0 item 3: the gates run LAST, on the data every earlier
       # stage just wrote, and fail the pipeline on a topology regression.
       {"Validating ingested data", fn -> run_validation([]) end}
     ]
+  end
+
+  # ROADMAP item 24: OSM voltage backfill for the voltage-blind yards and the
+  # TOPO-1 restored circuits. DRY RUN by default — `--apply` writes. Position
+  # in the documented order: after `map_buses`, before an `estimate_parameters`
+  # re-run (the pass stamps changed circuits `params_version: 0` for it). The
+  # snapshots are vendored, ODbL-licensed (NOT public domain) — see
+  # `data/vendored/PROVENANCE.md`.
+  defp run_osm_voltage(flags) do
+    {parsed, _rest, invalid} =
+      OptionParser.parse(flags,
+        strict: [apply: :boolean, snapshot: :string, line_snapshot: :string, audit: :string]
+      )
+
+    if invalid != [] do
+      Mix.raise(
+        "Unknown osm_voltage option(s): #{Enum.map_join(invalid, ", ", fn {flag, _} -> flag end)}"
+      )
+    end
+
+    opts =
+      [apply: Keyword.get(parsed, :apply, false)]
+      |> put_if(:snapshot, parsed[:snapshot])
+      |> put_if(:line_snapshot, parsed[:line_snapshot])
+      |> put_if(:audit_path, parsed[:audit])
+
+    default = PowerModel.Ingestion.OSM.default_snapshot()
+
+    if is_nil(opts[:snapshot]) and not File.regular?(default) do
+      Mix.raise("""
+      No OSM substation snapshot at #{default}.
+
+      Fetch it first (date-pinned Overpass pull, ~20 MB):
+
+          python3 scripts/fetch_osm_voltage.py substations
+
+      then record the printed sha256 against the PROVENANCE.md entry.
+      """)
+    end
+
+    result = PowerModel.Ingestion.OSM.run(opts)
+    Mix.shell().info("Done: #{inspect(Map.drop(result, [:match_stats]), limit: 30)}")
   end
 
   # Shared by `mix power_model.ingest validate` and the final pipeline stage.

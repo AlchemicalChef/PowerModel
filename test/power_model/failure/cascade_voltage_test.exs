@@ -645,9 +645,16 @@ defmodule PowerModel.Failure.CascadeVoltageTest do
         ],
         transformers: [],
         generators: [generator(1, 1, p_max_mw: 95.0), generator(2, 3, p_max_mw: 95.0)],
-        loads: [load(1, 2, 100.0, 45.0), load(2, 4, 100.0, 45.0)]
+        loads: [load(1, 2, 100.0, sagging_q()), load(2, 4, 100.0, sagging_q())]
       }
     end
+
+    # The fixture is tuned to sag, and what is under test is the alarm
+    # high-water mark, not the reactive model. Distribution compensation nets
+    # part of a load's reactive demand away, so the GROSS demand is grossed up
+    # to leave the same 45 MVAr at the bus at nominal voltage — keeping the
+    # compensation path exercised inside a cascade rather than switching it off.
+    defp sagging_q, do: 45.0 / (1.0 - PowerModel.Solver.LoadModel.compensation_fraction())
 
     test "a fragment can alarm again after a split" do
       # REVIEW CAS-24. The mark is a count of BUSES over the island it was

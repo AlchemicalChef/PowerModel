@@ -1037,92 +1037,30 @@ defmodule PowerModel.Grid do
   end
 
   @doc """
-  Map datacenters to their nearest grid bus and (re)build their load rows.
+  Map datacenters to the grid and (re)build their load rows.
+
+  Placement respects each campus's interconnection voltage class and the
+  delivery ceiling of the yard it lands on, splitting a campus across nearby
+  yards when no single one can host it — see
+  `PowerModel.Ingestion.DatacenterPlacement`, which also documents why this
+  runs BEFORE `estimate_loads` rather than after.
 
   Loads are rebuilt deterministically: all `load_type: "datacenter"` rows are
-  replaced by one row per bus summing the draw of every campus mapped there
+  replaced by one row per bus summing the draw of every campus placed there
   (PF 0.95, flat profile — see `PowerModel.Demand`). Re-running is idempotent.
 
   Returns `{mapped_count, load_rows, unmapped_count}`.
   """
   def map_datacenters_to_grid(opts \\ []) do
-    max_km = Keyword.get(opts, :max_km, 30)
-    max_meters = max_km * 1000
-
-    datacenters =
-      from(d in Datacenter,
-        where: d.status == "active" and not is_nil(d.coordinates)
-      )
-      |> Repo.all()
-
-    {mapped, unmapped} =
-      Enum.reduce(datacenters, {0, 0}, fn dc, {mapped, unmapped} ->
-        nearest =
-          from(b in Bus,
-            where: not is_nil(b.coordinates),
-            where:
-              fragment(
-                "ST_DWithin(?::geography, ?::geography, ?)",
-                b.coordinates,
-                ^dc.coordinates,
-                ^max_meters
-              ),
-            order_by:
-              fragment("ST_Distance(?::geography, ?::geography)", b.coordinates, ^dc.coordinates),
-            limit: 1
-          )
-          |> Repo.one()
-
-        case nearest do
-          nil ->
-            IO.puts("  No bus within #{max_km} km of datacenter: #{dc.name}")
-            {mapped, unmapped + 1}
-
-          bus ->
-            dc |> Ecto.Changeset.change(%{bus_id: bus.id}) |> Repo.update!()
-            {mapped + 1, unmapped}
-        end
-      end)
-
-    load_rows = rebuild_datacenter_loads()
-
-    {mapped, load_rows, unmapped}
+    PowerModel.Ingestion.DatacenterPlacement.run(opts)
   end
+  @doc """
+  Datacenters connected to a set of bus IDs (cascade power-loss checks).
 
-  defp rebuild_datacenter_loads do
-    {:ok, count} = Repo.transaction(fn -> do_rebuild_datacenter_loads() end)
-    count
-  end
-
-  defp do_rebuild_datacenter_loads do
-    Repo.delete_all(from l in Load, where: l.load_type == "datacenter")
-
-    now = NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
-
-    rows =
-      from(d in Datacenter,
-        where: d.status == "active" and not is_nil(d.bus_id),
-        group_by: d.bus_id,
-        select: {d.bus_id, sum(d.power_mw)}
-      )
-      |> Repo.all()
-      |> Enum.map(fn {bus_id, p_mw} ->
-        %{
-          bus_id: bus_id,
-          p_mw: p_mw,
-          q_mvar: p_mw * 0.3287,
-          load_type: "datacenter",
-          status: "in_service",
-          inserted_at: now,
-          updated_at: now
-        }
-      end)
-
-    {count, _} = Repo.insert_all(Load, rows)
-    count
-  end
-
-  @doc "Datacenters connected to a set of bus IDs (cascade power-loss checks)."
+  Matches on the ANCHOR bus — the yard carrying a campus's largest share. A
+  campus split across yards by `DatacenterPlacement` is returned for its anchor
+  only; see that module's moduledoc.
+  """
   def get_datacenters_for_buses(bus_ids) when is_list(bus_ids) do
     from(d in Datacenter,
       where: d.bus_id in ^bus_ids and d.status == "active"

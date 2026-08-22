@@ -9,6 +9,8 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   - Derates ratings for summer ambient temperature
   - Caps EHV ratings at St. Clair loadability (ROADMAP item 10)
   - Derives the emergency rating tiers (rate B / rate C) protection picks up on
+  - Synthesizes the bus shunt plant the network was missing entirely — EHV
+    line-end reactors and substation capacitor banks (`synthesize_bus_shunts/1`)
 
   ## Which rows this pass owns
 
@@ -61,8 +63,9 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   """
 
   import Ecto.Query
+  require Logger
   alias PowerModel.Repo
-  alias PowerModel.Grid.{TransmissionLine, Generator, Bus, Ratings}
+  alias PowerModel.Grid.{TransmissionLine, Generator, Bus, Load, Ratings}
 
   # IEEE/EPRI standard values per voltage class
   # {R (ohm/km), X (ohm/km), B (uS/km), Thermal rating (MVA), typical_circuits}
@@ -225,7 +228,11 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
     estimate_line_parameters()
     estimate_generator_q_limits()
     # After the line pass: the reactors are sized from the b_pu it just wrote.
-    synthesize_line_end_reactors()
+    # Capacitor banks are sized from the loads table, which on a fresh ingest is
+    # still empty here — `synthesize_bus_shunts/1` recomputes BOTH components
+    # from scratch every time, so the later pipeline stage that runs after
+    # `estimate_loads` fills them in without disturbing the reactors.
+    synthesize_bus_shunts()
   end
 
   @doc "Version of the line parameter recipe; rows stamped lower are recomputed."
@@ -449,117 +456,6 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   @reactor_excluded_sources ~w(matpower)
 
   @doc """
-  Synthesize line-end shunt reactors on EHV buses and write them to
-  `buses.bs_mvar`.
-
-  Every in-service AC line at or above #{trunc(@reactor_min_kv)} kV gets a
-  reactor at each terminal absorbing `K` of the charging that terminal injects:
-
-      bs_mvar(bus) = sum over EHV lines at that bus of  -K/2 x b_pu x 100
-
-  `b_pu x 100` is the line's total charging in MVAr at 1.0 pu, half of it at
-  each end in the pi model, so `-K/2 x b_pu x 100` per terminal absorbs exactly
-  the fraction `K` of it.
-
-  WHY THIS EXISTS: the network models line charging correctly (per-km values
-  match published typicals to three digits) but modeled ZERO compensation
-  anywhere — `bs_mvar` was 0.0 on all 89,969 buses. Western alone injects
-  44.3 GVAr of charging into a network whose only reactive sinks are generator
-  `q_min`, which is why its light-load AC solutions push thousands of buses
-  above 1.1 pu (LIN13-C). Real EHV systems absorb roughly half their charging
-  in line-end reactors; this pass supplies the missing half.
-
-  OWNERSHIP: this pass owns NEGATIVE `bs_mvar`. It writes the full computed
-  value (it does not accumulate), so re-running it — or running it with a
-  different `K` — converges on the same answer, and a bus that no longer
-  terminates an EHV line has its synthesized reactor cleared. Capacitor banks
-  (`bs_mvar > 0`) are never touched. If measured reactor data is ever ingested,
-  gate this pass rather than letting it overwrite.
-
-  Options:
-  - `:compensation` — `%{class_kv => K}` map overriding `@reactor_compensation`
-
-  Returns a summary map.
-  """
-  def synthesize_line_end_reactors(opts \\ []) do
-    compensation = Keyword.get(opts, :compensation, @reactor_compensation)
-
-    lines =
-      from(tl in TransmissionLine,
-        where:
-          tl.status == "in_service" and tl.voltage_kv >= @reactor_min_kv and
-            not is_nil(tl.b_pu) and tl.b_pu > 0.0 and
-            not is_nil(tl.from_bus_id) and not is_nil(tl.to_bus_id) and
-            (is_nil(tl.line_type) or tl.line_type != "dc") and
-            (is_nil(tl.source) or tl.source not in @reactor_excluded_sources),
-        select: {tl.voltage_kv, tl.b_pu, tl.from_bus_id, tl.to_bus_id}
-      )
-      |> Repo.all()
-
-    excluded_buses =
-      from(b in Bus, where: b.source in @reactor_excluded_sources, select: b.id)
-      |> Repo.all()
-      |> MapSet.new()
-
-    per_bus =
-      lines
-      |> Enum.reduce(%{}, fn {voltage_kv, b_pu, from_id, to_id}, acc ->
-        mvar = line_end_reactor_mvar(voltage_kv, b_pu, compensation)
-
-        acc
-        |> Map.update(from_id, mvar, &(&1 + mvar))
-        |> Map.update(to_id, mvar, &(&1 + mvar))
-      end)
-      |> Map.reject(fn {bus_id, _} -> MapSet.member?(excluded_buses, bus_id) end)
-
-    {bus_ids, mvars} = Enum.unzip(Map.to_list(per_bus))
-
-    if bus_ids == [] do
-      # No qualifying lines at all (an empty or non-EHV database). Returning
-      # early rather than running the statements below matters: the stale-
-      # reactor cleanup is "every reactor NOT in this set", which with an empty
-      # set would clear every reactor in the table.
-      %{lines: length(lines), buses: 0, written: 0, cleared: 0, mvar: 0.0}
-    else
-      write_reactors(lines, per_bus, bus_ids, mvars)
-    end
-  end
-
-  defp write_reactors(lines, per_bus, bus_ids, mvars) do
-    # One statement, not one per bus: this touches thousands of rows and the
-    # per-row changeset path made the pass the slowest thing in the ingest.
-    %{num_rows: written} =
-      Repo.query!(
-        """
-        UPDATE buses AS b SET bs_mvar = v.bs, updated_at = now()
-        FROM (SELECT unnest($1::bigint[]) AS id, unnest($2::float8[]) AS bs) AS v
-        WHERE b.id = v.id AND b.bs_mvar IS DISTINCT FROM v.bs
-        """,
-        [bus_ids, mvars]
-      )
-
-    # Buses that carry a synthesized reactor but no longer terminate a
-    # qualifying line — otherwise a re-ingest that drops or downgrades a line
-    # leaves its reactor behind forever.
-    %{num_rows: cleared} =
-      Repo.query!(
-        """
-        UPDATE buses SET bs_mvar = 0.0, updated_at = now()
-        WHERE bs_mvar < 0.0 AND NOT (id = ANY($1::bigint[]))
-        """,
-        [bus_ids]
-      )
-
-    %{
-      lines: length(lines),
-      buses: map_size(per_bus),
-      written: written,
-      cleared: cleared,
-      mvar: Enum.sum(mvars)
-    }
-  end
-
-  @doc """
   Reactor MVAr for ONE terminal of a line, given its voltage and total
   charging susceptance in per unit.
 
@@ -590,6 +486,570 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
 
   @doc "Default per-class reactor compensation fractions."
   def reactor_compensation, do: @reactor_compensation
+
+  @doc """
+  Per-bus line-end reactor MVAr, as a `%{bus_id => negative mvar}` map.
+
+  Pure computation — the write lives in `synthesize_bus_shunts/1`, because
+  reactors and capacitor banks share one column and neither may be written
+  without the other (see that function's OWNERSHIP note).
+  """
+  def line_end_reactor_targets(opts \\ []) do
+    compensation = Keyword.get(opts, :compensation, @reactor_compensation)
+
+    lines =
+      from(tl in TransmissionLine,
+        where:
+          tl.status == "in_service" and tl.voltage_kv >= @reactor_min_kv and
+            not is_nil(tl.b_pu) and tl.b_pu > 0.0 and
+            not is_nil(tl.from_bus_id) and not is_nil(tl.to_bus_id) and
+            (is_nil(tl.line_type) or tl.line_type != "dc") and
+            (is_nil(tl.source) or tl.source not in @reactor_excluded_sources),
+        # Deterministic order: the per-bus value is a float SUM, and float
+        # addition is not associative, so an unordered scan can land on a
+        # different last bit run to run and defeat the idempotency check in
+        # `write_bus_shunts/2` (`IS DISTINCT FROM`).
+        order_by: [asc: tl.id],
+        select: {tl.voltage_kv, tl.b_pu, tl.from_bus_id, tl.to_bus_id}
+      )
+      |> Repo.all()
+
+    per_bus =
+      Enum.reduce(lines, %{}, fn {voltage_kv, b_pu, from_id, to_id}, acc ->
+        mvar = line_end_reactor_mvar(voltage_kv, b_pu, compensation)
+
+        acc
+        |> Map.update(from_id, mvar, &(&1 + mvar))
+        |> Map.update(to_id, mvar, &(&1 + mvar))
+      end)
+
+    {per_bus, length(lines)}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Shunt capacitor banks (VC-COMP)
+  # ---------------------------------------------------------------------------
+
+  # Fraction of a bus's own load Q supplied by a synthesized LOAD-BUS capacitor
+  # bank. The rule is 1.00 — compensate the transmission-to-distribution
+  # interface to unity power factor, which is what distribution and transmission
+  # banks do in practice. **The shipped value is 0.0, i.e. this component is
+  # off, and the measurement below is why.**
+  #
+  # `bs_mvar` is a FIXED shunt. A real substation installation is SWITCHED: a
+  # small permanently-connected block plus steps that are out of service at
+  # light load. Modelling a load-sized installation as permanently connected
+  # puts peak-load compensation on a network the simulator only ever solves at a
+  # fraction of peak, and the result is not marginal.
+  #
+  # MEASURED 2026-08-18, one snapshot per island, FDPF, alpha bisected to 0.01,
+  # capacitors applied on top of the same reactor set (control = reactors only):
+  #
+  #   island   control   + load banks @ peak   + load banks @ MINIMUM load
+  #   Western   0.175    no solution at 0.05   no solution at 0.10
+  #                      (Vm to 1.5 pu,         (126 buses > 1.1 pu)
+  #                       343 buses > 1.1 pu)
+  #   ERCOT     0.5938   no solution at 0.10   0.6375, but 113 buses > 1.1 pu
+  #                      (2,094 buses > 1.1)    at alpha 0.45
+  #
+  # Minimum-load sizing is the smallest defensible fixed block (it is how the
+  # permanently-connected portion of a switched installation is sized), and it
+  # still fails on Western and buys ERCOT nothing over the generator-support
+  # banks alone (0.6375 either way) while degrading its voltage profile.
+  #
+  # The physical reason is in the reactive balance, not in the arithmetic:
+  # Western already runs a reactive SURPLUS at every operating point where a
+  # solution exists — 44.5 GVAr of line charging against 27.2 GVAr of load Q at
+  # the reference hour, with its generators NET-ABSORBING 14.6 GVAr at the
+  # ceiling. Adding capacitors to a system that is absorbing is backwards; that
+  # is what the line-end REACTOR pass is for.
+  #
+  # The vc-diagnose `caps100` lever that showed +19% on Western is not this: it
+  # sized banks against the ALREADY-alpha-scaled load, so at the ceiling it
+  # placed ~6 GVAr where a fixed peak-sized bank places ~51 GVAr. A lever that
+  # tracks load is a switched bank, and no `bs_mvar` value reproduces it.
+  #
+  # Interface compensation that DOES scale with load belongs in the loads'
+  # power factor (`Ingestion.LoadEstimator`), where distribution capacitors
+  # physically sit — behind the load bus. Set this to 1.0 to reproduce the
+  # measurement above.
+  @load_compensation 0.0
+
+  # WHICH load Q the 100% is a fraction OF.
+  #
+  # `loads.q_mvar` as stored is a per-BA ALLOCATION BASIS, not an operating
+  # point: every snapshot passes it through `Demand.scale_loads/3`, which
+  # multiplies it by `demand_mw(ba, hour) / (summed stored p_mw of that BA)`.
+  # MEASURED 2026-08-18 at `Demand.latest_demand_hour/0`: that factor is 0.352
+  # on Western, 0.379 on Eastern, 0.509 on ERCOT — and across all 4,420 ingested
+  # EIA-930 hours national demand spans 0.12x to 1.73x that hour, so the stored
+  # baseline is never reached at any hour in the record. Sizing a bank at 100%
+  # of it would over-compensate its bus at EVERY hour the simulator can be run
+  # at, by ~2.6x at the reference hour.
+  #
+  # So the bank is sized to the load Q at the BA's PEAK ingested demand hour,
+  # which is the operating point a planner compensates:
+  #
+  #     bank = q_mvar_stored x max_over_hours(demand_mw(ba, h)) / baseline_mw(ba)
+  #
+  # exactly the scaler's own factor evaluated at the peak hour instead of the
+  # simulated one. At any lighter hour the bank over-supplies and at the peak it
+  # lands on unity, which is what fixed plant does.
+  #
+  # Clamped to the same sanity range `Demand` applies to its own factors, so a
+  # BA whose demand rows disagree with its geolocated baseline cannot produce an
+  # absurd bank. A BA with no demand data falls back to 1.0 — the stored
+  # baseline is then the best available estimate of its peak.
+  @peak_factor_range {0.05, 2.0}
+  @default_peak_factor 1.0
+
+  # A capacitor bank is a discrete piece of plant. North American shunt banks
+  # are built from ~1.2 MVAr capacitor groups, so nothing smaller than one group
+  # is installed; a bus wanting less than this gets no bank rather than a
+  # fictitious fractional one. This also keeps the pass from writing tens of
+  # thousands of rows whose physical effect rounds to nothing.
+  @min_bank_mvar 1.2
+
+  # Plausibility ceiling on the TOTAL synthesized shunt capacitance at one bus,
+  # by voltage class (closest class wins, as everywhere else in this module).
+  #
+  # The model carries one bus per (substation, voltage level), so the value
+  # below is a whole station's capacitor installation, not a single bank. It is
+  # (largest bank normally built at that class) x (number of switching steps a
+  # station normally carries), rounded:
+  #
+  #   class      max bank    steps   ceiling
+  #   <=34.5 kV   3.6 MVAr     ~6      25
+  #   69 kV        25 MVAr      4     100
+  #   115-161 kV   60 MVAr      4     250
+  #   230 kV      150 MVAr      3     450
+  #   345 kV      250 MVAr      3     750
+  #   >=500 kV    300 MVAr      3     900
+  #
+  # Bank ratings and the multi-step construction follow IEEE Std 1036, "IEEE
+  # Guide for the Application of Shunt Power Capacitors": a station splits its
+  # compensation into steps because each energization step has to satisfy the
+  # ~2-3% bus voltage-step criterion (dV/V ~ Q_step / S_sc), so a single
+  # 500 MVAr block at a 69 kV yard is not a thing that gets built.
+  #
+  # This is a GUARD, not a sizing rule. It exists so that a load-allocation
+  # outlier — the 208.7 MW sitting on one 69 kV bus in Mesa AZ, the 405.4 MW on
+  # a 130.5 kV bus near Madison GA — cannot turn into a capacitor bank nobody
+  # would ever build.
+  @cap_class_ceiling_mvar %{
+    34.5 => 25.0,
+    69.0 => 100.0,
+    115.0 => 250.0,
+    138.0 => 250.0,
+    161.0 => 250.0,
+    230.0 => 450.0,
+    345.0 => 750.0,
+    500.0 => 900.0,
+    765.0 => 900.0
+  }
+
+  # Generator-support banks are a PLANNING STUDY RESULT, not a rule the
+  # ingestion can evaluate: which generator buses run out of vars is a property
+  # of the solved network, so it takes a power flow to find them. The study is
+  # therefore carried as data, keyed on `(source, source_id)` — stable across a
+  # re-ingest in a way row ids are not — and the file records the operating
+  # point it was measured at. See `generator_support_targets/1`.
+  @generator_support_study "reactive_support_banks.json"
+
+  @doc """
+  Per-bus capacitor bank MVAr, as a `%{bus_id => positive mvar}` map.
+
+  Two components, summed per bus and then held to the per-class ceiling:
+
+    * **generator-support banks** — substation compensation at the generator
+      buses a power flow shows running out of reactive production
+      (`generator_support_targets/2`). This is the component that ships on.
+    * **load-bus banks** — `@load_compensation` x the bus's own in-service load
+      Q at its balancing authority's peak ingested demand hour
+      (`ba_peak_factors/0`). OFF by default: a fixed shunt cannot represent a
+      switched installation, and installing one anyway measurably destroys the
+      solve. The measurement is on `@load_compensation`; read it before turning
+      this on.
+
+  SIZING BASIS: `loads.q_mvar` as stored is an allocation basis, not an
+  operating point — see `@peak_factor_range` for the measurement. A load-bus
+  bank is sized to that column times the BA's peak-hour scale factor, so it
+  would land on unity power factor at system peak and over-supply at lighter
+  hours. The bank does not follow load hour by hour, exactly as real plant
+  does not.
+
+  A capacitor's output falls as V^2, so this compensation FADES as the bus sags
+  — which is the real voltage-collapse mechanism and the reason banks are
+  modelled here rather than by lowering the loads' power factor.
+
+  Options:
+  - `:load_compensation` — fraction of load Q to compensate (default #{@load_compensation})
+  - `:peak_factors` — `%{ba_id => factor}` overriding `ba_peak_factors/0`
+  - `:generator_support` — `%{bus_id => mvar}`, or `false` to skip the study
+  """
+  def capacitor_bank_targets(opts \\ []) do
+    frac = Keyword.get(opts, :load_compensation, @load_compensation)
+
+    load_q =
+      if frac == 0.0 do
+        # Load-bus banks are off (the shipped default — see @load_compensation).
+        # Skipping the scan rather than computing a map of zeros: every value
+        # would be 0.0 and every one would then be dropped, and the two full
+        # table scans behind it are not free at 71k load buses.
+        %{}
+      else
+        peak = Keyword.get_lazy(opts, :peak_factors, &ba_peak_factors/0)
+
+        from(l in Load,
+          join: b in Bus,
+          on: l.bus_id == b.id,
+          where: l.status == "in_service" and not is_nil(l.q_mvar) and l.q_mvar > 0.0,
+          group_by: [l.bus_id, b.balancing_authority_id],
+          select: {l.bus_id, b.balancing_authority_id, sum(l.q_mvar)}
+        )
+        |> Repo.all()
+        |> Map.new(fn {bus_id, ba_id, q} ->
+          {bus_id, frac * Map.get(peak, ba_id, @default_peak_factor) * q}
+        end)
+      end
+
+    support =
+      case Keyword.get(opts, :generator_support, :study) do
+        :study -> generator_support_targets(load_q, opts)
+        false -> %{}
+        map when is_map(map) -> map
+      end
+
+    raw = Map.merge(load_q, support, fn _id, a, b -> a + b end)
+
+    # The ceiling is a per-BUS plausibility limit, so it is applied to the sum
+    # of both components, not to each one separately.
+    # `= ANY($1)` rather than `in ^ids`: this list runs to tens of thousands of
+    # buses and an expanded IN clause would exceed the 65,535 bind-parameter
+    # limit outright.
+    kv_by_bus =
+      from(b in Bus,
+        where:
+          fragment("? = ANY(?)", b.id, ^Map.keys(raw)) and
+            (is_nil(b.source) or b.source not in @reactor_excluded_sources),
+        select: {b.id, b.base_kv}
+      )
+      |> Repo.all()
+      |> Map.new()
+
+    per_bus =
+      kv_by_bus
+      |> Enum.reduce(%{}, fn {bus_id, base_kv}, acc ->
+        mvar = bank_target_mvar(Map.fetch!(raw, bus_id), base_kv)
+        if mvar > 0.0, do: Map.put(acc, bus_id, mvar), else: acc
+      end)
+
+    {per_bus, map_size(load_q), map_size(support)}
+  end
+
+  @doc """
+  Peak-hour load scale factor per balancing authority, `%{ba_id => factor}`.
+
+  This is `Demand`'s own scale factor — `demand_mw(ba, hour) / baseline_mw(ba)`
+  — evaluated at the BA's HIGHEST ingested demand hour instead of a simulated
+  one, so a bank sized against it compensates its bus to unity at system peak.
+  `baseline_mw` is the summed stored `p_mw` of that BA's geolocated in-service
+  non-datacenter loads, matching `Demand.universe_baselines/1`; datacenters are
+  excluded from the denominator there because they run flat and are not shaped
+  by the hourly curve.
+
+  Clamped to #{inspect(@peak_factor_range)}. BAs absent from the result fall
+  back to `#{@default_peak_factor}`.
+  """
+  def ba_peak_factors do
+    {lo, hi} = @peak_factor_range
+
+    baselines =
+      from(l in Load,
+        join: b in Bus,
+        on: l.bus_id == b.id,
+        where:
+          l.status == "in_service" and not is_nil(b.coordinates) and
+            not is_nil(b.balancing_authority_id) and
+            (is_nil(l.load_type) or l.load_type != "datacenter"),
+        group_by: b.balancing_authority_id,
+        select: {b.balancing_authority_id, sum(l.p_mw)}
+      )
+      |> Repo.all()
+      |> Map.new(fn {ba_id, mw} -> {ba_id, (mw || 0.0) * 1.0} end)
+
+    from(d in "ba_demand_hourly",
+      where: not is_nil(d.demand_mw),
+      group_by: d.balancing_authority_id,
+      select: {d.balancing_authority_id, max(d.demand_mw)}
+    )
+    |> Repo.all()
+    |> Enum.flat_map(fn {ba_id, peak_mw} ->
+      case Map.get(baselines, ba_id) do
+        base when is_number(base) and base > 0.0 ->
+          [{ba_id, peak_mw |> Kernel./(base) |> min(hi) |> max(lo)}]
+
+        _ ->
+          []
+      end
+    end)
+    |> Map.new()
+  end
+
+  @doc """
+  The bank actually installed for a raw requirement of `raw_mvar` at a bus of
+  `base_kv`: nothing below one standard capacitor group
+  (#{@min_bank_mvar} MVAr), and never more than the class ceiling.
+  """
+  def bank_target_mvar(raw_mvar, base_kv) when is_number(raw_mvar) do
+    cond do
+      raw_mvar < @min_bank_mvar -> 0.0
+      true -> min(raw_mvar, cap_class_ceiling(base_kv))
+    end
+  end
+
+  def bank_target_mvar(_raw_mvar, _base_kv), do: 0.0
+
+  @doc """
+  Largest total shunt capacitance this pass will place at one bus of the given
+  voltage, from the closest class in `@cap_class_ceiling_mvar`.
+  """
+  def cap_class_ceiling(base_kv) when is_number(base_kv) and base_kv > 0.0 do
+    closest = @cap_class_ceiling_mvar |> Map.keys() |> Enum.min_by(&abs(&1 - base_kv))
+    Map.fetch!(@cap_class_ceiling_mvar, closest)
+  end
+
+  # No usable voltage means no class, and therefore no defensible ceiling. The
+  # lowest one is the conservative choice.
+  def cap_class_ceiling(_), do: @cap_class_ceiling_mvar |> Map.values() |> Enum.min()
+
+  @doc "Per-class capacitor bank ceilings, for tests and reporting."
+  def cap_class_ceilings, do: @cap_class_ceiling_mvar
+
+  @doc "Path of the generator reactive support study this pass reads by default."
+  def generator_support_study_path do
+    Application.app_dir(:power_model, ["priv", "reactive_planning", @generator_support_study])
+  end
+
+  @doc """
+  Generator-support bank MVAr by bus id, read from the reactive planning study.
+
+  WHY THIS IS DATA AND NOT A RULE: 22% of Western's generator buses, 41% of
+  ERCOT's and 35% of Eastern's sit pinned at `q_max` at their island's AC
+  loadability ceiling, while every one of those islands is a reactive SURPLUS
+  in aggregate (Western's machines net-ABSORB 14.6 GVAr at the same instant).
+  The deficit is local and the surplus is global, so no aggregate quantity
+  identifies the buses — only a power flow does. Inflating unit `q_max` would
+  "fix" it by giving machines capability they do not have; the physical answer
+  is substation compensation next to the machines that are pinned.
+
+  SIZING RULE: each bus's bank is the part of its measured reactive shortfall
+  that the load-bus bank at the same substation does not already deliver,
+
+      support = max(0, shortfall - load_bus_bank x Vm^2)
+
+  The `Vm^2` is there because that is what a capacitor rated at 1.0 pu actually
+  produces at the bus voltage the study measured, so both terms are quantities
+  at the same operating point. The subtraction is what keeps this from
+  double-compensating: measured 2026-08-18, the load-bus banks alone already
+  deliver 290% of the pinned-bus shortfall on Western and 146% on Eastern, so
+  the residual is 14% and 33% of the raw shortfall there. Only ERCOT — where
+  48% of pinned generator buses serve no load at all — carries a large residual
+  (81%).
+
+  The shortfall itself is `q_free - q_max`: the reactive output the same bus
+  produces when its limit is lifted (the `qmax10` lever), minus what it is
+  allowed. It is not a multiple of `q_max`; a bus whose machines are pinned but
+  which the network does not actually want more vars from gets no bank.
+
+  The study file stores only the two MEASURED quantities, `shortfall_mvar` and
+  `vm_pu`. The subtraction happens here against `load_banks`, the load-bus bank
+  map this same run computed — so a later reallocation of load changes the
+  support bank without anyone having to re-run the power flow that found the
+  bus. With load-bus banks off (the shipped default) `load_banks` is empty and
+  the support bank is the whole measured shortfall, which is the self-consistent
+  pairing: nothing else is supplying those vars.
+
+  MEASURED effect of this component alone (2026-08-18, control = reactors only,
+  same snapshot, alpha bisected to 0.01): Western 0.175 -> 0.20 (+14.3%),
+  ERCOT 0.5938 -> 0.6375 (+7.4%). 13.1 GVAr placed across 2,061 buses.
+
+  Returns `%{}` when the study file is absent, so a checkout without it still
+  ingests.
+  """
+  def generator_support_targets(load_banks \\ %{}, opts \\ []) do
+    path = Keyword.get(opts, :study_path, generator_support_study_path())
+
+    with {:ok, body} <- File.read(path),
+         {:ok, %{"banks" => banks}} <- Jason.decode(body) do
+      keys = Enum.map(banks, &{&1["source"], &1["source_id"]})
+      sources = keys |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
+      source_ids = keys |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
+
+      # The unique constraint is on the PAIR, so filtering on each half
+      # separately can over-select; the exact pair lookup is the Map.get below.
+      id_by_key =
+        from(b in Bus,
+          where: b.source in ^sources and b.source_id in ^source_ids,
+          select: {{b.source, b.source_id}, b.id}
+        )
+        |> Repo.all()
+        |> Map.new()
+
+      {targets, unresolved} =
+        Enum.reduce(banks, {%{}, []}, fn bank, {acc, missing} ->
+          case Map.get(id_by_key, {bank["source"], bank["source_id"]}) do
+            nil ->
+              {acc, [bank["source_id"] | missing]}
+
+            id ->
+              vm = bank["vm_pu"] || 1.0
+              delivered = Map.get(load_banks, id, 0.0) * vm * vm
+              residual = max((bank["shortfall_mvar"] || 0.0) - delivered, 0.0)
+
+              acc =
+                if residual > 0.0,
+                  do: Map.update(acc, id, residual, &(&1 + residual)),
+                  else: acc
+
+              {acc, missing}
+          end
+        end)
+
+      warn_unresolved(unresolved, length(banks))
+      targets
+    else
+      _ -> %{}
+    end
+  end
+
+  # A study entry whose bus no longer exists is DROPPED, and dropping it
+  # silently is the defect this guards.
+  #
+  # The key is `(source, source_id)`, chosen because it survives a re-ingest
+  # where row ids do not. It does NOT survive a VOLTAGE correction: `BusMapper`
+  # writes `source_id` as "<substation id>_<kv>kV", so restamping a yard renames
+  # its bus. MEASURED 2026-08-19, after the OSM voltage backfill: 60 of 1,627
+  # entries stopped resolving, every one of them a `..._138.0kV` id — the blind-
+  # yard default that the backfill exists to correct, moved to 60/69/230 kV.
+  #
+  # Deliberately NOT repaired by fuzzy-matching the substation prefix: a yard
+  # has buses at several voltages, so a near-match would attach a measured
+  # shortfall to the wrong one, and a bank on the wrong bus is worse than no
+  # bank. The right response is to re-derive the study after any change to
+  # voltage data, which is what the warning tells the operator to do.
+  defp warn_unresolved([], _total), do: :ok
+
+  defp warn_unresolved(missing, total) do
+    Logger.warning(
+      "reactive support study: #{length(missing)} of #{total} banks did not resolve to a bus " <>
+        "and were dropped. `source_id` embeds the bus voltage, so a voltage restamp renames it " <>
+        "-- re-derive the study against the current network. Examples: " <>
+        (missing |> Enum.take(5) |> Enum.join(", "))
+    )
+  end
+
+  @doc """
+  Synthesize both bus shunt components and write their NET to `buses.bs_mvar`.
+
+  OWNERSHIP: `bs_mvar` is one column carrying two synthesized devices — the
+  EHV line-end reactors (negative) and the substation capacitor banks
+  (positive). Neither pass may write it alone. 3,798 load-serving buses also
+  terminate an EHV line (measured 2026-08-18: 34.8 GVAr of load Q and
+  -21.8 GVAr of reactor sit on the same rows), so a reactor pass that wrote its
+  own absolute value would erase the capacitor at every one of them, and vice
+  versa. The reactor pass therefore owns the negative COMPONENT, the capacitor
+  pass owns the positive COMPONENT, and this function recomputes both from
+  scratch and stores their sum.
+
+  Full recompute, never `+=`, so the pass is idempotent: running it twice — or
+  running it at a point in the pipeline where the loads table is still empty
+  and again after it is filled — converges on the same stored value, and a bus
+  that no longer qualifies for either device is cleared.
+
+  Externally authored shunts are protected by source (`@reactor_excluded_sources`),
+  including in the stale-device cleanup. If measured shunt data is ever
+  ingested from elsewhere, add its source to that list rather than letting this
+  pass overwrite it.
+
+  Options are passed through to `line_end_reactor_targets/1` and
+  `capacitor_bank_targets/1`.
+  """
+  def synthesize_bus_shunts(opts \\ []) do
+    {reactors, line_count} = line_end_reactor_targets(opts)
+    {caps, load_buses, support_buses} = capacitor_bank_targets(opts)
+
+    excluded_buses =
+      from(b in Bus, where: b.source in @reactor_excluded_sources, select: b.id)
+      |> Repo.all()
+      |> MapSet.new()
+
+    net =
+      reactors
+      |> Map.merge(caps, fn _id, r, c -> r + c end)
+      |> Map.reject(fn {bus_id, _} -> MapSet.member?(excluded_buses, bus_id) end)
+      # Round to 0.1 kVAr. Physically meaningless precision, but it makes the
+      # written value reproducible bit-for-bit across runs, which is what the
+      # `IS DISTINCT FROM` idempotency guard below rests on.
+      |> Map.new(fn {bus_id, mvar} -> {bus_id, Float.round(mvar, 4)} end)
+
+    {bus_ids, mvars} = Enum.unzip(Map.to_list(net))
+
+    summary = %{
+      lines: line_count,
+      reactor_buses: map_size(reactors),
+      cap_buses: map_size(caps),
+      load_banks: load_buses,
+      support_banks: support_buses,
+      buses: map_size(net),
+      reactor_mvar: reactors |> Map.values() |> Enum.sum(),
+      cap_mvar: caps |> Map.values() |> Enum.sum(),
+      mvar: Enum.sum(mvars)
+    }
+
+    if bus_ids == [] do
+      # Nothing qualifies for either device (an empty database, or one with no
+      # EHV lines and no loads). Returning early rather than running the
+      # statements below matters: the stale-device cleanup is "every
+      # synthesized shunt NOT in this set", which with an empty set would clear
+      # every shunt in the table.
+      Map.merge(summary, %{written: 0, cleared: 0})
+    else
+      Map.merge(summary, write_bus_shunts(bus_ids, mvars))
+    end
+  end
+
+  defp write_bus_shunts(bus_ids, mvars) do
+    # One statement, not one per bus: this touches thousands of rows and the
+    # per-row changeset path made the pass the slowest thing in the ingest.
+    %{num_rows: written} =
+      Repo.query!(
+        """
+        UPDATE buses AS b SET bs_mvar = v.bs, updated_at = now()
+        FROM (SELECT unnest($1::bigint[]) AS id, unnest($2::float8[]) AS bs) AS v
+        WHERE b.id = v.id AND b.bs_mvar IS DISTINCT FROM v.bs
+        """,
+        [bus_ids, mvars]
+      )
+
+    # Buses carrying a synthesized shunt that no longer qualifies for one —
+    # otherwise a re-ingest that drops a line, or a reallocation that moves a
+    # load off a bus, leaves the device behind forever. Both signs, because
+    # both signs are synthesized here; externally authored shunts are held out
+    # by source.
+    %{num_rows: cleared} =
+      Repo.query!(
+        """
+        UPDATE buses SET bs_mvar = 0.0, updated_at = now()
+        WHERE bs_mvar <> 0.0
+          AND NOT (id = ANY($1::bigint[]))
+          AND (source IS NULL OR NOT (source = ANY($2::text[])))
+        """,
+        [bus_ids, @reactor_excluded_sources]
+      )
+
+    %{written: written, cleared: cleared}
+  end
 
   @doc "Estimate reactive power limits for generators"
   def estimate_generator_q_limits do

@@ -903,3 +903,209 @@ tiebreak, stable in measurement but the slack MOVES when that unit trips, which 
 cascade scenario, not a hypothetical. And zero capacitor banks exist (all 7,222 shunts
 are reactors, diagonal-STRENGTHENING) — the first capacitor bank ingested is the first
 real test of B'' conditioning.
+
+## Voltage-coverage wave — 2026-08-19..22 (diagnosis wave + four fix agents, measured)
+
+Method: a two-agent diagnosis wave attributed the LIN-13 α ceiling per interconnection,
+then four fix agents (loads, corridor, compensation, OSM) worked under exclusive file
+ownership with every DB write gated on the lead. α means the highest uniform scaling of
+hour-scaled load P **and** Q **and** generator dispatch at which an AC solution exists,
+bisected to 0.01 on the largest island of `Partition.split/1`, hour =
+`Demand.latest_demand_hour/0`, `FDPF.solve(base_mva: 100.0, dense_nr_max_buses: 0,
+max_iterations: 400)`.
+
+| stage | Western | ERCOT | Eastern |
+|---|---|---|---|
+| diagnosis baseline | 0.2313 | 0.5687 | 0.3938 |
+| + OSM corridor voltage corrections | 0.175 | 0.5938 | 0.4313 |
+| + generator-support banks + interface compensation | 0.2062 | 0.6375 | 0.4313 |
+| + OSM voltage backfill (58,766-element pull) | ceiling-neutral | ceiling-neutral | ceiling-neutral |
+
+**MEASUREMENT LAW (adopted mid-wave, after it was violated).** Day one produced two
+invalidated baselines: loads were rewritten at 01:29 UTC underneath agents that had
+cached them earlier, so their "deltas" measured two waves at once. The rule that
+replaced it — and that every number above obeys — is *A/B on ONE snapshot, control
+being an in-memory undo of the treatment*, never a re-read of a table another writer
+may have moved. Corollaries that also had to be written down: private per-agent caches
+(the shared cache rebuilt only when a file was ABSENT, so it never noticed staleness);
+label every result with `max(updated_at)` fingerprints of its input tables; wait for an
+agent's explicit completion report rather than inferring completion from a table
+timestamp; pre-register the predicted direction before measuring.
+
+**LIN-13 CORRECTION (2026-08-19..22).** The wave's central negative result: **the OSM
+voltage backfill is NOT the α = 1.0 path.** ROADMAP item 24 was carried as the unlock
+for the voltage chain; measured, it is ceiling-neutral on all three interconnections.
+What it bought is data correctness — voltage-blind yards 8,404 → 3,617 — which is worth
+having and is not the same claim. The ceiling has three DIFFERENT causes, one per
+interconnection, and they need three different fixes:
+- **Western — LOCAL generator reactive exhaustion.** 22% of generator buses sit pinned
+  at `q_max` while the island as a whole is absorbing reactive power. The `qmax10` lever
+  (generator q limits ×10) alone buys +46%. This is a voltage-CONTROL gap, not a
+  reactive-supply gap: the vars exist, in the wrong places, with no mechanism to move
+  them. Capability curves, AVR/remote regulation and ULTC transformers are the shape of
+  the fix — see the note under "rejected" below, which this measurement reopens.
+- **Eastern — sub-transmission impedance.** The `xcap005` lever alone buys +71%;
+  every reactive lever moves it ~0%. This is a parameter-estimation defect and the
+  single highest-leverage number in the model.
+- **ERCOT — three super-additive constraints.** `caps100` + `freeq10` + `xcap010`
+  together reach α = 0.9875; no one of them is close on its own.
+All failures were confirmed to be genuine loss of the AC solution (past-the-nose
+trajectories), not solver artifacts. Max-lever walls — the ceiling with every lever
+applied at once — are Western 0.5062, ERCOT 1.4937, Eastern 1.2062, so ERCOT and
+Eastern have a reachable α = 1.0 and Western does not.
+
+**LIN-14 (MEASURED, HIGH) [OPEN]** Each interconnection's α swing is attributable to
+ONE line: 73687 (Western), 72357 (ERCOT), 67217 (Eastern) — proven by ablation, not
+inferred. Two consequences. First, the ceiling is far more brittle than a
+whole-network number suggests: a single mis-parameterised circuit can hold an entire
+interconnection's loadability. Second, the Western DROP at the corridor stage
+(0.2313 → 0.175) is a deliberate loss of a wrong number — line 67217 had been carrying
+a voltage class the OSM corridor pull contradicts, and correcting it removed artificial
+support. A ceiling that falls because the data got more honest is the right trade, but
+it means the α series is only comparable within a fixed data vintage. The >90° census
+is now 0/0/0 (72357 resolved as 138 kV, closing the last DR-wave survivor).
+
+**CAS-26 (MEASURED, HIGH) [OPEN]** The base case is overloaded to the point that
+contingency response is binary. Lines sit at 124–250% loading at rest, so a
+contingency either settles at zero (everything downstream was already immune) or runs
+away past the step budget; there is no settled non-trivial cascade regime in this model
+today. This is upstream of every cascade result the model produces and it will break
+ROADMAP item 26's historical replays before they can fail for an interesting reason.
+It is also directly testable: item 27's blackout-size CCDF against DOE OE-417's
+published α ≈ 1.31 should come out bimodal rather than power-law, and that measurement
+costs far less than fixing it.
+
+**CAS-27 (MED-HIGH) [OPEN]** Equipment-side voltage dropout is absent. The model keeps
+19.7 GW of datacenter load energised at ANY voltage sag, but real PSU/UPS front ends
+transfer or disconnect below roughly 0.85–0.90 pu (ITIC/CBEMA). This is a third,
+distinct mechanism from the two that DO exist and DO fire: utility UVLS (0.92/0.89/0.86
+pu, 8/5/3 s) and IEEE 1547 BTM trips. Stated carefully because an earlier framing of
+this finding — "nothing sheds on voltage" — was wrong and had to be retracted: plenty
+sheds on voltage, and the gap is specifically the load's own equipment.
+
+**LIN-15 (LOW, DOCUMENTATION) [OPEN]** The synthesized line-end reactor is
+K × the line's OWN charging on ≥230 kV circuits only, and 69% of the population sits
+at exactly 230.0 kV. That makes the reactor pass SELF-DAMPING under reclassification —
+moving a circuit across the 230 kV boundary moves its charging and its reactor
+together, so the net swing is far smaller than the gross. Worth recording because it
+was mis-predicted twice during the wave, once by 200× and once in the wrong direction.
+
+**DAT-30 (MED) [OPEN]** Key-design trap, with its own control case. `BusMapper` writes
+`buses.source_id` as `"<substation id>_<kv>kV"` — the key EMBEDS the voltage — so any
+voltage restamp renames the bus and silently orphans anything keyed to it. Measured
+after the OSM backfill: 60 of 1,627 reactive-support-study banks stopped resolving,
+every one a `..._138.0kV` id (down to 46 after the review gate's reverts). The fix
+shipped is a LOUD drop plus self-heal on re-derive, deliberately NOT fuzzy prefix
+matching: a yard has buses at several voltages and a bank on the wrong one is worse
+than no bank. Contrast `yard_key/1`, which parses only the integer prefix and is
+structurally immune to the same event. Any future key over substation identity should
+follow `yard_key`, not `source_id`.
+
+**DAT-31 (MED) [OPEN]** `priv/reactive_planning/reactive_support_banks.json` is a
+measured planning study carried as committed data with a full `basis` block (hour,
+snapshot recipe, solver options, control definition, lever, per-interconnection α), but
+it has NO committed producer — the harness that derives it lived in a session
+scratchpad both times it was run. The basis block makes it reproducible by a careful
+reader and that is why the re-derivation was possible at all; it should still become a
+mix task, because the study must be re-derived after ANY change to voltage data
+(see DAT-30) and a study nobody can regenerate on demand will go stale silently.
+
+**SOL-22 (LOW, CONTRACT) [OPEN]** Interface compensation has exactly one opt-out seam,
+and it is load-bearing. A published MATPOWER/IEEE case states each bus's load as the
+NET reactive demand already measured at the transmission bus; synthesizing our
+distribution compensation on top double-counts it and moves the case off its published
+solution. `PowerModel.Test.MATPOWER` therefore stamps `load_compensation: 0.0` on every
+case it parses (one line), and the global default stays ON because our own loads are
+synthesized at a flat 0.95 pf, which is a penalty threshold rather than an operating
+point. Any second importer of external cases must stamp the same field or it will
+silently reproduce the bug the reference tests caught.
+
+**LIN-16 (MEASURED, MED-HIGH) [OPEN]** Conflation anchor cases for the next wave, all
+selected because they are the ones that did NOT fix themselves:
+- Generator 21001 (wind) is stranded: its real point of interconnection is OSM 345 kV
+  way 1058593873, 7.52 km away, absent from HIFLD entirely. Remap survivors were
+  selected for unfixability, so this is the shape of the residue.
+- A systemic 138 kV misclassification across southwest Utah.
+- ERCOT bus 69603 carries six distinct OSM yards conflated onto one bus.
+Bus-level conflation puts load and generation in the wrong ELECTRICAL place, which is
+upstream of impedance, ratings and dispatch alike.
+
+**DAT-22 (CLOSED 2026-08-22)** Datacenter placement now derives its voltage floor from
+the same C57.12.00 delivery-ceiling table the load estimator uses (≤50 MW → 60 kV,
+≤250 → 100 kV, >250 → 230 kV, saturating at 230), prefers a single yard, doubles its
+search radius to 120 km, places largest-first, and splits campuses that no single bus
+can serve. `Datacenter.bus_id` is now the anchor (largest share). Verified by census
+on the live DB 2026-08-22: every gated section zero — unservable 0, radial >200 MW 0,
+over single-branch rating 0, over 0.8× capability 0, over class ceiling 0,
+transformer-fed above 0.8× bank 0, below the 60 kV load-serving floor 0.0 MW (from
+2,518 MW), worst degree-1 load share 10.8% against a 15% limit.
+
+**Process note — the three self-corrections.** The compensation agent caught and
+reversed three of its own conclusions before shipping any of them: a claimed shed-Q
+defect (retracted — `load_shedding.ex` already scales `q_mvar` with `p_mw`, confirmed
+across all four load mutations), uniform datacenter compensation (reversed on device
+physics — active front ends hold power factor across voltage, so a passive V² model
+would have overdrawn ~12% at 0.9 pu on 19.7 GW), and a reactor alarm that was
+overstated 200× and pointed the wrong way. One root cause: reasoning about a single
+term in isolation. The refined rule, worth keeping: *"I already looked at that file"
+is not "I checked whether this mechanism exists."*
+
+### Closing cycle — 2026-08-22 (reallocation + re-derived reactive study)
+
+Ran solo after the wave's fix agents finished. Three arms per interconnection on ONE
+snapshot each, control being an in-memory undo (stored `bs_mvar` minus
+`capacitor_bank_targets/1`) so no arm can contaminate another and the DB is untouched
+until the end:
+
+| interconnection | A control (reactors only) | B incumbent banks | C re-derived banks |
+|---|---|---|---|
+| Eastern | 0.4297 | 0.4297 | 0.4297 |
+| ERCOT | 0.625 | 0.6406 | 0.6406 |
+| Western | 0.1875 | 0.2031 | 0.2031 |
+
+**Eastern gains EXACTLY NOTHING from reactive support** — 13.1 GVAr of banks across the
+interconnection and the ceiling does not move one bisection step. This is an independent
+confirmation of the diagnosis wave's attribution (Eastern is bound by sub-transmission
+impedance; reactive levers ~0%) arriving down a different measurement path, and it is
+the sharpest evidence available that Eastern's α is a parameter problem rather than an
+equipment problem. ERCOT +2.5% and Western +8.3% are where the banks earn their place.
+
+**The re-derivation is ceiling-neutral (C == B at 0.01 resolution) and shipped anyway.**
+It resolves all 1,720 banks where the incumbent study left 46 orphaned by the OSM
+restamp (DAT-30), so it removes a standing warning at zero measured cost, and it is
+derived on the network as it now stands rather than on a superseded voltage vintage.
+Recording the neutrality explicitly because the tempting misreading is that healing the
+orphans mattered: it did not. The 46 dropped banks were not load-bearing for the
+ceiling. What re-derivation buys is a study that describes the current network and a
+pass that no longer warns — not α.
+
+Method reproducibility, which is the reason to trust the above: re-deriving from scratch
+against a network that had moved returned ERCOT at 592 gen buses / 232 pinned / 205 with
+shortfall against the 2026-08-19 study's identical 592/232/205, and Western's control α
+at 0.1875 against the same figure recorded in that study's own basis block. New totals
+1,720 banks / 8,912.6 MVAr (from 1,627 / 8,808.2).
+
+Reallocation, in the order the reserve logic requires (`map_datacenters_to_grid` anchors
+campuses, `reallocate` yields around them via `committed_load_by_bus`, then
+`resize_transformers_to_through_load`): 15,197.7 MW moved across 68,509 buses, 860
+emptied, 829 at their capability cap, residual 0.0 MW; datacenter MW conserved exactly
+at 19,715.0; constant-power total +2.4 MW on 1.12 TW, which is `Float.round/2` at two
+decimals over 70,694 rows. Transformers needed no resizing. `synthesize_bus_shunts/1`
+verified idempotent both times it ran (second pass wrote 0 rows).
+
+**DAT-32 (LOW) [OPEN]** 4,485 `connectivity_repair` lines and all 27 `international`
+lines sit at `params_version: 0`. This is inert rather than wrong — those rows are
+externally authored and the recompute predicate is guarded against them twice (ROADMAP
+item 8 records the near-miss where it was not) — but a v0 stamp normally MEANS "the
+estimator should revisit this", so the two readings of the same value should be
+separated before someone acts on the wrong one.
+
+**Topology baseline re-recorded 2026-08-22** (`priv/topology_baseline.json`,
+`generated_at` 2026-08-16T10:54:33Z → 2026-08-22T21:16:09Z). Every metric that moved
+moved in the IMPROVING direction and nothing regressed, which is why this was recorded
+rather than investigated: ERCOT `degree_1_load_mw` 4791 → 4107 (−14.3%, the metric that
+tripped the tolerance), Eastern 110581 → 106683 (−3.5%), Western 31781 → 31656 (−0.4%),
+matching shares, and `stranded_nameplate_mw` 99792 → 99641. The 2026-08-16 caveat still
+applies unchanged and is NOT re-litigated by this rewrite: `bus_count` is still 93,093,
+so the +10 synthetic buses and +24 unrecovered endpoints from the migration incident
+remain baked in, still inside the ±4,655 / ±235 diff tolerances in both directions.

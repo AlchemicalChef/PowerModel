@@ -182,6 +182,14 @@ defmodule PowerModel.Test.MATPOWER do
       transformers: transformers,
       generators: generators,
       loads: loads,
+      # A published case states each bus's Pd/Qd as the NET demand measured at
+      # the transmission bus, with whatever distribution capacitors exist
+      # already netted out. `Solver.LoadModel` synthesizes compensation for our
+      # OWN network, whose loads are estimated at a flat 0.95 power factor and
+      # therefore lack it; applying it here would double-count and walk every
+      # reference case away from its published solution. Stamped on the
+      # snapshot so any case added through this parser is correct by default.
+      load_compensation: 0.0,
       skipped_phase_shifters: shifters,
       transformers_with_dropped_charging: dropped_charging,
       demoted_pv_buses:

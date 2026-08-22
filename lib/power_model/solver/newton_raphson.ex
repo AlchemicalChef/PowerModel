@@ -59,7 +59,10 @@ defmodule PowerModel.Solver.NewtonRaphson do
     :q_gen,
     :v_sched,
     :q_limits,
-    :bus_loads
+    :bus_loads,
+    # Fraction of load reactive demand met by the distribution capacitors
+    # behind each load bus. See `load_compensation/2`.
+    :load_compensation
   ]
 
   @doc """
@@ -144,8 +147,34 @@ defmodule PowerModel.Solver.NewtonRaphson do
       q_gen: q_gen,
       v_sched: scheduled_voltages(buses, generators),
       q_limits: aggregate_q_limits(generators, bus_index, base_mva),
-      bus_loads: aggregate_loads_by_bus(loads, bus_index)
+      bus_loads: aggregate_loads_by_bus(loads, bus_index),
+      load_compensation: load_compensation(snapshot, opts)
     }
+  end
+
+  @doc """
+  Distribution compensation fraction for a snapshot.
+
+  A snapshot or an option may state its own; otherwise the model default
+  applies. The escape hatch is not a convenience — it is a correctness
+  requirement for IMPORTED cases. A published MATPOWER/IEEE case specifies each
+  bus's load as the NET reactive demand measured at the transmission bus, with
+  whatever distribution capacitors exist already netted out. Synthesizing more
+  compensation on top double-counts it and moves the case away from its
+  published solution, which is exactly what the reference-case tests detected.
+
+  Our own network is the opposite: `Ingestion.LoadEstimator` synthesizes every
+  load at a flat 0.95 power factor, which is a penalty threshold rather than an
+  operating point, so the compensation that a real interface carries is missing
+  and has to be modelled.
+
+  `PowerModel.Test.MATPOWER` therefore stamps `load_compensation: 0.0` on every
+  case it parses, so any reference case added through it is correct by default.
+  """
+  def load_compensation(snapshot, opts \\ []) do
+    Map.get(snapshot, :load_compensation) ||
+      Keyword.get(opts, :load_compensation) ||
+      LoadModel.compensation_fraction()
   end
 
   @doc """
@@ -302,7 +331,7 @@ defmodule PowerModel.Solver.NewtonRaphson do
       v = :array.get(bus_idx, vm)
 
       Enum.reduce(loads_at_bus, {pa, qa}, fn load, {pa2, qa2} ->
-        {p_eff, q_eff} = LoadModel.effective_load(load, v)
+        {p_eff, q_eff} = LoadModel.effective_load(load, v, prep.load_compensation)
 
         {array_add(pa2, bus_idx, -(p_eff / prep.base_mva)),
          array_add(qa2, bus_idx, -(q_eff / prep.base_mva))}
@@ -702,7 +731,8 @@ defmodule PowerModel.Solver.NewtonRaphson do
         # ZIP load voltage sensitivity: the scheduled injection itself depends
         # on V, so d(load)/dV joins the J2/J4 diagonals. Omitting it leaves
         # the residual exact but degrades convergence from quadratic to linear.
-        {dpload_dv, dqload_dv} = load_voltage_sensitivity(prep.bus_loads, vm, n, prep.base_mva)
+        {dpload_dv, dqload_dv} =
+          load_voltage_sensitivity(prep.bus_loads, vm, n, prep.base_mva, prep.load_compensation)
 
         jacobian =
           build_jacobian(
@@ -969,9 +999,16 @@ defmodule PowerModel.Solver.NewtonRaphson do
     end
   end
 
-  # Per-bus d(P_load)/dV and d(Q_load)/dV of the ZIP model at the current
-  # voltage, in per-unit. Zero for constant-power loads (dfactor_dv == 0).
-  defp load_voltage_sensitivity(bus_loads, vm, n, base_mva) do
+  # Per-bus d(P_load)/dV and d(Q_net_load)/dV at the current voltage, in
+  # per-unit.
+  #
+  # The two sides are asked for separately because they no longer share a
+  # factor: P follows the ZIP factor alone, while Q also carries the
+  # distribution compensation term, whose derivative is nonzero even where the
+  # ZIP factor's is not. The previous `if df == 0.0 -> skip` short-circuit
+  # would therefore drop the compensation on EVERY load in this database, all
+  # of which are constant-power.
+  defp load_voltage_sensitivity(bus_loads, vm, n, base_mva, k) do
     dp = :array.new(n, default: 0.0)
     dq = :array.new(n, default: 0.0)
 
@@ -979,15 +1016,14 @@ defmodule PowerModel.Solver.NewtonRaphson do
       v = :array.get(bus_idx, vm)
 
       Enum.reduce(loads_at_bus, {dpa, dqa}, fn load, {dpa2, dqa2} ->
-        df = LoadModel.dfactor_dv(Map.get(load, :load_type), v)
+        dp_mw = LoadModel.dp_load_dv(load, v)
+        dq_mvar = LoadModel.dq_load_dv(load, v, k)
 
-        if df == 0.0 do
+        if dp_mw == 0.0 and dq_mvar == 0.0 do
           {dpa2, dqa2}
         else
-          q0 = Map.get(load, :q_mvar) || 0.0
-
-          {array_add(dpa2, bus_idx, load.p_mw * df / base_mva),
-           array_add(dqa2, bus_idx, q0 * df / base_mva)}
+          {array_add(dpa2, bus_idx, dp_mw / base_mva),
+           array_add(dqa2, bus_idx, dq_mvar / base_mva)}
         end
       end)
     end)

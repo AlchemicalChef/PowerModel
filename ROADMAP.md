@@ -305,6 +305,66 @@ L ≈ multi-week.
 >   fields, reconciling the display-side AC refinement with FDPF's config
 >   (CAS-19 and the new event causes in CAS-17 ride along).
 
+> **STATUS 2026-08-22: VOLTAGE-COVERAGE WAVE LANDED** (diagnosis wave -> four fix
+> agents: loads, corridor, compensation, OSM). The wave set out to raise AC coverage
+> so the voltage layer stops running on a fragment. Measured (alpha = highest uniform
+> scaling of hour-scaled load P/Q AND generator dispatch with an AC solution, bisected
+> to 0.01, largest island, FDPF `dense_nr_max_buses: 0`):
+> - **Western 0.2313 -> 0.2062, ERCOT 0.5687 -> 0.6375, Eastern 0.3938 -> 0.4313.**
+>   The Western number FELL, deliberately: line 67217 was carrying a voltage class the
+>   OSM corridor pull contradicts, and correcting it removed artificial support. An
+>   alpha series is only comparable within a fixed data vintage.
+> - **The central negative result: OSM voltage backfill is NOT the alpha unlock this
+>   document carried it as** (item 24 amended below). Measured ceiling-neutral on all
+>   three interconnections. What it bought is data correctness -- voltage-blind yards
+>   8,404 -> 3,617 -- which is worth having and is a different claim.
+> - **The ceiling is three different bugs**, attributed by lever ablation (REVIEW
+>   LIN-13 correction): Western = LOCAL generator reactive exhaustion (22% of gen buses
+>   pinned at q_max while the island absorbs; qmax10 lever +46%); Eastern =
+>   sub-transmission impedance (xcap005 alone +71%, reactive levers ~0%); ERCOT =
+>   three super-additive constraints (caps100+freeq10+xcap010 -> 0.9875). Max-lever
+>   walls: Western 0.5062, ERCOT 1.4937, Eastern 1.2062 -- ERCOT and Eastern have a
+>   reachable alpha = 1.0, Western does not.
+> - **Every interconnection's swing is ONE line** (73687/72357/67217, by ablation).
+>   The >90 degree census is now 0/0/0; the last DR-wave survivor (72357) resolved as
+>   138 kV.
+> - **Interface compensation shipped** (`Solver.LoadModel`): Q_net(V) = q0.zip(V) -
+>   k.q0.V^2 with k = 0.3822 for an interface pf of 0.98, plus a device split --
+>   passive feeders fade as V^2, datacenter campuses (active front ends) hold power
+>   factor across voltage. Cascade effect: converts blackout to shed on a 2,702 MW
+>   case, +45% voltage-layer coverage, identical total load lost. FDPF needed zero
+>   changes (it reaches injections through `NewtonRaphson.scheduled_injections`).
+> - **Generator-support banks shipped**, sized from measured shortfall at each
+>   island's ceiling and class-capped per IEEE 1036. Fixed LOAD-bus banks were tried
+>   and REJECTED on measurement: no AC solution at alpha 0.05-0.10, Vm -> 1.5 pu. A
+>   fixed `bs_mvar` cannot represent a switched installation.
+> - **OSM pipeline shipped** with an ODbL-clean architecture: `voltage_source` markers
+>   on substations AND transmission_lines plus an `osm_substation_matches` evidence
+>   table make the OSM-derived portion extractable by construction. The review gate
+>   earned its place: a mechanical rule (revert when placed load >= 5 MW AND an
+>   incident >= 60 kV non-rederived line is inconsistent with every OSM level) caught
+>   the ConEd low-side-tag pattern ("27000;4000" on 138 kV yards) -- 740 yards /
+>   20,604 MW reverted, 882 yards / 1,350 MW confirmed.
+> - Load placement census fully green afterwards (every gated section zero, from
+>   2,518 MW below the load-serving floor); REVIEW DAT-22 closed.
+> - **CLOSING CYCLE (2026-08-22, run solo):** load reallocation landed (15,197.7 MW
+>   moved, load-placement census fully green, REVIEW DAT-22 closed) and the reactive
+>   support study was re-derived against the post-OSM network. Three arms per
+>   interconnection on one snapshot: control (reactors only) / incumbent banks /
+>   re-derived banks = Eastern 0.4297 / 0.4297 / 0.4297, ERCOT 0.625 / 0.6406 / 0.6406,
+>   Western 0.1875 / 0.2031 / 0.2031. **Eastern gains exactly nothing from 13.1 GVAr of
+>   reactive support** — an independent confirmation, down a different measurement path,
+>   that its ceiling is impedance and not equipment. The re-derivation is ceiling-neutral
+>   and shipped for correctness only (all 1,720 banks resolve; the incumbent left 46
+>   orphaned by the restamp).
+> - **What this reopens:** the salvage note below judged OLTC/SVC/FACTS controllers
+>   "not worth salvaging (no data substrate)". Western's ceiling is now measured to be
+>   caused precisely by the absence of that layer -- vars present, in the wrong places,
+>   with no mechanism to move them. The substrate objection is also weaker than it
+>   looked: capability curves are derivable from EIA-860 nameplate + power factor +
+>   fuel class, and ULTC presence is a defensible prior above a size threshold. Treat
+>   the rejection as reopened, not overturned -- it needs its own measurement.
+
 > **Salvage note (2026-08-15):** the absorbed pre-reset history (tip `159e900`,
 > retrievable via `git show 159e900:<path>` — do NOT use `origin/master`, which
 > now points at current work; the richer harmonics-era `lib.rs` is blob
@@ -354,7 +414,13 @@ L ≈ multi-week.
     stacked headers. Supersedes LODES/CBP (noise-infused; data centers employ nobody).
 23. **EIA-930 subregional demand** (M): 8–9 largest BAs report 4–14 zones each; after
     #22, CISO zones (PGAE/SCE/SDGE) map straight to service territories.
-24. **OSM circuits/voltage/substation polygons** (M–L): measured Ohio sample: 68% of
+24. **OSM circuits/voltage/substation polygons** (M–L). **LANDED 2026-08-22, and the
+    headline claim below did NOT survive measurement:** this item was carried as the
+    unlock for the voltage chain, and the backfill measured ceiling-neutral on all
+    three interconnections. It is a DATA-CORRECTNESS item (voltage-blind yards
+    8,404 -> 3,617), not an alpha item; the alpha work is the three per-interconnection
+    causes in the 2026-08-22 status block above. Original scoping follows.
+    Measured Ohio sample: 68% of
     lines carry `circuits`, 89% `voltage`; substation polygons anchor the 78% of
     endpoints with sentinel names. Requires local Overpass off the Geofabrik extract.
     SCOPE BOUNDARY (measured 2026-08-16, DR-3/TOPO-7 — this item must not absorb work
@@ -446,6 +512,39 @@ holding.
     probability, not as invented bus-section topology.
 28. **Restoration/reconnection** (L, last): reclosing, UFLS restoration, island
     resync — adds the duration dimension (customer-hours) the model cannot express.
+
+## Where the model is weakest now — 2026-08-22 (re-ranked after the voltage wave)
+
+The 2026-08-15 ranking at the top of this file was written before Phases 0-4 landed and
+before the alpha ceiling was attributed. Three accuracies are worth separating: **is the
+network the real network**, **is the operating point a real operating point**, **are the
+failure dynamics real dynamics**. A year of network work moved the first a long way. The
+second is where the model is genuinely broken, and it gates the third.
+
+1. **Nothing external has ever scored this model** (Phase 6 item 26, unstarted). Every
+   instrument is internal — alpha ceilings, census counts, TV distance, conservation
+   residuals — so "more accurate" currently has no denominator. 2011 Southwest is the
+   right first target: a named initiating element, a documented ~11-minute sequence,
+   entirely inside Western, and a near-binary outcome (does San Diego island and
+   collapse?). Item 27's CCDF-vs-OE-417 check (published alpha ~= 1.31 +/- 0.08) is the
+   cheap companion and is diagnostic even when it fails.
+2. **The alpha ceiling, as three separate bugs** (see the 2026-08-22 status block).
+   Eastern's sub-transmission impedance is the highest-leverage single number in the
+   model and is pure parameter work. Western needs a voltage-CONTROL layer that this
+   document currently rejects. ERCOT needs all three of its constraints at once.
+3. **Base-case overloads make contingencies binary** (REVIEW CAS-26). Lines at 124-250%
+   at rest mean a contingency either settles at zero or runs away past the step budget;
+   no settled non-trivial cascade regime exists. This is a PRECONDITION for item 26 —
+   a historical replay fails here before it can fail for an interesting reason.
+4. **Dispatch is still uniform inside the cascade** (REVIEW ENE-20, open). Fuel-anchored
+   dispatch fixed the ingest layer, but `balance_dispatch` re-spreads pro-rata, Eastern
+   runs ~65 GW long, and its N-1 census measures the dispatch imbalance rather than the
+   network. Uniform re-spread invents flows — plausibly part of why Western shows LOCAL
+   reactive exhaustion against a globally absorbing island.
+5. **Absent mechanisms, by how often they decide real cascades**: equipment-side voltage
+   dropout (REVIEW CAS-27); hidden-failure relay misoperation (item 27's other half —
+   no relay in this model ever operates when it should not); restoration (item 28 —
+   the model cannot express customer-hours, the unit every post-event report uses).
 
 ## Decisions needed now (independent of build order)
 

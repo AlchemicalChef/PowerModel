@@ -49,7 +49,16 @@ defmodule PowerModel.Solver.Solution do
     :dead_load_mw,
     :dead_bus_count,
     # Which solver produced these voltages. See the moduledoc.
-    :solver
+    :solver,
+    # Buses sitting on FDPF's voltage floor when the solve stopped, in bus
+    # order — there is no "worst" among them, the clamp puts them all at the
+    # same magnitude. A bus held there cannot satisfy its own Q equation (the
+    # clamp fixes |V| while the Q mismatch goes on asking for a lower one), so
+    # on an unconverged solve this list names the buses whose data is driving
+    # the failure. Empty on a healthy solve, nil from solvers with no floor.
+    :vm_floor_bus_ids,
+    :vm_floor_count,
+    :vm_floor_pu
   ]
 
   def new(bus_ids, vm_pu, va_rad, line_flows, base_mva, extra \\ []) do
