@@ -1109,3 +1109,182 @@ matching shares, and `stranded_nameplate_mw` 99792 → 99641. The 2026-08-16 cav
 applies unchanged and is NOT re-litigated by this rewrite: `bus_count` is still 93,093,
 so the +10 synthetic buses and +24 unrecovered endpoints from the migration incident
 remain baked in, still inside the ±4,655 / ±235 diff tolerances in both directions.
+
+### Eastern impedance — three hypotheses measured and refuted (2026-08-22)
+
+The closing cycle proved Eastern's ceiling is not reactive (13.1 GVAr moves it zero
+bisection steps), so the next question was which impedance. Recorded because each of
+these is the obvious guess and each is WRONG, and re-running them costs hours:
+
+**REFUTED — "the per-km impedance recipe is too high."** It is not. Implied series
+reactance is 0.335-0.50 Ω/km at the median across every voltage class, squarely in the
+physical band for overhead line, and NOT ONE in-service circuit exceeds 1 Ω/km. The
+monstrous per-unit values are real ohms divided by a tiny Z-base: line 76582 carries
+2.41 Ω over 5.36 km — entirely normal — but sits at `voltage_kv = 3.0`, so
+Z_base = 0.09 Ω and x_pu = 26.8. The estimator is right; the VOLTAGE CLASS on a handful
+of circuits is absurd (3.0 kV, 7.5 kV, 24.9 kV "transmission lines"), and several of the
+worst are `osm_rederived`, so the backfill moved some circuits DOWN into classes where
+their real length makes them electrically opaque. That is a data-correctness item, not
+the ceiling.
+
+**REFUTED — "load sits behind branches past their angle limit."** A lossless branch
+carries at most V·V/x, i.e. 100/x MW on a 100 MVA base, and the guess was that load
+placement respects the THERMAL rating while violating this one. Measured across all
+20,581 degree-1 load buses: **zero** exceed their single branch's angle limit, and the
+worst ratio in the population is 0.2. The angle limit is looser than thermal on
+99.6%+ of circuits in every class (median 100/x is 2,876 MW at 46-99 kV against a
+median rating of 116 MVA). `LoadEstimator`'s capability check against rating is the
+correct check.
+
+**REFUTED (with a caveat) — "load is delivered too many sub-transmission hops from
+generation."** The asymmetry is real and worth knowing: generation sits on EHV and load
+does not. Share of nameplate generation on a ≥230 kV bus vs share of load, by BFS hop
+distance over lines+transformers — Eastern 72.8% gen / 12.4% load, ERCOT 52.9% / 6.1%,
+Western 66.9% / 11.6%; 32.5% / 47.4% / 26.5% of load sits 5+ hops out. But lifting every
+load deeper than 2 hops up its BFS parent chain to the nearest shallow bus, conserving
+island MW exactly and changing only WHERE load is delivered, moved α: Eastern
+0.4297 → 0.4219 (−1.8%, one bisection step, i.e. slightly WORSE), ERCOT 0.6406 → 0.6953
+(+8.5%), Western 0.2031 → 0.2031 (0.0%) — while relocating 65.7% / 77.7% / 60.5% of each
+island's load. CAVEAT, stated because it limits the conclusion: lifting removes series
+impedance but CONCENTRATES load onto few shallow buses, so a null result is consistent
+with two effects cancelling rather than with depth being irrelevant. What it does rule
+out is depth as a *dominant* single cause — a 189 GW relocation cannot move Eastern one
+step in the right direction.
+
+The `xcap005` lever's +71% on Eastern therefore comes from the high TAIL of x_pu
+(≈19,000 sub-161 kV branches above 0.05 pu), not from the average delivery path and not
+from any single-branch limit. Which branches, at the failing operating point, is the
+next measurement — `Solution.vm_floor_bus_ids` (added by this wave for exactly this
+purpose) names the buses that cannot satisfy their own Q equation when the solve gives
+up.
+
+### The ceiling names one bus, and it is a generator-interconnection defect (2026-08-22)
+
+`Solution.vm_floor_bus_ids` — the telemetry this wave added for exactly this
+question — answers what three refuted hypotheses could not. At one bisection step
+past its ceiling, **Eastern reports `vm_floor_count = 1`**: bus 74129, 69 kV,
+degree 2, carrying 3.2 MW at the reference hour. ERCOT reports 3. Western's worst
+branch by angle is 67217, which is the line the wave attributed its whole swing to
+by ablation — an independent method landing on the same element.
+
+**LIN-17 (MEASURED, HIGH) [OPEN]** The α ceiling is set by generator
+interconnection defects, not by load-side impedance. The two named cases are the
+same shape:
+- **ERCOT bus 58121 is a 345 kV switchyard with ZERO 345 kV lines**, holding a
+  525 MW generator. Its only path out is a 600 MVA transformer to 69 kV, 8.4 km of
+  69 kV, then lines 74137 and 72922 — ERCOT's #1 and #2 worst branches at **69.0°
+  and 64.9°**, closing on the 90° limit past which no AC solution exists. Those two
+  lines carry 172.8 and 103.5 MW at α = 0.64: the plant's output, exported through
+  69 kV.
+- **Eastern bus 74129** hangs off two long 69 kV lines (37.9 km at x = 0.358,
+  48.8 km at x = 0.461), its #2 and #3 worst by angle.
+
+Peeling confirms it is STRUCTURAL, not load: zeroing the load at Eastern's floor
+buses and re-bisecting leaves α at 0.4297 for six consecutive rounds, with buses
+74129 and 74130 still on the floor **carrying zero MW**. Yard 73977's 33 kV line
+73687 carries `x = 1.5263 pu`; at 138 kV the same ohms would be 0.087 pu. One
+mis-tagged yard is pinning an interconnection.
+
+This MERGES two items previously ranked apart: the α work and the conflation wave
+(LIN-16) are the same work. HIFLD is missing the EHV circuits that connect large
+plants, so the model routes their output through whatever sub-transmission it does
+have. Census below.
+
+Also measured at Eastern's ceiling, and against the earlier framing: **two-thirds
+of the reactive absorption is on EHV** (43.1% on ≥345 kV, 23.6% on 230-344, against
+7.7% below 100 kV), and the worst branch angle anywhere is 29.4°. Eastern's ceiling
+is not an angle problem and not a sub-transmission problem — which is why banks at
+generator buses moved it zero steps.
+
+**OSM coverage of the fix path, measured**: of Eastern's 64 stranded yards ≥100 MW,
+48 carry an OSM match and 16 (3,455 MW) show a HIGHER voltage level than the bus the
+generator sits on, at 0-86 m. ERCOT — the biggest population at 17.3 GW over 51
+yards — has 7 matched and **zero** with a higher level. So the substation pull does
+not cover ERCOT's cases; recovering them needs a targeted OSM *line* pull around
+those yards, which is ROADMAP item 24's second bullet, now prioritised by MW.
+
+### Reference corpus — "is this number normal?" becomes a lookup (2026-08-22)
+
+`PowerModel.Reference` + `priv/reference/structural_stats.json` +
+`mix grid.reference_stats`. Structural distributions from the MATPOWER cases
+already vendored for solver validation, so a census can be read against something.
+
+It paid for itself before it shipped. The depth experiment above cost an hour and
+relocated 189 GW to return "inconclusive". `case_ACTIVSg2000` answers the same
+question in a lookup, and answers it the other way round from how the experiment was
+framed: **32% of its load sits 5+ hops from the top voltage level, against our 32.5%
+— our depth is ORDINARY.** What is not ordinary is where the load sits by voltage:
+reference places 100% of load at 115 kV (64.8%) and 161 kV (35.2%), **none on EHV
+and none below 115 kV**, where ours puts 12.4% of Eastern's on ≥230 kV.
+
+**Deliberate non-conclusions.** A reference case is one modeller's choices, and
+several differences are CONVENTION rather than defect. ACTIVSg2000 models every
+machine at its 13.8 kV terminal behind an explicit step-up; we place generators on
+the substation bus. It terminates at the distribution substation and therefore
+contains no sub-115 kV network at all, so our 364 GW of load outside its band is
+reported by the census as an OBSERVATION, explicitly not a gate — it is a
+convention difference until something ties it to a defect. The corpus module says
+this in its own moduledoc so the caveat travels with the numbers.
+
+**DAT-33 (LOW) [OPEN]** Both reference cases are small (2,000 and 118 buses) and
+neither is an Eastern-scale mesh; ACTIVSg2000 has no 345 kV level and case118 no
+500 kV. The corpus is honest about order-of-magnitude and presence/absence and
+should not be read finer than that. Adding RTS-GMLC or a published planning case
+would widen it.
+
+**LIN-18 (MEASURED, HIGH) [OPEN]** New gate: `mix grid.census
+generator_interconnection`, the generation-side mirror of `load_placement`. Where
+that census gates load against the C57.12.00 delivery ceiling, this one gates
+generation against the POI floor observed in the reference cases (115 kV above
+25 MW, 138 above 200, 230 above 800 — the LOWEST any reference case uses, so a
+flagged bus is one no reference case would produce even at its most generous).
+Measured on the live DB 2026-08-22: **574 buses / 87,285 MW below the floor**
+(Eastern 322 / 45.4 GW, Western 206 / 25.3 GW, ERCOT 46 / 16.6 GW) and **24,961 MW
+of generation on a bus with no branch at all**.
+
+Two design decisions, both of which the obvious version got wrong and only the
+reference corpus revealed:
+- **The metric is POI voltage, not degree.** "Generation on a bus with no line of
+  its own" looked like a 54.2 GW finding until the corpus showed 22.4% of
+  `case_ACTIVSg2000`'s buses are exactly that, because of the step-up convention. A
+  generator bus with no line is normal; a generator whose output has nowhere to go
+  after the step-up is not.
+- **The comparison carries a 0.95 class tolerance.** 220 kV and 230 kV are the same
+  class in different utilities (SCE vs PG&E), and 66 against 69 is the same split one
+  level down. The raw comparison flagged 3 buses / 2.3 GW of ordinary Western
+  generation. The tolerance is wide enough for a class variant (220/230 = 0.957) and
+  far too narrow for a real class gap (115/138 = 0.833).
+
+### DAT-31 CLOSED, DAT-30 gated (2026-08-22)
+
+`mix power_model.reactive_study` is the committed producer the study never had.
+Verified faithful against the scratchpad harness it replaces: identical α per
+interconnection (0.4297 / 0.625 / 0.1875), identical 1,720 banks, identical
+per-interconnection shortfall totals.
+
+`Grid.network_signature/0` stamps the study with a CONTENT DIGEST of the five
+tables a power flow reads. **Deliberately not `max(updated_at)`**, which is what
+`export_signature/0` uses for its different job: `synthesize_bus_shunts/1` writes
+`buses.bs_mvar`, so a table-level timestamp would be invalidated by the study's own
+OUTPUT the moment it was applied, and a gate that always fires is a gate everyone
+learns to ignore. `bs_mvar`/`gs_mw` are therefore excluded from the digest — they
+are what a study produces, not what it consumes — and there is a regression test
+whose whole job is that applying a study does not invalidate its own stamp. Cost
+measured at 0.26 s over 93k buses / 105k lines / 71k loads.
+
+Enforcement is split on purpose: `ParameterEstimator` WARNS, because a hard stop
+inside the ingest pipeline is worse than slightly-stale banks; `Ingestion.Validation`
+FAILS, because that is what CI reads and nothing is half-written there. "Unstamped"
+warns rather than passing — the 2026-08-19 study was unstamped, and reading that as
+fresh is exactly how it reached a network it did not describe.
+
+**Gate-design note, learned by tripping it.** The first version of the reactive-study
+gate failed on every database that was not the one the study was derived on —
+including every fresh checkout and every CI run against an un-ingested database.
+It broke two existing validation tests immediately, which is the cheap version of
+the lesson. A study can only be stale RELATIVE TO a network, so a database with no
+buses now reports `:skipped`, not `:error`. Stated because the same trap was already
+avoided once in the same change, in a different form (a `max(updated_at)` signature
+would have been invalidated by the study's own output) and was walked into anyway
+from the other direction: **a gate that fires when nothing is wrong is one people
+learn to route around, which costs more than the gate was ever worth.**

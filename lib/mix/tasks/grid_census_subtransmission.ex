@@ -47,6 +47,16 @@ defmodule Mix.Tasks.Grid.Census do
   voltage level. Documented in `Mix.Tasks.Grid.Census.LoadPlacement`, which
   this task delegates to. Note it defaults to `--graph main-island`, not `db`.
 
+  ## generator_interconnection
+
+      mix grid.census generator_interconnection
+
+  The generation-side mirror of `load_placement`: whether a plant's output can
+  physically leave the bus it sits on, scored against the reference cases in
+  `PowerModel.Reference`. Documented in
+  `Mix.Tasks.Grid.Census.GeneratorInterconnection`, which this task delegates
+  to. Reports `UNSCORED` rather than passing when the corpus is absent.
+
   ### Options
 
       --interconnection NAME     restrict to one interconnection (repeatable)
@@ -89,7 +99,7 @@ defmodule Mix.Tasks.Grid.Census do
   # `load_placement` in Mix.Tasks.Grid.Census.LoadPlacement (TOPO-2, DR-5);
   # this task is the front door for all of them so the CLI reads as one census
   # family.
-  @censuses ~w(subtransmission stranding load_placement)
+  @censuses ~w(subtransmission stranding load_placement generator_interconnection)
 
   @default_threshold 1.25
   @default_max_kv 100.0
@@ -154,6 +164,9 @@ defmodule Mix.Tasks.Grid.Census do
   """
   def report("stranding", opts), do: Mix.Tasks.Grid.Census.Stranding.report(opts)
   def report("load_placement", opts), do: Mix.Tasks.Grid.Census.LoadPlacement.report(opts)
+
+  def report("generator_interconnection", opts),
+    do: Mix.Tasks.Grid.Census.GeneratorInterconnection.report(opts)
 
   def report("subtransmission", opts) do
     hour = parse_hour(opts[:hour]) || Demand.latest_demand_hour()
@@ -284,6 +297,9 @@ defmodule Mix.Tasks.Grid.Census do
 
   defp render_text(%{census: "load_placement"} = report),
     do: Mix.Tasks.Grid.Census.LoadPlacement.render_text(report)
+
+  defp render_text(%{census: "generator_interconnection"} = report),
+    do: Mix.Tasks.Grid.Census.GeneratorInterconnection.render_text(report)
 
   defp render_text(report) do
     limit = @default_limit

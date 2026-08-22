@@ -84,6 +84,7 @@ defmodule PowerModel.Ingestion.Validation do
   alias PowerModel.Demand
   alias PowerModel.Demand.{BADemandHour, BAFuelHour}
   alias PowerModel.Dispatch
+  alias PowerModel.Grid
   alias PowerModel.Ingestion.BusMapper
 
   alias PowerModel.Grid.{
@@ -150,7 +151,8 @@ defmodule PowerModel.Ingestion.Validation do
       hour_completeness(opts),
       egrid_vintage(opts),
       topology_census(opts),
-      capacity_and_balance(opts)
+      capacity_and_balance(opts),
+      reactive_study_freshness(opts)
     ]
 
     reports = Enum.map(checks, fn {_tag, report} -> report end)
@@ -1349,6 +1351,122 @@ defmodule PowerModel.Ingestion.Validation do
   # Report plumbing / rendering
   # ---------------------------------------------------------------------------
 
+  # ---------------------------------------------------------------------------
+  # 5. Reactive study freshness (DAT-30 / DAT-31)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Whether `priv/reactive_planning/reactive_support_banks.json` still describes
+  the network it is about to be applied to.
+
+  The study is a MEASURED result: which generator buses run out of vars is a
+  property of a solved power flow, so it is only valid for the network it was
+  solved on. On 2026-08-19 it was applied to a network the OSM voltage
+  backfill had restamped underneath it, and the pipeline did not notice — the
+  drift surfaced only because 60 bank keys stopped resolving, a symptom that
+  is loud by luck and would have been silent had the ids survived while an
+  impedance moved.
+
+  This is the HARD gate for that. `ParameterEstimator` only warns, because a
+  hard stop inside the ingest pipeline would be worse than slightly-stale
+  banks; failing belongs here, where CI reads it and nothing is half-written.
+
+  Absent study: warn, not fail — a checkout without the artifact still
+  ingests, and the estimator falls back to no banks. Unstamped study: warn,
+  because "unknown" is not "stale". Drifted study: FAIL, with
+  `mix power_model.reactive_study` named as the fix.
+  """
+  def reactive_study_freshness(opts \\ []) do
+    path =
+      Keyword.get_lazy(opts, :study_path, fn ->
+        PowerModel.Ingestion.ParameterEstimator.generator_support_study_path()
+      end)
+
+    case read_study(path) do
+      {:error, reason} ->
+        report(:reactive_study, %{path: path, present: false, drift: nil},
+          warnings: [
+            "No reactive support study at #{path} (#{reason}). Generator support banks " <>
+              "will not be placed; derive one with `mix power_model.reactive_study`."
+          ]
+        )
+
+      {:ok, study} ->
+        check_study(study, path)
+    end
+  end
+
+  # A study can only be stale RELATIVE TO a network. On a database with no
+  # buses there is nothing to apply it to, so the honest answer is `:skipped`,
+  # not `:error`.
+  #
+  # This is not a test convenience. Without it the gate fails on every fresh
+  # checkout, every CI run against an un-ingested database, and every
+  # colleague's machine — and a gate that fires when nothing is wrong is one
+  # people learn to route around, which is the exact failure the digest choice
+  # was made to avoid.
+  defp check_study(study, path) do
+    signature = Grid.network_signature()
+
+    if signature.counts.buses == 0 do
+      report(
+        :reactive_study,
+        %{path: path, present: true, measured_on: study["measured_on"], drift: nil, skipped: true},
+        status: :skipped
+      )
+    else
+      evaluate_study(study, path)
+    end
+  end
+
+  defp evaluate_study(study, path) do
+    drift = Grid.network_signature_drift(study["inputs"])
+
+        metrics = %{
+      path: path,
+      present: true,
+      measured_on: study["measured_on"],
+      banks: length(study["banks"] || []),
+      drift: if(drift == [:unstamped], do: ["unstamped"], else: drift)
+    }
+
+    cond do
+          drift == [] ->
+            report(:reactive_study, metrics, [])
+
+          drift == [:unstamped] ->
+            report(:reactive_study, metrics,
+              warnings: [
+                "Reactive support study (#{study["measured_on"] || "undated"}) carries no " <>
+                  "`inputs` signature, so whether it matches this network cannot be checked. " <>
+                  "Re-derive with `mix power_model.reactive_study` to stamp it."
+              ]
+            )
+
+          true ->
+            report(:reactive_study, metrics,
+              failures: [
+                "Reactive support study (#{study["measured_on"] || "undated"}) was measured " <>
+                  "against a DIFFERENT network than the one it is applied to, so its " <>
+                  "shortfalls are not this network's. Re-derive with " <>
+                  "`mix power_model.reactive_study`. Drift: " <>
+                  Enum.join(Enum.take(drift, 5), "; ")
+              ]
+            )
+    end
+  end
+
+  defp read_study(path) do
+    with {:ok, body} <- File.read(path),
+         {:ok, %{"banks" => _} = study} <- Jason.decode(body) do
+      {:ok, study}
+    else
+      {:error, %Jason.DecodeError{}} -> {:error, "not valid JSON"}
+      {:ok, _} -> {:error, "no `banks` key"}
+      {:error, reason} -> {:error, inspect(reason)}
+    end
+  end
+
   defp report(check, metrics, opts) do
     warnings = Keyword.get(opts, :warnings, [])
     failures = Keyword.get(opts, :failures, [])
@@ -1455,6 +1573,22 @@ defmodule PowerModel.Ingestion.Validation do
       "(#{percent(m.capacity.shortfall_share)} of peaks); " <>
       "#{percent(m.balance.out_of_tolerance_share)} of #{m.balance.rows} " <>
       "BA-hours unbalanced on the fuel sum"
+  end
+
+  defp headline(%{check: :reactive_study, metrics: %{present: false}}), do: "no study file"
+
+  defp headline(%{check: :reactive_study, metrics: %{skipped: true}}),
+    do: "no network ingested — nothing to apply the study to"
+
+  defp headline(%{check: :reactive_study, metrics: m}) do
+    state =
+      case m.drift do
+        [] -> "matches this network"
+        ["unstamped"] -> "unstamped, cannot be checked"
+        drift -> "STALE (#{length(drift)} difference(s))"
+      end
+
+    "#{m.banks} banks measured #{m.measured_on || "?"}; #{state}"
   end
 
   defp headline(%{check: check}), do: to_string(check)

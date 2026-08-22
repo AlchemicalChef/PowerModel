@@ -528,10 +528,14 @@ second is where the model is genuinely broken, and it gates the third.
    entirely inside Western, and a near-binary outcome (does San Diego island and
    collapse?). Item 27's CCDF-vs-OE-417 check (published alpha ~= 1.31 +/- 0.08) is the
    cheap companion and is diagnostic even when it fails.
-2. **The alpha ceiling, as three separate bugs** (see the 2026-08-22 status block).
-   Eastern's sub-transmission impedance is the highest-leverage single number in the
-   model and is pure parameter work. Western needs a voltage-CONTROL layer that this
-   document currently rejects. ERCOT needs all three of its constraints at once.
+2. **The alpha ceiling is generator-interconnection completeness** (REVIEW LIN-17,
+   measured 2026-08-22 — this REPLACES the "Eastern sub-transmission impedance"
+   framing that stood here for a day). `vm_floor_bus_ids` names ONE bus in Eastern
+   and three in ERCOT; peeling their load leaves alpha unmoved for six rounds, so it
+   is structural. ERCOT's is a 525 MW plant on a 345 kV yard with no 345 kV lines,
+   exporting through 69 kV branches that sit at 69.0 and 64.9 degrees. The census
+   generalises it to 87.3 GW. This MERGES with the conflation wave (LIN-16): they are
+   the same work, and the OSM line pull around stranded yards is the tool.
 3. **Base-case overloads make contingencies binary** (REVIEW CAS-26). Lines at 124-250%
    at rest mean a contingency either settles at zero or runs away past the step budget;
    no settled non-trivial cascade regime exists. This is a PRECONDITION for item 26 —
@@ -545,6 +549,32 @@ second is where the model is genuinely broken, and it gates the third.
    dropout (REVIEW CAS-27); hidden-failure relay misoperation (item 27's other half —
    no relay in this model ever operates when it should not); restoration (item 28 —
    the model cannot express customer-hours, the unit every post-event report uses).
+
+## Reference corpus (added 2026-08-22)
+
+`PowerModel.Reference` / `priv/reference/structural_stats.json` /
+`mix grid.reference_stats`. Structural distributions from the MATPOWER cases
+already vendored for solver validation, so a census can be read against a
+yardstick instead of a guess.
+
+The motivating measurement: "12.4% of Eastern's load sits on EHV and 32.5% of it
+sits 5+ hops out" was unreadable without a reference, so it cost a 189 GW
+relocation experiment that returned "inconclusive". The corpus answers both in a
+lookup — reference depth is 32%, so ours is ORDINARY; reference places 0% of load
+on EHV and 0% below 115 kV, so our voltage placement is not. The experiment tested
+the wrong half.
+
+Uses landed:
+- **item 32 (new): `mix grid.census generator_interconnection`** — generation-side
+  mirror of `load_placement`, gating plant output against the reference POI floor.
+  Measured 574 buses / 87.3 GW below floor, 25.0 GW on a bus with no branch.
+- Reference caveats are carried in the module's own moduledoc so they travel with
+  the numbers; the load-band section renders as an OBSERVATION, not a gate,
+  because reference models terminate at the distribution substation and this one
+  does not.
+
+Worth adding next: RTS-GMLC or a published planning case (REVIEW DAT-33) — both
+current sources are small and neither covers every voltage level.
 
 ## Decisions needed now (independent of build order)
 

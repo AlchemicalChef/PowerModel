@@ -740,6 +740,111 @@ defmodule PowerModel.Grid do
     }
   end
 
+  # The exact columns a solved power flow reads, per table, as a content
+  # digest. Deliberately NOT a `max(updated_at)` like `export_signature/0`:
+  # `ParameterEstimator.synthesize_bus_shunts/1` writes `buses.bs_mvar`, so a
+  # table-level timestamp would be invalidated by the study's OWN OUTPUT the
+  # moment it was applied, and a gate that always fires is a gate everyone
+  # learns to ignore.
+  #
+  # `bs_mvar` and `gs_mw` are therefore absent below: they are what a study
+  # produces, not what it consumes. Everything listed IS consumed, so a change
+  # to any of it means the study describes a network that no longer exists.
+  @network_digest_columns [
+    buses: {"buses", ~w(id base_kv source source_id)},
+    loads: {"loads", ~w(id bus_id p_mw q_mvar load_type status)},
+    generators: {"generators", ~w(id bus_id p_max_mw q_max_mvar q_min_mvar status)},
+    transmission_lines:
+      {"transmission_lines",
+       ~w(id from_bus_id to_bus_id r_pu x_pu b_pu voltage_kv rating_a_mva status)},
+    transformers:
+      {"transformers", ~w(id from_bus_id to_bus_id r_pu x_pu rated_mva tap_ratio status)}
+  ]
+
+  @doc """
+  A content digest of the ELECTRICAL network, for artifacts measured against a
+  solved power flow that go stale when their inputs move.
+
+  Unlike `export_signature/0` this does not rest on `updated_at`, and so it has
+  none of that function's blind spot: a bulk `update_all` that rewrites a value
+  without touching a timestamp changes the digest. The trade is cost — this
+  hashes every row of five tables rather than reading five aggregates.
+
+  Why it exists at all: the 2026-08-19 reactive study was derived against one
+  network and applied to another after the OSM voltage backfill restamped bus
+  ids, and nothing in the pipeline noticed. It surfaced only because 60 bank
+  keys stopped resolving — a symptom that happens to be loud, and that would
+  have been SILENT had the ids survived while an impedance changed.
+
+      %{counts: %{buses: 93_093, ...}, digest: %{buses: "a1b2...", ...}}
+  """
+  def network_signature do
+    %{
+      counts:
+        Map.new(@network_digest_columns, fn {name, {table, _cols}} ->
+          %{rows: [[n]]} = Repo.query!("select count(*) from #{table}", [], timeout: :infinity)
+          {name, n}
+        end),
+      digest: Map.new(@network_digest_columns, fn {name, spec} -> {name, digest(spec)} end)
+    }
+  end
+
+  # md5 over every row's relevant columns, ordered by id so the value is
+  # independent of physical row order. NULLs are rendered as the empty string
+  # by concat_ws, which is fine: the column list is fixed, so a NULL and an
+  # empty string in the same position are not distinguishable but also not a
+  # state either can reach here.
+  defp digest({table, columns}) do
+    cols = Enum.map_join(columns, ", ", &"#{&1}::text")
+
+    %{rows: [[d]]} =
+      Repo.query!(
+        "select md5(coalesce(string_agg(concat_ws('|', #{cols}), E'\n' order by id), '')) " <>
+          "from #{table}",
+        [],
+        timeout: :infinity
+      )
+
+    d
+  end
+
+  @doc """
+  Which parts of a stored `network_signature/0` no longer match the database.
+
+  Returns `[]` when the stamp still holds, a list of human-readable
+  differences when it does not, and `[:unstamped]` when the artifact carries
+  no signature at all — which is NOT the same as fresh and must not be treated
+  as it.
+  """
+  def network_signature_drift(nil), do: [:unstamped]
+
+  def network_signature_drift(stored) when is_map(stored) do
+    now = network_signature()
+
+    counts =
+      for {name, value} <- now.counts,
+          was = get_in(stored, ["counts", to_string(name)]),
+          was != nil and was != value do
+        "#{name}: #{was} rows in the study, #{value} now"
+      end
+
+    digests =
+      for {name, value} <- now.digest,
+          was = get_in(stored, ["digest", to_string(name)]),
+          was != nil and was != value do
+        "#{name}: contents changed"
+      end
+
+    case counts ++ digests do
+      [] -> if stamped?(stored), do: [], else: [:unstamped]
+      drift -> drift
+    end
+  end
+
+  defp stamped?(stored) do
+    is_map(stored["digest"]) and map_size(stored["digest"]) > 0
+  end
+
   defp max_updated_at(schema) do
     Repo.one(from(r in schema, select: max(r.updated_at)))
   end

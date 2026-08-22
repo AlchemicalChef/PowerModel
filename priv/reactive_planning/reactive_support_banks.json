@@ -13585,7 +13585,7 @@
       "base_kv": 138.0,
       "interconnection": "Western",
       "q_max_mvar": 5.16,
-      "shortfall_mvar": 2.108,
+      "shortfall_mvar": 2.107,
       "source": "substation",
       "source_id": "73111_138.0kV",
       "vm_pu": 0.9995
@@ -13783,7 +13783,7 @@
       "base_kv": 115.0,
       "interconnection": "Western",
       "q_max_mvar": 0.561,
-      "shortfall_mvar": 4.663,
+      "shortfall_mvar": 4.662,
       "source": "substation",
       "source_id": "76213_115.0kV",
       "vm_pu": 0.9996
@@ -13909,7 +13909,7 @@
       "base_kv": 60.0,
       "interconnection": "Western",
       "q_max_mvar": 0.66,
-      "shortfall_mvar": 2.003,
+      "shortfall_mvar": 2.002,
       "source": "substation",
       "source_id": "70129_60.0kV",
       "vm_pu": 0.9995
@@ -13999,7 +13999,7 @@
       "base_kv": 69.0,
       "interconnection": "Western",
       "q_max_mvar": 0.6,
-      "shortfall_mvar": 0.117,
+      "shortfall_mvar": 0.116,
       "source": "substation",
       "source_id": "62351_69.0kV",
       "vm_pu": 1.0
@@ -14152,7 +14152,7 @@
       "base_kv": 115.0,
       "interconnection": "Western",
       "q_max_mvar": 1.32,
-      "shortfall_mvar": 5.295,
+      "shortfall_mvar": 5.294,
       "source": "substation",
       "source_id": "60448_115.0kV",
       "vm_pu": 0.9994
@@ -14197,7 +14197,7 @@
       "base_kv": 69.0,
       "interconnection": "Western",
       "q_max_mvar": 0.78,
-      "shortfall_mvar": 3.025,
+      "shortfall_mvar": 3.026,
       "source": "substation",
       "source_id": "74940_69.0kV",
       "vm_pu": 0.9996
@@ -14224,7 +14224,7 @@
       "base_kv": 66.0,
       "interconnection": "Western",
       "q_max_mvar": 2.7,
-      "shortfall_mvar": 0.239,
+      "shortfall_mvar": 0.238,
       "source": "substation",
       "source_id": "77843_66.0kV",
       "vm_pu": 0.9995
@@ -14314,7 +14314,7 @@
       "base_kv": 138.0,
       "interconnection": "Western",
       "q_max_mvar": 0.528,
-      "shortfall_mvar": 2.171,
+      "shortfall_mvar": 2.17,
       "source": "substation",
       "source_id": "74279_138.0kV",
       "vm_pu": 1.0004
@@ -14323,7 +14323,7 @@
       "base_kv": 115.0,
       "interconnection": "Western",
       "q_max_mvar": 0.297,
-      "shortfall_mvar": 0.989,
+      "shortfall_mvar": 0.991,
       "source": "substation",
       "source_id": "75141_115.0kV",
       "vm_pu": 1.0
@@ -14467,7 +14467,7 @@
       "base_kv": 66.0,
       "interconnection": "Western",
       "q_max_mvar": 1.65,
-      "shortfall_mvar": 1.563,
+      "shortfall_mvar": 1.562,
       "source": "substation",
       "source_id": "72062_66.0kV",
       "vm_pu": 0.9971
@@ -14503,7 +14503,7 @@
       "base_kv": 66.0,
       "interconnection": "Western",
       "q_max_mvar": 0.66,
-      "shortfall_mvar": 0.988,
+      "shortfall_mvar": 0.986,
       "source": "substation",
       "source_id": "75405_66.0kV",
       "vm_pu": 0.9999
@@ -14521,7 +14521,7 @@
       "base_kv": 66.0,
       "interconnection": "Western",
       "q_max_mvar": 0.54,
-      "shortfall_mvar": 1.456,
+      "shortfall_mvar": 1.458,
       "source": "substation",
       "source_id": "74231_66.0kV",
       "vm_pu": 0.9989
@@ -14539,7 +14539,7 @@
       "base_kv": 138.0,
       "interconnection": "Western",
       "q_max_mvar": 0.396,
-      "shortfall_mvar": 0.769,
+      "shortfall_mvar": 0.768,
       "source": "substation",
       "source_id": "69542_138.0kV",
       "vm_pu": 0.9999
@@ -14566,7 +14566,7 @@
       "base_kv": 230.0,
       "interconnection": "Western",
       "q_max_mvar": 0.429,
-      "shortfall_mvar": 1.569,
+      "shortfall_mvar": 1.568,
       "source": "substation",
       "source_id": "59119_230.0kV",
       "vm_pu": 1.0
@@ -14584,7 +14584,7 @@
       "base_kv": 69.0,
       "interconnection": "Western",
       "q_max_mvar": 0.99,
-      "shortfall_mvar": 3.449,
+      "shortfall_mvar": 3.45,
       "source": "substation",
       "source_id": "65817_69.0kV",
       "vm_pu": 0.9995
@@ -14602,7 +14602,7 @@
       "base_kv": 66.0,
       "interconnection": "Western",
       "q_max_mvar": 0.6,
-      "shortfall_mvar": 4.283,
+      "shortfall_mvar": 4.284,
       "source": "substation",
       "source_id": "75404_66.0kV",
       "vm_pu": 0.997
@@ -14683,7 +14683,7 @@
       "base_kv": 115.0,
       "interconnection": "Western",
       "q_max_mvar": 0.99,
-      "shortfall_mvar": 4.799,
+      "shortfall_mvar": 4.798,
       "source": "substation",
       "source_id": "59555_115.0kV",
       "vm_pu": 0.9992
@@ -14782,7 +14782,7 @@
       "base_kv": 66.0,
       "interconnection": "Western",
       "q_max_mvar": 0.66,
-      "shortfall_mvar": 2.619,
+      "shortfall_mvar": 2.62,
       "source": "substation",
       "source_id": "73641_66.0kV",
       "vm_pu": 0.9991
@@ -14791,7 +14791,7 @@
       "base_kv": 115.0,
       "interconnection": "Western",
       "q_max_mvar": 2.97,
-      "shortfall_mvar": 3.203,
+      "shortfall_mvar": 3.205,
       "source": "substation",
       "source_id": "58561_115.0kV",
       "vm_pu": 0.9986
@@ -14818,7 +14818,7 @@
       "base_kv": 60.0,
       "interconnection": "Western",
       "q_max_mvar": 2.04,
-      "shortfall_mvar": 1.793,
+      "shortfall_mvar": 1.794,
       "source": "substation",
       "source_id": "67483_60.0kV",
       "vm_pu": 0.9996
@@ -14836,7 +14836,7 @@
       "base_kv": 60.0,
       "interconnection": "Western",
       "q_max_mvar": 0.33,
-      "shortfall_mvar": 1.17,
+      "shortfall_mvar": 1.169,
       "source": "substation",
       "source_id": "77044_60.0kV",
       "vm_pu": 0.9994
@@ -14926,7 +14926,7 @@
       "base_kv": 66.0,
       "interconnection": "Western",
       "q_max_mvar": 0.429,
-      "shortfall_mvar": 0.705,
+      "shortfall_mvar": 0.704,
       "source": "substation",
       "source_id": "77680_66.0kV",
       "vm_pu": 0.9985
@@ -15025,7 +15025,7 @@
       "base_kv": 115.0,
       "interconnection": "Western",
       "q_max_mvar": 1.122,
-      "shortfall_mvar": 0.275,
+      "shortfall_mvar": 0.274,
       "source": "substation",
       "source_id": "71771_115.0kV",
       "vm_pu": 0.9997
@@ -15034,10 +15034,10 @@
       "base_kv": 66.0,
       "interconnection": "Western",
       "q_max_mvar": 6.897,
-      "shortfall_mvar": 0.878,
+      "shortfall_mvar": 0.879,
       "source": "substation",
       "source_id": "74962_66.0kV",
-      "vm_pu": 0.9994
+      "vm_pu": 0.9993
     },
     {
       "base_kv": 115.0,
@@ -15142,7 +15142,7 @@
       "base_kv": 66.0,
       "interconnection": "Western",
       "q_max_mvar": 1.32,
-      "shortfall_mvar": 2.684,
+      "shortfall_mvar": 2.683,
       "source": "substation",
       "source_id": "76896_66.0kV",
       "vm_pu": 0.9979
@@ -15169,7 +15169,7 @@
       "base_kv": 70.0,
       "interconnection": "Western",
       "q_max_mvar": 0.99,
-      "shortfall_mvar": 0.104,
+      "shortfall_mvar": 0.105,
       "source": "substation",
       "source_id": "76650_70.0kV",
       "vm_pu": 1.0
@@ -15187,7 +15187,7 @@
       "base_kv": 66.0,
       "interconnection": "Western",
       "q_max_mvar": 0.99,
-      "shortfall_mvar": 1.65,
+      "shortfall_mvar": 1.651,
       "source": "substation",
       "source_id": "76298_66.0kV",
       "vm_pu": 0.9999
@@ -15223,7 +15223,7 @@
       "base_kv": 115.0,
       "interconnection": "Western",
       "q_max_mvar": 0.33,
-      "shortfall_mvar": 0.114,
+      "shortfall_mvar": 0.113,
       "source": "substation",
       "source_id": "74207_115.0kV",
       "vm_pu": 1.0
@@ -15304,7 +15304,7 @@
       "base_kv": 60.0,
       "interconnection": "Western",
       "q_max_mvar": 0.858,
-      "shortfall_mvar": 1.359,
+      "shortfall_mvar": 1.36,
       "source": "substation",
       "source_id": "77047_60.0kV",
       "vm_pu": 1.0
@@ -15349,7 +15349,7 @@
       "base_kv": 66.0,
       "interconnection": "Western",
       "q_max_mvar": 0.924,
-      "shortfall_mvar": 0.856,
+      "shortfall_mvar": 0.857,
       "source": "substation",
       "source_id": "75055_66.0kV",
       "vm_pu": 0.9995
@@ -15457,7 +15457,7 @@
       "base_kv": 115.0,
       "interconnection": "Western",
       "q_max_mvar": 0.858,
-      "shortfall_mvar": 3.045,
+      "shortfall_mvar": 3.044,
       "source": "substation",
       "source_id": "60421_115.0kV",
       "vm_pu": 0.9994
@@ -15487,13 +15487,12 @@
       "Eastern": 0.4297,
       "Western": 0.1875
     },
-    "control": "reactors only: stored bs_mvar minus ParameterEstimator.capacitor_bank_targets/1, applied in memory so no arm contaminates another.",
+    "control": "reactors only: stored bs_mvar minus ParameterEstimator.capacitor_bank_targets/1, applied in memory. Deriving on a network that already carries the banks would measure the residual and shrink the study on every re-run.",
     "hour": "Demand.latest_demand_hour/0 (~U[2025-01-01 04:00:00Z])",
-    "load_model": "WITH distribution compensation active (Solver.LoadModel, interface pf 0.98, k = 0.382).",
     "note": "alpha is each island's AC loadability ceiling. It is well below 1.0, so these shortfalls are measured on a lightly loaded network and are conservative.",
-    "shortfall": "q_free - q_max, where q_free is the bus's reactive output with generator q_max x10 (the qmax10 lever) at the same alpha, and q_max is its units' summed rating. Only buses PINNED at q_max in the base solve are listed.",
+    "shortfall": "q_free - q_max, where q_free is the bus's reactive output with generator q_max x10 at the same alpha. Only buses PINNED at q_max in the base solve are listed.",
     "snapshot": "Grid.get_grid_snapshot(ic.id, hour: hour) -> Cascade.init(snap, 100.0, hour: hour) -> dispatched_generators/1; largest island of Solver.Partition.split/1",
-    "solver": "FDPF.solve(base_mva: 100.0, dense_nr_max_buses: 0, max_iterations: 400)",
+    "solver": "FDPF.solve([base_mva: 100.0, dense_nr_max_buses: 0, max_iterations: 400])",
     "vm_pu": "bus voltage in the BASE solve at that alpha"
   },
   "counts": {
@@ -15516,7 +15515,23 @@
       "with_shortfall": 214
     }
   },
+  "generated_by": "mix power_model.reactive_study",
+  "inputs": {
+    "counts": {
+      "buses": 93093,
+      "generators": 26882,
+      "loads": 70757,
+      "transformers": 14376,
+      "transmission_lines": 104759
+    },
+    "digest": {
+      "buses": "02d2e6d4de907b5ab68cc4e1a28782a0",
+      "generators": "44dafda060f212bbd27964de720ca702",
+      "loads": "6a719e7263c07f5b5e65050751ca68be",
+      "transformers": "efa121c0dd5971aa266659f77fd249b0",
+      "transmission_lines": "5294d7aa6eb6771e1e92a47dbe7b1fc7"
+    }
+  },
   "measured_on": "2026-08-22",
-  "study": "generator reactive support banks (vc-compensation)",
-  "supersedes": "2026-08-19 (re-derived after the OSM voltage backfill restamped bus source_ids)"
+  "study": "generator reactive support banks"
 }

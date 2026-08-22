@@ -881,7 +881,8 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
     path = Keyword.get(opts, :study_path, generator_support_study_path())
 
     with {:ok, body} <- File.read(path),
-         {:ok, %{"banks" => banks}} <- Jason.decode(body) do
+         {:ok, %{"banks" => banks} = study} <- Jason.decode(body) do
+      warn_stale(study, path)
       keys = Enum.map(banks, &{&1["source"], &1["source_id"]})
       sources = keys |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
       source_ids = keys |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
@@ -938,6 +939,40 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   # shortfall to the wrong one, and a bank on the wrong bus is worse than no
   # bank. The right response is to re-derive the study after any change to
   # voltage data, which is what the warning tells the operator to do.
+  # The study is measured against a solved network, so it is only valid for the
+  # network it was measured on. The 2026-08-19 study was applied to a network
+  # the OSM voltage backfill had restamped underneath it, and the only reason
+  # anyone noticed was that 60 bank keys stopped resolving — a symptom that
+  # happens to be loud, and that would have been SILENT had the ids survived a
+  # change to impedance or dispatch. `Grid.network_signature/0` closes that
+  # gap: it moves whenever any table a power flow reads moves.
+  #
+  # This warns rather than raises because the estimator runs inside the ingest
+  # pipeline, where a hard stop on a slightly-stale study would be worse than
+  # slightly-stale banks. The hard gate lives in `Ingestion.Validation`, which
+  # is what CI runs.
+  defp warn_stale(study, path) do
+    case PowerModel.Grid.network_signature_drift(study["inputs"]) do
+      [] ->
+        :ok
+
+      [:unstamped] ->
+        Logger.warning(
+          "reactive support study #{Path.basename(path)} carries no `inputs` signature, so " <>
+            "whether it matches this network is UNKNOWN -- not the same as fresh. " <>
+            "Re-derive with `mix power_model.reactive_study`."
+        )
+
+      drift ->
+        Logger.warning(
+          "reactive support study #{Path.basename(path)} was measured against a DIFFERENT " <>
+            "network than the one it is being applied to; its shortfalls are not this " <>
+            "network's. Re-derive with `mix power_model.reactive_study`. Drift: " <>
+            Enum.join(Enum.take(drift, 5), "; ")
+        )
+    end
+  end
+
   defp warn_unresolved([], _total), do: :ok
 
   defp warn_unresolved(missing, total) do
