@@ -20,13 +20,16 @@ defmodule PowerModel.GeneratorInterconnectionCensusTest do
   alias PowerModel.Grid.{Bus, Generator, Interconnection, Transformer, TransmissionLine}
   alias PowerModel.Repo
 
-  defp bus(ic, kv, tag) do
+  defp bus(ic, kv, tag, coords \\ {-97.0, 31.0}) do
+    {lon, lat} = coords
+
     Repo.insert!(%Bus{
       base_kv: kv,
       bus_type: 1,
       source: "substation",
       source_id: "#{tag}_#{kv}kV",
-      interconnection_id: ic.id
+      interconnection_id: ic.id,
+      coordinates: %Geo.Point{coordinates: {lon, lat}, srid: 4326}
     })
   end
 
@@ -157,6 +160,28 @@ defmodule PowerModel.GeneratorInterconnectionCensusTest do
     assert s.unconnected_mw == 300.0
     # It cannot also be a POI violation: it has no POI to compare.
     assert s.below_floor_count == 0
+  end
+
+  test "a flagged bus reports how far the nearest adequate bus is", %{ic: ic} do
+    # The reach column is what makes the section a work list rather than a
+    # tally: a plant whose floor is 30 km away is a missing circuit somebody
+    # can go and find.
+    yard = bus(ic, 69.0, "reach", {-97.0, 31.0})
+    near = bus(ic, 69.0, "reachnear", {-97.0, 31.0})
+    line(yard, near, 69.0)
+
+    # ~0.3 degrees of longitude at 31N is roughly 29 km.
+    high = bus(ic, 345.0, "reachhigh", {-96.7, 31.0})
+    highfar = bus(ic, 345.0, "reachhighfar", {-96.7, 31.05})
+    line(high, highfar, 345.0)
+
+    gen(yard, 400.0)
+
+    row = section(ic).below_floor |> hd()
+
+    assert row.reach_bus in [high.id, highfar.id]
+    assert row.reach_kv == 345.0
+    assert row.reach_km > 20.0 and row.reach_km < 40.0
   end
 
   test "a plant below the smallest reference band is unscored, not passed", %{ic: ic} do

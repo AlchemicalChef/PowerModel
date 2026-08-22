@@ -157,7 +157,6 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
       |> Map.new(fn {bus, mw} -> {bus, (mw || 0.0) * 1.0} end)
 
     band = Reference.stats() && get_in(Reference.stats(), ["derived", "load_bus_kv_range"])
-    bus_by_id = Map.new(buses, &{&1.id, &1})
 
     sections =
       Enum.map(interconnections, fn ic ->
@@ -182,6 +181,7 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
             end
           end)
           |> Enum.sort_by(& &1.mw, :desc)
+          |> with_reach()
 
         unconnected =
           ic_buses
@@ -215,6 +215,10 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
           unconnected_count: length(unconnected),
           unconnected_mw: sum_mw(unconnected),
           unconnected: unconnected,
+          below_floor_within_50km_mw:
+            below
+            |> Enum.filter(&(&1[:reach_km] && &1.reach_km <= 50.0))
+            |> sum_mw(),
           load_outside_band_buses: length(outside),
           load_outside_band_mw: outside |> Enum.map(&elem(&1, 1)) |> Enum.sum() |> r1(),
           load_below_band_mw:
@@ -235,9 +239,9 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
       total_unconnected_mw: sections |> Enum.map(& &1.unconnected_mw) |> Enum.sum() |> r1(),
       total_load_outside_band_mw:
         sections |> Enum.map(& &1.load_outside_band_mw) |> Enum.sum() |> r1(),
-      _unused: bus_by_id
+      total_below_floor_within_50km_mw:
+        sections |> Enum.map(& &1.below_floor_within_50km_mw) |> Enum.sum() |> r1()
     }
-    |> Map.delete(:_unused)
   end
 
   defp row(b, names, mw, units, escape, floor_kv) do
@@ -261,6 +265,50 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
 
   defp elem_or_nil({n, _}), do: n
   defp elem_or_nil(_), do: nil
+
+  # How far is the fix? For each flagged bus, the distance to the nearest bus
+  # that already carries lines at or above the floor voltage it needs.
+  #
+  # This is what turns the section from a tally into a work list: a 525 MW
+  # plant whose floor is 29 km away is a missing circuit somebody can go and
+  # find, while one with no adequate bus within 200 km is a different problem
+  # and should not sit in the same queue.
+  defp with_reach([]), do: []
+
+  defp with_reach(rows) do
+    Enum.map(rows, fn r ->
+      %{rows: found} =
+        Repo.query!(
+          """
+          select b.id, b.base_kv,
+                 round((ST_Distance(b.coordinates::geography, o.coordinates::geography) / 1000.0)::numeric, 1)
+          from buses b
+          cross join (select coordinates from buses where id = $1) o
+          where b.id <> $1
+            and b.coordinates is not null
+            and o.coordinates is not null
+            and b.base_kv >= $2
+            and exists (
+              select 1 from transmission_lines t
+              where t.status = 'in_service' and (t.from_bus_id = b.id or t.to_bus_id = b.id)
+            )
+          order by b.coordinates <-> o.coordinates
+          limit 1
+          """,
+          [r.bus, r.floor_kv * @class_tolerance],
+          timeout: :infinity
+        )
+
+      case found do
+        [[id, kv, km]] -> Map.merge(r, %{reach_bus: id, reach_kv: kv, reach_km: to_float(km)})
+        _ -> Map.merge(r, %{reach_bus: nil, reach_kv: nil, reach_km: nil})
+      end
+    end)
+  end
+
+  defp to_float(%Decimal{} = d), do: Decimal.to_float(d)
+  defp to_float(x) when is_number(x), do: x * 1.0
+  defp to_float(_), do: nil
 
   defp sum_mw(rows), do: rows |> Enum.map(& &1.mw) |> Enum.sum() |> r1()
 
@@ -298,13 +346,19 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
       IO.puts("── #{s.name} ──")
 
       IO.puts(
-        "  below the reference POI floor: #{s.below_floor_count} buses, #{s.below_floor_mw} MW"
+        "  below the reference POI floor: #{s.below_floor_count} buses, #{s.below_floor_mw} MW " <>
+          "(#{s.below_floor_within_50km_mw} MW of it within 50 km of an adequate bus)"
       )
 
       for r <- Enum.take(s.below_floor, @default_limit) do
+        reach =
+          if r[:reach_km],
+            do: " | #{r.reach_kv}kV bus #{r.reach_bus} is #{r.reach_km}km away",
+            else: " | no adequate bus found"
+
         IO.puts(
           "    bus #{r.bus} kv=#{r.kv} #{r.mw}MW on #{r.units} unit(s) " <>
-            "escapes at #{r.escape_kv}kV, floor #{r.floor_kv}kV  #{r.name || r.source_id}"
+            "escapes at #{r.escape_kv}kV, floor #{r.floor_kv}kV#{reach}  #{r.name || r.source_id}"
         )
       end
 
@@ -327,7 +381,12 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
       IO.puts("")
     end
 
-    IO.puts("TOTAL below the POI floor: #{report.total_below_floor} buses, #{report.total_below_floor_mw} MW")
+    IO.puts(
+      "TOTAL below the POI floor: #{report.total_below_floor} buses, " <>
+        "#{report.total_below_floor_mw} MW — of which " <>
+        "#{report.total_below_floor_within_50km_mw} MW sits within 50 km of a bus that " <>
+        "already carries lines at the voltage it needs"
+    )
     IO.puts("TOTAL generation with no branch: #{report.total_unconnected_mw} MW")
 
     IO.puts(

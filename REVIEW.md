@@ -1167,9 +1167,15 @@ degree 2, carrying 3.2 MW at the reference hour. ERCOT reports 3. Western's wors
 branch by angle is 67217, which is the line the wave attributed its whole swing to
 by ablation — an independent method landing on the same element.
 
-**LIN-17 (MEASURED, HIGH) [OPEN]** The α ceiling is set by generator
-interconnection defects, not by load-side impedance. The two named cases are the
-same shape:
+**LIN-17 (MEASURED, HIGH) [OPEN]** The α ceiling is set by SINGLE-ELEMENT HIFLD
+data defects at specific yards, not by any distributed property of the network.
+
+CORRECTION (same day, before this hardened): this entry first said "generator
+interconnection defects", which is true of ERCOT and FALSE of Eastern — Eastern's
+floor bus carries no generation at all, and its defect is a mis-tagged voltage
+class on a 6.5 MW load pocket. The common thread is the DATA, not the mechanism.
+Both cases are one element, and both are worth more than ten percent of their
+interconnection's ceiling:
 - **ERCOT bus 58121 is a 345 kV switchyard with ZERO 345 kV lines**, holding a
   525 MW generator. Its only path out is a 600 MVA transformer to 69 kV, 8.4 km of
   69 kV, then lines 74137 and 72922 — ERCOT's #1 and #2 worst branches at **69.0°
@@ -1182,8 +1188,34 @@ same shape:
 Peeling confirms it is STRUCTURAL, not load: zeroing the load at Eastern's floor
 buses and re-bisecting leaves α at 0.4297 for six consecutive rounds, with buses
 74129 and 74130 still on the floor **carrying zero MW**. Yard 73977's 33 kV line
-73687 carries `x = 1.5263 pu`; at 138 kV the same ohms would be 0.087 pu. One
-mis-tagged yard is pinning an interconnection.
+**73688** carries `x = 1.5263 pu` over 36.9 km — verified 2026-08-22 against the
+row itself, after this entry first mis-cited it as 73687, which is a different
+(OSM-corridor-corrected, 69 kV, x = 0.0467) line. At 69 kV, the yard's own other
+level, the same ohms would be 0.349 pu. One mis-tagged yard is pinning an
+interconnection.
+
+Geography, for whoever repairs it: yard 73977 is substation "#6" in eastern New
+Mexico (33.937, -103.673), levels {69, 33}, carrying 6.5 MW — and it sits 14.8 km
+from a 230 kV bus. ERCOT's 58121 has a 345 kV bus with lines 29.5 km away, and
+FOUR more 345 kV buses within 54 km that ALSO carry zero lines, so the missing-EHV
+-circuit defect there is regional (the San Angelo area) rather than a one-off.
+
+**REPAIRS MEASURED (2026-08-22, in-memory hypothesis tests, nothing written).**
+The question the census could not answer on its own is whether it measures
+something that MOVES α or merely something that is wrong. It moves α, and by a
+lot per element:
+
+| repair | α before | α after | change |
+|---|---|---|---|
+| ERCOT: one synthetic 345 kV tie from bus 58121 to bus 72395 (29.5 km) | 0.6406 | 0.7188 | **+12.2%** |
+| Eastern: line 73688 reclassed 33 → 69 kV (the yard's own other level) | 0.4297 | 0.4766 | **+10.9%** |
+
+One branch and one voltage tag, each worth over a tenth of a ceiling. ERCOT has 45
+more flagged buses; Eastern's census population is 322.
+
+A synthetic tie is a CLAIM about what the real network has, and these runs do not
+establish that claim — they measure what the ceiling would be if it were true,
+which is what decides whether chasing the real circuit is worth the effort. It is.
 
 This MERGES two items previously ranked apart: the α work and the conflation wave
 (LIN-16) are the same work. HIFLD is missing the EHV circuits that connect large
@@ -1195,6 +1227,13 @@ of the reactive absorption is on EHV** (43.1% on ≥345 kV, 23.6% on 230-344, ag
 7.7% below 100 kV), and the worst branch angle anywhere is 29.4°. Eastern's ceiling
 is not an angle problem and not a sub-transmission problem — which is why banks at
 generator buses moved it zero steps.
+
+**Reach, from the census (2026-08-22):** every one of ERCOT's 16,575 flagged MW
+sits within 50 km of a bus that ALREADY carries lines at the voltage it needs —
+H.O. Clarke's 828.9 MW has a 345 kV bus 8.6 km away, bus 71881's 1,884.4 MW has
+one at 33.0 km. These are missing circuits beside existing infrastructure, not
+plants stranded in empty country, which is why the reach column was added: it
+sorts the census into work somebody can actually do.
 
 **OSM coverage of the fix path, measured**: of Eastern's 64 stranded yards ≥100 MW,
 48 carry an OSM match and 16 (3,455 MW) show a HIGHER voltage level than the bus the
@@ -1288,3 +1327,24 @@ avoided once in the same change, in a different form (a `max(updated_at)` signat
 would have been invalidated by the study's own output) and was walked into anyway
 from the other direction: **a gate that fires when nothing is wrong is one people
 learn to route around, which costs more than the gate was ever worth.**
+
+**Method note — a broken unit propagated into an experiment, not just a report.**
+The first repair run's Eastern "tie" arms reported `alpha = 0.0` in ZERO seconds
+and were discarded, not believed. Cause: the tie target (bus 65674) came from a
+distance query using `ST_Distance` on `geometry`, which returns DEGREES; every
+distance rounded to `0.00 km` and the "nearest" bus was arbitrary. 65674 is in
+ERCOT, 312.6 km away, so the arm added a cross-island branch and the solver threw
+on every bisection step. Casting to `::geography` gives metres and the real
+neighbours.
+
+Two things worth keeping from that. First, the tell was the CLOCK, not the number:
+a 59,826-bus island cannot bisect in zero seconds, so the arm was structurally
+impossible before it was wrong. The re-run prints a warning when an arm finishes
+under five seconds for exactly this reason. Second, a bad measurement does not
+stop at being a bad number — this one silently chose the design of the next
+experiment. The 0.00 km readings were visible on screen and looked like rounding.
+
+A second target (bus 71740) was then rejected before spending compute on it: it is
+an Eastern bus 31.4 km away, but it sits in a FRAGMENT rather than the simulated
+island, so the arm would have thrown the same way. Island membership is now
+asserted in the harness before an arm runs.
