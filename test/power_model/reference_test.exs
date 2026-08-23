@@ -11,6 +11,11 @@ defmodule PowerModel.ReferenceTest do
 
   alias PowerModel.Reference
 
+  # Registered deliberately: the moduledoc example was previously unreachable,
+  # so it documented behaviour nothing checked. The example is chosen to hold
+  # whether or not the artifact is present, since absence is a supported state.
+  doctest PowerModel.Reference
+
   describe "stats/0" do
     test "the shipped artifact parses and carries its sources" do
       stats = Reference.stats()

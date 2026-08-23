@@ -99,10 +99,14 @@ defmodule PowerModel.Reference do
   161 kV, because exactly one plant in that band sits that low.
 
   Returns `nil` when the corpus is absent, which callers must treat as
-  "no opinion" rather than "passes".
+  "no opinion" rather than "passes". It also returns `nil` below the smallest
+  band, for the same reason — the reference cases say nothing about plants that
+  small, and inventing a floor there would flag every distribution-connected
+  generator in the country.
 
-      iex> is_nil(PowerModel.Reference.poi_floor_kv(300)) or PowerModel.Reference.poi_floor_kv(300) > 0
-      true
+      iex> PowerModel.Reference.poi_floor_kv(1)
+      nil
+
   """
   @spec poi_floor_kv(number()) :: float() | nil
   def poi_floor_kv(plant_mw) when is_number(plant_mw) do
