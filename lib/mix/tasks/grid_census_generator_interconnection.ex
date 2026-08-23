@@ -37,10 +37,45 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
   When the corpus is absent the floor is `nil` and the section reports
   `unscored` rather than passing vacuously.
 
+  ## This is a SCREEN, not a verdict — and it flags two different defects
+
+  A flagged bus is a candidate. Measured 2026-08-23 against a targeted OSM pull
+  over the 25 largest flagged yards, cross-checked against escape CAPACITY
+  (plant MW vs the summed rating of every branch at its bus):
+
+    * **10 of 25 yards (40.7% of MW) have an OSM circuit ABOVE their floor** —
+      a missing higher-voltage circuit, which is what this census is looking
+      for.
+    * **Most of the rest are still real defects, of a different kind.** Where
+      OSM AGREES with the model's escape voltage, the plant genuinely does
+      interconnect at 138 kV — but the model gives it far too FEW circuits at
+      that voltage. Bus 70528 carries 1,082 MW on ONE 200 MVA branch (5.4x its
+      rating); 75342 carries 640 MW on one 116 MVA branch (5.5x).
+    * Across the 23 generator buses at those yards, **19 are tight or stranded
+      on capacity (13 outright)** — so as a screen for "this plant cannot
+      export its output through the modelled network", precision is ~83%, not
+      the ~41% the voltage test alone suggests.
+
+  So the voltage test under-reads its own hit rate: it names the right buses
+  and mis-names the defect at roughly half of them. Missing parallel circuits
+  at the correct voltage and a missing higher-voltage circuit are both "HIFLD
+  has too few circuits at this plant", and both are worth finding.
+
+  The floor itself does over-read at the top band, and that is a corpus limit
+  (REVIEW DAT-33): >800 MW → 230 kV rests on ten plants across two reference
+  cases, neither of which pairs a 138 kV level with a large plant. Real
+  practice interconnects large plants at 138 kV routinely.
+
+  Read alongside `mix grid.census stranding`, which scores generation against
+  summed branch ratings. That census sees the capacity defect and is blind to
+  voltage class; this one sees voltage class and misreads multi-circuit plants.
+  Neither subsumes the other, and the cross-check above is what separated the
+  two failure modes.
+
   ## Sections
 
-    * **below the reference POI floor** — the gate. Plants whose escape
-      voltage is under the floor for their size.
+    * **below the reference POI floor** — the screen (see the precision note
+      above). Plants whose escape voltage is under the floor for their size.
     * **no branch at all** — buses holding generation with neither a line nor
       a transformer. Their MW cannot reach the network under any convention.
     * **load outside the reference bus-kV band** — an OBSERVATION, not a gate.
@@ -346,8 +381,11 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
       IO.puts("── #{s.name} ──")
 
       IO.puts(
-        "  below the reference POI floor: #{s.below_floor_count} buses, #{s.below_floor_mw} MW " <>
-          "(#{s.below_floor_within_50km_mw} MW of it within 50 km of an adequate bus)"
+        "  below the reference POI floor [SCREEN — see moduledoc; ~83% are tight or " <>
+          "stranded on capacity, ~41% specifically missing a higher-voltage circuit]: " <>
+          "#{s.below_floor_count} buses, " <>
+          "#{s.below_floor_mw} MW (#{s.below_floor_within_50km_mw} MW of it within 50 km of an " <>
+          "adequate bus)"
       )
 
       for r <- Enum.take(s.below_floor, @default_limit) do

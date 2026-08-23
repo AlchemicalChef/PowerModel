@@ -1348,3 +1348,70 @@ A second target (bus 71740) was then rejected before spending compute on it: it 
 an Eastern bus 31.4 km away, but it sits in a FRAGMENT rather than the simulated
 island, so the arm would have thrown the same way. Island membership is now
 asserted in the harness before an arm runs.
+
+### OSM verification of the POI census, and what it says about the floor (2026-08-23)
+
+**The vendored line snapshot does not cover the flagged yards, for a structural
+reason.** Only 10 of the 574 below-floor yards (3.0% of their MW) were queried by
+the 2026-08-18 line pull, and only 1 of the top 25 by MW has any snapshot way
+within 400 m. That pull queried "the 6,066 yards left UNMATCHED by the substation
+pass" — it was scoped to fill VOLTAGE gaps. These yards mostly have voltage; what
+they lack is CIRCUITS. Different gap, different query. (The no-branch population
+fares better at 32.2% of MW, because those yards were more often unmatched.)
+
+**Probe: 25 largest flagged yards, one Overpass request, 600-1000 m radius.**
+10 of 25 have an OSM circuit at or above their POI floor within 1 km — 9,210 of
+22,654 MW, **40.7%**. Confirmed cases include yard 6150 (2,055 MW, model escapes
+at 130.5 kV, OSM shows 765 kV at 230 m) and 72209 (1,884 MW, escapes 138 kV, OSM
+shows 345 kV at 450 m).
+
+**The other 15 are the more useful half, and they indict the floor rather than the
+network.** Eleven are cases where OSM AGREES with the model: yard 70528 carries
+1,175 MW and escapes at 138 kV, and the best OSM circuit within a kilometre is
+also 138 kV. Same for 71182 (1,082 MW), 74844 (1,052 MW, 115 kV), 67901, 22833,
+62519 and others. Those plants really do interconnect below the floor this census
+applies. Four more have no voltage-tagged way within 1 km at all — unknown, not
+confirmed.
+
+**CORRECTION, same session, from a capacity cross-check: the "OSM agrees" group
+are NOT false positives.** The hypothesis was that those plants interconnect at
+138 kV over SEVERAL circuits and are therefore fine. Measured against the summed
+rating of every branch at each bus, they are not fine — bus 70528 carries
+1,082 MW on ONE 200 MVA branch (5.4x), 75342 carries 640 MW on one 116 MVA branch
+(5.5x), 75222 1,052 MW on two branches totalling 358 MVA (2.9x). Across the 23
+generator buses at the 25 probe yards, **19 are tight or stranded on escape
+capacity and 13 are stranded outright.**
+
+So the census names the right buses and mis-names the DEFECT at about half of
+them. Two distinct failures, both "HIFLD has too few circuits at this plant":
+- a missing HIGHER-VOLTAGE circuit (the 10 OSM-confirmed cases), and
+- missing PARALLEL circuits at the voltage the plant really uses (the rest).
+
+As a screen for "this plant cannot export its output through the modelled
+network" the precision is therefore ~83%, not the 41% the voltage test alone
+suggests. The 41% figure — which this entry and the census moduledoc briefly
+carried as *the* precision — measures only the first failure mode. Both documents
+now say so.
+
+**The floor does still over-read at the top band, and the reason is in the
+corpus's own limits (DAT-33).** The >800 MW → 230 kV band rests on TEN plants
+across `case_ACTIVSg2000` and `case118`, neither of which contains a 138 kV level
+paired with a large plant — ACTIVSg2000 runs 115/161/230/500 and case118 runs
+138/161/345. Real US practice interconnects large plants at 138 kV routinely,
+usually over SEVERAL circuits, which the census cannot see because it reads only
+the single highest escape voltage.
+
+**Consequences, taken deliberately rather than by patching the number:**
+- The census stays a SCREEN, not a verdict: 574 flagged is not 574 confirmed
+  defects. But the measured hit rate for "cannot export its output" is ~83% at
+  the top of the list, and the census must report WHICH defect it found rather
+  than assuming the voltage one. Both figures now live in the moduledoc.
+- OSM is the VERIFIER. Flagged AND an OSM circuit above the floor nearby = a
+  confirmed missing circuit with a named way to go and find. That intersection,
+  not the raw flag list, is the work list.
+- Escape CAPACITY and escape VOLTAGE are different tests and neither subsumes the
+  other. `mix grid.census stranding` already scores generation against summed
+  branch ratings; it sees the parallel-circuit defect and is blind to voltage
+  class. Running the two together is what separated the failure modes above, and
+  is how the "multi-circuit plants are fine" hypothesis got killed in ten minutes
+  instead of surviving into the roadmap.
