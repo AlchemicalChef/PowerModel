@@ -184,6 +184,20 @@ defmodule PowerModel.GeneratorInterconnectionCensusTest do
     assert row.reach_km > 20.0 and row.reach_km < 40.0
   end
 
+  test "a self-loop does not rescue a stranded plant", %{ic: ic} do
+    # Without the from != to filter, poi[bus] would include the bus's OWN
+    # voltage, so a plant with nothing but a self-loop would look like it
+    # escapes at its own level and pass the screen.
+    yard = bus(ic, 69.0, "loop")
+    line(yard, yard, 69.0)
+    gen(yard, 400.0)
+
+    s = section(ic)
+    assert s.below_floor_count + s.unconnected_count == 1,
+           "a bus whose only branch is a self-loop must still be reported"
+    assert s.below_floor_mw + s.unconnected_mw == 400.0
+  end
+
   test "a plant below the smallest reference band is unscored, not passed", %{ic: ic} do
     yard = bus(ic, 69.0, "tiny")
     far = bus(ic, 69.0, "tinyfar")

@@ -164,15 +164,24 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
     buses = Repo.all(from b in Bus, select: %{id: b.id, kv: b.base_kv, ic: b.interconnection_id, src: b.source_id})
     kv = Map.new(buses, &{&1.id, &1.kv || 0.0})
 
+    # `from != to` is not decoration: a self-loop would make a bus its own
+    # neighbour, so `poi` would report the bus's OWN voltage as its escape and
+    # a stranded plant would silently pass. There are zero in service today
+    # (checked 2026-08-23) and the export queries filter them for the same
+    # reason; this keeps the census honest if they come back.
     branches =
       Repo.all(
         from l in TransmissionLine,
-          where: l.status == "in_service" and not is_nil(l.from_bus_id) and not is_nil(l.to_bus_id),
+          where:
+            l.status == "in_service" and not is_nil(l.from_bus_id) and
+              not is_nil(l.to_bus_id) and l.from_bus_id != l.to_bus_id,
           select: {l.from_bus_id, l.to_bus_id, "line"}
       ) ++
         Repo.all(
           from t in Transformer,
-            where: t.status == "in_service" and not is_nil(t.from_bus_id) and not is_nil(t.to_bus_id),
+            where:
+              t.status == "in_service" and not is_nil(t.from_bus_id) and
+                not is_nil(t.to_bus_id) and t.from_bus_id != t.to_bus_id,
             select: {t.from_bus_id, t.to_bus_id, "transformer"}
         )
 
