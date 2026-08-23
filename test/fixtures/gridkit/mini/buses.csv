@@ -1,0 +1,6 @@
+bus_id,station_id,voltage,dc,symbol,under_construction,tags,x,y
+b1,s1,380,f,Substation,f,'"country"=>"DE", "oid"=>"1"',9.0,52.0
+b2,s2,380,f,Substation,f,'"country"=>"DE", "oid"=>"2"',9.5,52.0
+b3,s3,220,f,Substation,f,'"country"=>"FR", "oid"=>"3"',10.0,52.0
+b4,s4,380,t,Converter,f,'"country"=>"DK", "oid"=>"4"',10.5,52.0
+b5,s5,380,f,Substation,t,'"country"=>"DE", "oid"=>"5"',11.0,52.0

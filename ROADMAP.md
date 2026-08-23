@@ -634,14 +634,71 @@ April 2025 Iberian blackout with an ENTSO-E expert-panel investigation. Combined
 with ENTSO-E's per-unit outage data, that is the first realistic route to
 scoring this model against something it did not generate itself.
 
-**Next, in order:** (1) pull a PyPSA-Eur continental network rather than the
-German example; (2) wire ENTSO-E Transparency load/generation as the demand
-substrate, replacing the uniform dispatch balance used in the smoke test with
-`Cascade.init`'s per-island balance; (3) attempt the 2006 UCTE split. Verify
-before committing: ENTSO-E redistribution terms (they matter here as much as
-ODbL and CEII have), whether the outage feed is complete enough per-unit to
-drive an initiating-event distribution, and how much of PyPSA-Eur is directly
-consumable versus needing a translation layer.
+### Step 1 — continental network: DONE (2026-08-23)
+
+`PowerModel.Network.GridKit` reads `data/entsoegridkit` from PyPSA-Eur — the
+GridKit extraction of the ENTSO-E interactive map, **CC-BY-4.0** (SPDX
+annotation in that repo's `REUSE.toml`). 8,510 AC buses, 9,936 lines, 1,017
+transformers, 400,897 km of circuit, with real per-line `circuits` counts
+(6,784 single / 3,014 double / 138 triple).
+
+**It recovers the real synchronous areas with no area labels in the input** —
+Continental Europe 6,761 buses (FR/RU/ES/DE/IT/UA, the March-2022 extract
+predating UA/MD resynchronisation), Maghreb 565 (DZ/MA/TN/LY), Great Britain
+385, all-island Ireland 60, Iceland 48, Cyprus 22. Those ARE separate
+synchronous areas joined only by HVDC, and the reader drops the 62 DC links
+deliberately (this repo models HVDC as scheduled injections), so the split is
+the physically correct one rather than a connectivity failure. 92.7% of buses
+sit in a component of 20 or more.
+
+Unlike a PyPSA export this source carries NO electrical parameters — voltage,
+circuits and length only — so impedance is DERIVED from PyPSA's standard type
+library. That makes it a like-for-like test of our own estimator recipe on
+another continent's topology rather than a way to avoid it. Its README's own
+caveats (unofficial, unendorsed, voltage is the LOWER BOUND of the ENTSO-E
+range, transformers inferred not sourced) are carried in `:provenance` so they
+travel with the numbers. Source defect noted: 38 buses at 0.0 kV — which the
+`class_ceiling` term-ordering guard added the same day now handles
+conservatively instead of granting them the most permissive ceiling.
+
+### Step 2 — ENTSO-E demand: BLOCKED on credentials, with a route around
+
+The Transparency Platform API requires a registered account and a security
+token, which cannot be obtained from here. Two consequences worth recording
+rather than working around silently:
+
+- The open substitute is **Open Power System Data** (`time_series` package,
+  CC-BY-4.0), which republishes ENTSO-E hourly load per country without a
+  token. It gives country totals, NOT per-bus demand — so using it reintroduces
+  the load-ALLOCATION problem that `Network.PyPSA` avoided, and would need the
+  same population/capability weighting the US pipeline uses.
+- The per-unit OUTAGE feed — the thing with no US equivalent and the reason
+  Europe is the validation path — is Transparency-only. It needs the token.
+
+So step 2 is not "do this next"; it is "get a token, or accept country-level
+allocation". That is a decision, not a task.
+
+### Step 3 — 2006 UCTE replay: BLOCKED behind the frequency port
+
+Two hard prerequisites, both now identified rather than assumed:
+
+1. **The frequency layer is North American.** `Solver.Frequency` compiles
+   `@f0 60.0` and UFLS at 59.3/58.9/58.5/58.1 Hz; a healthy 50 Hz system sits
+   below every stage. `Grid.SystemStandard` now carries both standards and
+   `Cascade.init/3` REFUSES the mismatch, so the failure is loud instead of
+   silent — but refusing is not porting. Threading a standard through
+   `Frequency`, `Protection`, `LoadShedding`, `Controls.AGC` and `Grid.BtmSolar`
+   is the real prerequisite, and it is the next substantial piece of work.
+2. **The network vintage is wrong.** The extract is March 2022; the 2006 UCTE
+   split happened on a network that no longer exists. A replay would score
+   topology-sensitive behaviour against the wrong topology. The honest first
+   target is therefore a MECHANISM test — does a deliberate cut of the
+   Continental Europe component separate it into islands the way the UCTE
+   report describes — rather than an event replay.
+
+**Ordering that follows from the above:** port the frequency layer (unblocks 3
+and everything downstream), then decide the ENTSO-E credential question, then
+attempt the mechanism test before any dated replay.
 
 ## Decisions needed now (independent of build order)
 

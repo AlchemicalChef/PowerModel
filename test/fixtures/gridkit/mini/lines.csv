@@ -1,0 +1,6 @@
+line_id,bus0,bus1,voltage,circuits,length,underground,under_construction,tags,geometry
+l1,b1,b2,380,2,60000.0,False,False,,'LINESTRING(9 52,9.5 52)'
+l2,b2,b3,220,1,40000.0,False,False,,'LINESTRING(9.5 52,10 52)'
+l3,b1,b5,380,1,25000.0,False,True,,'LINESTRING(9 52,11 52)'
+l4,b1,b1,380,1,10000.0,False,False,,'LINESTRING(9 52,9 52)'
+l5,b1,bMISSING,380,1,10000.0,False,False,,'LINESTRING(9 52,12 52)'
