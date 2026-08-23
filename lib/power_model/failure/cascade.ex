@@ -386,6 +386,14 @@ defmodule PowerModel.Failure.Cascade do
   is left standing, and its deficit clock starts at zero.
   """
   def init(snapshot, base_mva \\ 100.0, opts \\ []) do
+    # A cascade is a FREQUENCY-domain simulation, and every threshold in it —
+    # UFLS, PRC-024 ride-through, IEEE 1547 inverter trips — is North American
+    # and compiled for 60 Hz. A healthy 50 Hz system sits below all four UFLS
+    # stages, so a European network run through this would shed load before any
+    # contingency. Refuse rather than produce that number. Snapshots with no
+    # stated frequency (every DB-backed one) are unaffected.
+    PowerModel.Grid.SystemStandard.compatible!(snapshot, opts)
+
     # Dispatch is balanced PER ISLAND: snapshots may contain several
     # electrically separate systems (Eastern/Western/ERCOT), and generation
     # in one never serves load in another.

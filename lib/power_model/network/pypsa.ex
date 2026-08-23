@@ -161,6 +161,7 @@ defmodule PowerModel.Network.PyPSA do
       |> split_dropped()
 
     p_set = time_series(Path.join(dir, "loads-p_set.csv"), snapshot_idx)
+    nominal_hz = nominal_frequency(lines, opts)
 
     {loads, dropped_loads} =
       dir
@@ -179,6 +180,14 @@ defmodule PowerModel.Network.PyPSA do
       base_mva: base_mva,
       source: {:pypsa, Path.basename(Path.expand(dir))},
       snapshot_index: snapshot_idx,
+      # Stamped so `Grid.SystemStandard.compatible!/2` can refuse to run a
+      # 50 Hz network through the 60 Hz protection model. Steady-state power
+      # flow is unaffected — frequency enters only through line charging, which
+      # is already handled above — but every UFLS and ride-through threshold in
+      # this repo is North American, and a healthy 50 Hz system sits below all
+      # of them.
+      nominal_hz: nominal_hz,
+      system_standard: PowerModel.Grid.SystemStandard.for_frequency(nominal_hz),
       # Deliberately NOT `load_compensation: 0.0` — see the moduledoc. Load Q
       # here is synthesized at a flat power factor with no compensation netted
       # out, exactly like our own network, so the model default applies.
@@ -225,6 +234,7 @@ defmodule PowerModel.Network.PyPSA do
         rating_a_mva: num(row["s_nom"]),
         length_km: length_km,
         num_parallel: n,
+        frequency_hz: f,
         status: "in_service",
         source: "pypsa"
       }
@@ -387,6 +397,24 @@ defmodule PowerModel.Network.PyPSA do
   defp split_dropped(rows) do
     {dropped, kept} = Enum.split_with(rows, &match?({:dropped, _}, &1))
     {kept, Enum.map(dropped, fn {:dropped, name} -> name end)}
+  end
+
+  # The modal `frequency` across imported lines. PyPSA carries it per branch
+  # rather than per network, and a mixed set would mean two synchronous areas in
+  # one file, so the mode is the honest summary and the caller can override.
+  defp nominal_frequency(lines, opts) do
+    case Keyword.get(opts, :nominal_hz) do
+      hz when is_number(hz) ->
+        hz * 1.0
+
+      _ ->
+        lines
+        |> Enum.map(&Map.get(&1, :frequency_hz))
+        |> Enum.reject(&is_nil/1)
+        |> Enum.frequencies()
+        |> Enum.max_by(&elem(&1, 1), fn -> {@default_frequency, 0} end)
+        |> elem(0)
+    end
   end
 
   defp num(nil), do: nil
