@@ -109,3 +109,36 @@ per-yard evidence; nulling those markers removes every OSM-derived datum while
   2026-06-24T06:53:00Z — the attic pin that reproduces the pull.
 - Feeds the line-inference fallback (`voltage_source='osm_line_inferred'`) and the
   restored-circuit class re-derivation (`voltage_source='osm_rederived'`).
+
+## osm_stranded_yards_2026-08-23.json + osm_stranded_worklist_2026-08-23.csv
+- Source: Overpass API, https://overpass-api.de/api/interpreter (with
+  overpass.kumi.systems as the rotation mirror). Query shape:
+  `way(around:600,<yard lat/lon>)["power"~"^(line|minor_line)$"]["voltage"]`,
+  tags + way geometry, batched 15 yards per request over 39 batches. The
+  queried-yard list (574 entries: substation_id, lat, lon) is embedded in the
+  file metadata, so the pull is reproducible without this repo's database.
+- 3,245 ways, 5,022,442 bytes.
+- sha256: e03be56a499eafd932598c84898125f84164c0aa6f4171defec0fe505f4fdd51
+- Fetched 2026-08-23; oldest per-batch `timestamp_osm_base`:
+  2026-08-23T04:25:10Z — the attic pin that reproduces the pull. Ran LIVE for
+  the same reason as the 2026-08-18 pulls (attic queries time out at this
+  size); 20 retries across the run against 429/500/502/504, recovered by
+  backoff and mirror rotation.
+- WHY A SEPARATE PULL from `osm_line_voltages_2026-08-18.json`: that one
+  queried the 6,066 yards left UNMATCHED by the substation pass, at a 120 m
+  radius, to fill VOLTAGE gaps. It reaches only 10 of these 574 yards (3.0% of
+  their MW). These yards mostly HAVE voltage; what they lack is CIRCUITS, so
+  the target list and the radius are both different.
+- Target list: the 574 buses that `mix grid.census generator_interconnection`
+  flags below the reference point-of-interconnection floor.
+- `osm_stranded_worklist_2026-08-23.csv` (9,316 bytes, sha256
+  f5203a5aa66fce115ceca39802ab0bb785cde352178e3b3589f761e647eea4e1) is the
+  DERIVED result and IS committed, like the corridor corrections file: the 145
+  yards where a voltage-tagged OSM way at or above the yard's floor lies within
+  700 m, one row each with the OSM way id, the distance, and the plant MW. It
+  is the attribution record and the work list; the raw pull beside it is
+  re-fetchable from the pin above and stays unversioned like the other
+  snapshots.
+- ODbL 1.0, (c) OpenStreetMap contributors — see the section header above. The
+  way ids in the CSV are OSM-derived data and carry the same share-alike and
+  attribution obligations as everything else in that section.

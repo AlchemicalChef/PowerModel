@@ -61,6 +61,10 @@ data/vendored/*
 # values. The raw snapshots beside it are re-fetchable from PROVENANCE.md, this
 # is not — losing it loses the ability to reverse the corrections.
 !data/vendored/osm_corridor_corrections_2026-08-18.json
+# Same rule, same reason: the derived work list (which yards have an OSM
+# circuit above their POI floor, with way ids) is the attribution record and
+# is not re-derivable without the raw pull, which is.
+!data/vendored/osm_stranded_worklist_2026-08-23.csv
 
 # Byte-compiled helper scripts (scripts/*.py)
 __pycache__/
