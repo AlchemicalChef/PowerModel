@@ -1432,3 +1432,60 @@ matches the bus's own exactly (69→69, 23→23, 34.5→34.5, 115→115, 230→2
 are CONNECTIVITY defects rather than missing-circuit defects — the circuit exists
 in OSM at the right level and the ingest simply did not attach the bus to it,
 which is a different and cheaper repair than finding an absent circuit.
+
+### The 145 confirmed repairs are worth ZERO on α — and that is the finding (2026-08-23)
+
+All 130 OSM-confirmed repairs that land in a simulated island were applied in
+memory, in two arms, and re-bisected:
+
+| | confirmed in island | MW | control | line-only | full (bus+xfmr+line) |
+|---|---|---|---|---|---|
+| Eastern | 66 | 12,093 | 0.4297 | 0.4297 | 0.4297 |
+| ERCOT | 17 | 5,789 | 0.6406 | 0.6406 | 0.6406 |
+| Western | 47 | 6,224 | 0.2031 | 0.2031 | 0.2031 |
+
+Not one bisection step, anywhere, in either arm.
+
+**Verified against a positive control before being believed.** The same harness,
+same code paths, adding the tie already known to move ERCOT (58121 → 72395,
+345 kV, 29.5 km) reproduces α 0.6406 → 0.7188 — and so does the synthesized
+high-side-bus variant, so BOTH repair paths are detectable. The flat result is a
+property of the network, not of the experiment.
+
+**What it means: α is weakest-link, and only repairs at the BINDING bus move it.**
+This is consistent with everything else measured this week — the peel experiment
+held Eastern at 0.4297 through six rounds; `vm_floor_count` is 1 in Eastern and 3
+in ERCOT. The two repairs that DID move α were both at or beside the binding
+element (Eastern's 73688 reclass +10.9%, ERCOT's 58121 tie +12.2%). The 145
+confirmed missing circuits are somewhere else, so they buy nothing.
+
+**Consequences, and they redirect the work:**
+- The productive loop for α is **find the floor bus → repair it → re-measure →
+  find the next one**, using `Solution.vm_floor_bus_ids`. It is NOT bulk defect
+  repair, and a census — any census — cannot substitute for it. Each round buys
+  ~10% and exposes the next constraint.
+- `mix grid.census generator_interconnection` remains worth having, for MODEL
+  FIDELITY: 145 yards with a named OSM way above their floor are real data
+  defects, and a plant exporting through a circuit that does not exist misplaces
+  flows in every contingency. That is a different and still valuable claim from
+  "this raises the ceiling", and this entry exists so the two are never conflated
+  again.
+- LIN-17 is refined a THIRD time. "Single-element data defects at specific yards"
+  is right; "the flagged yards are those elements" is wrong. The binding elements
+  are wherever the voltage floor bites, which so far has been a 6.5 MW load pocket
+  (Eastern) and a plant switchyard (ERCOT) — one of which the census never flagged
+  because it holds no generation at all.
+
+**And the ERCOT +12.2% tie is NOT evidence-backed.** Yard 70023's OSM evidence is
+a single 69 kV way at 10 m — which AGREES with the model's 69 kV escape and
+CONTRADICTS the model's own 345 kV bus at that yard. So the honest reading of that
+experiment is "if this plant had a 345 kV tie, α would rise 12.2%", not "this
+plant is missing a 345 kV tie". It was framed as a hypothesis test when run and
+that framing holds, but the label matters.
+
+**DAT-34 (MED) [OPEN]** New candidate defect class from the above: yard 70023
+carries a 345 kV bus in the model with ZERO 345 kV branches, while OSM shows only
+69 kV there. A spurious high-side bus is the mirror image of the missing one that
+127 of the 145 confirmed yards have, and both come from voltage inference at
+ingest. Worth a census of its own — buses at a voltage level with no branch at
+that level and no OSM support for it.
