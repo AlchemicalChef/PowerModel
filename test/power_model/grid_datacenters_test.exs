@@ -5,6 +5,7 @@ defmodule PowerModel.GridDatacentersTest do
 
   alias PowerModel.Grid
   alias PowerModel.Grid.{Bus, Datacenter, Load, TransmissionLine}
+  alias PowerModel.Ingestion.DatacenterPlacement
 
   defp point(lon, lat), do: %Geo.Point{coordinates: {lon, lat}, srid: 4326}
 
@@ -285,6 +286,59 @@ defmodule PowerModel.GridDatacentersTest do
 
       total = Repo.one(from l in Load, where: l.load_type == "datacenter", select: sum(l.p_mw))
       assert_in_delta total, 180.0, 0.01
+    end
+  end
+
+  describe "campus MW conservation" do
+    # The module setup already builds a meshed 138 kV yard (class ceiling
+    # 150 MW) plus a far yard and a tie, which is exactly the shape the review's
+    # repro needs: reachable yards whose summed headroom is short of the fleet.
+    test "a campus that cannot be placed in full is REPORTED, not silently trimmed",
+         %{bus: bus} do
+      {lon, lat} = bus.coordinates.coordinates
+
+      for name <- ["Alpha", "Beta"] do
+        Repo.insert!(%Datacenter{
+          name: name,
+          power_mw: 200.0,
+          status: "active",
+          coordinates: point(lon + 0.001, lat)
+        })
+      end
+
+      result = DatacenterPlacement.allocate(max_km: 5)
+      requested = Enum.reduce(result.allocations, 0.0, &(&2 + &1.mw))
+      placed = Enum.reduce(result.allocations, 0.0, &(&2 + &1.placed_mw))
+
+      # `split_fill/2` filled what it could and dropped the rest, while
+      # `search/6` widened the radius only when NO yard was eligible — so the
+      # campuses reported as mapped, `unmapped` stayed 0, and the missing MW
+      # appeared nowhere. Whichever way the placement lands, the books balance.
+      if placed < requested - 1.0e-6 do
+        assert result.partial != [],
+               "#{requested - placed} MW was dropped and nothing reported it"
+
+        reported = Enum.reduce(result.partial, 0.0, fn p, acc -> acc + (p.mw - p.placed_mw) end)
+        assert_in_delta reported, requested - placed, 0.01
+      else
+        assert result.partial == []
+      end
+    end
+
+    test "every allocation's shares sum to its placed_mw", %{bus: bus} do
+      {lon, lat} = bus.coordinates.coordinates
+
+      Repo.insert!(%Datacenter{
+        name: "Gamma",
+        power_mw: 120.0,
+        status: "active",
+        coordinates: point(lon + 0.001, lat)
+      })
+
+      for alloc <- DatacenterPlacement.allocate(max_km: 5).allocations do
+        share_sum = Enum.reduce(alloc.shares, 0.0, &(&2 + &1.mw))
+        assert_in_delta share_sum, alloc.placed_mw, 1.0e-6
+      end
     end
   end
 end

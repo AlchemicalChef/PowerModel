@@ -96,6 +96,9 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
 
   # Interconnection floor, keyed on campus MW. See the moduledoc: each entry is
   # the class above the delivery ceiling of the class below it.
+  # MW below which a remainder is rounding, not load.
+  @mw_epsilon 1.0e-6
+
   @interconnection_floor_kv [
     {250.0, 230.0},
     {50.0, 100.0},
@@ -113,7 +116,7 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
   `Grid.map_datacenters_to_grid/1`'s contract.
   """
   def run(opts \\ []) do
-    %{allocations: allocations, unmapped: unmapped} = allocate(opts)
+    %{allocations: allocations, unmapped: unmapped, partial: partial} = allocate(opts)
 
     {mapped, load_rows} =
       Repo.transaction(fn -> write(allocations) end) |> then(fn {:ok, result} -> result end)
@@ -126,14 +129,35 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
       )
     end
 
+    if partial != [] do
+      lost = Enum.reduce(partial, 0.0, fn p, acc -> acc + (p.mw - p.placed_mw) end)
+
+      Logger.warning(
+        "#{length(partial)} datacenter campus(es) could not be placed in full within " <>
+          "#{@max_search_km} km — #{Float.round(lost, 1)} MW has no yard with headroom and is " <>
+          "NOT in the load table: " <>
+          Enum.map_join(Enum.take(partial, 5), ", ", fn p ->
+            "#{p.name} (#{Float.round(p.placed_mw, 1)} of #{Float.round(p.mw, 1)} MW)"
+          end)
+      )
+    end
+
     {mapped, load_rows, length(unmapped)}
   end
 
   @doc """
   Work out the placement without writing it.
 
-  `%{allocations: [%{datacenter_id, name, mw, shares: [%{bus_id, mw, km}]}],
-  unmapped: [campus]}`.
+  `%{allocations: [%{datacenter_id, name, mw, placed_mw, shares: [%{bus_id, mw,
+  km}]}], unmapped: [campus], partial: [%{name, mw, placed_mw}]}`.
+
+  `partial` is campuses that found SOME yard but not enough headroom for their
+  whole load even at `#{@max_search_km}` km. They are not `unmapped` — rows are
+  written for what fit — and before this list existed the remainder simply
+  vanished: the campus reported as mapped, `unmapped` stayed 0, and
+  `Datacenter.power_mw` no longer equalled the sum of its load rows. Losing
+  load is allowed here only because the alternative is inventing delivery
+  capacity that does not exist; losing it SILENTLY is not.
   """
   def allocate(opts \\ []) do
     max_km = Keyword.get(opts, :max_km, 30) * 1.0
@@ -145,7 +169,7 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
     # The id breaks ties so a re-run places the fleet the same way.
     campuses
     |> Enum.sort_by(&{-&1.mw, &1.id})
-    |> Enum.reduce(%{used: %{}, allocations: [], unmapped: []}, fn campus, acc ->
+    |> Enum.reduce(%{used: %{}, allocations: [], unmapped: [], partial: []}, fn campus, acc ->
       case place(campus, yards, acc.used, max_km) do
         [] ->
           %{acc | unmapped: [campus | acc.unmapped]}
@@ -156,14 +180,31 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
               Map.update(used, s.bus_id, s.mw, &(&1 + s.mw))
             end)
 
-          entry = %{datacenter_id: campus.id, name: campus.name, mw: campus.mw, shares: shares}
-          %{acc | used: used, allocations: [entry | acc.allocations]}
+          placed_mw = placed(shares)
+
+          entry = %{
+            datacenter_id: campus.id,
+            name: campus.name,
+            mw: campus.mw,
+            placed_mw: placed_mw,
+            shares: shares
+          }
+
+          partial =
+            if placed_mw < campus.mw - @mw_epsilon do
+              [%{name: campus.name, mw: campus.mw, placed_mw: placed_mw} | acc.partial]
+            else
+              acc.partial
+            end
+
+          %{acc | used: used, allocations: [entry | acc.allocations], partial: partial}
       end
     end)
     |> then(fn acc ->
       %{
         allocations: Enum.reverse(acc.allocations),
-        unmapped: Enum.reverse(acc.unmapped)
+        unmapped: Enum.reverse(acc.unmapped),
+        partial: Enum.reverse(acc.partial)
       }
     end)
   end
@@ -206,15 +247,27 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
   defp search(campus, yards, used, floor_kv, min_lines, radius_km)
        when radius_km <= @max_search_km do
     open = eligible(campus, yards, used, floor_kv, min_lines, radius_km)
+    shares = fill(open, campus.mw)
 
-    if open == [] do
-      search(campus, yards, used, floor_kv, min_lines, radius_km * 2.0)
+    # Widen while the reachable yards cannot take the WHOLE campus, not merely
+    # while none is reachable. `split_fill/2` fills what it can and returns; if
+    # the caller accepted that as a placement, the remainder vanished — the
+    # campus reported as mapped, `unmapped` stayed 0, and `Datacenter.power_mw`
+    # no longer equalled the sum of its load rows. A farther yard that could
+    # have taken the rest was never searched.
+    if placed(shares) >= campus.mw - @mw_epsilon do
+      shares
     else
-      fill(open, campus.mw)
+      case search(campus, yards, used, floor_kv, min_lines, radius_km * 2.0) do
+        [] -> shares
+        wider -> if placed(wider) > placed(shares), do: wider, else: shares
+      end
     end
   end
 
   defp search(_campus, _yards, _used, _floor_kv, _min_lines, _radius_km), do: []
+
+  defp placed(shares), do: Enum.reduce(shares, 0.0, &(&2 + &1.mw))
 
   # Eligible yards, nearest first: at or above the campus's floor, inside the
   # radius, with headroom left after everything already placed this pass, and
@@ -251,8 +304,10 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
   # substation that could have taken the whole campus is a modelling artifact,
   # not how it gets built. `open` is nearest-first, so this picks the nearest
   # yard that fits. Only when none fits does the campus split.
+  defp fill([], _mw), do: []
+
   defp fill(open, mw) do
-    case Enum.find(open, &(&1.headroom >= mw - 1.0e-6)) do
+    case Enum.find(open, &(&1.headroom >= mw - @mw_epsilon)) do
       nil -> split_fill(open, mw)
       yard -> [%{bus_id: yard.bus_id, mw: mw, km: Float.round(yard.km, 2)}]
     end
@@ -261,7 +316,7 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
   defp split_fill(open, mw) do
     {shares, _left} =
       Enum.reduce_while(open, {[], mw}, fn yard, {shares, left} ->
-        if left <= 1.0e-6 do
+        if left <= @mw_epsilon do
           {:halt, {shares, left}}
         else
           take = min(left, yard.headroom)

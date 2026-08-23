@@ -1542,3 +1542,86 @@ flag, unlike its siblings. That is right for a data-quality census, but its
 totals overstate what any solve sees — of the 145 OSM-confirmed yards, 130 fall
 in a simulated island and 15 do not. The moduledoc now says so, since comparing
 its totals against a solver result without intersecting is an easy mistake.
+
+### Code review of the week's work — 15 findings, triaged (2026-08-23)
+
+Ran `/code-review` over the eight commits after self-reviewing them, and it found
+things the self-review missed. Two of my own findings (the double
+`network_signature/0` call and the `concat_ws` NULL collision) were already fixed
+in the working tree while it read, so it excluded them.
+
+**FIXED — correctness:**
+- **Compensation leaked through island splits.** `Partition.split/1` rebuilt each
+  island from a fixed key list and dropped `:load_compensation` while forwarding
+  `:dc_ties`. A published MATPOWER case stamped 0.0 measured 0.0 solved whole and
+  **0.382 solved through `solve_islands`** — the exact double-count the stamp
+  exists to prevent, 38.2% of published Qd compensated away. This was a hole in
+  the compensation work shipped three days ago, in the one seam built to stop it.
+- **A migration called a deleted function.** `synthesize_line_end_reactors/0` →
+  `synthesize_bus_shunts/1` left migration 20260816120001 raising
+  `UndefinedFunctionError` on every fresh `mix ecto.migrate`. Nine migrations here
+  call into `lib` and a rename cannot break them at compile time, so the fix is a
+  test that extracts fully-qualified calls from every migration and asserts each
+  is still exported — confirmed to FAIL against the old name before being kept.
+- **`nil >= 500.0` is TRUE** (atoms sort above numbers), so
+  `LoadEstimator.class_ceiling(nil)` returned 1000.0, the MOST permissive ceiling,
+  making a voltage-less bus the most attractive load and datacenter target in the
+  network. `cap_class_ceiling/1` already chose conservatively for the identical
+  case — two implementations of one idea disagreeing. Same trap in `candidates/0`
+  and `DatacenterPlacement.eligible/6`. Latent: zero NULL `base_kv` rows today.
+- **`class_ceiling(-5.0)` and `interconnection_floor_kv(0.0)` raised MatchError**
+  from documented public API. Both now answer conservatively.
+- **The reactive study could write a fake measurement.** `ceiling/1` returns the
+  low end of the bisection, so "nothing converged" is 0.0; scaling to 0.0 zeroes
+  every injection, the flat case converges trivially, no bus can be pinned, and
+  the task wrote an empty bank list and exited 0. `solve!/2` cannot catch it
+  because the zero solve DOES converge. Now raises.
+- **Campus MW vanished silently.** `split_fill/2` placed what it could and dropped
+  the remainder, while `search/6` widened the radius only when NO yard was
+  eligible — never when eligible yards existed with too little headroom. A campus
+  reported as mapped, `unmapped` stayed 0, and `Datacenter.power_mw` no longer
+  equalled the sum of its load rows. The search now widens on partial placement,
+  and a campus that still cannot be placed in full is reported in `partial:` and
+  warned about with the MW that has no home. Live fleet re-checked: 19,715.0 MW
+  requested, 19,715.0 placed, 0 partial.
+
+**FIXED — performance, both mine:**
+- `gen_q_by_bus/2` used `Enum.at/2` on a ~90k list per generator bus — about
+  2×10⁸ list cells on Eastern, twice per interconnection. Inverts `bus_index`
+  once now.
+- `warn_stale/2` computed the full five-table md5 signature on every
+  `capacitor_bank_targets/1` call, to emit a warning the pipeline is documented as
+  continuing through. Counts only now; the full digest stays in the hard gate.
+
+**FIXED — process:** `mix format` was failing on `shunt_capacitor_test.exs`, so
+`mix precommit` was red on this branch.
+
+**OPEN, with reasons:**
+- **DAT-35 (MED)** `generator_support_targets/2` subtracts the RAW load-bank
+  requirement rather than the bank actually installed, so a bus whose raw Q was
+  clipped by `bank_target_mvar/2` (below 1.2 MVAr, or over its class ceiling) has
+  more subtracted than exists. Latent while `@load_compensation` ships at 0.0 and
+  `load_banks` is empty — but the coverage figures in that docstring were measured
+  through this path, so they are suspect.
+- **DAT-36 (MED)** Headroom is tracked per BUS but `eligible/6` picks one bus per
+  YARD, and which level it picks depends on the campus's own floor — so a 40 MW
+  hall and a 300 MW campus can each spend a full class ceiling at the same
+  substation, crediting it with 450 MW of delivery. `LoadEstimator.candidates/0`
+  consolidates by `yard_key` for exactly this reason; the placer consolidates for
+  selection but not for accounting.
+- **DAT-37 (LOW)** The stale-shunt cleanup widened from `bs_mvar < 0.0` to
+  `<> 0.0`, so the old guarantee "capacitor banks are never touched" is now scoped
+  to `@reactor_excluded_sources` (`matpower` alone). Intended under the new
+  one-column ownership model and documented there, and checked safe today — all
+  1,288 positive-shunt buses are this pass's own output — but the guarantee that
+  replaced it is much narrower than the one it replaced.
+- **DAT-38 (LOW)** `OSM.run/1` writes `tmp/osm_unmatched_yards.csv` on a DRY run,
+  contradicting its own "nothing is written" contract.
+- **DAT-39 (LOW)** `with_reach/1` fires one PostGIS query per flagged bus, and the
+  `EXISTS` predicate defeats the KNN index the `<->` ordering is written for. A
+  few hundred flagged buses means minutes. One `LATERAL` would do it in a round
+  trip.
+- **DAT-40 (LOW)** Two hand-rolled geodesy helpers where
+  `HIFLD.EndpointMatcher.haversine_km/4` exists, and `format_kv/1` copied verbatim
+  between `BusMapper` and `OSM.Matcher` — the copy feeds `source_id`, so a
+  divergence duplicates every retargeted yard with no compile-time signal.
