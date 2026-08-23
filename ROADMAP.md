@@ -540,7 +540,17 @@ second is where the model is genuinely broken, and it gates the third.
    control.
 
    So the method is a LOOP, not a sweep: solve at the ceiling, read the floor bus,
-   repair it, re-measure, find the next one. Budget it per round, not per defect.
+   repair it, re-measure, find the next one. RUN 2026-08-23, and the round count
+   is 1-2: Eastern 0.4297 -> 0.5156 (+20.0%) on ONE line, ERCOT 0.6406 -> 0.7188
+   (+12.2%) on two, Western zero because it never has a floor bus. The elements
+   are extreme rather than marginal (12.6x, 10.2x, 10.6x their class medians).
+
+   The loop is short because the failure MODE changes, not because the network
+   runs out of bad elements: after one or two repairs `vm_floor_bus_ids` comes
+   back EMPTY while the solve still fails. So the alpha work is NOT a large
+   repair programme — it is a couple of named elements per interconnection, and
+   then a different problem needing a different diagnostic. **The open question
+   is now: what fails when no bus is on the floor?**
    The generator-interconnection census and the conflation wave (LIN-16) keep their
    value for model FIDELITY — a plant exporting through a circuit that does not
    exist misplaces flows in every contingency — but they are NOT the alpha lever,

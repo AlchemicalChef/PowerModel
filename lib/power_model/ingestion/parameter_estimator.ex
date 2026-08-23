@@ -713,9 +713,23 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
         end)
       end
 
+    # What the generator-support study must subtract is the bank that will
+    # actually be INSTALLED at that bus, not the raw requirement. They differ:
+    # `bank_target_mvar/2` zeroes anything below one standard capacitor group
+    # and caps at the class ceiling, so a 69 kV bus wanting 600 MVAr installs
+    # 100 and a bus wanting 0.8 MVAr installs nothing. Passing the raw figure
+    # credited those buses with reactive support that does not exist and left
+    # them with no top-up at all.
+    #
+    # Residual, stated rather than hidden: the class ceiling is applied again
+    # below to the SUM of both components, so a bus near its ceiling can still
+    # have slightly more subtracted than finally installed. That is bounded by
+    # the ceiling; the raw-vs-installed gap was not.
+    installed_load_banks = clip_to_installed(load_q)
+
     support =
       case Keyword.get(opts, :generator_support, :study) do
-        :study -> generator_support_targets(load_q, opts)
+        :study -> generator_support_targets(installed_load_banks, opts)
         false -> %{}
         map when is_map(map) -> map
       end
@@ -745,6 +759,26 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
       end)
 
     {per_bus, map_size(load_q), map_size(support)}
+  end
+
+  # `%{bus_id => installed_mvar}` for a raw load-bank requirement map. Empty in,
+  # empty out — and the shipped default has load banks off, so this costs
+  # nothing on the normal path.
+  defp clip_to_installed(raw) when map_size(raw) == 0, do: %{}
+
+  defp clip_to_installed(raw) do
+    kv =
+      from(b in Bus,
+        where: fragment("? = ANY(?)", b.id, ^Map.keys(raw)),
+        select: {b.id, b.base_kv}
+      )
+      |> Repo.all()
+      |> Map.new()
+
+    raw
+    |> Enum.map(fn {bus_id, mvar} -> {bus_id, bank_target_mvar(mvar, Map.get(kv, bus_id))} end)
+    |> Enum.reject(fn {_id, mvar} -> mvar <= 0.0 end)
+    |> Map.new()
   end
 
   @doc """
@@ -872,7 +906,11 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
 
   MEASURED effect of this component alone (2026-08-18, control = reactors only,
   same snapshot, alpha bisected to 0.01): Western 0.175 -> 0.20 (+14.3%),
-  ERCOT 0.5938 -> 0.6375 (+7.4%). 13.1 GVAr placed across 2,061 buses.
+  ERCOT 0.5938 -> 0.6375 (+7.4%). 13.1 GVAr placed across 2,061 buses. Those
+  numbers were taken with load-bus banks OFF, so they are unaffected by the
+  raw-vs-installed subtraction fixed 2026-08-23 (REVIEW DAT-35) — any figure in
+  this module measured with `@load_compensation` non-zero predates that fix and
+  should be re-taken.
 
   Returns `%{}` when the study file is absent, so a checkout without it still
   ingests.

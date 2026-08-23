@@ -1597,12 +1597,18 @@ in the working tree while it read, so it excluded them.
 `mix precommit` was red on this branch.
 
 **OPEN, with reasons:**
-- **DAT-35 (MED)** `generator_support_targets/2` subtracts the RAW load-bank
-  requirement rather than the bank actually installed, so a bus whose raw Q was
-  clipped by `bank_target_mvar/2` (below 1.2 MVAr, or over its class ceiling) has
-  more subtracted than exists. Latent while `@load_compensation` ships at 0.0 and
-  `load_banks` is empty — but the coverage figures in that docstring were measured
-  through this path, so they are suspect.
+- **DAT-35 (FIXED 2026-08-23)** `generator_support_targets/2` subtracted the RAW
+  load-bank requirement rather than the bank actually installed: a 69 kV bus
+  wanting 600 MVAr installs 100 (its class ceiling) and one wanting 0.8 MVAr
+  installs nothing, yet both had the raw figure deducted from their measured
+  shortfall — crediting them with support that does not exist and leaving them
+  no top-up. Now clipped through `bank_target_mvar/2` first. Residual stated in
+  the code rather than hidden: the class ceiling is applied again to the SUM of
+  both components, so a bus near its ceiling can still have slightly more
+  subtracted than finally installed — bounded by the ceiling, where the
+  raw-vs-installed gap was not. The docstring's Western/ERCOT coverage figures
+  were taken with load banks OFF and are unaffected; any figure measured with
+  `@load_compensation` non-zero predates this and should be re-taken.
 - **DAT-36 (FIXED 2026-08-23)** Headroom was tracked per BUS while `eligible/6`
   picks one bus per YARD, and which level it picks depends on the campus's own
   floor — so a small hall and a large campus kept two independent ledgers at one
@@ -1623,8 +1629,11 @@ in the working tree while it read, so it excluded them.
   one-column ownership model and documented there, and checked safe today — all
   1,288 positive-shunt buses are this pass's own output — but the guarantee that
   replaced it is much narrower than the one it replaced.
-- **DAT-38 (LOW)** `OSM.run/1` writes `tmp/osm_unmatched_yards.csv` on a DRY run,
-  contradicting its own "nothing is written" contract.
+- **DAT-38 (FIXED 2026-08-23)** `OSM.run/1` wrote `tmp/osm_unmatched_yards.csv`
+  on a DRY run, contradicting its own "with `apply: false` nothing is written"
+  contract and mutating a shared checkout for anyone previewing the pass. The
+  write is a fetch input for the next apply run, so it is now gated on `apply?`
+  and the dry run says what it WOULD write instead.
 - **DAT-39 (LOW)** `with_reach/1` fires one PostGIS query per flagged bus, and the
   `EXISTS` predicate defeats the KNN index the `<->` ordering is written for. A
   few hundred flagged buses means minutes. One `LATERAL` would do it in a round
@@ -1633,3 +1642,52 @@ in the working tree while it read, so it excluded them.
   `HIFLD.EndpointMatcher.haversine_km/4` exists, and `format_kv/1` copied verbatim
   between `BusMapper` and `OSM.Matcher` — the copy feeds `source_id`, so a
   divergence duplicates every retargeted yard with no compile-time signal.
+
+### The α loop, run: it is 1-2 elements per interconnection, then the MODE changes (2026-08-23)
+
+The week established that α is weakest-link. The open question was whether that
+means five fixes or five hundred. Running the loop — solve at the ceiling, read
+`vm_floor_bus_ids`, neutralise the worst-parameterised branch on it, re-measure —
+answers it, and the answer is neither.
+
+| | α before | α after | neutralisations | why it stopped |
+|---|---|---|---|---|
+| Eastern | 0.4297 | **0.5156** (+20.0%) | 1 | no floor bus at the new ceiling |
+| ERCOT | 0.6406 | **0.7188** (+12.2%) | 2 | no floor bus at the new ceiling |
+| Western | 0.2031 | 0.2031 | 0 | **no floor bus at its ceiling at all** |
+
+The "repair" is deliberately the weakest defensible one: set the branch's
+impedance to the MEDIAN for its own voltage class, computed from the island's own
+population. It is not a claim about the real circuit — it asks "if this branch
+were merely TYPICAL rather than extreme, where would the ceiling be", which is
+what decides whether chasing the real data is worth it.
+
+**The elements are extreme, not marginal.** Eastern's line 77986 is 69 kV,
+48.8 km, x = 0.4612 pu — **12.6x its class median of 0.0365**. ERCOT's 72922 and
+73149 are 10.2x and 10.6x. These are not close calls.
+
+**ERCOT's round-1 floor bus is 58121** — the 525 MW plant on a 345 kV yard with
+no 345 kV lines. Neutralising one of its 69 kV export paths buys +12.2%, the
+SAME figure a synthetic 345 kV tie bought. Two framings of one constraint: the
+plant's export path is the binding element, and it does not matter whether you
+fix it by giving the plant the circuit it should have or by making the circuit it
+does have plausible.
+
+**The loop is short because the failure MODE changes, not because the network
+runs out of bad elements.** After one or two repairs `vm_floor_bus_ids` comes
+back EMPTY — the solve still fails, but no bus is pinned at the voltage floor.
+So that instrument diagnoses the first one or two constraints per
+interconnection and then goes quiet, and a different one is needed past it.
+
+**Western never had a floor bus.** Its ceiling is not set by a weak bus at all,
+which is consistent with the diagnosis wave's attribution (local generator
+reactive exhaustion, 22% of gen buses pinned at q_max) and with the closing
+cycle's finding that 13.1 GVAr of banks moved Eastern zero steps. Three
+interconnections, three mechanisms — and only two of them are visible to this
+instrument.
+
+**What this means for planning:** the α work is NOT a large repair programme. It
+is one or two named elements per interconnection, worth 12-20% each, followed by
+a different problem that needs a different diagnostic. ROADMAP's "budget it per
+round, not per defect" was right; the round count is 1-2, and the next question
+is what fails when no bus is on the floor.

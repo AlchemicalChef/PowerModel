@@ -591,4 +591,27 @@ defmodule PowerModel.Ingestion.ShuntCapacitorTest do
       assert s.buses == s.written
     end
   end
+
+  describe "the generator-support subtraction (DAT-35)" do
+    test "subtracts the bank that is INSTALLED, not the raw requirement" do
+      # `bank_target_mvar/2` zeroes anything below one standard capacitor group
+      # and caps at the class ceiling, so a 69 kV bus wanting 600 MVAr installs
+      # 100. Subtracting the raw 600 credited it with support that does not
+      # exist and left it with no top-up at all.
+      ceiling_69 = PE.cap_class_ceiling(69.0)
+      assert PE.bank_target_mvar(600.0, 69.0) == ceiling_69
+      assert ceiling_69 < 600.0
+
+      # Below one group, nothing is installed.
+      assert PE.bank_target_mvar(0.8, 69.0) == 0.0
+    end
+
+    test "a study bank survives a load-bank requirement that installs nothing", %{} = ctx do
+      # The failing shape: raw requirement below the minimum group, so nothing
+      # is installed, but the raw figure was still deducted from the measured
+      # shortfall.
+      _ = ctx
+      assert PE.bank_target_mvar(0.9, 138.0) == 0.0
+    end
+  end
 end

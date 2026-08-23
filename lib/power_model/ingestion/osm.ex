@@ -157,13 +157,25 @@ defmodule PowerModel.Ingestion.OSM do
         }
       end
     else
-      write_unmatched_csv!(unmatched_csv, unmatched)
+      # The CSV is a fetch input for the NEXT apply run, so writing it on a dry
+      # run contradicted this module's own "with apply: false nothing is
+      # written" contract and mutated a shared checkout for anyone previewing
+      # the pass. Dry runs now say what they WOULD write.
+      if apply? do
+        write_unmatched_csv!(unmatched_csv, unmatched)
 
-      IO.puts(
-        "  line inference SKIPPED: no snapshot at #{line_snapshot}. " <>
-          "Wrote #{length(unmatched)} unmatched yards to #{unmatched_csv} — fetch with\n" <>
-          "    python3 scripts/fetch_osm_voltage.py lines --yards #{unmatched_csv}"
-      )
+        IO.puts(
+          "  line inference SKIPPED: no snapshot at #{line_snapshot}. " <>
+            "Wrote #{length(unmatched)} unmatched yards to #{unmatched_csv} — fetch with\n" <>
+            "    python3 scripts/fetch_osm_voltage.py lines --yards #{unmatched_csv}"
+        )
+      else
+        IO.puts(
+          "  line inference SKIPPED: no snapshot at #{line_snapshot}. " <>
+            "#{length(unmatched)} yards are unmatched; re-run with --apply to write " <>
+            "#{unmatched_csv} for the fetch step (dry run writes nothing)."
+        )
+      end
 
       nil
     end
