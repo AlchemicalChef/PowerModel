@@ -15,7 +15,7 @@ defmodule PowerModel.GridNetworkSignatureTest do
   @moduletag :db
 
   alias PowerModel.Grid
-  alias PowerModel.Grid.{Bus, Interconnection, TransmissionLine}
+  alias PowerModel.Grid.{Bus, Generator, Interconnection, TransmissionLine}
   alias PowerModel.Repo
 
   defp seed do
@@ -117,6 +117,42 @@ defmodule PowerModel.GridNetworkSignatureTest do
 
     drift = Grid.network_signature_drift(stored(sig))
     assert Enum.any?(drift, &String.starts_with?(&1, "buses: "))
+  end
+
+  test "a NULL moving between adjacent columns changes the digest" do
+    # `concat_ws` OMITS null arguments rather than emitting an empty field, so
+    # a bare `col::text` list hashes ('100', NULL, '-50') and ('100', '-50',
+    # NULL) identically. Verified in psql 2026-08-23, and not hypothetical —
+    # 27 in-service lines carry a null in these columns today. The digest
+    # coalesces for exactly this reason; `q_max_mvar` and `q_min_mvar` are
+    # adjacent in the generator column list and both nullable, which is the
+    # collision in its smallest form.
+    %{a: a} = seed()
+
+    {:ok, gen} =
+      Repo.insert(%Generator{
+        bus_id: a.id,
+        generator_id: "sigtest-1",
+        fuel_type: "natural_gas",
+        p_max_mw: 100.0,
+        q_max_mvar: nil,
+        q_min_mvar: -50.0,
+        status: "in_service"
+      })
+
+    sig = Grid.network_signature()
+
+    # Swap the value and the NULL between the two columns: same multiset of
+    # non-null fields, different row.
+    {:ok, _} =
+      gen
+      |> Ecto.Changeset.change(%{q_max_mvar: -50.0, q_min_mvar: nil})
+      |> Repo.update()
+
+    drift = Grid.network_signature_drift(stored(sig))
+
+    assert "generators: contents changed" in drift,
+           "a value moving between two nullable columns must change the digest"
   end
 
   defp stored(%{counts: counts, digest: digest}) do

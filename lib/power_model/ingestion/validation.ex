@@ -1406,9 +1406,9 @@ defmodule PowerModel.Ingestion.Validation do
   # people learn to route around, which is the exact failure the digest choice
   # was made to avoid.
   defp check_study(study, path) do
-    signature = Grid.network_signature()
-
-    if signature.counts.buses == 0 do
+    # `bus_count/0`, not `network_signature/0`: the full signature hashes five
+    # whole tables, and `evaluate_study/2` computes it again a line later.
+    if Grid.bus_count() == 0 do
       report(
         :reactive_study,
         %{path: path, present: true, measured_on: study["measured_on"], drift: nil, skipped: true},

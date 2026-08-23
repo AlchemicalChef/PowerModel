@@ -35,6 +35,14 @@ defmodule Mix.Tasks.Grid.ReferenceStats do
   network, where generators sit directly on a substation bus: in both
   conventions the question "what does this plant's output have to leave
   through" has the same answer.
+
+  **Plant size is NAMEPLATE (Pmax), not the dispatched Pg the parser puts in
+  `p_max_mw`.** The consumer of this table is a census scoring
+  `generators.p_max_mw` from our own schema, which IS nameplate. Deriving the
+  table from Pg would compare one plant's rating against another's dispatch —
+  a 1.40x error here, since `case_ACTIVSg2000` sums to 96,292 MW of Pmax
+  against 68,725 MW of Pg, and it moves 34 of its 390 plants into a different
+  POI band. Measured and corrected 2026-08-23.
   """
 
   use Mix.Task
@@ -66,6 +74,11 @@ defmodule Mix.Tasks.Grid.ReferenceStats do
     corpus = %{
       "schema_version" => 1,
       "generated_by" => "mix grid.reference_stats",
+      "generation_basis" =>
+        "NAMEPLATE (MATPOWER Pmax), not the dispatched Pg. The consumer scores " <>
+          "generators.p_max_mw from this repo's schema, which is nameplate; deriving " <>
+          "from Pg would compare one plant's rating to another's dispatch (1.40x in " <>
+          "case_ACTIVSg2000).",
       "sources" => Enum.map(per_case, fn {path, c, a} -> source_entry(path, c, a) end),
       "metrics" => metrics(per_case),
       "derived" => %{
@@ -128,7 +141,7 @@ defmodule Mix.Tasks.Grid.ReferenceStats do
 
     plants =
       c.generators
-      |> Enum.group_by(& &1.bus_id, & &1.p_max_mw)
+      |> Enum.group_by(& &1.bus_id, &nameplate/1)
       |> Enum.map(fn {bus, mws} ->
         %{bus: bus, mw: Enum.sum(mws), terminal_kv: Map.get(kv, bus), poi_kv: Map.get(poi, bus)}
       end)
@@ -211,7 +224,7 @@ defmodule Mix.Tasks.Grid.ReferenceStats do
         end),
       "generation_mw_share_by_bus_kv" =>
         by_case(per_case, fn c, a ->
-          share_by(c.generators, & &1.p_max_mw, &Map.get(a.kv, &1.bus_id))
+          share_by(c.generators, &nameplate/1, &Map.get(a.kv, &1.bus_id))
         end),
       "generation_mw_share_by_poi_kv" =>
         by_case(per_case, fn _c, a ->
@@ -288,6 +301,13 @@ defmodule Mix.Tasks.Grid.ReferenceStats do
   end
 
   defp by_case(per_case, fun), do: Map.new(per_case, fn {_p, c, a} -> {c.case_name, fun.(c, a)} end)
+
+  # Every generation figure in this corpus is on the NAMEPLATE basis, because
+  # the consumer scores `generators.p_max_mw` from our schema, which is
+  # nameplate. Mixing bases across metrics is the bug this function exists to
+  # prevent: `generation_mw_share_by_poi_kv` was moved to nameplate first and
+  # left `generation_mw_share_by_bus_kv` on dispatched Pg for one commit.
+  defp nameplate(gen), do: Map.get(gen, :p_nameplate_mw) || gen.p_max_mw
 
   defp share_by(items, mw_fun, key_fun) do
     total = items |> Enum.map(mw_fun) |> Enum.sum()

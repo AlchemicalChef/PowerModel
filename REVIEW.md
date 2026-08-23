@@ -1489,3 +1489,56 @@ carries a 345 kV bus in the model with ZERO 345 kV branches, while OSM shows onl
 127 of the 145 confirmed yards have, and both come from voltage inference at
 ingest. Worth a census of its own — buses at a voltage level with no branch at
 that level and no OSM support for it.
+
+### Self-review of this week's work — three bugs found in it (2026-08-23)
+
+Reviewing the eight commits above rather than trusting them.
+
+**BUG 1 (CORRECTNESS, fixed) — the network digest could not see a NULL move
+between columns.** `Grid.network_signature/0` built its md5 from
+`concat_ws('|', col::text, ...)`, and `concat_ws` OMITS null arguments rather
+than emitting an empty field. So `('100', NULL, '-50')` and `('100', '-50',
+NULL)` render identically as `100|-50` and hash the same. Verified in psql:
+`md5(concat_ws('|','1',NULL,'x')) = md5(concat_ws('|','1','x',NULL))` is TRUE.
+Not hypothetical — 27 in-service `transmission_lines` carry a null in these
+columns today, and `generators.q_max_mvar`/`q_min_mvar` are adjacent and both
+nullable. The comment in the code asserted the opposite ("NULLs are rendered as
+the empty string"), which is how it survived being written. Fixed with
+`coalesce(col::text, '')`; regression test pins it and was confirmed to FAIL
+against the old form before being kept.
+
+**BUG 2 (CORRECTNESS, fixed) — the POI floor was derived on the wrong basis.**
+`Reference.poi_floor_kv/1` maps plant MW to a voltage, and the census scores
+`generators.p_max_mw`, which in this schema is NAMEPLATE. But the table was
+derived from the MATPOWER parser's `p_max_mw`, which the parser explicitly sets
+to the DISPATCHED Pg. `case_ACTIVSg2000` sums to 96,292 MW of Pmax against
+68,725 MW of Pg — a 1.40x basis error — and 34 of its 390 plants sit in a
+different POI band under one basis than the other. So the census was comparing
+one plant's rating against another plant's dispatch.
+
+Fixed by carrying `p_nameplate_mw` alongside in the parser (additive, unread by
+any solver) and deriving the table from it. **The derived bands come out
+IDENTICAL** — `[[25, 115.0], [200, 138.0], [800, 230.0]]` — because the floor is
+a MINIMUM and moving plants between bands rarely moves a minimum. Recorded that
+way rather than as a fix that changed the answer: the bug was real, the reasoning
+was wrong, and the output happened not to move.
+
+**BUG 3 (CONSISTENCY, fixed) — introduced while fixing bug 2.** Moving
+`generation_mw_share_by_poi_kv` to nameplate left
+`generation_mw_share_by_bus_kv` on dispatched Pg, so the corpus briefly carried
+two generation metrics on two different bases. Both now go through one
+`nameplate/1` helper, and the artifact records `generation_basis` explicitly so
+a reader never has to infer it.
+
+**Not fixed, judged not worth it:** `Reference.stats/0` reads and parses the
+artifact on every call, so the census's ~9,600 `poi_floor_kv/1` calls cost about
+0.6 s. Measured at 0.072 ms per call against a multi-minute run whose cost is
+dominated by 574 spatial KNN queries. A cache would need invalidation to stay
+correct across `mix grid.reference_stats`, which is more machinery than 0.6 s
+justifies. Documented in the moduledoc instead.
+
+**Also documented, not changed:** this census is DB-wide and has no `--graph`
+flag, unlike its siblings. That is right for a data-quality census, but its
+totals overstate what any solve sees — of the 145 OSM-confirmed yards, 130 fall
+in a simulated island and 15 do not. The moduledoc now says so, since comparing
+its totals against a solver result without intersecting is an easy mistake.

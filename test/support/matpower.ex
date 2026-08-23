@@ -110,6 +110,7 @@ defmodule PowerModel.Test.MATPOWER do
   @gen_qmin 5
   @gen_vg 6
   @gen_status 8
+  @gen_pmax 9
 
   @br_f_bus 1
   @br_t_bus 2
@@ -250,6 +251,13 @@ defmodule PowerModel.Test.MATPOWER do
   # inject `p_max_mw * capacity_factor`, so the scheduled operating point has to
   # arrive as p_max_mw with capacity_factor pinned to 1.0. Pmax/Pmin are OPF
   # limits and would be the wrong injection.
+  #
+  # `p_nameplate_mw` carries the Pmax column ALONGSIDE it, unread by any solver,
+  # because a consumer comparing this case to our own database needs the same
+  # BASIS on both sides. `generators.p_max_mw` in our schema is nameplate, so
+  # scoring it against a table derived from Pg compares a plant's rating to
+  # another plant's dispatch — in this case a 1.40x error, since ACTIVSg2000
+  # sums to 96,292 MW of Pmax against 68,725 MW of Pg.
   defp build_generators(gen_rows) do
     gen_rows
     |> Enum.with_index(1)
@@ -258,6 +266,7 @@ defmodule PowerModel.Test.MATPOWER do
         id: idx,
         bus_id: bus_id(row, @gen_bus),
         p_max_mw: col(row, @gen_pg),
+        p_nameplate_mw: col(row, @gen_pmax),
         capacity_factor: 1.0,
         q_max_mvar: col(row, @gen_qmax),
         q_min_mvar: col(row, @gen_qmin)

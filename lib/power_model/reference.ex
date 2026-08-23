@@ -62,6 +62,11 @@ defmodule PowerModel.Reference do
 
   Absent is a supported state: a checkout without the file still runs every
   census, just without the reference column.
+
+  Reads and parses the file on EVERY call — measured 0.072 ms, so the census's
+  ~9,600 `poi_floor_kv/1` calls cost about 0.6 s of a multi-minute run, which
+  is not worth a cache with invalidation to match. A genuinely hot loop should
+  hoist the call rather than expect memoisation here.
   """
   @spec stats() :: map() | nil
   def stats do

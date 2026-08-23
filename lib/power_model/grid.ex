@@ -762,6 +762,12 @@ defmodule PowerModel.Grid do
   ]
 
   @doc """
+  Row count of `buses`, for callers that only need to know whether a network
+  exists. Cheaper than `network_signature/0`, which hashes five whole tables.
+  """
+  def bus_count, do: Repo.aggregate(Bus, :count)
+
+  @doc """
   A content digest of the ELECTRICAL network, for artifacts measured against a
   solved power flow that go stale when their inputs move.
 
@@ -790,12 +796,16 @@ defmodule PowerModel.Grid do
   end
 
   # md5 over every row's relevant columns, ordered by id so the value is
-  # independent of physical row order. NULLs are rendered as the empty string
-  # by concat_ws, which is fine: the column list is fixed, so a NULL and an
-  # empty string in the same position are not distinguishable but also not a
-  # state either can reach here.
+  # independent of physical row order.
+  #
+  # `coalesce(col::text, '')` and NOT a bare `col::text`: `concat_ws` OMITS
+  # null arguments rather than emitting an empty field, so `('1', NULL, 'x')`
+  # and `('1', 'x', NULL)` both render as "1|x" and hash identically. Verified
+  # 2026-08-23 in psql, and not hypothetical — 27 in-service transmission_lines
+  # carry a null in these columns today. Coalescing keeps every field in its
+  # position, so a value moving between columns changes the digest.
   defp digest({table, columns}) do
-    cols = Enum.map_join(columns, ", ", &"#{&1}::text")
+    cols = Enum.map_join(columns, ", ", &"coalesce(#{&1}::text, '')")
 
     %{rows: [[d]]} =
       Repo.query!(

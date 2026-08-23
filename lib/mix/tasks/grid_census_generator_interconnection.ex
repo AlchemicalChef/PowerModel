@@ -72,6 +72,17 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
   Neither subsumes the other, and the cross-check above is what separated the
   two failure modes.
 
+  ## Which graph — this census is DB-wide, unlike its siblings
+
+  `load_placement` defaults to `--graph main-island` and `stranding` offers the
+  choice. This one has no `--graph` flag and always measures every bus in the
+  database, including components that never reach a simulation. That is the
+  right default for a DATA-QUALITY census — a stranded plant in a fragment is
+  still a stranded plant — but it means the totals here OVERSTATE what any
+  solve sees. Measured 2026-08-23: of the 145 OSM-confirmed yards, 130 fall in
+  a simulated island and 15 do not. Compare against a solver result only after
+  intersecting with `Grid.get_grid_snapshot/2`.
+
   ## Sections
 
     * **below the reference POI floor** — the screen (see the precision note
