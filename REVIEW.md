@@ -1415,3 +1415,20 @@ the single highest escape voltage.
   class. Running the two together is what separated the failure modes above, and
   is how the "multi-circuit plants are fine" hypothesis got killed in ten minutes
   instead of surviving into the roadmap.
+
+**No-branch population, from the EXISTING snapshot (2026-08-23, inconclusive by
+construction — recorded so it is not re-run as if it were).** 346 of the 804
+generation-with-no-branch yards (8,046 MW) were covered by the 2026-08-18 line
+pull. A tagged OSM circuit lies within 1 km of 67 of them (1,841 MW, 22.9%).
+
+That 22.9% is NOT a statement about OSM's coverage of these yards: the snapshot
+was pulled at a **120 m radius**, so a circuit 500 m from a yard is absent from
+the file unless it happened to sit near some other queried yard. The number is
+bounded by the old pull geometry. Answering the question properly needs these
+yards re-pulled at the wider radius the flagged-yard pull uses.
+
+What IS informative is the shape of the hits: where a circuit is found its voltage
+matches the bus's own exactly (69→69, 23→23, 34.5→34.5, 115→115, 230→230). Those
+are CONNECTIVITY defects rather than missing-circuit defects — the circuit exists
+in OSM at the right level and the ingest simply did not attach the bus to it,
+which is a different and cheaper repair than finding an absent circuit.
