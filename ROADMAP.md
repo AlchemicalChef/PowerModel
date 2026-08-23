@@ -528,14 +528,23 @@ second is where the model is genuinely broken, and it gates the third.
    entirely inside Western, and a near-binary outcome (does San Diego island and
    collapse?). Item 27's CCDF-vs-OE-417 check (published alpha ~= 1.31 +/- 0.08) is the
    cheap companion and is diagnostic even when it fails.
-2. **The alpha ceiling is generator-interconnection completeness** (REVIEW LIN-17,
-   measured 2026-08-22 — this REPLACES the "Eastern sub-transmission impedance"
-   framing that stood here for a day). `vm_floor_bus_ids` names ONE bus in Eastern
-   and three in ERCOT; peeling their load leaves alpha unmoved for six rounds, so it
-   is structural. ERCOT's is a 525 MW plant on a 345 kV yard with no 345 kV lines,
-   exporting through 69 kV branches that sit at 69.0 and 64.9 degrees. The census
-   generalises it to 87.3 GW. This MERGES with the conflation wave (LIN-16): they are
-   the same work, and the OSM line pull around stranded yards is the tool.
+2. **The alpha ceiling is weakest-link: only the BINDING bus moves it** (REVIEW
+   LIN-17, measured 2026-08-22/23; this entry has now been rewritten twice as the
+   measurements came in, and the current form is the one that survived a negative
+   result). `vm_floor_bus_ids` names ONE bus in Eastern and three in ERCOT; peeling
+   their load leaves alpha unmoved for six rounds, so it is structural. Repairs AT
+   the binding element buy ~10-12% each (Eastern's 73688 reclassed 33 -> 69 kV,
+   +10.9%; a 345 kV tie at ERCOT's 58121, +12.2%). Repairs anywhere else buy
+   NOTHING: 130 OSM-confirmed missing circuits applied at once moved alpha zero
+   bisection steps on all three interconnections, verified against a positive
+   control.
+
+   So the method is a LOOP, not a sweep: solve at the ceiling, read the floor bus,
+   repair it, re-measure, find the next one. Budget it per round, not per defect.
+   The generator-interconnection census and the conflation wave (LIN-16) keep their
+   value for model FIDELITY — a plant exporting through a circuit that does not
+   exist misplaces flows in every contingency — but they are NOT the alpha lever,
+   and this document said they were for a day.
 3. **Base-case overloads make contingencies binary** (REVIEW CAS-26). Lines at 124-250%
    at rest mean a contingency either settles at zero or runs away past the step budget;
    no settled non-trivial cascade regime exists. This is a PRECONDITION for item 26 —
