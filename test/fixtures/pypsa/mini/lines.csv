@@ -1,0 +1,4 @@
+name,bus0,bus1,type,s_nom,length,num_parallel,r_ohmkm,x_ohmkm,c_nfkm,voltage,frequency
+L_explicit,A,B,Al/St 240/40 4-bundle 380.0,1700.0,100.0,2.0,0.03,0.25,14.0,380000.0,50.0
+L_typed,C,D,Al/St 240/40 2-bundle 220.0,495.0,50.0,1.0,,,,220000.0,50.0
+L_orphan,A,NOSUCHBUS,Al/St 240/40 4-bundle 380.0,1700.0,10.0,1.0,0.03,0.25,14.0,380000.0,50.0

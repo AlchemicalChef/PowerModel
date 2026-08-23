@@ -1,0 +1,3 @@
+name,bus,control,type,p_nom,carrier,marginal_cost
+G1,A,PQ,,800.0,Gas,50.0
+G2,D,PQ,,400.0,Wind Onshore,0.0

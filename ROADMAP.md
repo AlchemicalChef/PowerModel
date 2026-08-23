@@ -585,6 +585,64 @@ Uses landed:
 Worth adding next: RTS-GMLC or a published planning case (REVIEW DAT-33) — both
 current sources are small and neither covers every voltage level.
 
+## Europe (added 2026-08-23) — a reader, not a second pipeline
+
+`PowerModel.Network.PyPSA` reads a PyPSA CSV export into the snapshot map the
+solvers already consume, so `Partition`/`FDPF`/`Cascade` and the whole
+protection stack run on a European network with no further plumbing. Same shape
+as `Test.MATPOWER`, but in `lib` because this is a simulation substrate.
+
+**Why a reader.** The EU publishes more than the US does — ENTSO-E Transparency
+gives per-bidding-zone load and generation at 15-minute resolution, cross-border
+flows, and per-unit generation and transmission OUTAGE data that has no US
+equivalent — and the open modelling ecosystem has already spent years turning it
+into networks. PyPSA-Eur builds a continental model from OSM and ENTSO-E and
+ships it in this format. Rebuilding that as a second HIFLD-style ingest would
+duplicate a mature effort and inherit none of it. What is missing THERE is what
+this repo has: PyPSA is a capacity-expansion and dispatch optimiser and does no
+AC contingency cascades, protection, UFLS/UVLS or voltage collapse.
+
+**Measured on scigrid-de** (585 buses, 852 lines, 1,423 generators, 51.8 GW):
+
+- **It converges at alpha = 1.0.** Full hour-load, 10 FDPF iterations, Vm
+  0.9973-1.0039, losses 884.9 MW (1.7%). Against our own 0.2062/0.6375/0.4313.
+  The alpha ceiling is substantially an artifact of ingesting raw HIFLD, and a
+  curated 220/380 kV backbone does not have it.
+- **Real per-circuit impedance** (`r_ohmkm`/`x_ohmkm`/`c_nfkm`, `length`,
+  `num_parallel`), so no estimation from a voltage class — the root of LIN-13.
+  Median `x_ohmkm` 0.32 against the 0.335-0.50 our estimator produces: an
+  independent corroboration of that recipe.
+- **`num_parallel` is present**, which is the missing-parallel-circuits half of
+  the POI census findings.
+- **Per-bus hourly load.** The whole load-ALLOCATION problem — population
+  weights, delivery ceilings, capability caps — does not arise.
+- **The Western reactive finding reproduces.** With naive uniform generator q
+  limits at 0.95 pf the network FAILS (Vm -> 0.5) despite 56.7 GVAr of total
+  absorption against 13.3 GVAr of charging. Local exhaustion, global surplus —
+  the same mechanism, on a different continent's data, from a different source.
+
+**What it costs.** The curated backbone has no sub-transmission, so the failure
+modes that live there are absent too. And PyPSA carries no reactive limits and
+no load Q; both are synthesized and declared in the returned `:synthesized` map
+rather than assumed.
+
+**Why this is the validation path.** REVIEW's standing top item is that nothing
+external has ever scored this model. Europe has better-documented cascades than
+the US record: the 2006 UCTE disturbance (the system split into three islands,
+with a full UCTE final report), the 2021 Continental Europe separation, and the
+April 2025 Iberian blackout with an ENTSO-E expert-panel investigation. Combined
+with ENTSO-E's per-unit outage data, that is the first realistic route to
+scoring this model against something it did not generate itself.
+
+**Next, in order:** (1) pull a PyPSA-Eur continental network rather than the
+German example; (2) wire ENTSO-E Transparency load/generation as the demand
+substrate, replacing the uniform dispatch balance used in the smoke test with
+`Cascade.init`'s per-island balance; (3) attempt the 2006 UCTE split. Verify
+before committing: ENTSO-E redistribution terms (they matter here as much as
+ODbL and CEII have), whether the outage feed is complete enough per-unit to
+drive an initiating-event distribution, and how much of PyPSA-Eur is directly
+consumable versus needing a translation layer.
+
 ## Decisions needed now (independent of build order)
 
 - **Vendor a pinned HIFLD snapshot — concrete targets verified live (2026-08):**

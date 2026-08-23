@@ -1,0 +1,5 @@
+name,v_nom,type,x,y,carrier,control
+A,380.0,,9.0,52.0,AC,PQ
+B,380.0,,9.5,52.0,AC,PQ
+C,220.0,,9.5,52.0,AC,PQ
+D,220.0,,10.0,52.0,AC,Slack
