@@ -1603,12 +1603,20 @@ in the working tree while it read, so it excluded them.
   more subtracted than exists. Latent while `@load_compensation` ships at 0.0 and
   `load_banks` is empty — but the coverage figures in that docstring were measured
   through this path, so they are suspect.
-- **DAT-36 (MED)** Headroom is tracked per BUS but `eligible/6` picks one bus per
-  YARD, and which level it picks depends on the campus's own floor — so a 40 MW
-  hall and a 300 MW campus can each spend a full class ceiling at the same
-  substation, crediting it with 450 MW of delivery. `LoadEstimator.candidates/0`
-  consolidates by `yard_key` for exactly this reason; the placer consolidates for
-  selection but not for accounting.
+- **DAT-36 (FIXED 2026-08-23)** Headroom was tracked per BUS while `eligible/6`
+  picks one bus per YARD, and which level it picks depends on the campus's own
+  floor — so a small hall and a large campus kept two independent ledgers at one
+  station. NOT latent, contrary to the first triage: measured on the live fleet,
+  yard 77032 carried 100 MW at 120 kV and 350 MW at 360 kV, 450 MW of delivery
+  from one substation. Now keyed by `yard_key`, the way
+  `LoadEstimator.candidates/0` has always done it. After: 0 yards receive load
+  at more than one bus, 19,715.0 MW requested and 19,715.0 placed.
+
+  The regression test needed a genuine TWO-LEVEL substation to reproduce — the
+  first version passed against the buggy code because the fixture had one level,
+  where `bus_id` and `yard_key` are 1:1 and the two ledgers cannot diverge. With
+  a 69/230 kV yard it fails at 440 MW against the old ledger and passes at 400
+  with the fix.
 - **DAT-37 (LOW)** The stale-shunt cleanup widened from `bs_mvar < 0.0` to
   `<> 0.0`, so the old guarantee "capacitor banks are never touched" is now scoped
   to `@reactor_excluded_sources` (`matpower` alone). Intended under the new

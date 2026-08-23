@@ -325,6 +325,53 @@ defmodule PowerModel.GridDatacentersTest do
       end
     end
 
+    test "two campuses cannot each spend a full ceiling at the SAME substation" do
+      # DAT-36, live on the fleet: yard 77032 carried 100 MW at 120 kV and
+      # 350 MW at 360 kV. Headroom was tracked per BUS while `eligible/6` picks
+      # one bus per YARD, and WHICH level it picks depends on the campus's own
+      # floor — so a small hall and a large campus kept two independent ledgers
+      # at one station. This needs a genuine two-level substation to reproduce:
+      # with one level, bus_id and yard_key are 1:1 and the bug is invisible.
+      here = {-77.0, 39.0}
+      low = bus(69.0, here, yard: 999)
+      high = bus(230.0, here, yard: 999)
+
+      low_far = bus(69.0, {-77.2, 39.0}, yard: 1001)
+      low_tie = bus(69.0, {-77.1, 39.0}, yard: 1002)
+      high_far = bus(230.0, {-77.2, 39.05}, yard: 1003)
+      high_tie = bus(230.0, {-77.1, 39.05}, yard: 1004)
+
+      line(low, low_far, 200.0)
+      line(low, low_tie, 200.0)
+      line(low_far, low_tie, 200.0)
+      line(high, high_far, 900.0)
+      line(high, high_tie, 900.0)
+      line(high_far, high_tie, 900.0)
+
+      # 400 MW fills the 230 kV class ceiling exactly; 40 MW then fits only if
+      # the 69 kV level keeps its own ledger.
+      for {name, mw} <- [{"Campus", 400.0}, {"Hall", 40.0}] do
+        Repo.insert!(%Datacenter{
+          name: name,
+          power_mw: mw,
+          status: "active",
+          coordinates: point(-77.0, 39.0)
+        })
+      end
+
+      result = DatacenterPlacement.allocate(max_km: 5)
+
+      at_999 =
+        result.allocations
+        |> Enum.flat_map(& &1.shares)
+        |> Enum.filter(&(&1.yard_key == PowerModel.Ingestion.LoadEstimator.yard_key(low)))
+        |> Enum.reduce(0.0, &(&2 + &1.mw))
+
+      assert at_999 <= 400.0 + 1.0e-6,
+             "one substation credited with #{at_999} MW across its levels, above the " <>
+               "largest ceiling any single level delivers"
+    end
+
     test "every allocation's shares sum to its placed_mw", %{bus: bus} do
       {lon, lat} = bus.coordinates.coordinates
 

@@ -175,9 +175,19 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
           %{acc | unmapped: [campus | acc.unmapped]}
 
         shares ->
+          # Keyed by YARD, not by bus. `eligible/6` picks ONE bus per substation
+          # and WHICH level it picks depends on the campus's own floor, so a
+          # 40 MW hall taking a 69 kV level and a 300 MW campus later taking the
+          # 230 kV level of the SAME station were two independent ledgers — the
+          # station got credited with both class ceilings at once. Measured on
+          # the live fleet 2026-08-23: yard 77032 carrying 100 MW at 120 kV and
+          # 350 MW at 360 kV, 450 MW of delivery from one substation.
+          # `LoadEstimator.candidates/0` consolidates by `yard_key` for exactly
+          # this reason; the placer consolidated for selection and not for
+          # accounting.
           used =
             Enum.reduce(shares, acc.used, fn s, used ->
-              Map.update(used, s.bus_id, s.mw, &(&1 + s.mw))
+              Map.update(used, s.yard_key, s.mw, &(&1 + s.mw))
             end)
 
           placed_mw = placed(shares)
@@ -291,8 +301,9 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
     |> Enum.map(fn {yard, d} ->
       %{
         bus_id: yard.id,
+        yard_key: yard.yard_key,
         km: d / 1000.0,
-        headroom: max(yard.delivery_cap_mw - Map.get(used, yard.id, 0.0), 0.0)
+        headroom: max(yard.delivery_cap_mw - Map.get(used, yard.yard_key, 0.0), 0.0)
       }
     end)
     |> Enum.filter(&(&1.headroom > 1.0e-6))
@@ -308,8 +319,11 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
 
   defp fill(open, mw) do
     case Enum.find(open, &(&1.headroom >= mw - @mw_epsilon)) do
-      nil -> split_fill(open, mw)
-      yard -> [%{bus_id: yard.bus_id, mw: mw, km: Float.round(yard.km, 2)}]
+      nil ->
+        split_fill(open, mw)
+
+      yard ->
+        [%{bus_id: yard.bus_id, yard_key: yard.yard_key, mw: mw, km: Float.round(yard.km, 2)}]
     end
   end
 
@@ -322,7 +336,15 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
           take = min(left, yard.headroom)
 
           {:cont,
-           {[%{bus_id: yard.bus_id, mw: take, km: Float.round(yard.km, 2)} | shares], left - take}}
+           {[
+              %{
+                bus_id: yard.bus_id,
+                yard_key: yard.yard_key,
+                mw: take,
+                km: Float.round(yard.km, 2)
+              }
+              | shares
+            ], left - take}}
         end
       end)
 
