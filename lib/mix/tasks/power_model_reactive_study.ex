@@ -136,6 +136,21 @@ defmodule Mix.Tasks.PowerModel.ReactiveStudy do
     alpha = ceiling(control)
     Mix.shell().info("  alpha ceiling (reactors only): #{alpha}")
 
+    # `ceiling/1` returns the low end of the bisection, so "nothing converged"
+    # comes back as 0.0 — and 0.0 is not a de-energised network's ceiling, it is
+    # the absence of a measurement. Scaling to it zeroes every injection, the
+    # flat case converges trivially, no bus can be pinned, and the task would
+    # write an empty `banks` list that looks exactly like a real result. The
+    # convergence guard in `solve!/2` cannot catch this because the zero solve
+    # DOES converge.
+    if alpha <= 0.0 do
+      Mix.raise(
+        "#{ic.name}: no AC solution at any load scaling down to the bisection floor, so " <>
+          "there is no operating point to measure shortfalls at. Refusing to write an " <>
+          "empty bank list that would look like a measurement."
+      )
+    end
+
     scaled = scale(control, alpha)
     base_sol = solve!(scaled, "base solve at the ceiling")
     lifted = qmax_lever(scaled, @qmax_lever)
@@ -217,7 +232,10 @@ defmodule Mix.Tasks.PowerModel.ReactiveStudy do
     %{
       island
       | loads:
-          Enum.map(island.loads, &%{&1 | p_mw: (&1.p_mw || 0.0) * a, q_mvar: (&1.q_mvar || 0.0) * a}),
+          Enum.map(
+            island.loads,
+            &%{&1 | p_mw: (&1.p_mw || 0.0) * a, q_mvar: (&1.q_mvar || 0.0) * a}
+          ),
         generators: Enum.map(island.generators, &%{&1 | p_max_mw: &1.p_max_mw * a})
     }
   end
@@ -291,11 +309,17 @@ defmodule Mix.Tasks.PowerModel.ReactiveStudy do
          end)}
       end)
 
+    # `prep.bus_ids` is a LIST, so `Enum.at/2` here is an O(n) walk per generator
+    # bus — about 2e8 list cells on Eastern (5k generator buses x 90k buses),
+    # twice per interconnection. `prep.bus_index` is already `%{bus_id => idx}`;
+    # inverting it once is one pass.
+    id_by_idx = Map.new(prep.bus_index, fn {bus_id, idx} -> {idx, bus_id} end)
+
     prep.generators
     |> Enum.map(&Map.fetch!(prep.bus_index, &1.bus_id))
     |> Enum.uniq()
     |> Map.new(fn idx ->
-      {Enum.at(prep.bus_ids, idx),
+      {Map.fetch!(id_by_idx, idx),
        @base_mva * :array.get(idx, q_calc) + Map.get(q_load, idx, 0.0)}
     end)
   end

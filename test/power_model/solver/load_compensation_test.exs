@@ -14,7 +14,8 @@ defmodule PowerModel.Solver.LoadCompensationTest do
 
   alias PowerModel.Solver.{LoadModel, NewtonRaphson, DCPowerFlow, Solution}
 
-  @q_over_p 0.3287  # tan(acos(0.95)), the ratio the load estimator synthesizes
+  # tan(acos(0.95)), the ratio the load estimator synthesizes
+  @q_over_p 0.3287
 
   defp load(p, q, type \\ "constant_power"), do: %{p_mw: p, q_mvar: q, load_type: type}
 
@@ -29,7 +30,12 @@ defmodule PowerModel.Solver.LoadCompensationTest do
       implied_pf = :math.cos(:math.atan(q_net / p))
 
       assert_in_delta implied_pf, LoadModel.interface_pf(), 1.0e-4
-      assert_in_delta k, 1.0 - :math.tan(:math.acos(LoadModel.interface_pf())) / :math.tan(:math.acos(0.95)), 1.0e-9
+
+      assert_in_delta k,
+                      1.0 -
+                        :math.tan(:math.acos(LoadModel.interface_pf())) /
+                          :math.tan(:math.acos(0.95)),
+                      1.0e-9
     end
 
     test "the shipped target sits inside the 0.95-to-unity band" do
@@ -279,7 +285,9 @@ defmodule PowerModel.Solver.LoadCompensationTest do
       raw_q = 150.0 * @q_over_p
 
       heavier =
-        put_in(uncompensated.loads, [%{uncompensated |> Map.get(:loads) |> hd() | q_mvar: raw_q / (1.0 - k)}])
+        put_in(uncompensated.loads, [
+          %{(uncompensated |> Map.get(:loads) |> hd()) | q_mvar: raw_q / (1.0 - k)}
+        ])
 
       {:ok, sol2} = NewtonRaphson.solve(heavier, base_mva: 100.0, tolerance: 1.0e-10)
       assert sol2.converged
@@ -298,6 +306,57 @@ defmodule PowerModel.Solver.LoadCompensationTest do
 
       assert Solution.line_flow(a, :line, 1).p_flow_mw ==
                Solution.line_flow(b, :line, 1).p_flow_mw
+    end
+  end
+
+  describe "island partitioning" do
+    test "a case's load_compensation stamp survives Partition.split/1" do
+      # `Test.MATPOWER` stamps 0.0 on every published case because its Qd is
+      # already NET of distribution capacitors. `Partition.split/1` rebuilt each
+      # island from a fixed key list and dropped the stamp, so solving the same
+      # case through `solve_islands` compensated 38.2% of published Qd away —
+      # the exact double-count the stamp exists to prevent.
+      snapshot = %{
+        buses: [
+          %{id: 1, base_kv: 138.0, bus_type: 3, vm_pu: 1.0},
+          %{id: 2, base_kv: 138.0, bus_type: 1, vm_pu: 1.0}
+        ],
+        lines: [
+          %{
+            id: 1,
+            from_bus_id: 1,
+            to_bus_id: 2,
+            r_pu: 0.01,
+            x_pu: 0.05,
+            b_pu: 0.0,
+            rating_a_mva: 100.0
+          }
+        ],
+        transformers: [],
+        generators: [%{id: 1, bus_id: 1, p_max_mw: 50.0, capacity_factor: 1.0}],
+        loads: [%{id: 1, bus_id: 2, p_mw: 30.0, q_mvar: 10.0, load_type: "constant_power"}],
+        load_compensation: 0.0
+      }
+
+      {[island], _dead} = PowerModel.Solver.Partition.split(snapshot)
+
+      assert PowerModel.Solver.NewtonRaphson.load_compensation(island, []) == 0.0,
+             "a published case must not gain synthesized compensation by being partitioned"
+    end
+
+    test "a snapshot without the key still gets the model default" do
+      snapshot = %{
+        buses: [%{id: 1, base_kv: 138.0, bus_type: 3, vm_pu: 1.0}],
+        lines: [],
+        transformers: [],
+        generators: [%{id: 1, bus_id: 1, p_max_mw: 10.0, capacity_factor: 1.0}],
+        loads: []
+      }
+
+      {[island], _dead} = PowerModel.Solver.Partition.split(snapshot)
+
+      assert PowerModel.Solver.NewtonRaphson.load_compensation(island, []) ==
+               PowerModel.Solver.LoadModel.compensation_fraction()
     end
   end
 end

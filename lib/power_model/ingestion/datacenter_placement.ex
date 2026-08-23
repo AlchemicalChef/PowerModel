@@ -171,10 +171,16 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
   @doc """
   The lowest transmission class a campus of `mw` is interconnected at.
   """
-  def interconnection_floor_kv(mw) do
+  def interconnection_floor_kv(mw) when is_number(mw) and mw > 0.0 do
     {_mw, kv} = Enum.find(@interconnection_floor_kv, fn {over, _kv} -> mw > over end)
     kv
   end
+
+  # A non-positive or non-numeric MW has no band, and `Enum.find/2` returning
+  # nil made this documented public function raise an opaque MatchError. The
+  # lowest floor is the answer that cannot over-constrain a placement.
+  def interconnection_floor_kv(_),
+    do: @interconnection_floor_kv |> Enum.map(&elem(&1, 1)) |> Enum.min()
 
   # ---------------------------------------------------------------------------
   # Placement
@@ -218,7 +224,11 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
     radius_m = radius_km * 1000.0
 
     yards
-    |> Enum.filter(&(&1.base_kv >= floor_kv and &1.line_degree >= min_lines))
+    # `is_number/1` first: `nil >= floor_kv` is TRUE under Elixir term ordering
+    # (atoms sort above numbers), so a voltage-less bus would clear every floor.
+    |> Enum.filter(
+      &(is_number(&1.base_kv) and &1.base_kv >= floor_kv and &1.line_degree >= min_lines)
+    )
     |> Enum.map(&{&1, distance_m(campus.lon, campus.lat, &1.lon, &1.lat)})
     |> Enum.filter(fn {_yard, d} -> d <= radius_m end)
     |> Enum.group_by(fn {yard, _d} -> yard.yard_key end)
@@ -257,8 +267,7 @@ defmodule PowerModel.Ingestion.DatacenterPlacement do
           take = min(left, yard.headroom)
 
           {:cont,
-           {[%{bus_id: yard.bus_id, mw: take, km: Float.round(yard.km, 2)} | shares],
-            left - take}}
+           {[%{bus_id: yard.bus_id, mw: take, km: Float.round(yard.km, 2)} | shares], left - take}}
         end
       end)
 

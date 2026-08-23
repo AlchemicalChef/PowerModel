@@ -193,8 +193,10 @@ defmodule PowerModel.GeneratorInterconnectionCensusTest do
     gen(yard, 400.0)
 
     s = section(ic)
+
     assert s.below_floor_count + s.unconnected_count == 1,
            "a bus whose only branch is a self-loop must still be reported"
+
     assert s.below_floor_mw + s.unconnected_mw == 400.0
   end
 

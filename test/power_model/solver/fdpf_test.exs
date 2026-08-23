@@ -239,9 +239,15 @@ defmodule PowerModel.Solver.FDPFTest do
         lines:
           Enum.map(
             snapshot.lines,
-            &%{&1 | id: &1.id + off, from_bus_id: &1.from_bus_id + off, to_bus_id: &1.to_bus_id + off}
+            &%{
+              &1
+              | id: &1.id + off,
+                from_bus_id: &1.from_bus_id + off,
+                to_bus_id: &1.to_bus_id + off
+            }
           ),
-        generators: Enum.map(snapshot.generators, &%{&1 | id: &1.id + off, bus_id: &1.bus_id + off}),
+        generators:
+          Enum.map(snapshot.generators, &%{&1 | id: &1.id + off, bus_id: &1.bus_id + off}),
         loads: Enum.map(snapshot.loads, &%{&1 | id: &1.id + off, bus_id: &1.bus_id + off})
     }
   end

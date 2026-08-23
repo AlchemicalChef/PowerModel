@@ -330,7 +330,8 @@ defmodule PowerModel.Ingestion.LoadEstimator do
 
     network.buses
     |> Enum.filter(fn bus ->
-      bus.bus_type == 1 and bus.base_kv >= @min_load_kv and not is_nil(bus.lon) and
+      bus.bus_type == 1 and is_number(bus.base_kv) and bus.base_kv >= @min_load_kv and
+        not is_nil(bus.lon) and
         Map.has_key?(caps, bus.id) and headroom(caps[bus.id], occupied, bus.id) > 0.0 and
         (not ba_known? or not is_nil(bus.balancing_authority_id))
     end)
@@ -440,11 +441,25 @@ defmodule PowerModel.Ingestion.LoadEstimator do
 
   @doc """
   The most load a substation of `base_kv` ordinarily delivers, in MW.
+
+  A bus with no usable voltage gets the LOWEST ceiling, not the highest. That
+  is not a stylistic choice: `base_kv >= kv` with a `nil` on the left is TRUE
+  under Elixir term ordering, because atoms sort above numbers — so the guardless
+  version answered `nil` with 1000.0 and made a voltage-less bus the single most
+  attractive load and datacenter target in the network. Caught in review
+  2026-08-23. `ParameterEstimator.cap_class_ceiling/1` already made the
+  conservative choice for the same edge case; the two now agree.
+
+  Non-positive MW gets the same treatment rather than a `MatchError`: this is
+  public, documented API, and a census or a test may reasonably ask about a
+  zero-MW bus.
   """
-  def class_ceiling(base_kv) do
+  def class_ceiling(base_kv) when is_number(base_kv) and base_kv > 0.0 do
     {_kv, mw} = Enum.find(@class_ceiling_mw, fn {kv, _mw} -> base_kv >= kv end)
     mw
   end
+
+  def class_ceiling(_), do: @class_ceiling_mw |> Enum.map(&elem(&1, 1)) |> Enum.min()
 
   @doc """
   `%{bus_id => %{cap_mw, delivery_cap_mw, class_cap_mw, capability_mva, line_mva,

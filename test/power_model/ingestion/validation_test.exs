@@ -534,7 +534,7 @@ defmodule PowerModel.Ingestion.ValidationTest do
                  :egrid_vintage,
                  :topology_census,
                  :capacity_and_balance,
-             :reactive_study
+                 :reactive_study
                ]
 
         table = Validation.summary_table(summary)

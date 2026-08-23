@@ -57,7 +57,16 @@ defmodule PowerModel.Solver.Partition do
             end),
           generators: Enum.filter(snapshot.generators, &MapSet.member?(island, &1.bus_id)),
           loads: Enum.filter(snapshot.loads, &MapSet.member?(island, &1.bus_id)),
-          dc_ties: Enum.filter(dc_ties, &DcTie.touches?(&1, island))
+          dc_ties: Enum.filter(dc_ties, &DcTie.touches?(&1, island)),
+          # An island is still the SAME CASE, so anything that describes how to
+          # read its loads has to survive the split. A published MATPOWER case
+          # states Qd net of distribution capacitors and `Test.MATPOWER` stamps
+          # `load_compensation: 0.0` to say so; dropping the key here sent every
+          # island back to the model default (0.382), silently compensating
+          # 38.2% of published Qd away — the exact double-count the stamp exists
+          # to prevent. Measured on case118 2026-08-23: whole snapshot 0.0,
+          # island 0.382.
+          load_compensation: Map.get(snapshot, :load_compensation)
         }
       end)
 

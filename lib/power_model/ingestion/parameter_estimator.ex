@@ -952,7 +952,14 @@ defmodule PowerModel.Ingestion.ParameterEstimator do
   # slightly-stale banks. The hard gate lives in `Ingestion.Validation`, which
   # is what CI runs.
   defp warn_stale(study, path) do
-    case PowerModel.Grid.network_signature_drift(study["inputs"]) do
+    # COUNTS ONLY here. `network_signature_drift/1` md5s every row of five
+    # tables (~90k each), and this runs on every `capacitor_bank_targets/1`
+    # call — twice per full pipeline, plus once per reactive-study run — purely
+    # to emit a warning the pipeline is documented as continuing through. The
+    # authoritative check is `Validation.reactive_study_freshness/1`, which
+    # runs the full digest once. A count change is the cheap half of the same
+    # signal; a same-count content change is caught by the hard gate.
+    case PowerModel.Grid.network_signature_count_drift(study["inputs"]) do
       [] ->
         :ok
 

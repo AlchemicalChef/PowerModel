@@ -819,6 +819,30 @@ defmodule PowerModel.Grid do
   end
 
   @doc """
+  The cheap half of `network_signature_drift/1`: row counts only, no digests.
+
+  For callers that want a loud hint without paying for five whole-table md5
+  aggregates — the estimator warns on this while `Ingestion.Validation` runs
+  the full comparison as the hard gate.
+  """
+  def network_signature_count_drift(nil), do: [:unstamped]
+
+  def network_signature_count_drift(stored) when is_map(stored) do
+    counts =
+      for {name, {table, _cols}} <- @network_digest_columns,
+          was = get_in(stored, ["counts", to_string(name)]),
+          %{rows: [[now]]} = Repo.query!("select count(*) from #{table}", [], timeout: :infinity),
+          was != now do
+        "#{name}: #{was} rows in the study, #{now} now"
+      end
+
+    case counts do
+      [] -> if stamped?(stored), do: [], else: [:unstamped]
+      drift -> drift
+    end
+  end
+
+  @doc """
   Which parts of a stored `network_signature/0` no longer match the database.
 
   Returns `[]` when the stamp still holds, a list of human-readable
@@ -1169,6 +1193,7 @@ defmodule PowerModel.Grid do
   def map_datacenters_to_grid(opts \\ []) do
     PowerModel.Ingestion.DatacenterPlacement.run(opts)
   end
+
   @doc """
   Datacenters connected to a set of bus IDs (cascade power-loss checks).
 

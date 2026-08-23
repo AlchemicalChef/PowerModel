@@ -161,7 +161,12 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
         given -> Enum.map(given, &fetch_interconnection!/1)
       end
 
-    buses = Repo.all(from b in Bus, select: %{id: b.id, kv: b.base_kv, ic: b.interconnection_id, src: b.source_id})
+    buses =
+      Repo.all(
+        from b in Bus,
+          select: %{id: b.id, kv: b.base_kv, ic: b.interconnection_id, src: b.source_id}
+      )
+
     kv = Map.new(buses, &{&1.id, &1.kv || 0.0})
 
     # `from != to` is not decoration: a self-loop would make a bus its own
@@ -242,8 +247,11 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
           ic_buses
           |> Enum.flat_map(fn b ->
             case Map.get(gen_by_bus, b.id) do
-              nil -> []
-              {mw, units} -> if Map.has_key?(poi, b.id), do: [], else: [row(b, names, mw, units, nil, nil)]
+              nil ->
+                []
+
+              {mw, units} ->
+                if Map.has_key?(poi, b.id), do: [], else: [row(b, names, mw, units, nil, nil)]
             end
           end)
           |> Enum.sort_by(& &1.mw, :desc)
@@ -277,9 +285,17 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
           load_outside_band_buses: length(outside),
           load_outside_band_mw: outside |> Enum.map(&elem(&1, 1)) |> Enum.sum() |> r1(),
           load_below_band_mw:
-            outside |> Enum.filter(fn {b, _} -> band && b.kv < hd(band) end) |> Enum.map(&elem(&1, 1)) |> Enum.sum() |> r1(),
+            outside
+            |> Enum.filter(fn {b, _} -> band && b.kv < hd(band) end)
+            |> Enum.map(&elem(&1, 1))
+            |> Enum.sum()
+            |> r1(),
           load_above_band_mw:
-            outside |> Enum.filter(fn {b, _} -> band && b.kv > List.last(band) end) |> Enum.map(&elem(&1, 1)) |> Enum.sum() |> r1()
+            outside
+            |> Enum.filter(fn {b, _} -> band && b.kv > List.last(band) end)
+            |> Enum.map(&elem(&1, 1))
+            |> Enum.sum()
+            |> r1()
         }
       end)
 
@@ -424,7 +440,9 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
         IO.puts("    ... #{s.below_floor_count - @default_limit} more")
       end
 
-      IO.puts("  generation on a bus with NO branch: #{s.unconnected_count} buses, #{s.unconnected_mw} MW")
+      IO.puts(
+        "  generation on a bus with NO branch: #{s.unconnected_count} buses, #{s.unconnected_mw} MW"
+      )
 
       for r <- Enum.take(s.unconnected, 5) do
         IO.puts("    bus #{r.bus} kv=#{r.kv} #{r.mw}MW  #{r.name || r.source_id}")
@@ -445,6 +463,7 @@ defmodule Mix.Tasks.Grid.Census.GeneratorInterconnection do
         "#{report.total_below_floor_within_50km_mw} MW sits within 50 km of a bus that " <>
         "already carries lines at the voltage it needs"
     )
+
     IO.puts("TOTAL generation with no branch: #{report.total_unconnected_mw} MW")
 
     IO.puts(

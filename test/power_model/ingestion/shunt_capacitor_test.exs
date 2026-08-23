@@ -233,9 +233,21 @@ defmodule PowerModel.Ingestion.ShuntCapacitorTest do
     test "an empty network clears nothing", %{ic: _ic} do
       # The guard that matters: the stale-device cleanup is "every synthesized
       # shunt NOT in this set", so an empty set would wipe the table.
-      kept = Repo.insert!(%Bus{bus_type: 1, base_kv: 138.0, bs_mvar: -12.0, source: "substation", source_id: "keep-me"})
+      kept =
+        Repo.insert!(%Bus{
+          bus_type: 1,
+          base_kv: 138.0,
+          bs_mvar: -12.0,
+          source: "substation",
+          source_id: "keep-me"
+        })
 
-      summary = PE.synthesize_bus_shunts(peak_factors: %{}, generator_support: false, load_compensation: 1.0)
+      summary =
+        PE.synthesize_bus_shunts(
+          peak_factors: %{},
+          generator_support: false,
+          load_compensation: 1.0
+        )
 
       if summary.buses == 0 do
         assert summary.cleared == 0
@@ -247,13 +259,19 @@ defmodule PowerModel.Ingestion.ShuntCapacitorTest do
   describe "peak-hour sizing basis" do
     test "the bank is the load Q at the BA's peak hour, not the stored baseline",
          %{ic: ic} do
-      ba = Repo.insert!(%BalancingAuthority{code: "TBA", name: "Test BA", interconnection_id: ic.id})
+      ba =
+        Repo.insert!(%BalancingAuthority{code: "TBA", name: "Test BA", interconnection_id: ic.id})
+
       b = bus(ic, %{balancing_authority_id: ba.id})
       load(b, 100.0, 40.0)
 
       # A BA running at 60% of its allocation basis at peak compensates to
       # unity THERE, not at a basis no hour in the record ever reaches.
-      PE.synthesize_bus_shunts(peak_factors: %{ba.id => 0.6}, generator_support: false, load_compensation: 1.0)
+      PE.synthesize_bus_shunts(
+        peak_factors: %{ba.id => 0.6},
+        generator_support: false,
+        load_compensation: 1.0
+      )
 
       assert_in_delta bs(b), 24.0, 1.0e-6
     end
@@ -262,7 +280,11 @@ defmodule PowerModel.Ingestion.ShuntCapacitorTest do
       b = bus(ic)
       load(b, 100.0, 40.0)
 
-      PE.synthesize_bus_shunts(peak_factors: %{999_999 => 0.1}, generator_support: false, load_compensation: 1.0)
+      PE.synthesize_bus_shunts(
+        peak_factors: %{999_999 => 0.1},
+        generator_support: false,
+        load_compensation: 1.0
+      )
 
       assert_in_delta bs(b), 40.0, 1.0e-6
     end
@@ -287,7 +309,12 @@ defmodule PowerModel.Ingestion.ShuntCapacitorTest do
       path = Path.join(System.tmp_dir!(), "study-#{System.unique_integer([:positive])}.json")
 
       study(path, [
-        %{"source" => b.source, "source_id" => b.source_id, "shortfall_mvar" => 10.0, "vm_pu" => 1.0}
+        %{
+          "source" => b.source,
+          "source_id" => b.source_id,
+          "shortfall_mvar" => 10.0,
+          "vm_pu" => 1.0
+        }
       ])
 
       on_exit(fn -> File.rm(path) end)
@@ -305,7 +332,12 @@ defmodule PowerModel.Ingestion.ShuntCapacitorTest do
       path = Path.join(System.tmp_dir!(), "study-#{System.unique_integer([:positive])}.json")
 
       study(path, [
-        %{"source" => b.source, "source_id" => b.source_id, "shortfall_mvar" => 30.0, "vm_pu" => 0.95}
+        %{
+          "source" => b.source,
+          "source_id" => b.source_id,
+          "shortfall_mvar" => 30.0,
+          "vm_pu" => 0.95
+        }
       ])
 
       on_exit(fn -> File.rm(path) end)
@@ -324,7 +356,12 @@ defmodule PowerModel.Ingestion.ShuntCapacitorTest do
       vm = 0.9
 
       study(path, [
-        %{"source" => b.source, "source_id" => b.source_id, "shortfall_mvar" => 30.0, "vm_pu" => vm}
+        %{
+          "source" => b.source,
+          "source_id" => b.source_id,
+          "shortfall_mvar" => 30.0,
+          "vm_pu" => vm
+        }
       ])
 
       on_exit(fn -> File.rm(path) end)

@@ -187,7 +187,8 @@ defmodule PowerModel.GridDatacentersTest do
     test "never lands on a bus with no line of its own", %{bus: bus} do
       # A bus reached only through banks is the far side of a transformer, and
       # a PV bus is not a delivery point at all.
-      branchless = Repo.insert!(%Bus{bus_type: 2, base_kv: 138.0, coordinates: point(-77.4601, 39.0201)})
+      branchless =
+        Repo.insert!(%Bus{bus_type: 2, base_kv: 138.0, coordinates: point(-77.4601, 39.0201)})
 
       Repo.insert!(%Datacenter{
         name: "Campus",
@@ -248,13 +249,15 @@ defmodule PowerModel.GridDatacentersTest do
 
       {1, 2, 0} = Grid.map_datacenters_to_grid(max_km: 30)
 
-      loads = Repo.all(from l in Load, where: l.load_type == "datacenter", order_by: [desc: l.p_mw])
+      loads =
+        Repo.all(from l in Load, where: l.load_type == "datacenter", order_by: [desc: l.p_mw])
+
       assert length(loads) == 2
       assert_in_delta Enum.sum(Enum.map(loads, & &1.p_mw)), 250.0, 0.01
       assert Enum.all?(loads, &(&1.p_mw <= 150.0 + 1.0e-6))
 
       # The anchor FK is the yard carrying the largest share.
-      dc = Repo.one!(from d in Datacenter)
+      dc = Repo.one!(from(d in Datacenter))
       assert dc.bus_id == hd(loads).bus_id
     end
 
@@ -272,7 +275,11 @@ defmodule PowerModel.GridDatacentersTest do
       {3, _rows, 0} = Grid.map_datacenters_to_grid(max_km: 30)
 
       held =
-        Repo.one(from l in Load, where: l.load_type == "datacenter" and l.bus_id == ^bus.id, select: l.p_mw)
+        Repo.one(
+          from l in Load,
+            where: l.load_type == "datacenter" and l.bus_id == ^bus.id,
+            select: l.p_mw
+        )
 
       assert held <= 150.0 + 1.0e-6
 

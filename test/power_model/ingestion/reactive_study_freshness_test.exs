@@ -21,7 +21,9 @@ defmodule PowerModel.Ingestion.ReactiveStudyFreshnessTest do
   alias PowerModel.Repo
 
   setup do
-    dir = Path.join(System.tmp_dir!(), "reactive_study_test_#{System.unique_integer([:positive])}")
+    dir =
+      Path.join(System.tmp_dir!(), "reactive_study_test_#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf(dir) end)
 
@@ -57,7 +59,8 @@ defmodule PowerModel.Ingestion.ReactiveStudyFreshnessTest do
   end
 
   test "a study stamped with the current network passes", %{dir: dir} do
-    path = write(dir, %{"banks" => [], "measured_on" => "2026-08-22", "inputs" => current_stamp()})
+    path =
+      write(dir, %{"banks" => [], "measured_on" => "2026-08-22", "inputs" => current_stamp()})
 
     {_tag, report} = Validation.reactive_study_freshness(study_path: path)
 
@@ -95,7 +98,13 @@ defmodule PowerModel.Ingestion.ReactiveStudyFreshnessTest do
     # against an empty database — the exact false-alarm the digest was chosen
     # to avoid.
     Repo.delete_all(Bus)
-    path = write(dir, %{"banks" => [], "measured_on" => "2026-08-19", "inputs" => %{"digest" => %{"buses" => "stale"}}})
+
+    path =
+      write(dir, %{
+        "banks" => [],
+        "measured_on" => "2026-08-19",
+        "inputs" => %{"digest" => %{"buses" => "stale"}}
+      })
 
     {_tag, report} = Validation.reactive_study_freshness(study_path: path)
 

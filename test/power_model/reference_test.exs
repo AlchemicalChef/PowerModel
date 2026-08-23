@@ -42,7 +42,9 @@ defmodule PowerModel.ReferenceTest do
       floors = Enum.map(sizes, &Reference.poi_floor_kv/1)
 
       refute Enum.any?(floors, &is_nil/1)
-      assert floors == Enum.sort(floors), "floor must be monotonic in plant size: #{inspect(floors)}"
+
+      assert floors == Enum.sort(floors),
+             "floor must be monotonic in plant size: #{inspect(floors)}"
     end
 
     test "a plant smaller than the first band has no opinion" do

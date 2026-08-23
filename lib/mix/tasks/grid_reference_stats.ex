@@ -300,7 +300,8 @@ defmodule Mix.Tasks.Grid.ReferenceStats do
     }
   end
 
-  defp by_case(per_case, fun), do: Map.new(per_case, fn {_p, c, a} -> {c.case_name, fun.(c, a)} end)
+  defp by_case(per_case, fun),
+    do: Map.new(per_case, fn {_p, c, a} -> {c.case_name, fun.(c, a)} end)
 
   # Every generation figure in this corpus is on the NAMEPLATE basis, because
   # the consumer scores `generators.p_max_mw` from our schema, which is

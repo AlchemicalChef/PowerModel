@@ -1411,7 +1411,13 @@ defmodule PowerModel.Ingestion.Validation do
     if Grid.bus_count() == 0 do
       report(
         :reactive_study,
-        %{path: path, present: true, measured_on: study["measured_on"], drift: nil, skipped: true},
+        %{
+          path: path,
+          present: true,
+          measured_on: study["measured_on"],
+          drift: nil,
+          skipped: true
+        },
         status: :skipped
       )
     else
@@ -1422,7 +1428,7 @@ defmodule PowerModel.Ingestion.Validation do
   defp evaluate_study(study, path) do
     drift = Grid.network_signature_drift(study["inputs"])
 
-        metrics = %{
+    metrics = %{
       path: path,
       present: true,
       measured_on: study["measured_on"],
@@ -1431,28 +1437,28 @@ defmodule PowerModel.Ingestion.Validation do
     }
 
     cond do
-          drift == [] ->
-            report(:reactive_study, metrics, [])
+      drift == [] ->
+        report(:reactive_study, metrics, [])
 
-          drift == [:unstamped] ->
-            report(:reactive_study, metrics,
-              warnings: [
-                "Reactive support study (#{study["measured_on"] || "undated"}) carries no " <>
-                  "`inputs` signature, so whether it matches this network cannot be checked. " <>
-                  "Re-derive with `mix power_model.reactive_study` to stamp it."
-              ]
-            )
+      drift == [:unstamped] ->
+        report(:reactive_study, metrics,
+          warnings: [
+            "Reactive support study (#{study["measured_on"] || "undated"}) carries no " <>
+              "`inputs` signature, so whether it matches this network cannot be checked. " <>
+              "Re-derive with `mix power_model.reactive_study` to stamp it."
+          ]
+        )
 
-          true ->
-            report(:reactive_study, metrics,
-              failures: [
-                "Reactive support study (#{study["measured_on"] || "undated"}) was measured " <>
-                  "against a DIFFERENT network than the one it is applied to, so its " <>
-                  "shortfalls are not this network's. Re-derive with " <>
-                  "`mix power_model.reactive_study`. Drift: " <>
-                  Enum.join(Enum.take(drift, 5), "; ")
-              ]
-            )
+      true ->
+        report(:reactive_study, metrics,
+          failures: [
+            "Reactive support study (#{study["measured_on"] || "undated"}) was measured " <>
+              "against a DIFFERENT network than the one it is applied to, so its " <>
+              "shortfalls are not this network's. Re-derive with " <>
+              "`mix power_model.reactive_study`. Drift: " <>
+              Enum.join(Enum.take(drift, 5), "; ")
+          ]
+        )
     end
   end
 

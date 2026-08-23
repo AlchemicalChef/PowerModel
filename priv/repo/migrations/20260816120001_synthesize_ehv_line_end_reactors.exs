@@ -13,17 +13,23 @@ defmodule PowerModel.Repo.Migrations.SynthesizeEhvLineEndReactors do
   systems absorb roughly half their charging in line-end reactors.
 
   This is a DATA migration, not a schema one: it calls
-  `ParameterEstimator.synthesize_line_end_reactors/1`, which is the same pass a
+  `ParameterEstimator.synthesize_bus_shunts/1`, which is the same pass a
   re-ingest runs, so the migrated database and a freshly ingested one hold the
   same reactors rather than two implementations that can drift. The pass writes
-  absolute values (it does not accumulate) and owns only negative `bs_mvar`, so
-  running it twice is a no-op and capacitor banks are never touched.
+  absolute values (it does not accumulate), so running it twice is a no-op.
+
+  RENAMED 2026-08-23: the pass was `synthesize_line_end_reactors/0` when this
+  migration was written and is now `synthesize_bus_shunts/1`, which recomputes
+  the capacitor component alongside the reactor one and writes their NET. A data
+  migration calling a function by name is a standing hazard for exactly this
+  reason — the rename left `mix ecto.migrate` raising UndefinedFunctionError on
+  every fresh checkout until it was caught in review.
 
   DC solutions are unaffected, provably: DC power flow never reads `bs_mvar`.
   """
 
   def up do
-    summary = PowerModel.Ingestion.ParameterEstimator.synthesize_line_end_reactors()
+    summary = PowerModel.Ingestion.ParameterEstimator.synthesize_bus_shunts()
 
     IO.puts(
       "EHV line-end reactors: #{summary.buses} buses across #{summary.lines} lines, " <>
