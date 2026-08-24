@@ -1739,14 +1739,24 @@ voltage band instead of bare convergence:
 
 | | solvable (historical α) | emergency 0.90-1.10 pu | normal 0.95-1.05 pu |
 |---|---|---|---|
-| ERCOT | 0.6406 / 27,839 MW | **α 0.2-0.3 / 13,037 MW** | **none** |
+| Eastern | 0.4297 / 123,635 MW | α 0.02-0.25 / 71,931 MW | **none** |
+| ERCOT | 0.6406 / 27,839 MW | α 0.2-0.3 / 13,037 MW | **none** |
 | Western | 0.2031 / 16,914 MW | **none** | **none** |
 
-Western cannot hold every bus inside 0.90-1.10 pu at ANY load scaling. ERCOT can
-only inside a narrow window around α 0.2-0.3, and neither can reach the normal
-band at all. So the honest statement is not "α overstates operable load by
-half" — it is that for two of three interconnections **there is no load level at
-which this network presents an acceptable voltage profile.**
+**No interconnection can hold every bus inside the normal band at any load
+scaling.** Eastern and ERCOT do have an emergency-band window — at 58% and 47%
+of their solvable ceilings respectively — and Western has none at all: it cannot
+keep every bus inside 0.90-1.10 pu at ANY α.
+
+(An earlier draft of this entry, written before Eastern's run finished, said
+"two of three have no load level with an acceptable profile". That overstated
+it: two of three DO have an emergency-band window, and what is universal is the
+failure to reach the normal band. Corrected rather than left standing.)
+
+Eastern's normal-band failure is narrow and two-sided in the same way: at its
+emergency floor of α 0.02 the profile is 0.9113-1.0523, so it misses 1.05 on the
+UPPER bound at light load and 0.95 on the lower at heavy load. Western's is not
+narrow — it reaches Vm 1.5 with 167 buses over 1.10 pu as α approaches zero.
 
 **Method error found and fixed in the same session, worth recording.** The first
 version bisected each band from zero and returned α = 0.0 for `normal`
@@ -1764,8 +1774,14 @@ tested the undervoltage side, on a network that fails from both. LIN-13 recorded
 reflected it.
 
 **What this changes.** The reactive substrate — charging, shunt plant,
-impedances, generator capability placement — cannot support a realistic
-operating point at any loading, and that is upstream of every voltage-layer and
-cascade result. It is a bigger finding than the α ceiling it replaces, and it
-makes the reactive-planning work (switched shunts, ULTC, capability curves)
-the load-bearing item rather than an optimisation.
+impedances, generator capability placement — cannot hold a normal operating
+profile at any loading on any interconnection, and cannot hold even an emergency
+one on Western. That is upstream of every voltage-layer and cascade result. It
+is a bigger finding than the α ceiling it replaces, and it makes the
+reactive-planning work (switched shunts, ULTC, capability curves) the
+load-bearing item rather than an optimisation.
+
+The emergency windows also give the first defensible coverage numbers this repo
+has had: Eastern 71,931 MW and ERCOT 13,037 MW are load levels at which the
+model holds a profile a real operator would tolerate under contingency. Those,
+not the solvable α, are what a cascade result should be quoted against.

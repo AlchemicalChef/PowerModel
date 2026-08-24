@@ -521,10 +521,12 @@ network the real network**, **is the operating point a real operating point**, *
 failure dynamics real dynamics**. A year of network work moved the first a long way. The
 second is where the model is genuinely broken, and it gates the third.
 
-0. **There is no load level at which two of three interconnections present an
-   acceptable voltage profile** (REVIEW CAS-28, measured 2026-08-23 via
-   `mix grid.census loadability`). Western holds no α inside 0.90-1.10 pu;
-   ERCOT only α 0.2-0.3; neither reaches 0.95-1.05 at all. Every α this document
+0. **No interconnection can hold a normal voltage profile at any load level**
+   (REVIEW CAS-28, measured 2026-08-23 via `mix grid.census loadability`).
+   Nothing reaches 0.95-1.05 pu at any α. Eastern and ERCOT hold the EMERGENCY
+   band (0.90-1.10) over α 0.02-0.25 and 0.2-0.3 — 71,931 MW and 13,037 MW,
+   which are the first defensible coverage numbers this document has had, and
+   what cascade results should be quoted against. Western holds no α at all. Every α this document
    quotes tested the undervoltage side only, on a network that fails from both —
    at light load it OVERVOLTS on line charging (Western Vm 1.5 as α → 0). This
    sits above everything below it: the reactive substrate cannot support a
