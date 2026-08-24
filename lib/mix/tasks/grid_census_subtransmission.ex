@@ -99,7 +99,7 @@ defmodule Mix.Tasks.Grid.Census do
   # `load_placement` in Mix.Tasks.Grid.Census.LoadPlacement (TOPO-2, DR-5);
   # this task is the front door for all of them so the CLI reads as one census
   # family.
-  @censuses ~w(subtransmission stranding load_placement generator_interconnection)
+  @censuses ~w(subtransmission stranding load_placement generator_interconnection loadability)
 
   @default_threshold 1.25
   @default_max_kv 100.0
@@ -167,6 +167,8 @@ defmodule Mix.Tasks.Grid.Census do
 
   def report("generator_interconnection", opts),
     do: Mix.Tasks.Grid.Census.GeneratorInterconnection.report(opts)
+
+  def report("loadability", opts), do: Mix.Tasks.Grid.Census.Loadability.report(opts)
 
   def report("subtransmission", opts) do
     hour = parse_hour(opts[:hour]) || Demand.latest_demand_hour()
@@ -300,6 +302,9 @@ defmodule Mix.Tasks.Grid.Census do
 
   defp render_text(%{census: "generator_interconnection"} = report),
     do: Mix.Tasks.Grid.Census.GeneratorInterconnection.render_text(report)
+
+  defp render_text(%{census: "loadability"} = report),
+    do: Mix.Tasks.Grid.Census.Loadability.render_text(report)
 
   defp render_text(report) do
     limit = @default_limit

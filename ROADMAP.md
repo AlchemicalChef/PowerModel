@@ -521,6 +521,17 @@ network the real network**, **is the operating point a real operating point**, *
 failure dynamics real dynamics**. A year of network work moved the first a long way. The
 second is where the model is genuinely broken, and it gates the third.
 
+0. **There is no load level at which two of three interconnections present an
+   acceptable voltage profile** (REVIEW CAS-28, measured 2026-08-23 via
+   `mix grid.census loadability`). Western holds no α inside 0.90-1.10 pu;
+   ERCOT only α 0.2-0.3; neither reaches 0.95-1.05 at all. Every α this document
+   quotes tested the undervoltage side only, on a network that fails from both —
+   at light load it OVERVOLTS on line charging (Western Vm 1.5 as α → 0). This
+   sits above everything below it: the reactive substrate cannot support a
+   realistic operating point, so reactive planning (switched shunts, ULTC,
+   generator capability placement) is load-bearing rather than an optimisation,
+   and no cascade or voltage result rests on solid ground until it moves.
+
 1. **Nothing external has ever scored this model** (Phase 6 item 26, unstarted). Every
    instrument is internal — alpha ceilings, census counts, TV distance, conservation
    residuals — so "more accurate" currently has no denominator. 2011 Southwest is the

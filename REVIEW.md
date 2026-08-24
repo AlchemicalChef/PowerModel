@@ -1691,3 +1691,81 @@ is one or two named elements per interconnection, worth 12-20% each, followed by
 a different problem that needs a different diagnostic. ROADMAP's "budget it per
 round, not per defect" was right; the round count is 1-2, and the next question
 is what fails when no bus is on the floor.
+
+### What fails when no bus is on the floor — three signatures, one shared surprise (2026-08-23)
+
+The α loop left `vm_floor_bus_ids` diagnosing only the first one or two
+constraints per interconnection before going quiet, and Western never had a
+floor bus at all. Instrumenting the failing solve directly — residual by
+equation, which bus carries it, how many machines are at a reactive limit —
+gives three DIFFERENT answers:
+
+| | failure | residual at the failing step | worst bus | gen at q_max |
+|---|---|---|---|---|
+| Eastern | reactive | 10.8 MVAr / 2.7 MW — tiny, one bus | 74129 | 26.5% |
+| ERCOT | reactive | **994 MVAr / 404 MW** — system-wide | 68327 | 35.6% |
+| Western | **active** | 8.6 MW / 0.8 MVAr — tiny, no floor bus | 88550 | 14.2% |
+
+Eastern's ceiling is one bus missing its Q equation by 5.1 MVAr — the same bus
+74129 the floor instrument named, so the two agree. ERCOT's is two orders of
+magnitude larger and spread across the island. Western's is ACTIVE-dominated and
+has no floor bus at all, which is why the floor instrument was silent there.
+Three mechanisms, and only two of them are visible to the tool built for it.
+
+**The shared surprise: reactive pinning is universal, not Western's alone.** At
+their CONVERGED ceilings, 26.5% (Eastern), 35.6% (ERCOT) and 14.2% (Western) of
+generator buses are already at `q_max`. The diagnosis wave attributed reactive
+exhaustion to Western and impedance to Eastern; the pinning is in all three, and
+what differs is whether it is the BINDING constraint. Eastern is pinned heavily
+and still fails locally on one bus; ERCOT is pinned hardest and fails globally.
+
+**CAS-28 (MEASURED, HIGH) [OPEN] — α measures solvability, not operability, and
+the gap is large.** The converged solutions at these ceilings are operating
+points no system would run:
+
+- Eastern converges with **Vm min 0.6163** and 17 buses under 0.90 pu
+- ERCOT converges with **Vm min 0.7448** and **90 buses** under 0.90 pu
+- Western with 0.8615 and 9
+
+This repo's own UVLS arms at 0.92/0.89/0.86 pu, so `Failure.LoadShedding` would
+shed load to escape the exact state the ceiling is measured at. Every α figure
+in this document therefore answers "how much load can the solver find a root
+for", not "how much load can the network carry" — and those are not close. Any
+coverage claim derived from α inherits the gap.
+
+**CAS-28 MEASURED (2026-08-23) — and the answer is worse than "α overstates".**
+`mix grid.census loadability` scores each interconnection against a TWO-SIDED
+voltage band instead of bare convergence:
+
+| | solvable (historical α) | emergency 0.90-1.10 pu | normal 0.95-1.05 pu |
+|---|---|---|---|
+| ERCOT | 0.6406 / 27,839 MW | **α 0.2-0.3 / 13,037 MW** | **none** |
+| Western | 0.2031 / 16,914 MW | **none** | **none** |
+
+Western cannot hold every bus inside 0.90-1.10 pu at ANY load scaling. ERCOT can
+only inside a narrow window around α 0.2-0.3, and neither can reach the normal
+band at all. So the honest statement is not "α overstates operable load by
+half" — it is that for two of three interconnections **there is no load level at
+which this network presents an acceptable voltage profile.**
+
+**Method error found and fixed in the same session, worth recording.** The first
+version bisected each band from zero and returned α = 0.0 for `normal`
+everywhere. That was the METHOD, not the grid: bisection from zero assumes
+monotonicity — if α works, everything below works — and an upper bound breaks
+it, because at LIGHT load the network overvolts on line charging with nothing to
+absorb it (Western reaches Vm 1.5 with 167 buses over 1.10 pu as α → 0). A
+two-sided criterion defines a WINDOW with a floor and a ceiling, and a bisection
+starting below the floor finds nothing and calls it zero. The banded rows are
+now scanned on a coarse α grid and reported as the feasible interval.
+
+This also explains why the single-sided α reads as high as it does: it only ever
+tested the undervoltage side, on a network that fails from both. LIN-13 recorded
+"Western fails from BOTH sides" on 2026-08-15 and the ceiling metric never
+reflected it.
+
+**What this changes.** The reactive substrate — charging, shunt plant,
+impedances, generator capability placement — cannot support a realistic
+operating point at any loading, and that is upstream of every voltage-layer and
+cascade result. It is a bigger finding than the α ceiling it replaces, and it
+makes the reactive-planning work (switched shunts, ULTC, capability curves)
+the load-bearing item rather than an optimisation.
