@@ -2311,3 +2311,44 @@ instrument's coverage (31/80 geocoded). Re-dispatch is opt-in everywhere
 (`constrained_dispatch: true` on `Cascade.init/3`, `--redispatch` on the
 loadings, `redispatch: true` on the capacity pass) until measured under
 cascades.
+
+**EXT-3 (MEASURED, 2026-09-01) — blackout-size distribution vs OE-417
+(ROADMAP item 27).** `mix power_model.cascade_ccdf`: random initiating
+outages over the main island's rated branches at real demand, one cascade
+each, the lost load's complementary cumulative distribution and an MLE tail
+exponent against the published OE-417 blackout-size law (α ≈ 1.31). ERCOT,
+150 samples per arm, seed 7, plain and `--constrained`.
+
+**N-1: every sample settles.** Terminations 150/150 `settled` in both arms —
+the step budget is never exhausted, so CAS-26's runaway mode ("a contingency
+either settles at zero or runs away past the budget") is measurably gone on
+ERCOT. 138/150 fully intact (132 constrained), largest single event 26 MW
+(80 constrained), zero events ≥ 100 MW: no tail exists under single
+contingencies. That is not by itself a failure against OE-417 — real
+single-element events rarely make the report either — but it means the
+N-1 ensemble cannot test the tail. Constrained dispatch trades a handful of
+intact outcomes for small sheds (12 → 18 degraded): moving flow off the
+real constraints spends margin elsewhere, in tens of MW.
+
+**N-2: still no tail — and that is the finding.** Simultaneous pairs, same
+seeds: 150/150 settle, 113 and 112 fully intact, q99 72 MW, at most one event
+reaches 100 MW; OE-417's distribution reaches gigawatts on a power law. The
+model has swung from CAS-26's binary regime ("a seventh of the network past
+its rating at rest; a contingency either settles at zero or runs away") to
+the opposite defect: almost nothing propagates. The reason is visible in the
+at-rest numbers — after the capacity inference, zero rated branches are over
+100 % and the fleet median loading is low, so an N-2 rarely pushes anything
+past a rating, and thermal cascading needs stress to propagate. Reality's
+fat tail comes from a grid operated NEAR its limits with re-dispatch holding
+dozens of constraints at 100 % — which is exactly the operating point EXT-2
+reproduces at six branches and the BA-fuel dispatch fails to reproduce
+anywhere else. Caveats: initiating events here are branch trips only (no
+generation or weather losses), one hour, one interconnection, 150 samples.
+
+**What EXT-3 orders next.** The tail will not appear from more samples; it
+needs the operating point: (a) C1's unit-level CEMS dispatch plus EXT-2's
+re-dispatch as the DEFAULT operating point, so the fleet of real constraints
+sits at 100 % the way the market's does; (b) the congestion score's coverage
+(31/80) so the exclusion list grows toward the real constraint set; then
+re-run this instrument. Its value today is the regime diagnosis, and that
+CAS-26 is closed on ERCOT: no initiating pair exhausts the step budget.

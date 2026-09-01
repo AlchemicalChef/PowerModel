@@ -597,8 +597,13 @@ second is where the model is genuinely broken, and it gates the third.
    model's top-30 are still not real constraints, which points at C1 (CEMS
    unit-level dispatch) and the instrument's coverage (31/80, 29/57
    geocoded); (iii) MISO's 16 "no bus at class" yards join the corridor
-   worklist; (iv) `mix power_model.cascade_ccdf` (item 27's OE-417 check) is
-   built, first runs pending.
+   worklist; (iv) `mix power_model.cascade_ccdf` ran (EXT-3):
+   every N-1 and N-2 sample SETTLES — CAS-26's runaway regime is closed on
+   ERCOT — and no tail exists (q99 ≈ 72 MW vs OE-417's gigawatt power law):
+   the model now under-propagates because, post-inference, it runs far from
+   its limits everywhere the BA-fuel dispatch reaches. The tail needs the
+   operating point, not more samples: C1 (CEMS unit dispatch) + re-dispatch
+   as the default, then re-run.
 
 1. **Nothing external has ever scored this model** (Phase 6 item 26, unstarted). Every
    instrument is internal — alpha ceilings, census counts, TV distance, conservation
