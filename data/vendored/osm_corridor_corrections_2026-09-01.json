@@ -1,0 +1,28 @@
+{
+  "generated": "2026-09-01",
+  "attribution": "Evidence (c) OpenStreetMap contributors, ODbL 1.0 — osm_corridor_ga_2026-09-01.json (osm base 2026-09-01T15:21:51Z) and osm_corridor_ut_2026-08-18.json.",
+  "why": "REVIEW CAS-30: two refused corridors where the missing capacity is a station the model carries as untied HIFLD records, not a missing line. Applied by migration 20260901130000; this file is the reversibility and attribution record.",
+  "corrections": [
+    {
+      "site": "Plant Vogtle, GA",
+      "change": "insert 500 kV tie line",
+      "from_bus_source_id": "37107_500.0kV",
+      "to_bus_source_id": "40786_500.0kV",
+      "length_km": 0.65,
+      "prior": "no branch between the two 500 kV yards; each had its own 500/230 kV transformer (3057, 14764) and the 230 kV yards were tied by HIFLD lines 157213/157214, so the plant's 4,658 MW and the West McIntosh/Warthen 500 kV circuits reached Thomson Primary 500 kV only through 230 kV; line 109468 (UNKNOWN120783-VOGTLE 230 kV) carried 14,639 MW at rest, 1,615 % post-outage as the worst Eastern N-1.",
+      "evidence": "OSM way 863571818 'Vogtle 500KV Switchyard' (Georgia Power, voltage 500000) and way 121812102 'Vogtle Substation (500KV/230KV)'; 500 kV busbar ways 1058940702/1058940733/1058940734 span (33.143,-81.771)-(33.146,-81.770), i.e. between the two HIFLD yard positions; named 500 kV lines West McIntosh-Vogtle (121758604), Vogtle-Wadley (160057254), Thomson Primary-Vogtle (863571817) all terminate at one switchyard."
+    },
+    {
+      "site": "Red Butte, UT",
+      "change": "reclass HIFLD yard 58560's 115 kV bus and its line 204330 to 138 kV; insert 138 kV weld to yard 63596's 138 kV bus",
+      "bus_source_id": "58560_115.0kV",
+      "line_source_id": "204330",
+      "weld_from_bus_source_id": "58560_115.0kV",
+      "weld_to_bus_source_id": "63596_138.0kV",
+      "weld_length_km": 0.13,
+      "prior": "bus 58560_115.0kV base_kv 115, line 204330 voltage_kv 115 (RED BUTTE-UNKNOWN202071); the 345/138 kV transformer 6794 landed on that dead-end 115 kV bus while the real 138 kV yard (63596, 130 m away, with three ST GEORGE-RED BUTTE 138 kV lines) had no path to the 345 kV; St. George was fed through 69 kV (CAS-29).",
+      "evidence": "OSM way 88146572 'Red Butte Substation' voltage 345000;138000 (no 115 kV level); OSM way 173899732 double-circuit 138 kV (37.410,-113.644)-(37.143,-113.564) Red Butte to St. George; way 87886527 345 kV Harry Allen-Red Butte terminating at (37.412,-113.646).",
+      "note": "line 204330's per-unit impedance was estimated at the 115 kV class and is left as written (about 10 % high for 138 kV); the estimator re-derives it on the next params_version bump."
+    }
+  ]
+}

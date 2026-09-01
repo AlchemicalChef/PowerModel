@@ -160,3 +160,16 @@ dev database after migrations 20260901100001-120000; regenerate after any
 change to those passes. Use: the next OSM pull's target list (as
 `osm_stranded_worklist_2026-08-23.csv` was for item 24), starting with
 Plant Vogtle's 500 kV yard (line 7723, 14.6 GW at rest on its 230 kV tie).
+
+## osm_corridor_ga_2026-09-01.json
+- Source: Overpass API, https://overpass-api.de/api/interpreter, LIVE query (attic
+  queries time out on corridor tiles — see fetch_osm_voltage.py), response
+  `timestamp_osm_base` 2026-09-01T15:21:51Z, which is the reproducibility pin.
+  Query shape: `(way[power=line]; way[power=minor_line]; nwr[power=substation];
+  nwr[power=plant];) out tags geom;` over bbox (S,W,N,E) 32.85,-82.25,33.45,-81.30 —
+  Plant Vogtle and its 500 kV corridors (REVIEW CAS-30: the model's worst Eastern
+  N-1 at real demand is Vogtle's 230 kV tie carrying 14.6 GW because the 500 kV
+  yard has one line). 522 elements: 381 power=line ways (21 at 500 kV, 137 at 230,
+  180 at 115), 102 substations, 23 plants.
+- 712,068 B, sha256 c52fe7967ea7ee49d8ed71688b4c3be18246a9fee7caf9ce64278d60d2ff1241. Unversioned like the other raw pulls; (c) OpenStreetMap
+  contributors, ODbL 1.0.
