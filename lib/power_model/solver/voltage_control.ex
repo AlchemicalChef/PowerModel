@@ -86,10 +86,17 @@ defmodule PowerModel.Solver.VoltageControl do
        bus's strength, estimated from its self-susceptance (the sum of 1/x
        over its branches): IEEE 1036's voltage-step criterion, applied with
        the only strength estimate a snapshot carries.
-    5. A round whose solve diverges is BACKED OFF: the round's shunt moves are
-       reverted and those devices latched, and the taps are retried alone; if
-       that diverges too, everything that moved is reverted and latched. The
-       loop then continues from the last converged point.
+    5. A round whose solve diverges is BACKED OFF down a ladder: if taps and
+       shunts both moved, the shunts are reverted and the taps retried alone;
+       if the shunts moved in both directions, the SUPPLYING moves (capacitor
+       in, reactor out) are reverted and the absorbing ones retried alone —
+       measured on Western at α 0.2, a round of 8 capacitor steps at weak
+       buses and 10 reactor steps at a 500 kV cluster diverged on the caps,
+       and latching all 18 together left the cluster at 1.127 pu for the rest
+       of the solve; failing that, everything that moved is reverted. A
+       reverted shunt is treated as an overshoot (rule 11: step halved), a
+       reverted tap is latched. The loop then continues from the last
+       converged point.
     6. A move that carries its bus clean ACROSS the band — below it before,
        above it after, or the reverse — is undone: a bank step is halved
        (rule 10), a tap is latched. The
@@ -668,30 +675,27 @@ defmodule PowerModel.Solver.VoltageControl do
   # solve is spent re-deriving it.
   defp back_off(snapshot, devices, state, ctx, round, last_good, prev, backoffs) do
     {shunt_acts, ltc_acts} = Enum.split_with(prev.actions, fn {{k, _}, _, _} -> k == :shunt end)
+    {supply, absorb} = Enum.split_with(shunt_acts, fn {_, dir, _} -> dir == :raise end)
 
-    {retry_state, retry_prev} =
-      if shunt_acts != [] and ltc_acts != [] do
-        st = prev.state |> latch(shunt_acts) |> move(ltc_acts)
-        {st, %{prev | state: prev.state, actions: ltc_acts}}
-      else
-        {latch(prev.state, prev.actions), nil}
+    # {moves to retry, moves to revert}; nil retry means a full revert.
+    {retry, revert} =
+      cond do
+        shunt_acts != [] and ltc_acts != [] -> {ltc_acts, shunt_acts}
+        supply != [] and absorb != [] -> {absorb, supply}
+        true -> {nil, prev.actions}
       end
 
-    trace_backoff(ctx.trace, round, prev.actions, retry_prev != nil)
+    penalized = penalize(prev.state, revert)
+    trace_backoff(ctx.trace, round, prev.actions, retry)
 
     cond do
       round >= ctx.max_rounds ->
-        {:ok,
-         finish(
-           last_good.sol,
-           devices,
-           latch(prev.state, prev.actions),
-           round,
-           :round_cap,
-           backoffs + 1
-         )}
+        {:ok, finish(last_good.sol, devices, penalized, round, :round_cap, backoffs + 1)}
 
-      retry_prev != nil ->
+      retry != nil ->
+        retry_state = move(penalized, retry)
+        retry_prev = %{prev | state: penalized, actions: retry}
+
         loop(
           snapshot,
           devices,
@@ -706,18 +710,34 @@ defmodule PowerModel.Solver.VoltageControl do
 
       true ->
         # Full revert: the last converged solution is the current operating
-        # point again. Re-decide on it with the offenders latched.
+        # point again. Re-decide on it with the offenders penalized.
         _ = state
-        advance(snapshot, devices, retry_state, ctx, round + 1, last_good.sol, nil, backoffs + 1)
+        advance(snapshot, devices, penalized, ctx, round + 1, last_good.sol, nil, backoffs + 1)
     end
   end
 
-  defp latch(state, actions) do
-    %{
-      state
-      | latched:
-          Enum.reduce(actions, state.latched, fn {id, _, _}, acc -> MapSet.put(acc, id) end)
-    }
+  # Offenders of a diverged round, at the positions the round started from: a
+  # shunt has its step halved (or is latched once it cannot be halved), a tap
+  # is latched.
+  defp penalize(state, actions) do
+    Enum.reduce(actions, state, fn {id, _dir, _pos}, st ->
+      before = Map.fetch!(st.positions, id)
+      k = Map.get(st.split, id, 1)
+
+      case id do
+        {:shunt, _} when k < @max_split_factor ->
+          {c, r} = before
+
+          %{
+            st
+            | positions: Map.put(st.positions, id, {c * 2, r * 2}),
+              split: Map.put(st.split, id, k * 2)
+          }
+
+        _ ->
+          %{st | latched: MapSet.put(st.latched, id)}
+      end
+    end)
   end
 
   defp trace_overshoot(false, _round, _overshot), do: :ok

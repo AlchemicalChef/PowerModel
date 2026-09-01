@@ -436,6 +436,77 @@ defmodule PowerModel.Solver.VoltageControlTest do
       assert sol.voltage_control.stopped == :settled
     end
 
+    test "a diverged round retries its absorbing moves alone, so a reactor is not latched for a bank's sin" do
+      # The sagging case plus an open-ended 230 kV radial (bus 4) whose charging
+      # lifts its far end over 1.05 while 90 MVAr of load sags bus 3: one round
+      # wants a reactor step at bus 4 AND a capacitor step at bus 3. The
+      # capacitor is a 5,000 MVAr bomb that diverges the solve; the reactor
+      # must survive the back-off.
+      with_radial = fn b ->
+        sagging_case(:high_from, q_mvar: 90.0)
+        |> update_in(
+          [:buses],
+          &(&1 ++ [%{id: 4, bus_type: 1, base_kv: 230.0, vm_pu: 1.0, va_rad: 0.0}])
+        )
+        |> update_in([:lines], fn ls ->
+          ls ++
+            [
+              %{
+                id: 2,
+                from_bus_id: 2,
+                to_bus_id: 4,
+                r_pu: 0.01,
+                x_pu: 0.3,
+                b_pu: b,
+                rating_a_mva: 500.0
+              }
+            ]
+        end)
+        |> update_in([:loads], &(&1 ++ [%{id: 2, bus_id: 4, p_mw: 2.0, q_mvar: 0.5}]))
+      end
+
+      b =
+        Enum.find(Enum.map(1..40, &(&1 * 0.1)), fn b ->
+          {:ok, s} = FDPF.solve(with_radial.(b), @opts)
+          s.converged and vm(s, 4) > 1.05 and vm(s, 3) < 0.95
+        end)
+
+      assert b, "no charging lifted bus 4 over 1.05 with bus 3 still sagging"
+      snap = with_radial.(b)
+
+      reactor = %{
+        type: :switched_shunt,
+        id: {:shunt, 4},
+        bus_id: 4,
+        cap_step_mvar: 0.0,
+        cap_steps: 0,
+        reac_step_mvar: 5.0,
+        reac_steps: 20,
+        lo: 0.95,
+        hi: 1.05
+      }
+
+      bomb = %{
+        type: :switched_shunt,
+        id: {:shunt, 3},
+        bus_id: 3,
+        cap_step_mvar: 5000.0,
+        cap_steps: 1,
+        reac_step_mvar: 0.0,
+        reac_steps: 0,
+        lo: 0.95,
+        hi: 1.05
+      }
+
+      {:ok, sol} = VoltageControl.solve(snap, @opts ++ [devices: [reactor, bomb]])
+      assert sol.converged
+      assert sol.voltage_control.backoffs >= 1
+      {0, reacs} = shunt_pos(sol, 4)
+      assert reacs >= 1, "the reactor step was latched away with the bomb"
+      assert shunt_pos(sol, 3) == {0, 0}
+      assert MapSet.member?(sol.voltage_control.state.latched, {:shunt, 3})
+    end
+
     test "a bank step that overshoots the band is halved, not abandoned" do
       # 120 MVAr in one step at a bus that wants ~0.02 pu: straight over 1.05.
       big = %{
