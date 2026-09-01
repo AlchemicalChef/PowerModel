@@ -1785,3 +1785,117 @@ The emergency windows also give the first defensible coverage numbers this repo
 has had: Eastern 71,931 MW and ERCOT 13,037 MW are load levels at which the
 model holds a profile a real operator would tolerate under contingency. Those,
 not the solvable α, are what a cascade result should be quoted against.
+
+**CAS-29 (BUILT + MEASURED, 2026-08-31) — controllable reactive plant: switched
+shunts and LTC taps as an outer loop, and what the normal band looks like with
+them.** CAS-28 said the reactive substrate cannot hold a profile because nothing
+in it MOVES. `PowerModel.Solver.VoltageControl` is the layer that moves:
+capacitor and reactor steps at every bus the rules place them on, LTC taps on
+every voltage-crossing transformer, all switched on local voltage in an outer
+loop around `FDPF.solve/2`. The substrate objection ("no data") turned out to
+be weaker than recorded: every transformer in the live model is stamped high
+side = `from` (14,374 of 14,374, zero exceptions, all taps nominal), so an LTC
+prior is unambiguous, and the plant already in `bs_mvar` — 38.7/4.8/21.8 GVAr
+of synthesized reactors and 5.6/2.6/0.4 GVAr of generator-support banks — is
+switchable equipment that had been modelled as a constant.
+`mix grid.census loadability --controls` is the acceptance instrument.
+
+| | solvable | emergency 0.90-1.10 | normal 0.95-1.05 |
+|---|---|---|---|
+| ERCOT, fixed plant (CAS-28) | 0.6406 / 27,839 MW | α 0.2-0.3 / 13,037 MW | none |
+| **ERCOT, controls** | **0.6719 / 29,199 MW** | **α 0.02-0.5 / 21,729 MW** | **α 0.15-0.2 / 8,691 MW** |
+| Western, fixed plant | 0.2031 / 16,914 MW | none | none |
+| **Western, controls** | **0.2109 / 17,563 MW** | **α 0.05-0.2 / 16,656 MW** | none |
+| Eastern, fixed plant | 0.4297 / 123,635 MW | α 0.02-0.25 / 71,931 MW | none |
+| **Eastern, controls** | **0.4766 / 137,129 MW** | **α 0.02-0.3 / 86,317 MW** | none |
+
+ERCOT is the clean result: the emergency band now holds from the lightest grid
+point to α 0.5 — 21.7 GW, 67 % more than the fixed-plant window — and the
+normal band, which no interconnection reached before, holds at α 0.15-0.2 and
+misses by 2-5 buses out of 5,748 through α 0.4. Fresh per-α point solves show
+the same: `out[0.90,1.10] = 0` at every α from 0.02 to 0.5, versus 27-65 buses
+uncontrolled at the light end and 36 at α 0.5. Western, which held NO α at
+either band with fixed plant, holds the emergency band over α 0.05-0.2 —
+16.7 GW, 95 % of its solvable ceiling — with 555 MVAr of switched reactor in
+and 142 taps moved; its normal band is still out of reach, 70-90 buses at
+every α, on the same 115/230 kV subtransmission that the pocket below sits in.
+Eastern's emergency window grows a grid step, 71.9 → 86.3 GW (+20 %), and its
+solvable ceiling 0.4297 → 0.4766 (+11 %) — a bigger move than 130 confirmed
+OSM circuits bought it (LIN-17: zero steps), because this is the first change
+that acts at the binding buses rather than around them. The uncontrolled rows
+were re-run under the restructured census and reproduce CAS-28's numbers
+exactly.
+
+**Eleven rules, every one of them a measurement.** The first version of the
+loop made things WORSE on every interconnection (Western α 0.2: out of band
+9 → 48, then a diverged round), and each rule in the module's docs is the fix
+for a specific measured failure. The ones that mattered most:
+
+- *Taps alone make it worse; reactors alone settle in one round.* Isolation
+  runs at Western α 0.2: reactors 97 → 33 out of band in one round; LTCs at
+  four steps/round 97 → 106 with the EHV side rising 1.127 → 1.231. A tap only
+  redistributes; shunts supply. Hence shunts first, one tap step per round.
+- *Capacitor steps at weak buses diverge FDPF, and the self-susceptance
+  strength estimate cannot see a weak radial pocket* (a bus with three short
+  lines inside a pocket hanging on one 32-km line looks strong). Hence the
+  no-overshoot rule — a move that carries its bus across the band is undone —
+  and step-halving down to an 8-way split before a device is latched.
+- *LTC blocking, both ways.* With the rules above, the normal-band count
+  improved but the MINIMUM voltage got worse everywhere (Western α 0.2 0.873 →
+  0.815; ERCOT α 0.4 0.900 → 0.818), with 12-26 taps run to 0.90 lifting low
+  sides a var-starved high side could not supply — the LTC voltage-collapse
+  mechanism. And at light load the mirror image: ERCOT 138 kV buses at 1.06
+  in the base case ended at 1.157 AFTER control, because the taps under them
+  ran to 1.10 pulling their low sides down and shedding the absorption the
+  138 kV side depended on. Utilities fit LTC blocking on transmission voltage
+  for exactly the first; the second is the same rule with the sign flipped.
+  With both: ERCOT α 0.4 Vm min 0.900 → 0.944 and max 1.115 → 1.058 at α 0.1.
+
+- *Discretisation and attribution, the last two.* With every rule above,
+  Western still held a 500 kV cluster at 1.127 pu at α 0.05 and 0.2. Two
+  causes, both mine: bus 73810's 185 MVAr of charging against a stamped −111
+  MVAr reactor truncated to ONE 100 MVAr step the stamped reactor already
+  occupied (steps now cover the capacity exactly); and a diverged round of 8
+  capacitor steps plus 10 reactor steps latched all 18, the innocent reactors
+  included (the back-off now retries the absorbing moves alone and halves the
+  offenders instead of latching them). With both: Western α 0.05 emergency
+  violations 165 → 0 (Vm max 1.389 → 1.067), α 0.2 Vm 0.873-1.127 →
+  0.906-1.063.
+
+**Continuation is not capability.** A scan that carries device positions
+upward from α 0.02 left 1-2 ERCOT buses outside the normal band at 0.15-0.25
+where a fresh solve leaves none — hysteresis from an unphysically light start
+(α 0.02 is 870 MW for all of ERCOT). The census therefore solves each grid
+point fresh and uses continuation only to seed the ceiling bisection, where a
+cold solve diverges before any device can act.
+
+**The St. George pocket (Western), found on the way.** Western's 1.5 pu at
+light load is not distributed: it is a 147-bus region (55 at 69 kV, 34 at 138,
+30 at 115, 21 at 230) around bus 62631 whose ONLY in-service connection to the
+rest of the interconnection is transmission line 67217 — a 32.5 km, 69 kV-class
+Dixie Escalante REA circuit (x 0.31 pu) — and the same bus 55628 at its mouth is
+Western's floor bus at α 0.3 (Vm 0.6247). Both of Western's failure ends are one
+topology defect. OSM has Red Butte as a 345/138 kV station 39 km away (HIFLD
+stamps it 345/115 with no 138 kV bus in the model), so the pocket's real tie is
+a 138 kV network the model lacks. Controls now hold the pocket inside the
+emergency band at light load (every one of its 147 buses), but nothing in
+this layer can feed it at heavy load — its mouth is still Western's α floor —
+and that is a data repair, ROADMAP item 2's loop, and the next Western move.
+
+**The cascade runs it, opt-in.** `Cascade.init/3` takes `voltage_control:
+true`: devices are derived once from the base snapshot (a bank must not shrink
+as the cascade sheds load), each island's AC solve gets its share and resumes
+the positions its previous segment settled at through
+`record.ac_voltage.control_state`. Off by default, so every existing cascade
+number is unchanged; nothing has been re-measured under cascades with it on
+yet, and that measurement — not this census — is what should decide the
+default.
+
+**What is not done.** Device placement is rule-derived, not ingested — the
+rules are in the module and every number above depends on them (peak
+multiplier 1.75, class step sizes, the 2 % strength guard, 100 % reactor
+compensation ceiling, the 0.95/1.05 blocking thresholds); a sensitivity pass
+over those is owed before any of it is called calibrated. Reactor devices
+exist only at ≥ 230 kV, so a 138 kV region with a var surplus at light load has
+nothing to absorb it except the LTC block; that is where the remaining
+light-load normal-band misses sit.

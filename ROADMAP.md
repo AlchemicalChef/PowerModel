@@ -364,6 +364,11 @@ L ≈ multi-week.
 >   looked: capability curves are derivable from EIA-860 nameplate + power factor +
 >   fuel class, and ULTC presence is a defensible prior above a size threshold. Treat
 >   the rejection as reopened, not overturned -- it needs its own measurement.
+> - **2026-08-31: built and measured** — `PowerModel.Solver.VoltageControl`
+>   (REVIEW CAS-29): switched shunts + LTC taps, eleven measured rules, run by
+>   `mix grid.census loadability --controls` and opt-in in the cascade.
+>   Western now holds the emergency band over α 0.05-0.2 where it held none;
+>   ERCOT reaches the normal band for the first time. See item 0.
 
 > **Salvage note (2026-08-15):** the absorbed pre-reset history (tip `159e900`,
 > retrievable via `git show 159e900:<path>` — do NOT use `origin/master`, which
@@ -521,18 +526,30 @@ network the real network**, **is the operating point a real operating point**, *
 failure dynamics real dynamics**. A year of network work moved the first a long way. The
 second is where the model is genuinely broken, and it gates the third.
 
-0. **No interconnection can hold a normal voltage profile at any load level**
-   (REVIEW CAS-28, measured 2026-08-23 via `mix grid.census loadability`).
-   Nothing reaches 0.95-1.05 pu at any α. Eastern and ERCOT hold the EMERGENCY
-   band (0.90-1.10) over α 0.02-0.25 and 0.2-0.3 — 71,931 MW and 13,037 MW,
-   which are the first defensible coverage numbers this document has had, and
-   what cascade results should be quoted against. Western holds no α at all. Every α this document
-   quotes tested the undervoltage side only, on a network that fails from both —
-   at light load it OVERVOLTS on line charging (Western Vm 1.5 as α → 0). This
-   sits above everything below it: the reactive substrate cannot support a
-   realistic operating point, so reactive planning (switched shunts, ULTC,
-   generator capability placement) is load-bearing rather than an optimisation,
-   and no cascade or voltage result rests on solid ground until it moves.
+0. **The reactive substrate now MOVES, and the coverage numbers move with it**
+   (REVIEW CAS-28 → CAS-29, measured 2026-08-23 and 2026-08-31 via
+   `mix grid.census loadability [--controls]`). With fixed plant only, nothing
+   reaches 0.95-1.05 pu at any α and Western holds no α at either band. With
+   `PowerModel.Solver.VoltageControl` — switched capacitor/reactor steps and
+   LTC taps in an outer loop around FDPF, derived by rule, eleven measured
+   anti-hunting rules — the controlled census reads: ERCOT emergency band
+   α 0.02-0.5 / 21,729 MW (was 0.2-0.3 / 13,037) and normal band α 0.15-0.2 /
+   8,691 MW (was none); Western emergency band α 0.05-0.2 / 16,656 MW (was
+   none), normal still none; Eastern emergency band α 0.02-0.3 / 86,317 MW
+   (was 0.02-0.25 / 71,931) and solvable 0.4766 (was 0.4297), normal still
+   none. These are the coverage figures cascade results should be quoted
+   against.
+   Still open, in order: (a) Western's light-load end is ONE topology defect —
+   the St. George 230 kV pocket, 147 buses tied to the interconnection by a
+   single 32 km 69 kV-class line, whose mouth is also Western's α floor bus
+   (CAS-29); the fix is a 138 kV OSM pull around Red Butte, item 2's loop.
+   (b) The cascade runs the loop OPT-IN (`voltage_control: true` on
+   `Cascade.init/3`, device positions resumed between segments through
+   `record.ac_voltage.control_state`); nothing has been re-measured under
+   cascades with it on, and that measurement — not this census — should
+   decide the default. (c) Placement is
+   rule-derived; a sensitivity pass over peak multiplier, step sizes and the
+   strength guard is owed before "calibrated" is claimed.
 
 1. **Nothing external has ever scored this model** (Phase 6 item 26, unstarted). Every
    instrument is internal — alpha ceilings, census counts, TV distance, conservation
