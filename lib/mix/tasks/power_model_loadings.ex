@@ -125,6 +125,7 @@ defmodule Mix.Tasks.PowerModel.Loadings do
           round(f.rating_mva),
           Map.get(l, :inferred_circuits) || 1,
           l.source,
+          l.source_id || "",
           l.from_bus_id,
           l.to_bus_id,
           lat1,
@@ -155,6 +156,7 @@ defmodule Mix.Tasks.PowerModel.Loadings do
           round(f.rating_mva),
           Map.get(t, :inferred_circuits) || 1,
           "",
+          "",
           t.from_bus_id,
           t.to_bus_id,
           lat1,
@@ -165,7 +167,7 @@ defmodule Mix.Tasks.PowerModel.Loadings do
       end
 
     header =
-      "id,kv,sub_1,sub_2,dc_loading_pct,ac_loading_pct,dc_flow_mw,rating_mva,inferred_circuits,source,from_bus_id,to_bus_id,from_lat,from_lon,to_lat,to_lon"
+      "id,kv,sub_1,sub_2,dc_loading_pct,ac_loading_pct,dc_flow_mw,rating_mva,inferred_circuits,source,source_id,from_bus_id,to_bus_id,from_lat,from_lon,to_lat,to_lon"
 
     File.write!(out, Enum.join([header | Enum.map(rows ++ xrows, &csv_row/1)], "\n") <> "\n")
 
