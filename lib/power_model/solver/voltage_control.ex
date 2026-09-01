@@ -445,15 +445,22 @@ defmodule PowerModel.Solver.VoltageControl do
     |> Map.new()
   end
 
-  # Discretize a capacity into whole steps. Below one step the whole
-  # installation is a single step of its own size; below the smallest bank
-  # that gets built, nothing.
+  # Discretize a capacity into equal steps no larger than `step` that cover it
+  # EXACTLY. Truncating to whole class steps was measured to matter: Western's
+  # bus 73810 (500 kV) carries 185 MVAr of incident charging and a stamped
+  # −111 MVAr reactor; 185 / 100 truncated to ONE step, which the stamped
+  # reactor already occupied, and the 85 MVAr the rule meant to provide was
+  # silently dropped — leaving the cluster at 1.127 pu with the loop reporting
+  # nothing left to switch. Below one step the installation is a single step
+  # of its own size; below the smallest bank that gets built, nothing.
   defp steps_for(capacity, _step) when capacity < @min_bank_mvar, do: nil
 
-  defp steps_for(capacity, step) when capacity < step, do: {capacity, 1}
+  defp steps_for(capacity, step) when capacity <= step, do: {capacity, 1}
 
-  # The epsilon keeps 250 / (100/0.12 × 0.02) from truncating to 14 steps.
-  defp steps_for(capacity, step), do: {step, trunc(capacity / step + 1.0e-9)}
+  defp steps_for(capacity, step) do
+    n = ceil(capacity / step - 1.0e-9)
+    {capacity / n, n}
+  end
 
   defp class_value(table, kv) when is_number(kv) and kv > 0.0 do
     closest = table |> Map.keys() |> Enum.min_by(&abs(&1 - kv))

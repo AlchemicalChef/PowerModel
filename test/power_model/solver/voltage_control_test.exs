@@ -155,8 +155,9 @@ defmodule PowerModel.Solver.VoltageControlTest do
     end
 
     # Bus 3 hangs on one 0.12 pu transformer: strength 100/0.12 = 833 MVA, so a
-    # step is held to 2 % of that — 16.67 MVAr — rather than the 30 MVAr class
-    # step a strong 115 kV bus would get.
+    # step is held to at most 2 % of that — 16.67 MVAr — rather than the 30
+    # MVAr class step a strong 115 kV bus would get. Steps are equal and cover
+    # the capacity exactly, so 40 MVAr is three steps of 13.33.
     @weak_step 100.0 / 0.12 * 0.02
 
     test "capacitor capacity scales with the peak multiplier, is stepped and held to the class ceiling" do
@@ -164,15 +165,18 @@ defmodule PowerModel.Solver.VoltageControlTest do
 
       [%{type: :switched_shunt} = one] = VoltageControl.devices(snap, ltc: false)
       assert one.bus_id == 3
-      assert_in_delta one.cap_step_mvar, @weak_step, 1.0e-9
-      assert one.cap_steps == 2
+      assert one.cap_steps == 3
+      assert_in_delta one.cap_step_mvar, 40.0 / 3, 1.0e-9
+      assert one.cap_step_mvar <= @weak_step
 
       [two] = VoltageControl.devices(snap, ltc: false, peak_multiplier: 2.0)
-      assert two.cap_steps == 4
+      assert two.cap_steps == 5
+      assert_in_delta two.cap_step_mvar * two.cap_steps, 80.0, 1.0e-9
 
       # 40 × 10 = 400 MVAr; the 115 kV ceiling is 250 → 15 steps of 16.67.
       [capped] = VoltageControl.devices(snap, ltc: false, peak_multiplier: 10.0)
       assert capped.cap_steps == 15
+      assert_in_delta capped.cap_step_mvar, @weak_step, 1.0e-9
 
       # Below one step the installation is a single step of its own size.
       [small] = VoltageControl.devices(sagging_case(:high_from, q_mvar: 7.0), ltc: false)
@@ -207,8 +211,10 @@ defmodule PowerModel.Solver.VoltageControlTest do
         end)
 
       [d] = VoltageControl.devices(strong, ltc: false)
-      assert d.cap_step_mvar == 30.0
-      assert d.cap_steps == 1
+      # Not strength-limited: 40 MVAr in two 20 MVAr steps under the 30 class step.
+      assert d.cap_steps == 2
+      assert d.cap_step_mvar == 20.0
+      assert d.cap_step_mvar > @weak_step
     end
 
     test "reactor capacity is the incident charging, with the stamped reactor as steps already in, at EHV only" do
@@ -325,7 +331,8 @@ defmodule PowerModel.Solver.VoltageControlTest do
       assert vm(sol, 3) > vm(base, 3)
       {caps, 0} = shunt_pos(sol, 3)
       assert caps >= 1
-      assert_in_delta sol.voltage_control.shunt.cap_mvar_in, caps * @weak_step, 0.1
+      [d] = VoltageControl.devices(snap, ltc: false, peak_multiplier: 2.0)
+      assert_in_delta sol.voltage_control.shunt.cap_mvar_in, caps * d.cap_step_mvar, 0.1
     end
 
     test "a reactor step comes in for a Ferranti rise" do
@@ -352,10 +359,12 @@ defmodule PowerModel.Solver.VoltageControlTest do
         |> update_in([:lines], fn [l] -> [%{l | b_pu: 1.2}] end)
         |> update_in([:buses], fn [a, b] -> [a, Map.put(b, :bs_mvar, 16.0)] end)
 
+      # 16 MVAr stamped + 1 MVAr of load Q = 17 MVAr in three equal steps.
       [d] = VoltageControl.devices(snap, reactors: false)
       assert d.bus_id == 2
-      assert d.initial == {2, 0}
-      assert_in_delta d.cap_step_mvar, 8.0, 1.0e-9
+      assert d.initial == {3, 0}
+      assert d.cap_steps == 3
+      assert_in_delta d.cap_step_mvar, 17.0 / 3, 1.0e-9
 
       {:ok, base} = FDPF.solve(snap, @opts)
       assert base.converged
@@ -365,7 +374,7 @@ defmodule PowerModel.Solver.VoltageControlTest do
       {:ok, sol} = VoltageControl.solve(snap, @opts ++ [devices: [d]])
       assert sol.converged
       assert shunt_pos(sol, 2) == {0, 0}
-      assert_in_delta sol.voltage_control.shunt.cap_mvar_in, -16.0, 1.0e-6
+      assert_in_delta sol.voltage_control.shunt.cap_mvar_in, -17.0, 1.0e-6
       assert vm(sol, 2) < vm(base, 2)
     end
 
