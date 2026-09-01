@@ -62,4 +62,17 @@ defmodule PowerModel.LoadabilityCensusTest do
     assert report.census == "loadability"
     assert report.interconnections == []
   end
+
+  test "the report says whether the reactive plant was switched on, and how banks were sized" do
+    off = Loadability.report([])
+    assert off.controls == false
+    assert off.peak_multiplier == nil
+
+    on = Loadability.report(controls: true)
+    assert on.controls == true
+    assert is_number(on.peak_multiplier) and on.peak_multiplier > 1.0
+
+    sized = Loadability.report(controls: true, peak_multiplier: 2.5)
+    assert sized.peak_multiplier == 2.5
+  end
 end

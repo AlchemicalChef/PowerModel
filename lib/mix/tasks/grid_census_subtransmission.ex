@@ -68,6 +68,9 @@ defmodule Mix.Tasks.Grid.Census do
                                  of using the as-dispatched operating point
       --format text|json         default text; json keys are stable for CI
       --base-mva F               solver base, default 100.0
+      --controls                 loadability only: run every solve through the
+                                 voltage-control loop (switched shunts + LTC)
+      --peak-multiplier F        loadability only: bank sizing basis, default 1.75
   """
 
   use Mix.Task
@@ -92,7 +95,10 @@ defmodule Mix.Tasks.Grid.Census do
     base_mva: :float,
     # stranding only
     graph: :string,
-    headroom: :float
+    headroom: :float,
+    # loadability only
+    controls: :boolean,
+    peak_multiplier: :float
   ]
 
   # `stranding` lives in Mix.Tasks.Grid.Census.Stranding (LIN13-B, DR-4) and

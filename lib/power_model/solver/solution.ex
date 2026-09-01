@@ -58,7 +58,12 @@ defmodule PowerModel.Solver.Solution do
     # the failure. Empty on a healthy solve, nil from solvers with no floor.
     :vm_floor_bus_ids,
     :vm_floor_count,
-    :vm_floor_pu
+    :vm_floor_pu,
+    # Summary of the voltage-control outer loop that produced this solution
+    # (`PowerModel.Solver.VoltageControl`): rounds, device counts, MVAr
+    # switched in, taps moved, remaining violations, final positions. nil when
+    # no controls ran.
+    :voltage_control
   ]
 
   def new(bus_ids, vm_pu, va_rad, line_flows, base_mva, extra \\ []) do
