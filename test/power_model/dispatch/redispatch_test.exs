@@ -68,6 +68,26 @@ defmodule PowerModel.Dispatch.RedispatchTest do
     assert [%{branch: {:line, 1}}] = report.relieved
   end
 
+  test "Cascade.init constrained_dispatch: true starts from the relieved operating point" do
+    alias PowerModel.Failure.Cascade
+    # In a cascade snapshot p_max_mw is CAPACITY and the dispatch is separate:
+    # load-following gives 100/100 for the 200 MW load, so the 60 MVA line
+    # from A carries 100 until 40 MW moves to B.
+    snap =
+      case3(400.0, 400.0)
+      |> Map.put(:dc_ties, [])
+      |> update_in([:loads], fn [l] -> [%{l | p_mw: 200.0}] end)
+      |> update_in([:lines], fn [a, b] -> [%{a | rating_a_mva: 60.0}, b] end)
+
+    plain = Cascade.init(snap, 100.0)
+    constrained = Cascade.init(snap, 100.0, constrained_dispatch: true)
+
+    assert MapSet.member?(plain.base_overloaded, {:line, 1})
+    refute MapSet.member?(constrained.base_overloaded, {:line, 1})
+    assert constrained.dispatch[1] < plain.dispatch[1]
+    assert_in_delta constrained.dispatch[1] + constrained.dispatch[2], 200.0, 1.0e-6
+  end
+
   test "a network with nothing over its rating is untouched" do
     snap = case3(50.0, 50.0)
     {same, report} = Redispatch.relieve(snap)

@@ -428,6 +428,15 @@ defmodule PowerModel.Failure.Cascade do
     # (see the docstring), and record where each island starts.
     {dispatch, island_states} = balance_operating_point(dispatch, islands, snapshot)
 
+    # `constrained_dispatch: true` — shift generation until no rated branch
+    # is over its rating (REVIEW EXT-1, `Dispatch.Redispatch`): the operating
+    # point a security-constrained market would actually run. Opt-in until
+    # measured under cascades.
+    dispatch =
+      if Keyword.get(opts, :constrained_dispatch, false) == true,
+        do: constrain_dispatch(dispatch, islands, snapshot, base_mva),
+        else: dispatch
+
     # Solve base case to identify lines already overloaded due to model limitations.
     # These are excluded from cascade trip consideration since they represent
     # impedance estimation errors, not actual overloads.
@@ -575,6 +584,57 @@ defmodule PowerModel.Failure.Cascade do
   # Balance each island's dispatch against its load with unbounded reserves
   # (see `init/3`). Returns the closed dispatch and one record per island,
   # with the deficit clock started only where a gap survives.
+  # Per island: shape the generators at their dispatch, relieve every rated
+  # overload by generation shift, and read the shifted MW back into the
+  # dispatch map. Islands the relief cannot factorize are left as dispatched.
+  defp constrain_dispatch(dispatch, islands, snapshot, base_mva) do
+    Enum.reduce(islands, dispatch, fn island, dispatch ->
+      gens = Enum.filter(snapshot.generators, &MapSet.member?(island, &1.bus_id))
+
+      if gens == [] do
+        dispatch
+      else
+        shaped =
+          Enum.map(gens, fn g ->
+            d = Map.get(dispatch, g.id, g.p_max_mw * (g.capacity_factor || 1.0))
+
+            %{g | p_max_mw: d, capacity_factor: 1.0}
+            |> Map.put(:p_dispatch_mw, d)
+            |> Map.put(:p_nameplate_mw, g.p_max_mw)
+          end)
+
+        sub = %{
+          buses: Enum.filter(snapshot.buses, &MapSet.member?(island, &1.id)),
+          lines:
+            Enum.filter(
+              snapshot.lines,
+              &(MapSet.member?(island, &1.from_bus_id) and MapSet.member?(island, &1.to_bus_id))
+            ),
+          transformers:
+            Enum.filter(
+              Map.get(snapshot, :transformers, []),
+              &(MapSet.member?(island, &1.from_bus_id) and MapSet.member?(island, &1.to_bus_id))
+            ),
+          generators: shaped,
+          loads: Enum.filter(snapshot.loads, &MapSet.member?(island, &1.bus_id)),
+          dc_ties: Map.get(snapshot, :dc_ties, [])
+        }
+
+        {relieved, report} = PowerModel.Dispatch.Redispatch.relieve(sub, base_mva: base_mva)
+
+        if report.shifted_mw > 0.0 do
+          Logger.info(
+            "Constrained dispatch: island of #{MapSet.size(island)} buses, #{round(report.shifted_mw)} MW shifted " <>
+              "over #{report.iterations} iterations, #{length(report.relieved)} branches relieved, " <>
+              "#{length(report.residual)} residual (#{report.stopped})"
+          )
+        end
+
+        Enum.reduce(relieved.generators, dispatch, fn g, d -> Map.put(d, g.id, g.p_max_mw) end)
+      end
+    end)
+  end
+
   defp balance_operating_point(dispatch, islands, snapshot) do
     loads = snapshot.loads
     generators = snapshot.generators

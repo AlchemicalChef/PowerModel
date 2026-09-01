@@ -814,9 +814,13 @@ defmodule PowerModel.Ingestion.CapacityInference do
   The operating point is the measured dispatch at each hour in `:hours`
   (default: the peak demand hour in the ingested record and the latest one —
   the capacity a grid is built for, and the hour everything else here is
-  measured at); a branch gets the largest count any hour asks for. The pass
-  first UNFOLDS the circuits a previous run stored, so it is idempotent and
-  can be re-run after any change to the network.
+  measured at); a branch gets the largest count any hour asks for. With
+  `redispatch: true` the dispatch is first shifted until no overload a
+  generation shift can relieve remains (`Dispatch.Redispatch`), so only what
+  re-dispatch cannot fix is read as missing capacity — the distinction EXT-1
+  showed the at-rest rule needs. The pass first UNFOLDS the circuits a
+  previous run stored, so it is idempotent and can be re-run after any change
+  to the network.
 
   Returns `%{name => report}`.
   """
@@ -861,6 +865,14 @@ defmodule PowerModel.Ingestion.CapacityInference do
           })
 
         Enum.reduce(subs, acc, fn island, acc ->
+          # `redispatch: true` — relieve every overload a generation shift
+          # can before reading what is left as missing capacity (EXT-1).
+          island =
+            if Keyword.get(opts, :redispatch, false) == true,
+              do:
+                island |> PowerModel.Dispatch.Redispatch.relieve(base_mva: @base_mva) |> elem(0),
+              else: island
+
           {_snap, report} = infer(island, opts)
 
           if report.over_cap != %{} do
