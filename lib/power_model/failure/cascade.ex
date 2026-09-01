@@ -203,6 +203,7 @@ defmodule PowerModel.Failure.Cascade do
   alias PowerModel.Controls.AGC
   alias PowerModel.Dispatch
   alias PowerModel.Grid.{BtmSolar, DcTie, Ratings}
+  alias PowerModel.Solver.VoltageControl
   alias PowerModel.Solver.{DCPowerFlow, FDPF, Frequency}
   alias PowerModel.Failure.{Protection, LoadShedding, Reserves}
   alias PowerModel.Simulation.Cascading.IslandDetector
@@ -248,6 +249,11 @@ defmodule PowerModel.Failure.Cascade do
   # Nominal frequency, used when an island carries no deficit and therefore no
   # under-frequency excursion to evaluate. Matches `Frequency`'s f0.
   @nominal_frequency_hz 60.0
+
+  # Bank sizing basis for the voltage-control layer when `voltage_control:
+  # true`: peak-to-reference-hour demand ratio, the same default the
+  # loadability census uses (see `Mix.Tasks.Grid.Census.Loadability`).
+  @default_peak_multiplier 1.75
 
   # An island's AC solve is not retried while nothing about the island has
   # changed enough to change the answer. Bus count and branch count are exact;
@@ -350,7 +356,16 @@ defmodule PowerModel.Failure.Cascade do
       ac_solves: 0,
       ac_diverged: 0,
       ac_skipped: 0
-    }
+    },
+    # Controllable reactive plant (REVIEW CAS-29). Off by default: the AC pass
+    # then solves with the stamped, fixed plant exactly as before. When on,
+    # `voltage_devices` is the device list `PowerModel.Solver.VoltageControl`
+    # derived from the BASE snapshot at init — sized once, so a bank does not
+    # shrink as the cascade sheds load — and every island's AC solve runs
+    # through the control loop, resuming the positions its previous segment
+    # settled at (`record.ac_voltage.control_state`).
+    voltage_control: false,
+    voltage_devices: []
   ]
 
   @doc """
@@ -419,6 +434,16 @@ defmodule PowerModel.Failure.Cascade do
     {base_overloaded, base_line_categories, base_line_loading} =
       compute_base_overloads(snapshot, dispatch, base_mva)
 
+    voltage_control = Keyword.get(opts, :voltage_control, false) == true
+
+    voltage_devices =
+      if voltage_control,
+        do:
+          VoltageControl.devices(snapshot,
+            peak_multiplier: Keyword.get(opts, :peak_multiplier, @default_peak_multiplier)
+          ),
+        else: []
+
     %__MODULE__{
       buses: snapshot.buses,
       lines: snapshot.lines,
@@ -460,6 +485,8 @@ defmodule PowerModel.Failure.Cascade do
       conductor_state: %{},
       conductor_at_s: 0.0,
       voltage_layer: fresh_voltage_layer(),
+      voltage_control: voltage_control,
+      voltage_devices: voltage_devices,
       termination: nil,
       frequency_nadir_hz: @nominal_frequency_hz
     }
@@ -488,8 +515,11 @@ defmodule PowerModel.Failure.Cascade do
   # makes it structurally impossible for a voltage-sensitive protection to be
   # reading the DC solve's flat 1.0 pu:
   #
-  #   :ac_voltage       `nil`, or `%{vm_by_bus:, at_s:, warm_start:}` from the
-  #                     END of the previous segment. `nil` IS the common case
+  #   :ac_voltage       `nil`, or `%{vm_by_bus:, at_s:, warm_start:,
+  #                     control_state:}` from the END of the previous segment
+  #                     (`control_state` is the voltage-control loop's device
+  #                     positions, nil unless `voltage_control: true`). `nil`
+  #                     IS the common case
   #                     at real demand (REVIEW LIN-13) and every consumer
   #                     below treats it as "no voltage layer this segment".
   #   :ac_failed        the island fingerprint an AC attempt last failed on,
@@ -2021,6 +2051,8 @@ defmodule PowerModel.Failure.Cascade do
       base_overloaded: state.base_overloaded,
       base_line_loading: state.base_line_loading || %{},
       now: state.simulated_time,
+      voltage_control: state.voltage_control,
+      voltage_devices: state.voltage_devices,
       # Seconds since the conductor temperatures were last advanced — the
       # PREVIOUS step's clock advance, which is the only interval whose
       # duration is known when this step starts.
@@ -2589,7 +2621,10 @@ defmodule PowerModel.Failure.Cascade do
       | ac_voltage: %{
           vm_by_bus: Map.new(Enum.zip(ac.bus_ids, ac.vm_pu)),
           at_s: ctx.now,
-          warm_start: ac
+          warm_start: ac,
+          # Device positions the control loop settled at (nil when the AC
+          # pass ran without controls), resumed by the next segment's solve.
+          control_state: ac.voltage_control && ac.voltage_control.state
         },
         ac_failed: nil
     }
@@ -3393,7 +3428,25 @@ defmodule PowerModel.Failure.Cascade do
         _ -> opts
       end
 
-    case FDPF.solve(snapshot, opts) do
+    result =
+      if Map.get(ctx, :voltage_control, false) do
+        # The island's share of the base snapshot's devices, resuming the
+        # positions its previous segment settled at. Positions are keyed by
+        # device id, so they survive an island splitting or merging.
+        devices = island_devices(Map.get(ctx, :voltage_devices, []), snapshot)
+
+        opts =
+          case record.ac_voltage do
+            %{control_state: %{} = st} -> Keyword.put(opts, :control_state, st)
+            _ -> opts
+          end
+
+        VoltageControl.solve(snapshot, Keyword.put(opts, :devices, devices))
+      else
+        FDPF.solve(snapshot, opts)
+      end
+
+    case result do
       {:ok, %{converged: true} = solution} -> {:ok, solution}
       _ -> :error
     end
@@ -3401,6 +3454,17 @@ defmodule PowerModel.Failure.Cascade do
     _ -> :error
   catch
     _kind, _payload -> :error
+  end
+
+  defp island_devices(devices, snapshot) do
+    buses = MapSet.new(snapshot.buses, & &1.id)
+    xfmrs = MapSet.new(Map.get(snapshot, :transformers, []), & &1.id)
+
+    Enum.filter(devices, fn
+      %{type: :ltc, transformer_id: id} -> MapSet.member?(xfmrs, id)
+      %{type: :switched_shunt, bus_id: id} -> MapSet.member?(buses, id)
+      _ -> false
+    end)
   end
 
   defp count_voltage(acc, island_key, attempt_key) do

@@ -215,6 +215,35 @@ defmodule PowerModel.Failure.CascadeVoltageTest do
   # UVLS
   # ===========================================================================
 
+  describe "the voltage-control layer in the cascade loop" do
+    test "off by default: the layer carries no device positions" do
+      {state, _steps} = run(sagging_snapshot())
+      layer = Enum.find(state.island_states, & &1.ac_voltage)
+      assert layer.ac_voltage.control_state == nil
+    end
+
+    test "on: a bank steps in at the sagging bus, and its position rides along in the layer" do
+      {off, _} = run(sagging_snapshot())
+      off_layer = Enum.find(off.island_states, & &1.ac_voltage)
+
+      state = Cascade.init(sagging_snapshot(), 100.0, voltage_control: true, peak_multiplier: 2.0)
+      assert state.voltage_control
+      assert Enum.any?(state.voltage_devices, &(&1.type == :switched_shunt and &1.bus_id == 2))
+
+      {on, _steps} = Cascade.run_cascade(state)
+      on_layer = Enum.find(on.island_states, & &1.ac_voltage)
+      assert on_layer, "expected the controlled island to end with a voltage layer"
+
+      st = on_layer.ac_voltage.control_state
+      assert is_map(st) and is_map(st.positions)
+      {caps, 0} = st.positions[{:shunt, 2}]
+      assert caps >= 1
+
+      assert on_layer.ac_voltage.vm_by_bus[2] > off_layer.ac_voltage.vm_by_bus[2]
+      assert on.voltage_layer.islands_ac > 0
+    end
+  end
+
   describe "UVLS in the cascade loop" do
     test "a sagging bus sheds through the staged program" do
       {state, _steps} = run(sagging_snapshot())
