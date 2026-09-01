@@ -592,18 +592,24 @@ second is where the model is genuinely broken, and it gates the third.
    (a thermal overload is not an infeasibility); (ii) `Dispatch.Redispatch`
    holds them at their limits like the market does (Bruni → 100.0 %, 1,424 MW
    shifted; Frontera residual at 110 % — the Valley is import-constrained,
-   faithfully), opt-in everywhere until measured under cascades. Still open:
-   the distribution — the median found element loads 21 % and 27 of the
-   model's top-30 are still not real constraints, which points at C1 (CEMS
-   unit-level dispatch) and the instrument's coverage (31/80, 29/57
-   geocoded); (iii) MISO's 16 "no bus at class" yards join the corridor
-   worklist; (iv) `mix power_model.cascade_ccdf` ran (EXT-3):
-   every N-1 and N-2 sample SETTLES — CAS-26's runaway regime is closed on
-   ERCOT — and no tail exists (q99 ≈ 72 MW vs OE-417's gigawatt power law):
-   the model now under-propagates because, post-inference, it runs far from
-   its limits everywhere the BA-fuel dispatch reaches. The tail needs the
-   operating point, not more samples: C1 (CEMS unit dispatch) + re-dispatch
-   as the default, then re-run.
+   faithfully), opt-in everywhere until measured under cascades; (iii) MISO's
+   16 "no bus at class" yards join the corridor worklist; (iv) C1 is BUILT
+   and measured (EXT-4): CEMS pins the fossil fleet to its measured operation
+   (`Ingestion.Epa.Cems`, `cems: true` / `--cems`, opt-in), and the
+   distribution moved — ERCOT median found-element loading 20 % → 54 %, four
+   real named constraints overloaded in the model organically, MISO
+   29 % → 62 % (rank 2.8 %, reverse 0 → 7/30) against a season-matched July
+   constraint week plus its exclusion rows (migration 20260901150000); (v)
+   `mix power_model.cascade_ccdf` at the peak hour under measured dispatch
+   found the FIRST fittable blackout-size tail: N-2, α = 1.48 on 10 events
+   ≥ 100 MW vs OE-417's published ≈ 1.31, P[≥ 10 GW] = 0.7 %, terminations
+   settled throughout (one budget exhaustion in the N-1 measured arm, 1/150)
+   — EXT-3's "the tail needs the operating point, not more samples" measured
+   TRUE. Still open: the scorer's geocoding coverage (31/80, 29/57), the
+   Permian 69 kV through-flow artifacts the measured dispatch exposed
+   (1.9 GW routed through subtransmission is topology, not congestion), and
+   flipping `cems` + re-dispatch to default once measured under the census
+   and validation.
 
 1. **Nothing external has ever scored this model** (Phase 6 item 26, unstarted). Every
    instrument is internal — alpha ceilings, census counts, TV distance, conservation

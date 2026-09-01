@@ -223,3 +223,16 @@ empirically, not assumed — the TX gas fleet's 24 h shape correlates with
 EIA-930's ERCO gas column at r=0.992 under UTC-6 against 0.929 (UTC-5) and
 0.956 (UTC-7). Gross load is GROSS (station service included); EIA-930 is net —
 `PowerModel.Ingestion.Epa.Cems` treats 930 as the total and CEMS as the shape.
+
+## miso_rt_binding_constraints_2024-07-09_07-16.csv
+COMMITTED: the eight daily MISO "Binding Constraints Report - Real-Time
+Market" workbooks for 2024-07-09..2024-07-16 (the week of the model's
+reference day), same source and flattening as the winter week above; 4,725
+rows. Pulled 2026-09-01 (re-fetchable). The season-matched record set for the
+EXT-4 congestion score — the winter week scores a July operating point as
+season mismatch, not signal — and the source of the July rows in
+`known_binding_elements_2026-09-01_jul.csv` (both ISOs, 58 rows, emitted by
+`scripts/score_congestion.py --emit` from the CEMS-dispatch loadings; the
+capacity passes were re-derived after it landed, because 12 of its 34 MISO
+elements had been given inferred circuits by passes that only knew the
+winter list).

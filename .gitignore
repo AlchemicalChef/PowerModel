@@ -73,6 +73,8 @@ data/vendored/*
 # day, so its flattened pull is not re-fetchable; MISO's is the derived record.
 !data/vendored/ercot_sced_binding_constraints_2026-08-28_09-01.csv
 !data/vendored/miso_rt_binding_constraints_2024-12-25_2025-01-01.csv
+# EXT-4: the season-matched MISO week for the model's reference day.
+!data/vendored/miso_rt_binding_constraints_2024-07-09_07-16.csv
 # The matched real limits: the capacity passes' exclusion list (derived record).
 !data/vendored/known_binding_elements_*.csv
 # C1: EPA CEMS measured unit dispatch for the reference day (trimmed pulls; the

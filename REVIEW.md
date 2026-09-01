@@ -2352,3 +2352,88 @@ sits at 100 % the way the market's does; (b) the congestion score's coverage
 (31/80) so the exclusion list grows toward the real constraint set; then
 re-run this instrument. Its value today is the regime diagnosis, and that
 CAS-26 is closed on ERCOT: no initiating pair exhausts the step budget.
+
+**EXT-4 (BUILT + MEASURED, 2026-09-01) — measured unit dispatch (ROADMAP C1),
+and the first blackout-size tail.** EXT-2 ended on "the distribution is still
+wrong" and EXT-3 on "the tail needs the operating point"; both fingered the
+same suspect, the BA-fuel dispatch, which spreads each fuel's measured MW over
+a merit order the model invented. C1 replaces the invention with measurement:
+EPA's continuous emissions monitors (CEMS) report gross load per fossil unit
+per hour, keyed by the ORIS id that IS `eia_plant_id`, and the vendored
+reference day (2024-07-15, nationwide, 3,990 units, 89 % of ERCOT's fossil
+capacity) covers the model's peak hour. `Ingestion.Epa.Cems` reads it at
+local STANDARD time — verified against EIA-930's ERCO gas shape (r = 0.992
+at UTC−6 vs 0.929/0.956 at ±1 h), not assumed — and `Dispatch` pins each
+measured plant to the measured shape. The division of authority is strict:
+EIA-930 still owns every (BA, fuel) total (which also absorbs gross-vs-net
+without a per-fuel constant), CEMS owns the shape inside it; units the
+monitors watched sit idle stay OFF even when the merit order wants them, and
+unmeasured units fill only the residual. Opt-in everywhere (`cems: true`,
+`--cems`) until measured end to end.
+
+**The congestion score moves at both ISOs.** ERCOT, same records and
+instrument as EXT-1/2, baseline vs measured dispatch: median found-element
+loading **20 % → 54 %** (mean 45 → 61 %), median percentile rank 22.5 % →
+9.7 %. Four of ERCOT's real named constraints — Bruni (193 %), Seagoville
+(183 %), Frontera (172 %), La Palma–Haine Dr (132 %) — now show up overloaded
+in the model WITHOUT being told where they are; under EXT-2 the model had to
+be handed their locations as an exclusion list before their overloads even
+appeared. On La Palma–Haine Dr the model's 224 MVA rating brackets ERCOT's
+own enforced limit (213–229 MVA in the SCED records): the remaining error
+there is flow concentration, not the rating. Re-dispatch on the measured
+point relieves the model's ARTIFACTS (a Permian 69 kV line at 560 % → 101 %,
+a 138/69 transformer 122 % → 22 %) and cannot relieve the real four — 3,782
+MW shifted, none of them moved — which is the market's own experience of
+those constraints: they bind because no re-dispatch room is left on a July
+peak. MISO's winter-week records score a summer hour poorly in either
+direction (median 34–36 %), which is season mismatch, not signal: against a
+freshly pulled season-matched July week (2024-07-09..16, 151 constraints, 85
+geocoded, 34 in the model — richer than the winter set), the same move
+appears: median **29 % → 48 %**, top-5 % membership 14 → 15 of 34.
+
+**The lesson of EXT-1 recurred and was closed the same day.** 12 of the 34
+July MISO elements sat on inferred capacity — the exclusion list only knew
+the winter week, so the at-rest pass had "fixed" the July constraints'
+real limits. The July matches (58 rows, both ISOs) are now
+`known_binding_elements_2026-09-01_jul.csv` and both capacity passes were
+re-derived (migration 20260901150000; ceilings stayed at 1.0, one extra
+circuit in Eastern — honesty again cost nothing). Post-derivation the MISO
+score moves from good to right: median found-element loading **62 %** (mean
+72 %), median rank 2.8 %, 20 of 34 in the model's top 5 %, and the reverse
+direction lights up for the first time — **7 of the model's top-30 loaded
+branches have both yards among MISO's constraint stations** (0 before C1,
+0 after C1 alone). ERCOT re-scored unchanged (median 54 %, 0/23 on inferred
+capacity). The exclusion list is not a static artifact; it grows
+with every record set the scorer can reach, and re-derivation is part of
+ingesting one.
+
+**The tail exists now (item 27).** `mix power_model.cascade_ccdf`, ERCOT,
+150 samples, seed 7, at the PEAK hour (EXT-3's arms ran at the winter latest
+hour — stress matters even before dispatch does: plain N-2 q99 is 2.1 GW at
+the peak vs 72 MW there). N-1: both arms 129/127 intact, q99 464/205 MW, ≤ 2
+events ≥ 100 MW — still no tail under single contingencies, as OE-417 itself
+would predict. N-2, measured dispatch: **10 of 150 events ≥ 100 MW and the
+MLE tail exponent fits: α = 1.48, against OE-417's published ≈ 1.31**
+(plain N-2 at the same hour: 5 events, below the fit floor). P[≥ 1 GW] =
+3.3 %, P[≥ 10 GW] = 0.7 %, outcomes 108 intact / 42 degraded, terminations
+150/150 settled (the N-1 measured arm had the session's only budget
+exhaustion, 1/150 — CAS-26 stays closed, now with one asterisk). A first
+fittable tail 0.17 above the published exponent, from 150 doubles at one
+hour of one interconnection, is not agreement yet — but EXT-3's diagnosis
+("the OE-417 tail is absent because almost nothing grows; the operating
+point is the missing propagation mechanism") is now measured as TRUE: the
+same instrument, same seeds, same network found the tail the moment the
+fleet ran where the monitors saw it run.
+
+**Caveats, honestly.** One vendored day (the reference day) — other hours
+run unpinned by design; facility timezones are state+longitude approximate
+(boundary plants can read one hour off); plant gross is apportioned to units
+by capability (units of a plant share a bus, so flows barely notice); CEMS
+covers fossil ≥ 25 MW only — nuclear/hydro/wind/solar stay on the BA-fuel
+path; and the cascade's base-overload exclusion means the four real
+constraints, overloaded at rest, are never themselves trip candidates — the
+measured tail is if anything understated. Next: the scorer's geocoding
+coverage (31/80 ERCOT), the Permian 69 kV through-flow artifacts the
+measured dispatch exposed (branches 84309, 281180, T8927 — 1.9 GW routed
+through subtransmission is a topology error, not congestion), and only then
+the question of flipping `cems` + re-dispatch to default.
