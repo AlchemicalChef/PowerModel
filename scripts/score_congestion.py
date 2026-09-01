@@ -34,9 +34,25 @@ def load_osm(path,bbox):
         nn=norm(n)
         if nn: byname[nn].append({'name':n,'lat':c['lat'],'lon':c['lon'],'kvs':[int(x)/1000 for x in re.findall(r'\d{4,6}',t.get('voltage','') or '')]})
     return byname
+def load_stations(byname,path,bbox):
+    # Second name source: the model's own HIFLD substations (name,lat,lon,kv;kv)
+    # -- OSM's named-yard coverage is the geocoder's bottleneck, and the model
+    # already carries 19k+ named yards with coordinates and voltage levels.
+    for row in csv.reader(open(path)):
+        if len(row)<4: continue
+        n,la,lo,kvs=row[0],float(row[1]),float(row[2]),row[3]
+        if not (bbox[0]<la<bbox[2] and bbox[1]<lo<bbox[3]): continue
+        nn=norm(n)
+        if nn: byname[nn].append({'name':n,'lat':la,'lon':lo,'kvs':[float(k) for k in kvs.split(';') if k]})
+    return byname
 def geocode(byname,names,tok,kv):
     raw=tok.upper().replace('_',' ')
-    for v in (raw, re.sub(r'(SW|SWS|SES|SS)$','',raw), re.sub(r'\d+$','',raw), re.sub(r'^(S|N|E|W|MV|I|TN)\s*','',raw)):
+    # Direction/system prefixes are stripped only when a separator follows
+    # ("S MISSIN", "MV WESL4") -- stripping a bare leading letter turned
+    # SALDS into ALDS and false-matched ALGODONES.
+    for v in (raw, re.sub(r'(SW|SWS|SES|SS)$','',raw), re.sub(r'\d+$','',raw),
+              re.sub(r'^(S|N|E|W|MV|I|TN) +','',raw),
+              re.sub(r'S$','',raw) if len(raw)>5 else raw):
         t=norm(v); tk=t.replace(' ','')
         if len(tk)<3: continue
         if t in byname: c=byname[t]
@@ -68,9 +84,12 @@ def main():
     ap.add_argument('--osm',default='data/vendored/osm_substations_2026-08-18.json'); ap.add_argument('--top',type=int,default=30); ap.add_argument('--quiet',action='store_true')
     ap.add_argument('--emit',help='append the matched model branches (real binding elements found in the model) to this CSV: iso,label,binding_intervals,branch_id,source_id,kv,inferred_circuits,dc_loading_pct')
     ap.add_argument('--records',help='constraint-record CSV overriding the ISO default (e.g. a season-matched MISO week)')
+    ap.add_argument('--stations',help='model substation CSV (name,lat,lon,kv;kv) merged into the geocoder, from `mix power_model.loadings --stations`')
     a=ap.parse_args(); cfg=ISO[a.iso]
     if a.records: cfg=dict(cfg, file=a.records)
-    byname=load_osm(a.osm,cfg['bbox']); names=list(byname)
+    byname=load_osm(a.osm,cfg['bbox'])
+    if a.stations: load_stations(byname,a.stations,cfg['bbox'])
+    names=list(byname)
     buses={r['id']:(float(r['kv']),float(r['lat']),float(r['lon'])) for r in csv.DictReader(open(a.buses))}
     model=list(csv.DictReader(open(a.loadings)))
     adj=collections.defaultdict(list)

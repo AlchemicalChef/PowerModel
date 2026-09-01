@@ -24,6 +24,8 @@ defmodule Mix.Tasks.PowerModel.Loadings do
 
   require Logger
 
+  import Ecto.Query
+
   alias PowerModel.{Demand, Grid, Repo}
   alias PowerModel.Dispatch.Redispatch
   alias PowerModel.Failure.Cascade
@@ -35,6 +37,7 @@ defmodule Mix.Tasks.PowerModel.Loadings do
     interconnection: :string,
     out: :string,
     buses: :string,
+    stations: :string,
     hour: :string,
     ac: :boolean,
     redispatch: :boolean,
@@ -183,6 +186,31 @@ defmodule Mix.Tasks.PowerModel.Loadings do
         end
 
       File.write!(opts[:buses], Enum.join(["id,kv,lat,lon" | lines], "\n") <> "\n")
+    end
+
+    # `--stations`: the model's named yards (name, coords, kv levels) as a
+    # second geocoding source for the scorer (`--stations` there too) — OSM's
+    # named-yard coverage is its bottleneck.
+    if opts[:stations] do
+      rows =
+        Repo.all(
+          from(s in "substations",
+            where:
+              not like(s.name, "UNKNOWN%") and not like(s.name, "TAP%") and
+                not is_nil(s.coordinates),
+            select: {s.name, s.coordinates, s.voltage_levels}
+          )
+        )
+
+      lines =
+        for {name, geom, levels} <- rows, %Geo.Point{coordinates: {lon, lat}} <- [geom] do
+          clean = String.replace(name, ",", " ")
+          kvs = Enum.map_join(levels || [], ";", &trunc/1)
+          "#{clean},#{Float.round(lat, 5)},#{Float.round(lon, 5)},#{kvs}"
+        end
+
+      File.write!(opts[:stations], Enum.join(lines, "\n") <> "\n")
+      Mix.shell().info("#{length(lines)} named stations written to #{opts[:stations]}")
     end
 
     Mix.shell().info(
