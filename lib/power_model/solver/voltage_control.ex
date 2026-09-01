@@ -754,13 +754,13 @@ defmodule PowerModel.Solver.VoltageControl do
   defp trace_backoff(true, round, actions, retry) do
     n = length(actions)
 
-    Logger.info(
-      "voltage-control round #{round}: diverged after #{n} moves — " <>
-        if(retry,
-          do: "reverting shunts, retrying taps alone",
-          else: "reverting and latching all #{n}"
-        )
-    )
+    how =
+      case retry do
+        nil -> "reverting all #{n}"
+        kept -> "reverting #{n - length(kept)}, retrying #{length(kept)} alone"
+      end
+
+    Logger.info("voltage-control round #{round}: diverged after #{n} moves — #{how}")
   end
 
   defp trace(false, _round, _sol, _actions, _state), do: :ok
