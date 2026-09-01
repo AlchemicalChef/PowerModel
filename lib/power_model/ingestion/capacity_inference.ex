@@ -53,6 +53,31 @@ defmodule PowerModel.Ingestion.CapacityInference do
   A branch needing more than `max_circuits` (default #{"8"}) is left as it is and
   reported: that is not a missing parallel circuit but misplaced load or a
   missing corridor, and inferring eight circuits of 69 kV would hide it.
+
+  ## The second rule: pockets the at-rest test cannot see (`raise_ceiling/2`)
+
+  With the at-rest circuits in, Western's AC still failed at α 0.4 with eleven
+  buses on the solver's 0.5 pu floor and a mismatch of 0.14 MVA — one pocket
+  collapsing, not a network. A 66 kV load area in the San Bernardino mountains
+  (~30 MW) whose only feed in the model is a chain of 33 kV lines, 14.5 + 13.3
+  + 10 km at x 0.60 + 0.55 + 0.41 pu: 30 MW at the P-V nose of 1.5 pu of
+  series reactance, at 54 % MVA loading. The rating is fine; the IMPEDANCE is
+  the limit, so no MW criterion can see it, and the real 66 kV feed is missing.
+
+  `raise_ceiling/2` is ROADMAP item 2's loop automated: step α upward; when
+  the controlled AC solve fails, take the buses under `@pocket_vm` in its last
+  iterate as pockets (connected components), and from each pocket's DEEPEST
+  bus trace a single series path outward along the largest DC inflow — through
+  the pocket and beyond it — until a source: a bus whose generation can carry
+  the load the path has picked up, or an EHV bus (a failed iterate's voltages
+  are not an operating point, so nothing else counts as strong). Then double
+  the highest-reactance branch on that path until the load it carries times
+  its reactance is inside `@pocket_margin` — the radial loadability criterion,
+  `S · X ≤ margin`, which is only meaningful for a series path, which is why
+  the walk is one. When the criterion is already satisfied and the pocket
+  still collapses, the evidence wins: one more doubling of the weakest branch.
+  Re-solve; repeat. The circuits it adds carry the same `inferred_circuits`
+  provenance.
   """
 
   import Ecto.Query
@@ -60,7 +85,7 @@ defmodule PowerModel.Ingestion.CapacityInference do
   alias PowerModel.{Demand, Grid, Repo}
   alias PowerModel.Failure.Cascade
   alias PowerModel.Grid.{Interconnection, TransmissionLine, Transformer}
-  alias PowerModel.Solver.{DCPowerFlow, Partition}
+  alias PowerModel.Solver.{DCPowerFlow, Partition, VoltageControl}
 
   require Logger
 
@@ -70,6 +95,23 @@ defmodule PowerModel.Ingestion.CapacityInference do
   @base_mva 100.0
 
   @loading_bins [100, 150, 200, 300, 500]
+
+  # raise_ceiling/2: a bus below this in a failed iterate is in a collapsing
+  # pocket; the feeding path is traced until a generator bus; a pocket is
+  # reinforced until S_path · X_path ≤ margin (pu on the solver base — 0.2
+  # keeps a radial well inside its nose).
+  @pocket_vm 0.7
+  @pocket_vm_wide 0.85
+  @pocket_margin 0.2
+  @max_path_hops 25
+  # A source, for the walk: a bus whose generators can carry the load the path
+  # picked up, or a bus at/above this class (the EHV network).
+  @source_kv 230.0
+  @default_alpha_steps [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  @max_fixes_per_alpha 40
+  # "Evidence wins" doublings a pocket (by its deepest bus) may receive after
+  # the criterion is already met; past that it is declared unfixable.
+  @max_forced_per_pocket 2
 
   @doc "Defaults, for callers that report them."
   def default_threshold, do: @default_threshold
@@ -267,6 +309,413 @@ defmodule PowerModel.Ingestion.CapacityInference do
   end
 
   # ---------------------------------------------------------------------------
+  # Pockets: the AC-driven loop
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Raise an island's controlled AC ceiling toward `:target` by reinforcing the
+  feeding paths of the pockets that collapse (see the moduledoc). Pure.
+
+  Returns `{island, report}`: the island with circuits folded in and
+  `:inferred_circuits` stamped (relative to the island as given), and
+
+      %{ceiling: α, target: α, circuits: %{key => n}, fixes: [%{alpha:, pocket_buses:,
+        pocket_mw:, path: [key], before: S·X, after: S·X}], unfixable: [...]}
+
+  Options: `:target` (default 1.0), `:alpha_steps`, `:margin`, `:max_circuits`,
+  `:peak_multiplier`, `:base_mva`, plus solver options.
+  """
+  def raise_ceiling(island, opts \\ []) do
+    target = Keyword.get(opts, :target, 1.0)
+    steps = Keyword.get(opts, :alpha_steps, @default_alpha_steps) |> Enum.filter(&(&1 <= target))
+    margin = Keyword.get(opts, :margin, @pocket_margin)
+    max_circuits = Keyword.get(opts, :max_circuits, @default_max_circuits)
+    base_mva = Keyword.get(opts, :base_mva, @base_mva)
+    peak = Keyword.get(opts, :peak_multiplier, 1.75)
+
+    solve_opts = [
+      base_mva: base_mva,
+      dense_nr_max_buses: Keyword.get(opts, :dense_nr_max_buses, 0),
+      max_iterations: Keyword.get(opts, :max_iterations, 400)
+    ]
+
+    acc0 = %{
+      island: island,
+      circuits: %{},
+      fixes: [],
+      unfixable: [],
+      ceiling: 0.0,
+      carry: nil,
+      stopped: nil,
+      # deepest bus => forced doublings so far; unfixable pockets are skipped
+      forced: %{},
+      given_up: MapSet.new()
+    }
+
+    acc =
+      Enum.reduce_while(steps, acc0, fn a, acc ->
+        case climb(a, acc, solve_opts, margin, max_circuits, base_mva, peak, 0) do
+          {:ok, acc} -> {:cont, %{acc | ceiling: a}}
+          {:stuck, acc} -> {:halt, acc}
+        end
+      end)
+
+    report = %{
+      ceiling: acc.ceiling,
+      target: target,
+      circuits: acc.circuits,
+      branches: map_size(acc.circuits),
+      extra_circuits: acc.circuits |> Map.values() |> Enum.map(&(&1 - 1)) |> Enum.sum(),
+      fixes: Enum.reverse(acc.fixes),
+      unfixable: Enum.reverse(acc.unfixable),
+      stopped: acc.stopped
+    }
+
+    {stamp_circuits(acc.island, acc.circuits), report}
+  end
+
+  # Solve at α; on failure, fix the pockets and try again, up to the per-α cap.
+  defp climb(a, acc, solve_opts, margin, max_circuits, base_mva, peak, n_fixes) do
+    scaled = scale_island(acc.island, a)
+    devices = VoltageControl.devices(scaled, peak_multiplier: peak)
+
+    opts =
+      solve_opts ++
+        [devices: devices] ++
+        case acc.carry do
+          %{state: st, warm: w} -> [control_state: st, warm_start: w]
+          _ -> []
+        end
+
+    sol =
+      try do
+        {:ok, s} = VoltageControl.solve(scaled, opts)
+        s
+      catch
+        _, _ -> nil
+      end
+
+    cond do
+      sol && sol.converged ->
+        {:ok, %{acc | carry: %{state: sol.voltage_control.state, warm: sol}}}
+
+      n_fixes >= @max_fixes_per_alpha ->
+        {:stuck, %{acc | stopped: %{alpha: a, reason: :fix_cap, fixes: n_fixes}}}
+
+      true ->
+        v = if sol, do: Enum.zip(sol.bus_ids, sol.vm_pu) |> Map.new(), else: %{}
+
+        pockets =
+          scaled
+          |> pockets(v)
+          |> Enum.reject(fn pocket -> MapSet.member?(acc.given_up, deepest_bus(pocket, v)) end)
+
+        if pockets == [] do
+          vm_min = if v == %{}, do: nil, else: v |> Map.values() |> Enum.min()
+
+          {:stuck,
+           %{acc | stopped: %{alpha: a, reason: :no_pockets, vm_min: vm_min, solved: sol != nil}}}
+        else
+          dc = DCPowerFlow.solve(scaled, base_mva: base_mva)
+
+          {acc, fixed_any} =
+            Enum.reduce(pockets, {acc, false}, fn pocket, {acc, fixed_any} ->
+              case reinforce(acc, scaled, pocket, v, dc, a, margin, max_circuits, base_mva) do
+                {:fixed, acc} -> {acc, true}
+                {:unfixable, acc} -> {acc, fixed_any}
+              end
+            end)
+
+          if fixed_any,
+            do: climb(a, acc, solve_opts, margin, max_circuits, base_mva, peak, n_fixes + 1),
+            else:
+              {:stuck,
+               %{acc | stopped: %{alpha: a, reason: :unfixable, pockets: length(pockets)}}}
+        end
+    end
+  end
+
+  defp deepest_bus(pocket, v), do: Enum.min_by(pocket, &Map.get(v, &1, 1.0))
+
+  defp scale_island(island, a) do
+    %{
+      island
+      | loads:
+          Enum.map(
+            island.loads,
+            &%{&1 | p_mw: (&1.p_mw || 0.0) * a, q_mvar: (&1.q_mvar || 0.0) * a}
+          ),
+        generators: Enum.map(island.generators, &%{&1 | p_max_mw: &1.p_max_mw * a})
+    }
+  end
+
+  # Connected components of the buses under @pocket_vm — or, when the failed
+  # iterate has none that deep, under @pocket_vm_wide — each as a MapSet.
+  defp pockets(island, v) do
+    low_at = fn t ->
+      v |> Enum.filter(fn {_b, vm} -> vm < t end) |> Enum.map(&elem(&1, 0)) |> MapSet.new()
+    end
+
+    low = low_at.(@pocket_vm)
+    low = if MapSet.size(low) == 0, do: low_at.(@pocket_vm_wide), else: low
+    adj = adjacency(island)
+
+    {components, _seen} =
+      Enum.reduce(low, {[], MapSet.new()}, fn b, {comps, seen} ->
+        if MapSet.member?(seen, b) do
+          {comps, seen}
+        else
+          comp = flood(b, low, adj)
+          {[comp | comps], MapSet.union(seen, comp)}
+        end
+      end)
+
+    components
+  end
+
+  defp adjacency(island) do
+    Enum.reduce(island.lines ++ island.transformers, %{}, fn br, acc ->
+      acc
+      |> Map.update(br.from_bus_id, [br.to_bus_id], &[br.to_bus_id | &1])
+      |> Map.update(br.to_bus_id, [br.from_bus_id], &[br.from_bus_id | &1])
+    end)
+  end
+
+  defp flood(start, allowed, adj) do
+    do_flood([start], MapSet.new([start]), allowed, adj)
+  end
+
+  defp do_flood([], seen, _allowed, _adj), do: seen
+
+  defp do_flood([b | rest], seen, allowed, adj) do
+    next =
+      adj
+      |> Map.get(b, [])
+      |> Enum.filter(&(MapSet.member?(allowed, &1) and not MapSet.member?(seen, &1)))
+
+    do_flood(rest ++ next, Enum.reduce(next, seen, &MapSet.put(&2, &1)), allowed, adj)
+  end
+
+  # Trace the pocket's feeding path and double its weakest branches until the
+  # radial loadability criterion holds.
+  defp reinforce(acc, island, pocket, v, dc, a, margin, max_circuits, base_mva) do
+    branches = index_branches(island)
+
+    gen_mw =
+      Enum.reduce(island.generators, %{}, fn g, acc ->
+        Map.update(acc, g.bus_id, g.p_max_mw || 0.0, &(&1 + (g.p_max_mw || 0.0)))
+      end)
+
+    load_mw =
+      Enum.reduce(island.loads, %{}, fn l, acc ->
+        Map.update(acc, l.bus_id, l.p_mw || 0.0, &(&1 + (l.p_mw || 0.0)))
+      end)
+
+    bus_kv = Map.new(island.buses, &{&1.id, &1.base_kv || 0.0})
+
+    # A source carries the load, so a bus with no generation is never one and
+    # a walk that has picked up nothing yet cannot stop at the first machine.
+    source? = fn bus, carried ->
+      Map.get(gen_mw, bus, 0.0) >= max(carried, 1.0) or
+        Map.get(bus_kv, bus, 0.0) >= @source_kv
+    end
+
+    # One series path from the pocket's deepest bus to a source, carrying the
+    # whole pocket's load from the start.
+    pocket_mw = pocket |> Enum.map(&Map.get(load_mw, &1, 0.0)) |> Enum.sum()
+    deepest = Enum.min_by(pocket, &Map.get(v, &1, 1.0))
+
+    {path, walked} =
+      feeding_path(MapSet.new([deepest]), branches, dc, source?, load_mw, pocket_mw)
+
+    # The load the path carries: the pocket's, plus what the walk picked up
+    # outside it on the way to the source.
+    carried = MapSet.union(pocket, walked)
+
+    {p, q} =
+      Enum.reduce(island.loads, {0.0, 0.0}, fn l, {p, q} ->
+        if MapSet.member?(carried, l.bus_id),
+          do: {p + (l.p_mw || 0.0), q + (l.q_mvar || 0.0)},
+          else: {p, q}
+      end)
+
+    s_pu = :math.sqrt(p * p + q * q) / base_mva
+
+    x_of = fn key ->
+      {_, br} = Map.fetch!(branches, key)
+      abs(br.x_pu || 0.0)
+    end
+
+    x_path = path |> Enum.map(x_of) |> Enum.sum()
+
+    # Greedy: double the highest-reactance branch on the path until inside the
+    # margin, or until every branch is at the cap. If the criterion is already
+    # met and the pocket still collapses, the evidence wins — a bounded number
+    # of times per pocket.
+    forced_so_far = Map.get(acc.forced, deepest, 0)
+
+    {doublings, x_after, forced} =
+      case greedy_doublings(path, x_of, acc.circuits, s_pu, x_path, margin, max_circuits) do
+        {d, x} when d == %{} and path != [] and forced_so_far < @max_forced_per_pocket ->
+          # One doubling: a margin just under the current S·X forces exactly
+          # the largest-reactance branch to halve.
+          {d2, x2} =
+            greedy_doublings(
+              path,
+              x_of,
+              acc.circuits,
+              s_pu,
+              x_path,
+              s_pu * x_path * 0.99,
+              max_circuits
+            )
+
+          if d2 == %{}, do: {d, x, false}, else: {d2, x2, true}
+
+        {d, x} ->
+          {d, x, false}
+      end
+
+    acc = if forced, do: %{acc | forced: Map.update(acc.forced, deepest, 1, &(&1 + 1))}, else: acc
+
+    if doublings == %{} do
+      {:unfixable,
+       %{
+         acc
+         | given_up: MapSet.put(acc.given_up, deepest),
+           unfixable: [
+             %{
+               alpha: a,
+               pocket_buses: MapSet.size(pocket),
+               pocket_mw: p,
+               path: path,
+               s_x: s_pu * x_path
+             }
+             | acc.unfixable
+           ]
+       }}
+    else
+      island2 =
+        Enum.reduce(doublings, acc.island, fn {key, k}, isl -> multiply_branch(isl, key, k) end)
+
+      circuits =
+        Enum.reduce(doublings, acc.circuits, fn {key, k}, c ->
+          Map.update(c, key, k, &(&1 * k))
+        end)
+
+      {:fixed,
+       %{
+         acc
+         | island: island2,
+           circuits: circuits,
+           fixes: [
+             %{
+               alpha: a,
+               pocket_buses: MapSet.size(pocket),
+               pocket_mw: p,
+               path: path,
+               doublings: doublings,
+               before: s_pu * x_path,
+               after: s_pu * x_after
+             }
+             | acc.fixes
+           ]
+       }}
+    end
+  end
+
+  defp greedy_doublings(path, x_of, circuits, s_pu, x_path, margin, max_circuits) do
+    xs = Map.new(path, &{&1, x_of.(&1)})
+    do_greedy(xs, %{}, circuits, s_pu, x_path, margin, max_circuits)
+  end
+
+  defp do_greedy(xs, doublings, circuits, s_pu, x_path, margin, max_circuits) do
+    if s_pu * x_path <= margin or xs == %{} do
+      {doublings, x_path}
+    else
+      candidates =
+        Enum.reject(xs, fn {key, _x} ->
+          Map.get(circuits, key, 1) * Map.get(doublings, key, 1) * 2 > max_circuits
+        end)
+
+      case candidates do
+        [] ->
+          {doublings, x_path}
+
+        _ ->
+          {key, x} = Enum.max_by(candidates, &elem(&1, 1))
+          xs = Map.put(xs, key, x / 2)
+          doublings = Map.update(doublings, key, 2, &(&1 * 2))
+          do_greedy(xs, doublings, circuits, s_pu, x_path - x / 2, margin, max_circuits)
+      end
+    end
+  end
+
+  defp index_branches(island) do
+    lines = Map.new(island.lines, &{{:line, &1.id}, {:line, &1}})
+    xfmrs = Map.new(island.transformers, &{{:transformer, &1.id}, {:transformer, &1}})
+    Map.merge(lines, xfmrs)
+  end
+
+  # Walk outward from the pocket along the largest DC inflow until a source —
+  # a bus whose generation can carry the load picked up so far, or an EHV bus
+  # — or the hop cap. Returns `{branch keys walked, buses walked}`.
+  defp feeding_path(pocket, branches, dc, source?, load_mw, carried_mw) do
+    do_path(pocket, branches, dc, source?, load_mw, carried_mw, [], MapSet.new(), 0)
+  end
+
+  defp do_path(_set, _b, _dc, _s, _l, _c, path, walked, hops) when hops >= @max_path_hops,
+    do: {Enum.reverse(path), walked}
+
+  defp do_path(set, branches, dc, source?, load_mw, carried, path, walked, hops) do
+    best =
+      branches
+      |> Enum.flat_map(fn {key, {_t, br}} ->
+        fi = MapSet.member?(set, br.from_bus_id)
+        ti = MapSet.member?(set, br.to_bus_id)
+
+        case {fi, ti} do
+          {true, false} ->
+            flow = dc.line_flows[key][:p_flow_mw] || 0.0
+            [{-flow, key, br.to_bus_id}]
+
+          {false, true} ->
+            flow = dc.line_flows[key][:p_flow_mw] || 0.0
+            [{flow, key, br.from_bus_id}]
+
+          _ ->
+            []
+        end
+      end)
+      |> Enum.max_by(&elem(&1, 0), fn -> nil end)
+
+    case best do
+      nil ->
+        {Enum.reverse(path), walked}
+
+      {_inflow, key, outside} ->
+        path = [key | path]
+        carried = carried + Map.get(load_mw, outside, 0.0)
+
+        if source?.(outside, carried) do
+          {Enum.reverse(path), walked}
+        else
+          do_path(
+            MapSet.put(set, outside),
+            branches,
+            dc,
+            source?,
+            load_mw,
+            carried,
+            path,
+            MapSet.put(walked, outside),
+            hops + 1
+          )
+        end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # The database pass
   # ---------------------------------------------------------------------------
 
@@ -339,7 +788,7 @@ defmodule PowerModel.Ingestion.CapacityInference do
         end)
       end)
 
-    written = write_circuits(requirements)
+    written = write_circuits(requirements, :absolute)
 
     Logger.info(
       "capacity inference #{ic.name}: #{written} branches given " <>
@@ -395,7 +844,9 @@ defmodule PowerModel.Ingestion.CapacityInference do
     :ok
   end
 
-  defp write_circuits(requirements) do
+  # `:absolute` sets the count (the caller unfolded first); `:multiply` folds a
+  # further factor onto whatever is stored.
+  defp write_circuits(requirements, mode) do
     Enum.reduce(requirements, 0, fn
       {{:line, id}, n}, acc when n > 1 ->
         f = n * 1.0
@@ -411,7 +862,13 @@ defmodule PowerModel.Ingestion.CapacityInference do
                 rating_a_mva: l.rating_a_mva * ^f,
                 rating_b_mva: l.rating_b_mva * ^f,
                 rating_c_mva: l.rating_c_mva * ^f,
-                inferred_circuits: ^n
+                inferred_circuits:
+                  fragment(
+                    "CASE WHEN ? THEN ? ELSE inferred_circuits * ? END",
+                    ^(mode == :absolute),
+                    ^n,
+                    ^n
+                  )
               ]
             ]
           ),
@@ -431,7 +888,13 @@ defmodule PowerModel.Ingestion.CapacityInference do
                 r_pu: t.r_pu / ^f,
                 x_pu: t.x_pu / ^f,
                 rated_mva: t.rated_mva * ^f,
-                inferred_circuits: ^n
+                inferred_circuits:
+                  fragment(
+                    "CASE WHEN ? THEN ? ELSE inferred_circuits * ? END",
+                    ^(mode == :absolute),
+                    ^n,
+                    ^n
+                  )
               ]
             ]
           ),
@@ -442,6 +905,59 @@ defmodule PowerModel.Ingestion.CapacityInference do
 
       _, acc ->
         acc
+    end)
+  end
+
+  @doc """
+  Run the pocket loop (`raise_ceiling/2`) on every interconnection's main
+  island at `:hour` (default: the latest ingested hour, where the census
+  measures) and WRITE the circuits it adds on top of what is stored. Not
+  idempotent in the sense of `run/1` — it adds capacity only where the AC
+  solve still fails, so a second run on a network that already reaches the
+  target adds nothing.
+
+  Returns `%{name => report}` with the ceiling reached and what was written.
+  """
+  def run_ceiling(opts \\ []) do
+    hour = Keyword.get_lazy(opts, :hour, &Demand.latest_demand_hour/0)
+    names = Keyword.get(opts, :names)
+
+    interconnections =
+      case names do
+        nil -> Repo.all(from(i in Interconnection, order_by: i.name))
+        names -> Enum.map(names, &Repo.get_by!(Interconnection, name: &1))
+      end
+
+    Map.new(interconnections, fn ic ->
+      snap = Grid.get_grid_snapshot(ic.id, hour: hour)
+      state = Cascade.init(snap, @base_mva, hour: hour)
+
+      {subs, _dead} =
+        Partition.split(%{
+          buses: state.buses,
+          lines: state.lines,
+          transformers: state.transformers,
+          generators: Cascade.dispatched_generators(state),
+          loads: state.loads
+        })
+
+      case subs do
+        [] ->
+          {ic.name, %{ceiling: nil, branches: 0, extra_circuits: 0}}
+
+        _ ->
+          island = Enum.max_by(subs, &length(&1.buses))
+          {_island, report} = raise_ceiling(island, opts)
+          written = write_circuits(report.circuits, :multiply)
+
+          Logger.info(
+            "capacity inference (pockets) #{ic.name}: ceiling #{report.ceiling} of #{report.target}; " <>
+              "#{written} branches given #{report.extra_circuits} extra circuits over " <>
+              "#{length(report.fixes)} pocket fixes (#{length(report.unfixable)} unfixable)"
+          )
+
+          {ic.name, Map.put(report, :written, written)}
+      end
     end)
   end
 

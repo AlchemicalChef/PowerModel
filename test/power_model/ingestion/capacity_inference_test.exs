@@ -113,3 +113,117 @@ defmodule PowerModel.Ingestion.CapacityInferenceTest do
     assert t.x_pu == 0.05 and t.r_pu == 0.005 and t.rated_mva == 200.0
   end
 end
+
+defmodule PowerModel.Ingestion.CapacityInferencePocketTest do
+  @moduledoc """
+  The AC-driven loop (REVIEW CAS-30): a pocket whose feed is too WEAK rather
+  than too small — fine on MVA loading, past its P-V nose on reactance — is
+  found from the failed AC iterate, its feeding path traced from the DC flow,
+  and the path reinforced until the pocket is inside the radial loadability
+  criterion.
+  """
+
+  use ExUnit.Case, async: true
+
+  alias PowerModel.Ingestion.CapacityInference
+  alias PowerModel.Solver.VoltageControl
+
+  # Slack (138 kV) — stiff line — bus 2 — a long weak 33 kV-class chain (three
+  # lines at x 0.6 pu, rated well above their flow) — bus 5 with 30 MW. At
+  # full load the chain is past its nose; at 40 % it solves.
+  defp weak_radial do
+    %{
+      buses: [
+        %{id: 1, bus_type: 3, base_kv: 138.0, vm_pu: 1.0, va_rad: 0.0},
+        %{id: 2, bus_type: 1, base_kv: 138.0, vm_pu: 1.0, va_rad: 0.0},
+        %{id: 3, bus_type: 1, base_kv: 33.0, vm_pu: 1.0, va_rad: 0.0},
+        %{id: 4, bus_type: 1, base_kv: 33.0, vm_pu: 1.0, va_rad: 0.0},
+        %{id: 5, bus_type: 1, base_kv: 33.0, vm_pu: 1.0, va_rad: 0.0}
+      ],
+      lines: [
+        %{
+          id: 1,
+          from_bus_id: 1,
+          to_bus_id: 2,
+          r_pu: 0.005,
+          x_pu: 0.02,
+          b_pu: 0.0,
+          rating_a_mva: 500.0
+        },
+        %{
+          id: 3,
+          from_bus_id: 3,
+          to_bus_id: 4,
+          r_pu: 0.2,
+          x_pu: 0.6,
+          b_pu: 0.0,
+          rating_a_mva: 56.0
+        },
+        %{
+          id: 4,
+          from_bus_id: 4,
+          to_bus_id: 5,
+          r_pu: 0.2,
+          x_pu: 0.6,
+          b_pu: 0.0,
+          rating_a_mva: 56.0
+        }
+      ],
+      transformers: [
+        %{
+          id: 1,
+          from_bus_id: 2,
+          to_bus_id: 3,
+          r_pu: 0.0,
+          x_pu: 0.6,
+          tap_ratio: 1.0,
+          rated_mva: 100.0
+        }
+      ],
+      generators: [
+        %{
+          id: 1,
+          bus_id: 1,
+          p_max_mw: 500.0,
+          capacity_factor: 1.0,
+          q_max_mvar: 400.0,
+          q_min_mvar: -400.0
+        }
+      ],
+      loads: [%{id: 1, bus_id: 5, p_mw: 30.0, q_mvar: 6.0}],
+      load_compensation: 0.0
+    }
+  end
+
+  test "the at-rest rule cannot see a weak feed, and the pocket loop can" do
+    snap = weak_radial()
+
+    # 30 MW on 56 MVA is 54 %: nothing for the at-rest rule.
+    {_same, at_rest} = CapacityInference.infer(snap)
+    assert at_rest.branches == 0
+
+    # And the full load has no controlled AC solution.
+    {:ok, base} = VoltageControl.solve(snap, base_mva: 100.0, load_compensation: 0.0)
+    refute base.converged
+
+    {fixed, report} =
+      CapacityInference.raise_ceiling(snap,
+        alpha_steps: [0.4, 1.0],
+        target: 1.0,
+        load_compensation: 0.0,
+        dense_nr_max_buses: 25
+      )
+
+    assert report.ceiling == 1.0
+    assert report.fixes != []
+    assert report.unfixable == []
+
+    # The reinforcement landed on the weak chain, not on the stiff 138 kV line.
+    assert Enum.all?(report.circuits, fn {key, n} -> key != {:line, 1} and n >= 2 end)
+    assert report.circuits != %{}
+    assert Enum.find(fixed.lines, &(&1.id == 1)).inferred_circuits == 1
+
+    {:ok, sol} = VoltageControl.solve(fixed, base_mva: 100.0, load_compensation: 0.0)
+    assert sol.converged
+  end
+end
