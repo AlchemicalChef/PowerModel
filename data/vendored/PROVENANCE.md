@@ -142,3 +142,21 @@ per-yard evidence; nulling those markers removes every OSM-derived datum while
 - ODbL 1.0, (c) OpenStreetMap contributors — see the section header above. The
   way ids in the CSV are OSM-derived data and carry the same share-alike and
   attribution obligations as everything else in that section.
+
+## ehv_corridor_worklist_2026-09-01.csv
+
+Derived, not downloaded: the corridors the capacity-inference passes REFUSE
+(REVIEW CAS-30). `at_cap` rows are in-service branches whose stored
+`inferred_circuits` reached the 8-circuit cap — the at-rest pass wanted more
+than the cap allows, which is misplaced load or a missing higher-class
+corridor, not a missing parallel; `pocket_refused` rows are load regions the
+AC-driven loop could not bring inside the radial loadability criterion
+because every branch on their feeding path is at the cap (Western: the
+St. George pocket, CAS-29). Columns: interconnection, kind, hour_or_alpha,
+type, id_or_path, kv, inferred_circuits, extra_needed, flow_or_load_mw,
+rating_mva_or_buses, loading_pct_or_sx, lat, lon, substations. Produced by
+the session scratch script `worklist.exs` plus two SQL selects over the
+dev database after migrations 20260901100001-120000; regenerate after any
+change to those passes. Use: the next OSM pull's target list (as
+`osm_stranded_worklist_2026-08-23.csv` was for item 24), starting with
+Plant Vogtle's 500 kV yard (line 7723, 14.6 GW at rest on its 230 kV tie).

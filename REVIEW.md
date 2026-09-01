@@ -2046,3 +2046,97 @@ or a confirmed line can replace it. The 80 % threshold, the two hours and the
 8-circuit cap are choices; the peak-hour requirement (1,761 ERCOT circuits
 against 476 for the reference hour alone) shows the answer depends on the
 hour, and a pass over more hours would raise it further.
+
+**CAS-30, second rule (BUILT + MEASURED, 2026-09-01) — the pockets the at-rest
+test cannot see.** The San Bernardino pocket above was the general case, not
+an exception: with the at-rest circuits in, every remaining AC failure on
+Western between α 0.5 and 1.0 was a load area fed through a chain whose
+IMPEDANCE, not rating, is the limit — 54 % MVA loading and past the P-V nose.
+`CapacityInference.raise_ceiling/2` is ROADMAP item 2's loop automated: step
+α upward; when the controlled AC solve fails, take the buses under 0.7 pu in
+its last iterate as pockets, and from each pocket's deepest bus trace ONE
+series path outward along the largest DC inflow until a source — a bus whose
+generation can carry the load the path has picked up, or an EHV bus — then
+double the highest-reactance branch on that path until `S_path · X_path ≤
+0.2`, the radial loadability criterion. Re-solve; repeat. Refusals are
+recorded, not hidden.
+
+Two earlier forms of the loop are worth keeping because they were wrong in
+instructive ways. Summing every branch of a meshed 152-bus region as if it
+were one radial produced `S · X = 17` and multiplied 219 branches to the
+cap — 2,870 phantom circuits and a "ceiling" of 1.0 that meant nothing; the
+criterion is only meaningful for a series path, so the walk is one. And
+stopping the walk at any bus with a generator made a 2 MW machine a source
+and a 1-branch path; a source has to carry what the path picked up. A third,
+a units error in the "evidence wins" rule (`S · X` compared against `X`),
+silently refused Captain Jack-Sycan 500 kV and two 69 kV lines in eastern
+New Mexico until the DB rows said n = 1 and n = 2, not 8.
+
+Measured in memory from the at-rest network:
+
+| | ceiling before | after | fixes | circuits added | refused |
+|---|---|---|---|---|---|
+| Western | 0.49 | **1.0** | 22 pockets | 448 on 100 branches | 4 |
+| Eastern | 0.90 | **1.0** | 2 pockets | 61 on 11 branches | 0 |
+| ERCOT | 1.0 | 1.0 | — | — | — |
+
+Western's fixes are what they should be — paths of 4-17 branches at 33-138 kV
+with `S · X` brought from 0.6-3.2 to ~0.2, plus two single doublings at 230
+and 500 kV — and its refusals are the honest boundary: three regions of
+1,024-1,127 MW behind 4-5-branch 69/115 kV paths already at the 8-circuit cap.
+A gigawatt does not arrive over 115 kV; those are misplaced load or a missing
+EHV corridor, and the pass declines them by design.
+
+**Persisted, then corrected.** Migration 20260901110000 applied `run_ceiling/1`
+at the reference hour (Western 14 fixes / 297 circuits, Eastern 1, ERCOT 0;
+all three reached α 1.0 inside the pass). The totals then showed four Western
+lines at 64 inferred circuits and a transformer at 24: the loop had applied
+its 8-circuit cap to what it added in its own run, not to what the at-rest
+pass had already stored. A 33 kV line with 64 circuits is what the cap exists
+to refuse, so the cap now counts stored × added (a test pins it), migration
+20260901120000 rescaled the over-cap rows back to 8, and the pockets behind
+them became refusals. The honest census on the capped network:
+
+| | + at-rest circuits | **+ pocket loop, capped** |
+|---|---|---|
+| ERCOT solvable / emergency / normal | 1.0 / α 0.02-0.9 / 0.3-0.4 | unchanged (no pockets) |
+| Western solvable | 0.4922 / 40,989 MW | **0.7422 / 61,809 MW** |
+| Western emergency | α 0.02-0.3 / 24,983 MW | **α 0.02-0.6 / 49,967 MW** |
+| Western normal | none | none |
+| Eastern solvable | 0.8984 / 258,490 MW | **0.9922 / 285,479 MW** |
+| Eastern emergency | α 0.02-0.6 / 172,634 MW | **α 0.02-0.75 / 215,792 MW** |
+| Eastern normal | none | none |
+
+Western's ceiling went 0.21 → 0.49 → 0.74 across the three passes, its
+emergency window 0 → 25 → 50 GW. What refuses at α 0.8 is a 147-bus collapse
+whose feeding paths are at the cap: an 857 MW region behind three 69 kV lines,
+1.0-1.1 GW regions behind 115 kV. A gigawatt does not arrive over 69 kV.
+
+**Cold starts, and the cascade.** The loop climbs by continuation — each step
+from the previous step's voltages and device positions — and the cascade's AC
+attempt is one cold solve. Measured on Western: the same capped network holds
+the emergency band at α 0.5 and 0.6 from a flat start and diverges from flat
+at 0.7 with 147 buses on the floor, while a continuation from 0.5 reaches
+0.7. `VoltageControl.solve/2` gained `:ramp` — a load-ramp continuation
+(0.5, 0.7, 0.85, 0.95, then the full snapshot), on when the cascade runs with
+controls. It cannot reach what the ceiling refuses: the Western cascade at
+real demand still runs DC-only (α 1.0 > 0.74), at 45 s instead of 3.5 s.
+ERCOT's runs AC. Eastern's now does too: with controls and the ramp its main
+island solves at real demand under the cascade (`ac_diverged` 1 → 0, Vm
+0.754-1.035 after 9 rounds, 30 taps and 2,973 MVAr of banks), where the
+fixed-plant arm runs DC-only — the first Eastern cascade with a voltage
+layer at real demand. Its initiating N-1 is the Vogtle tie below, and both
+arms lose the same 238 MW island to it. The price is stark: 1,123 s against
+11 s, five controlled solves of a 60,000-bus island each running up to forty
+device rounds. That is why the layer stays opt-in, and it is the next
+solver-cost item — the ramp should carry B′ across rounds and steps rather
+than refactorize it, which FDPF's design already allows (SOL-14).
+
+**The refusals are the worklist.** Every refusal names a corridor whose real
+supply path — usually a higher class — HIFLD does not carry: Eastern's worst
+N-1 at real demand is Plant Vogtle's 230 kV tie carrying 14.6 GW at rest
+(1,615 % post-outage) because the model has Vogtle's 500 kV bus with ONE
+500 kV line; Western's are the 69/115 kV paths above and Captain Jack-Sycan
+500 kV. `data/vendored/ehv_corridor_worklist_2026-09-01.csv` lists them with
+coordinates, flow and class, the way the OSM stranded-yard worklist did for
+item 24. That, not more inference, is the next Western and Eastern move.

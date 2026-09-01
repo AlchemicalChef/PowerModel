@@ -538,29 +538,39 @@ second is where the model is genuinely broken, and it gates the third.
    which is at once why no AC solution existed at real demand and CAS-26's
    binary contingency regime. `Ingestion.CapacityInference` infers the parallel
    circuits that flow implies (stored as `inferred_circuits`, folded into the
-   parameters, idempotent, gated by `validate`'s `at_rest_loading`). *Control*
-   (CAS-29): `Solver.VoltageControl`, switched shunts and LTC taps in an outer
-   loop, eleven measured rules, opt-in in the cascade. Together on ERCOT:
-   solvable α 0.6406 → **1.0 (43,457 MW, all of real demand)**, emergency band
-   α 0.2-0.3 → **0.02-0.9 (39,111 MW)**, normal band none → **0.3-0.4
-   (17,383 MW)**; under a cascade the main island solves AC at real demand
-   (`ac_diverged` 50 → 0) and the worst thermal N-1 settles intact instead of
-   exhausting the step budget with 8.5 GW of UFLS. Western: solvable α 0.2109 → 0.4922 (40,989 MW), emergency α 0.05-0.2 → 0.02-0.3 (24,983 MW), normal still none.
-   Eastern: solvable α 0.4766 → 0.8984 (258,490 MW), emergency α 0.02-0.3 → 0.02-0.6 (172,634 MW), normal still none.
-   Still open, in order: (a) Western's next binding element is a 66 kV pocket
-   in the San Bernardino mountains fed only through a chain of 33 kV lines
-   (CAS-30) — impedance, not rating, so the at-rest pass cannot see it; like
-   St. George (CAS-29) it is a missing feed, and the automatable form is an
-   AC-driven loop (floor region → feeding path → infer capacity there), item
-   2's method. (b) The inferred capacity sits at the same class between the
-   same buses; where the real path is a higher class the network is right for
-   flows and wrong for anything reading circuit class — `inferred_circuits > 1`
-   marks every such row for replacement by OSM circuit counts or confirmed
-   lines. (c) Threshold 0.8, the two hours and the 8-circuit cap are choices;
-   the peak-hour requirement (ERCOT 1,761 circuits against 476 for the
-   reference hour) says more hours would ask for more. (d) The control layer
-   stays opt-in in the cascade until re-measured on the inferred network
-   across item 1's external target.
+   parameters, idempotent, gated by `validate`'s `at_rest_loading`), and its
+   second rule finds the pockets the at-rest test cannot see — load areas fed
+   through chains whose IMPEDANCE, not rating, is the limit — from where the
+   AC solve collapses, and reinforces one series feeding path per pocket up
+   to the radial loadability criterion. Both refuse past 8 circuits.
+   *Control* (CAS-29): `Solver.VoltageControl`, switched shunts and LTC taps
+   in an outer loop, eleven measured rules, a load-ramp continuation for cold
+   starts, opt-in in the cascade.
+   Controlled census, capped network (fixed plant → now): ERCOT solvable
+   α 0.64 → **1.0 (43,457 MW, all of real demand)**, emergency band 0.2-0.3 →
+   **0.02-0.9 (39,111 MW)**, normal none → **0.3-0.4**; Western solvable 0.20 →
+   **0.74 (61,809 MW)**, emergency none → **0.02-0.6 (49,967 MW)**; Eastern
+   solvable 0.43 → **0.99 (285,479 MW)**, emergency 0.02-0.25 → **0.02-0.75
+   (215,792 MW)**. Under a
+   cascade at real demand ERCOT's main island solves AC (`ac_diverged` 50 → 0)
+   and the worst thermal N-1 settles intact instead of exhausting the step
+   budget with 8.5 GW of UFLS; Eastern's main island now solves AC at real
+   demand too (controls + ramp); Western's still runs DC-only (ceiling 0.74).
+   Still open, in order: (a) **The refusals are the worklist**
+   (`data/vendored/ehv_corridor_worklist_2026-09-01.csv`, 93 corridors): every
+   one is a corridor whose real supply path — usually a higher class — HIFLD
+   does not carry. Plant Vogtle's 230 kV tie carries 14.6 GW at rest because
+   the model has its 500 kV bus with ONE 500 kV line; Western's are ~1 GW
+   regions behind 69/115 kV paths and the St. George pocket. A 500 kV OSM
+   pull at those yards, item 24's method, is the next capacity move; more
+   inference is not. (b) The inferred capacity sits at the same class between
+   the same buses; right for flows, wrong for anything reading circuit class;
+   `inferred_circuits > 1` marks every such row for replacement. (c) Threshold
+   0.8, the two hours, the 0.2 radial margin and the 8-circuit cap are
+   choices; the peak-hour requirement (ERCOT 1,761 circuits against 476 for
+   the reference hour) says more hours would ask for more. (d) The control
+   layer stays opt-in in the cascade until re-measured across item 1's
+   external target. (e) The normal band is unreached on Western and Eastern.
 
 1. **Nothing external has ever scored this model** (Phase 6 item 26, unstarted). Every
    instrument is internal — alpha ceilings, census counts, TV distance, conservation

@@ -65,6 +65,8 @@ data/vendored/*
 # circuit above their POI floor, with way ids) is the attribution record and
 # is not re-derivable without the raw pull, which is.
 !data/vendored/osm_stranded_worklist_2026-08-23.csv
+# REVIEW CAS-30: the corridors the capacity passes refuse — the next OSM pull's targets.
+!data/vendored/ehv_corridor_worklist_2026-09-01.csv
 
 # Byte-compiled helper scripts (scripts/*.py)
 __pycache__/
