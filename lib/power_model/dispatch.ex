@@ -288,8 +288,14 @@ defmodule PowerModel.Dispatch do
   alias PowerModel.Demand
   alias PowerModel.Dispatch.Storage
   alias PowerModel.Grid.{BalancingAuthority, Bus, Interconnection}
+  alias PowerModel.Ingestion.Epa.Cems
   alias PowerModel.Repo
   alias PowerModel.Solver.Frequency
+
+  # CEMS gross load counts station service that EIA-930's net columns do not;
+  # this prior only sizes the residual offered to unmeasured units, because
+  # the final measured allocation is rebalanced to the 930 total either way.
+  @cems_net_of_gross 0.95
 
   # Design contingency per interconnection (MW): the resource loss each one
   # sizes its frequency response against, and the floor on the primary-capable
@@ -435,14 +441,20 @@ defmodule PowerModel.Dispatch do
     # Grouped by the (BA, fuel) key the measurement is published at.
     by_group = Enum.group_by(pooled, &{&1.ba_id, &1.fuel})
 
-    {fuel_alloc, group_stats, missing} = allocate_groups(by_group, fuel_totals, %{})
+    # ROADMAP C1: CEMS measured what every monitored fossil unit was actually
+    # doing at this hour. Pins carry that measurement into the group fills —
+    # EIA-930 still owns every total, CEMS replaces the invented merit order
+    # with the real one.
+    pins = cems_pins(pooled, hour, opts)
+
+    {fuel_alloc, group_stats, missing} = allocate_groups(by_group, fuel_totals, %{}, pins)
 
     # REVIEW ENE-19: back governor-duty units down until each interconnection
     # carries primary-capable spinning reserve for its design contingency.
     # The measured MW are unchanged — only which units carry them, and how
     # hard each one is pushed.
     {fuel_alloc, group_stats, reserve_stats} =
-      hold_contingency_reserve(by_group, fuel_totals, fuel_alloc, group_stats)
+      hold_contingency_reserve(by_group, fuel_totals, fuel_alloc, group_stats, pins)
 
     # A unit inside a measured group that lost the merit order stays offline —
     # the measurement placed every MW it had. Only units whose group was never
@@ -492,9 +504,82 @@ defmodule PowerModel.Dispatch do
         opts
       )
 
+    coverage = attach_cems(coverage, pins, dispatch)
+
     log_summary(coverage, unavailable)
 
     {:ok, %{dispatch: dispatch, coverage: coverage}}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Measured operation (CEMS, ROADMAP C1)
+  # ---------------------------------------------------------------------------
+
+  # Pin decisions for the pooled fleet: `%{unit_id => {:on, gross_mw} | :off}`.
+  # `cems: true` reads the vendored measurement for the hour; `cems_pins:`
+  # injects decisions directly (tests, replays).
+  defp cems_pins(pooled, hour, opts) do
+    case Keyword.fetch(opts, :cems_pins) do
+      {:ok, pins} when is_map(pins) ->
+        pins
+
+      :error ->
+        if Keyword.get(opts, :cems, false) do
+          build_pins(pooled, Cems.measured_at(hour))
+        else
+          %{}
+        end
+    end
+  end
+
+  defp build_pins(_pooled, measured) when map_size(measured) == 0, do: %{}
+
+  # A plant's measured gross per fuel lands on the model's units of that
+  # (plant, fuel) in proportion to capability — units of one plant share a
+  # bus, so the within-plant split is second-order for flows. A measured 0.0
+  # pins the units OFF: the monitors watched them sit idle, which is as much
+  # a measurement as any MW. Plants absent from CEMS stay unpinned and keep
+  # the merit order.
+  defp build_pins(pooled, measured) do
+    fuels = Cems.fuels()
+
+    pooled
+    |> Enum.filter(&(&1.fuel in fuels and is_binary(&1.plant_id)))
+    |> Enum.group_by(&{&1.plant_id, &1.fuel})
+    |> Enum.flat_map(fn {{plant_id, fuel}, units} ->
+      case measured |> Map.get(plant_id, %{}) |> Map.fetch(fuel) do
+        :error ->
+          []
+
+        {:ok, gross} when gross <= 0.0 ->
+          Enum.map(units, &{&1.id, :off})
+
+        {:ok, gross} ->
+          total_cap = sum_by(units, & &1.capability_mw)
+
+          Enum.map(units, fn u ->
+            share =
+              if total_cap > 0.0,
+                do: u.capability_mw / total_cap,
+                else: 1.0 / length(units)
+
+            {u.id, {:on, gross * share}}
+          end)
+      end
+    end)
+    |> Map.new()
+  end
+
+  defp attach_cems(coverage, pins, _dispatch) when map_size(pins) == 0, do: coverage
+
+  defp attach_cems(coverage, pins, dispatch) do
+    on = for {id, {:on, _}} <- pins, do: id
+
+    Map.put(coverage, :cems, %{
+      measured_units: length(on),
+      off_units: Enum.count(pins, fn {_id, pin} -> pin == :off end),
+      measured_mw: on |> Enum.map(&Map.get(dispatch, &1, 0.0)) |> Enum.sum()
+    })
   end
 
   # ---------------------------------------------------------------------------
@@ -511,6 +596,9 @@ defmodule PowerModel.Dispatch do
       ba_id: Map.get(bus_ba, bus_id),
       interconnection: Map.get(bus_interconnection, bus_id),
       fuel: fuel_for(generator),
+      # ORIS join key for measured (CEMS) operation; nil for MATPOWER
+      # imports and fixtures, which are simply never pinned.
+      plant_id: Cems.plant_id(Map.get(generator, :eia_plant_id)),
       capability_mw: capability,
       # A minimum above the seasonal capability would make the unit
       # undispatchable at any MW; clamp so it can still run at capability.
@@ -689,7 +777,7 @@ defmodule PowerModel.Dispatch do
   # Measured allocation
   # ---------------------------------------------------------------------------
 
-  defp allocate_groups(by_group, fuel_totals, holdback) do
+  defp allocate_groups(by_group, fuel_totals, holdback, pins) do
     Enum.reduce(by_group, {%{}, %{}, []}, fn {{ba_id, fuel}, group_units},
                                              {alloc, stats, missing} ->
       case measured_mw(fuel_totals, ba_id, fuel) do
@@ -706,7 +794,8 @@ defmodule PowerModel.Dispatch do
            ]}
 
         target_mw ->
-          {group_alloc, remaining} = fill(group_units, max(target_mw, 0.0), holdback)
+          {group_alloc, remaining, cems} =
+            fill_group(group_units, max(target_mw, 0.0), holdback, pins)
 
           dispatched = target_mw |> max(0.0) |> Kernel.-(remaining)
 
@@ -717,9 +806,106 @@ defmodule PowerModel.Dispatch do
             online_units: Enum.count(group_alloc, fn {_id, mw} -> mw > 0.0 end)
           }
 
+          stat = if cems, do: Map.put(stat, :cems, cems), else: stat
+
           {Map.merge(alloc, group_alloc), Map.put(stats, {ba_id, fuel}, stat), missing}
       end
     end)
+  end
+
+  # A group nothing measured keeps the merit order. A group CEMS measured
+  # splits three ways: measured-off units stay offline (the monitors watched
+  # them idle — the merit order may NOT recommit them), measured-on units
+  # carry the measured shape, and unmeasured units merit-fill only the
+  # residual the measurement left. The 930 target still binds exactly: the
+  # measured allocation is rebalanced so the group total lands on it, which
+  # also absorbs the gross-vs-net gap without a per-fuel constant.
+  defp fill_group(group_units, target_mw, holdback, pins) when map_size(pins) == 0 do
+    {group_alloc, remaining} = fill(group_units, target_mw, holdback)
+    {group_alloc, remaining, nil}
+  end
+
+  defp fill_group(group_units, target_mw, holdback, pins) do
+    {on, rest} = Enum.split_with(group_units, &match?({:on, _}, Map.get(pins, &1.id)))
+    {off, unmeasured} = Enum.split_with(rest, &(Map.get(pins, &1.id) == :off))
+
+    if on == [] and off == [] do
+      {group_alloc, remaining} = fill(group_units, target_mw, holdback)
+      {group_alloc, remaining, nil}
+    else
+      weights = Map.new(on, fn u -> {u.id, elem(Map.get(pins, u.id), 1)} end)
+
+      estimate =
+        sum_by(on, fn u ->
+          min(@cems_net_of_gross * Map.fetch!(weights, u.id), u.capability_mw)
+        end)
+
+      residual = max(target_mw - estimate, 0.0)
+      {un_alloc, un_left} = fill(unmeasured, residual, holdback)
+
+      # What unmeasured units could not take flows back to the measured
+      # fleet, so the group still meets its 930 total whenever it physically
+      # can — measurement reshapes the group, it never shrinks it.
+      pinned_target = max(target_mw - (residual - un_left), 0.0)
+      {pin_alloc, pin_left} = distribute_measured(on, weights, pinned_target, %{})
+
+      group_alloc =
+        off
+        |> Map.new(&{&1.id, 0.0})
+        |> Map.merge(un_alloc)
+        |> Map.merge(pin_alloc)
+
+      cems = %{
+        measured_units: length(on),
+        off_units: length(off),
+        measured_mw: pinned_target - pin_left
+      }
+
+      {group_alloc, pin_left, cems}
+    end
+  end
+
+  # Water-fill the measured target over the measured units, proportional to
+  # measured gross and capped at capability; a capped unit's overflow
+  # re-spreads over the rest. Measured minimum loads are NOT enforced — the
+  # unit demonstrably ran where the monitor saw it run.
+  defp distribute_measured([], _weights, remaining, alloc), do: {alloc, remaining}
+
+  defp distribute_measured(units, _weights, remaining, alloc) when remaining <= 0.0 do
+    {Enum.reduce(units, alloc, &Map.put_new(&2, &1.id, 0.0)), max(remaining, 0.0)}
+  end
+
+  defp distribute_measured(units, weights, remaining, alloc) do
+    total_w = sum_by(units, &Map.fetch!(weights, &1.id))
+
+    if total_w <= 0.0 do
+      {Enum.reduce(units, alloc, &Map.put_new(&2, &1.id, 0.0)), remaining}
+    else
+      {capped, open} =
+        Enum.split_with(units, fn u ->
+          remaining * Map.fetch!(weights, u.id) / total_w > u.capability_mw
+        end)
+
+      case capped do
+        [] ->
+          alloc =
+            Enum.reduce(units, alloc, fn u, acc ->
+              Map.put(acc, u.id, remaining * Map.fetch!(weights, u.id) / total_w)
+            end)
+
+          {alloc, 0.0}
+
+        _ ->
+          alloc = Enum.reduce(capped, alloc, &Map.put(&2, &1.id, &1.capability_mw))
+
+          distribute_measured(
+            open,
+            weights,
+            remaining - sum_by(capped, & &1.capability_mw),
+            alloc
+          )
+      end
+    end
   end
 
   # Measured MW the network cannot place at all: the BA is in this snapshot but
@@ -939,7 +1125,7 @@ defmodule PowerModel.Dispatch do
   # hold-back, so a bisection is exact enough and cheap; the interconnections
   # are resolved one at a time because a (BA, fuel) group whose units straddle
   # a seam is rare and its coupling is second-order.
-  defp hold_contingency_reserve(by_group, fuel_totals, alloc, stats) do
+  defp hold_contingency_reserve(by_group, fuel_totals, alloc, stats, pins) do
     requirements = contingency_reserves()
     pooled = by_group |> Map.values() |> List.flatten()
 
@@ -959,7 +1145,7 @@ defmodule PowerModel.Dispatch do
           if held >= requirement do
             {alloc, stats, holdback, 0.0, held}
           else
-            search_holdback(by_group, fuel_totals, units, name, requirement, holdback)
+            search_holdback(by_group, fuel_totals, units, name, requirement, holdback, pins)
           end
 
         {alloc, stats, holdback,
@@ -980,9 +1166,19 @@ defmodule PowerModel.Dispatch do
   # already resolved for its neighbours. The largest fraction is evaluated
   # first, so a requirement the fleet cannot meet at all still leaves the best
   # operating point available rather than the untouched one.
-  defp search_holdback(by_group, fuel_totals, units, name, requirement, holdback) do
+  # The hold-back caps only the merit fills: a pinned unit stays where the
+  # monitor measured it, and the reserve it carries is its REAL headroom.
+  defp search_holdback(by_group, fuel_totals, units, name, requirement, holdback, pins) do
     {ceiling_alloc, ceiling_stats, ceiling_held} =
-      evaluate_holdback(by_group, fuel_totals, units, name, @max_holdback_fraction, holdback)
+      evaluate_holdback(
+        by_group,
+        fuel_totals,
+        units,
+        name,
+        @max_holdback_fraction,
+        holdback,
+        pins
+      )
 
     if ceiling_held < requirement do
       {ceiling_alloc, ceiling_stats, Map.put(holdback, name, @max_holdback_fraction),
@@ -997,7 +1193,7 @@ defmodule PowerModel.Dispatch do
             mid = (low + high) / 2.0
 
             {mid_alloc, mid_stats, mid_held} =
-              evaluate_holdback(by_group, fuel_totals, units, name, mid, holdback)
+              evaluate_holdback(by_group, fuel_totals, units, name, mid, holdback, pins)
 
             if mid_held >= requirement do
               {low, mid, mid_alloc, mid_stats, mid, mid_held}
@@ -1011,9 +1207,9 @@ defmodule PowerModel.Dispatch do
     end
   end
 
-  defp evaluate_holdback(by_group, fuel_totals, units, name, fraction, holdback) do
+  defp evaluate_holdback(by_group, fuel_totals, units, name, fraction, holdback, pins) do
     {alloc, stats, _missing} =
-      allocate_groups(by_group, fuel_totals, Map.put(holdback, name, fraction))
+      allocate_groups(by_group, fuel_totals, Map.put(holdback, name, fraction), pins)
 
     {alloc, stats, reserve_mw(units, alloc)}
   end
@@ -1407,6 +1603,13 @@ defmodule PowerModel.Dispatch do
         "#{coverage.storage.charging_units}/#{coverage.storage.units} units), " <>
         "#{length(unavailable)} units out of service)"
     )
+
+    if cems = Map.get(coverage, :cems) do
+      Logger.info(
+        "Dispatch CEMS (C1): #{gw(cems.measured_mw)} GW pinned to measured operation on " <>
+          "#{cems.measured_units} units, #{cems.off_units} units measured off"
+      )
+    end
 
     share = coverage.share
 

@@ -207,3 +207,19 @@ found in the model (23 ERCOT, 11 MISO), keyed on HIFLD `source_id` (lines) or
 `T<id>` (transformers), with the model's loading and inferred count at the time.
 `CapacityInference` reads every `known_binding_elements_*.csv` and never adds
 capacity on those branches (REVIEW EXT-1). Regenerate after re-pulling ISO records.
+
+## epa_cems_hourly_2024-07-15.csv + epa_camd_facilities_2024.csv
+COMMITTED (gitignore exceptions): EPA Clean Air Markets (CAMPD) measured hourly
+unit operation for the model's reference day, and the 2024 CAMD unit attribute
+roster. Pulled 2026-09-01 from the CAMPD streaming services
+(https://api.epa.gov/easey/streaming-services/emissions/apportioned/hourly?beginDate=2024-07-15&endDate=2024-07-15
+and .../facilities/attributes?year=2024), columns trimmed to what the model
+reads (hourly: State, Facility ID, Unit ID, Date, Hour, Operating Time, Gross
+Load (MW), Primary Fuel Type — 95,760 rows, 3,990 units; facilities: + Latitude,
+Longitude, Operating Status, Associated Generators & Nameplate Capacity —
+4,093 rows). Facility ID is the ORIS code = EIA plant id, the join key to
+EIA-860 generators. Hours are LOCAL STANDARD time year-round: verified
+empirically, not assumed — the TX gas fleet's 24 h shape correlates with
+EIA-930's ERCO gas column at r=0.992 under UTC-6 against 0.929 (UTC-5) and
+0.956 (UTC-7). Gross load is GROSS (station service included); EIA-930 is net —
+`PowerModel.Ingestion.Epa.Cems` treats 930 as the total and CEMS as the shape.

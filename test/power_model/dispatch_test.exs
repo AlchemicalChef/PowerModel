@@ -1525,4 +1525,114 @@ defmodule PowerModel.DispatchTest do
       balancing_authority_id: ba.id
     })
   end
+
+  describe "measured operation (CEMS, ROADMAP C1)" do
+    test "pins carry the measured shape and the 930 total still binds" do
+      gens = [
+        gen(1, bus_id: 1, capacity_factor: 0.2, p_max_mw: 200.0),
+        gen(2, bus_id: 1, capacity_factor: 0.9, p_max_mw: 200.0),
+        gen(3, bus_id: 1, capacity_factor: 0.5, p_max_mw: 200.0)
+      ]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"natural_gas" => 100.0}},
+          cems_pins: %{1 => {:on, 80.0}, 2 => :off}
+        )
+
+      # Unit 2 was measured OFF; even as the best unit in merit order it may
+      # not be recommitted. Unmeasured unit 3 merit-fills only the residual
+      # the estimate (0.95 x 80 gross) left, and the measured unit carries
+      # the rest, so the group still lands exactly on the 930 total.
+      assert dispatch[2] == 0.0
+      assert_in_delta dispatch[3], 24.0, 1.0e-9
+      assert_in_delta dispatch[1], 76.0, 1.0e-9
+      assert coverage.cems.measured_units == 1
+      assert coverage.cems.off_units == 1
+      assert_in_delta coverage.cems.measured_mw, 76.0, 1.0e-9
+    end
+
+    test "a measured-off unit stays off even when the group runs short" do
+      gens = [
+        gen(1, bus_id: 1, p_max_mw: 60.0),
+        gen(2, bus_id: 1, capacity_factor: 0.9, p_max_mw: 100.0)
+      ]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"natural_gas" => 100.0}},
+          cems_pins: %{1 => {:on, 50.0}, 2 => :off}
+        )
+
+      # The measured unit absorbs what it can (capability 60); the other
+      # 40 MW are unserved, because recommitting a unit the monitors watched
+      # sit idle would be inventing generation.
+      assert dispatch[1] == 60.0
+      assert dispatch[2] == 0.0
+      assert_in_delta coverage.unserved_mw, 40.0, 1.0e-9
+    end
+
+    test "measured gross above the 930 total scales down to it, keeping the shape" do
+      gens = [
+        gen(1, bus_id: 1, p_max_mw: 200.0),
+        gen(2, bus_id: 1, p_max_mw: 200.0)
+      ]
+
+      {:ok, %{dispatch: dispatch, coverage: _}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"natural_gas" => 90.0}},
+          cems_pins: %{1 => {:on, 120.0}, 2 => {:on, 60.0}}
+        )
+
+      # Gross (station service included) exceeds the net total; the 2:1
+      # measured shape survives the rescale.
+      assert_in_delta dispatch[1], 60.0, 1.0e-9
+      assert_in_delta dispatch[2], 30.0, 1.0e-9
+    end
+
+    test "groups nothing measured keep the merit order untouched" do
+      gens = [
+        gen(1, bus_id: 1, p_max_mw: 100.0),
+        gen(2, bus_id: 2, capacity_factor: 0.9, p_max_mw: 100.0),
+        gen(3, bus_id: 2, capacity_factor: 0.1, p_max_mw: 100.0)
+      ]
+
+      {:ok, %{dispatch: dispatch}} =
+        Dispatch.for_hour(gens, @hour,
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"natural_gas" => 50.0}, 2 => %{"natural_gas" => 30.0}},
+          cems_pins: %{1 => {:on, 50.0}}
+        )
+
+      assert dispatch[1] == 50.0
+      assert dispatch[2] == 30.0
+      assert dispatch[3] == 0.0
+    end
+
+    test "cems: true joins the vendored measurement on eia_plant_id" do
+      # Both units at W A Parish (ORIS 3470; the leading zeros must not
+      # break the join), gas side: measured 607 MW gross at 21:00Z (hour 15
+      # CST -- see CemsTest). Equal capabilities split it equally, and the
+      # 930 total of 500 MW rebalances the pins onto itself.
+      gens = [
+        gen(1, bus_id: 1, eia_plant_id: "3470", p_max_mw: 700.0),
+        gen(2, bus_id: 1, eia_plant_id: "0003470", p_max_mw: 700.0)
+      ]
+
+      {:ok, %{dispatch: dispatch, coverage: coverage}} =
+        Dispatch.for_hour(gens, ~U[2024-07-15 21:00:00Z],
+          bus_ba: bus_ba(),
+          fuel_totals: %{1 => %{"natural_gas" => 500.0}},
+          cems: true
+        )
+
+      assert_in_delta dispatch[1], 250.0, 1.0e-9
+      assert_in_delta dispatch[2], 250.0, 1.0e-9
+      assert coverage.cems.measured_units == 2
+      assert coverage.cems.off_units == 0
+    end
+  end
 end

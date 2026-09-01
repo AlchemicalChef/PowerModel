@@ -1066,6 +1066,7 @@ defmodule PowerModel.Failure.Cascade do
       if match?(%DateTime{}, hour) do
         dispatch_opts =
           [bus_ba: bus_ba, islands: islands, loads: snapshot.loads]
+          |> Keyword.put(:cems, Keyword.get(opts, :cems, false))
           |> then(fn o ->
             case Keyword.fetch(opts, :fuel_totals) do
               {:ok, totals} -> Keyword.put(o, :fuel_totals, totals)

@@ -17,7 +17,8 @@ defmodule Mix.Tasks.PowerModel.CascadeCcdf do
   zero or runs away — is CAS-26's binary regime, and this is how it is seen.
 
   `--constrained` starts each cascade from the transmission-constrained
-  operating point (`Cascade.init(constrained_dispatch: true)`);
+  operating point (`Cascade.init(constrained_dispatch: true)`); `--cems` pins
+  the fossil fleet to its measured CEMS operation (ROADMAP C1);
   `--voltage-control` turns the reactive layer on. `--seed` fixes the draw.
   """
 
@@ -37,6 +38,7 @@ defmodule Mix.Tasks.PowerModel.CascadeCcdf do
     hour: :string,
     n2: :boolean,
     constrained: :boolean,
+    cems: :boolean,
     voltage_control: :boolean,
     seed: :integer,
     xmin: :float
@@ -61,6 +63,7 @@ defmodule Mix.Tasks.PowerModel.CascadeCcdf do
     init_opts =
       [hour: hour] ++
         if(opts[:constrained], do: [constrained_dispatch: true], else: []) ++
+        if(opts[:cems], do: [cems: true], else: []) ++
         if(opts[:voltage_control], do: [voltage_control: true], else: [])
 
     base = Cascade.init(snap, 100.0, init_opts)

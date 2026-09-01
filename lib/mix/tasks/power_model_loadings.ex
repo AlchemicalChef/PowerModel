@@ -7,6 +7,10 @@ defmodule Mix.Tasks.PowerModel.Loadings do
       mix power_model.loadings --interconnection ERCOT --out loadings.csv
       mix power_model.loadings --interconnection Eastern --out e.csv --buses buses.csv --ac
       mix power_model.loadings --interconnection ERCOT --out c.csv --redispatch
+      mix power_model.loadings --interconnection ERCOT --out m.csv --cems
+
+  `--cems` pins the fossil fleet to its measured CEMS operation at the hour
+  (ROADMAP C1, `PowerModel.Ingestion.Epa.Cems`).
 
   One row per rated branch of the main island at the latest ingested hour
   (`--hour` to choose): DC loading, AC loading when `--ac` (the controlled
@@ -33,7 +37,8 @@ defmodule Mix.Tasks.PowerModel.Loadings do
     buses: :string,
     hour: :string,
     ac: :boolean,
-    redispatch: :boolean
+    redispatch: :boolean,
+    cems: :boolean
   ]
 
   @impl Mix.Task
@@ -49,7 +54,7 @@ defmodule Mix.Tasks.PowerModel.Loadings do
     hour = parse_hour(opts[:hour]) || Demand.latest_demand_hour()
     ic = Repo.get_by(Grid.Interconnection, name: name) || Mix.raise("no interconnection #{name}")
     snap = Grid.get_grid_snapshot(ic.id, hour: hour)
-    state = Cascade.init(snap, 100.0, hour: hour)
+    state = Cascade.init(snap, 100.0, hour: hour, cems: opts[:cems] == true)
 
     {subs, _} =
       Partition.split(%{

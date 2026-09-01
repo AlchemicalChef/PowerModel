@@ -67,7 +67,9 @@ def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--iso',required=True,choices=ISO); ap.add_argument('--loadings',required=True); ap.add_argument('--buses',required=True)
     ap.add_argument('--osm',default='data/vendored/osm_substations_2026-08-18.json'); ap.add_argument('--top',type=int,default=30); ap.add_argument('--quiet',action='store_true')
     ap.add_argument('--emit',help='append the matched model branches (real binding elements found in the model) to this CSV: iso,label,binding_intervals,branch_id,source_id,kv,inferred_circuits,dc_loading_pct')
+    ap.add_argument('--records',help='constraint-record CSV overriding the ISO default (e.g. a season-matched MISO week)')
     a=ap.parse_args(); cfg=ISO[a.iso]
+    if a.records: cfg=dict(cfg, file=a.records)
     byname=load_osm(a.osm,cfg['bbox']); names=list(byname)
     buses={r['id']:(float(r['kv']),float(r['lat']),float(r['lon'])) for r in csv.DictReader(open(a.buses))}
     model=list(csv.DictReader(open(a.loadings)))
