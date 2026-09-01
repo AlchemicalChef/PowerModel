@@ -1935,3 +1935,114 @@ evidence, while in the right direction, is one contingency on two
 interconnections. Turn it on for what-if studies at loadings inside the
 controlled emergency window; re-decide when item 1's external target (2011
 Southwest, a Western light-load event) is runnable both ways.
+
+**CAS-30 (BUILT + MEASURED, 2026-09-01) — no AC solution at real demand because
+the load is carried on branches at multiples of their rating; the parallel
+circuits inferred from that flow give ERCOT its first AC solution at real
+demand.** CAS-29's cascade A/B ended on "the layer is inert at real demand
+because the main island has no AC solution there". This entry is why, and the
+fix.
+
+**The diagnosis is the DC flow, which always solves.** At the reference hour
+with nothing out of service:
+
+| | rated branches over 100 % | over 200 % | overload |
+|---|---|---|---|
+| ERCOT | 218 of 7,465 | 26 | 22,097 MW |
+| Western | 135 of 22,155 | 18 | 12,030 MW |
+| Eastern | 335 of 79,673 | 34 | 37,989 MW |
+
+The worst are 69 kV lines carrying 300-520 MW on 116 MVA ratings (ERCOT line
+79903 at 449 %), 138/69 kV transformers at 250-340 %, New York City 138 kV
+circuits at 900 MW each (East Astoria-Corona, Corona-Jamaica), Turkey Point's
+230 kV tie at 1,291 MW on 402 MVA, and — Western's #1 and #2 — the St. George
+pocket's own tie (CAS-29): 496 MW through a 100 MVA transformer and a 116 MVA
+69 kV line. A 69 kV line does not carry 520 MW, and the real grid carries this
+load today, so a branch at several times its rating with nothing out of
+service is a MODELLING GAP — capacity the real grid has along that corridor
+and the model does not (HIFLD carries no circuit count; a double-circuit
+tower is one record; a missing 138 or 230 kV path leaves its 69 kV neighbour
+doing its work) — not an overload. It is also CAS-26 in a sentence: the
+"binary contingency regime" is what a network looks like when a seventh of
+it is already past its rating before anything happens. And it is why AC
+fails: forcing bulk power through subtransmission is the P-V nose, and the
+AC floor buses at real demand are 69/115 kV (ERCOT 82 buses under 0.7 pu,
+57 of them at 69 kV).
+
+**The pass.** `PowerModel.Ingestion.CapacityInference`: solve the DC flow at a
+measured operating point; every rated branch over 80 % gets
+`ceil(loading / 0.8)` circuits (series impedance / n, charging and ratings ×
+n); iterate until nothing is over; over the peak and latest ingested hours,
+take the larger. The count is stored as `inferred_circuits`, the factor is
+folded into r/x/b and the ratings exactly as `ParameterEstimator` folds its
+per-class `typical_circuits`, and every run unfolds the stored count first —
+idempotent, re-runnable. Branches that would need more than 8 circuits are
+left alone and named (Eastern 21 at peak, ERCOT 24, Western 3 — St. George's
+transformer 422 wants 9): that is misplaced load or a missing corridor, not a
+missing parallel, and eight circuits of 69 kV would hide it. Data migration
+20260901100001 applied it; `mix power_model.validate` gained an
+`at_rest_loading` gate (warns on any rated branch over its rating at rest,
+fails above 0.5 %).
+
+What it wrote, at the peak hour 2024-07-15 21:00Z and the reference hour:
+ERCOT 1,015 lines + 91 transformers (17.7 % of its in-service lines; 1,761
+extra line circuits), Western 599 + 123 (3.1 %; 827), Eastern 3,332 + 473
+(4.4 %; 4,417). By class the extra circuits sit at 138 kV (2,047), 230 (1,426),
+115 (949), 69 (705), 161 (633), 345 (454), 500 (292). ERCOT's 17.7 % is the
+honest measure of how far its HIFLD network is from carrying its own peak.
+
+**What it bought.**
+
+| | fixed plant (CAS-28) | + controls (CAS-29) | + inferred circuits |
+|---|---|---|---|
+| ERCOT solvable | 0.6406 / 27,839 MW | 0.6719 / 29,199 MW | **1.0 / 43,457 MW** |
+| ERCOT emergency | α 0.2-0.3 / 13,037 MW | α 0.02-0.5 / 21,729 MW | **α 0.02-0.9 / 39,111 MW** |
+| ERCOT normal | none | α 0.15-0.2 / 8,691 MW | **α 0.3-0.4 / 17,383 MW** |
+| Western solvable | 0.2031 / 16,914 MW | 0.2109 / 17,563 MW | **0.4922 / 40,989 MW** |
+| Western emergency | none | α 0.05-0.2 / 16,656 MW | **α 0.02-0.3 / 24,983 MW** |
+| Western normal | none | none | none |
+| Eastern solvable | 0.4297 / 123,635 MW | 0.4766 / 137,129 MW | **0.8984 / 258,490 MW** |
+| Eastern emergency | α 0.02-0.25 / 71,931 MW | α 0.02-0.3 / 86,317 MW | **α 0.02-0.6 / 172,634 MW** |
+| Eastern normal | none | none | none |
+
+ERCOT solves AC at the full 43,457 MW of real demand — the first time this
+model has had an operating point at real demand on any interconnection — and
+holds the emergency band to 90 % of it. Western's ceiling more than doubles
+(0.21 → 0.49, 41 GW) with a clean 0.93-1.06 profile at the top, and its
+emergency window widens to 25 GW. Eastern's ceiling nearly doubles (0.48 →
+0.90, 258 GW of 288) and its emergency window doubles to 173 GW — a
+coverage figure that, for the first time, is the same order as the
+interconnection's real demand. The normal band is still unreached on Western
+and Eastern. Under a cascade at real demand the
+main island now solves AC (`ac_diverged` 50 → 0), the worst thermal N-1 is a
+line at 197 % post-outage rather than a transformer at 517 %, and it settles
+`intact` in one or two steps where before it exhausted the step budget with
+8,473 MW of UFLS: CAS-26's binary regime is gone on ERCOT. And the control
+layer now has something to act on at real demand: controls off leaves a bus
+at 0.575 pu and a `voltage_violation`; on, 253 taps and 769 MVAr of banks hold
+the island at 0.871-1.041.
+
+**Western's next binding element is not capacity.** With circuits inferred,
+its fresh-start AC fails at α 0.4 with 11 buses on the 0.5 pu floor and a
+mismatch of 0.14 MVA — a pocket collapsing, not a network. The pocket is a
+66 kV load area in the San Bernardino mountains (CAISO; buses 74381, 75046,
+76906, 77081, 78283; ~30 MW at α 0.4) whose ONLY feed in the model is a chain
+of 33 kV lines — L85410 14.5 km, L85419 13.3 km, L85418 10 km, x 0.60 + 0.55 +
+0.41 pu — so 30 MW sits at the P-V nose of 1.5 pu of series reactance. Its
+MVA loading is 54 %, which is exactly why an at-rest MW criterion cannot see
+it: the impedance, not the rating, is the limit, and the real 66 kV feed is
+missing from HIFLD. It is the St. George pattern (CAS-29) at a smaller scale,
+and it says what the remaining Western work is: pockets fed through a
+lower-voltage remnant, found by the floor buses, repaired by topology. An
+AC-driven pass — floor region → its feeding path → infer capacity there —
+would automate ROADMAP item 2's loop; it is not built.
+
+**What it is not.** The capacity lands at the same voltage class between the
+same buses. Often the missing path is a HIGHER class, so the inferred network
+has the right capacity in the right place at the wrong voltage: correct for
+flows and for the AC solution, wrong for anything that reads the class of a
+circuit. `inferred_circuits > 1` marks every such row so an OSM circuit count
+or a confirmed line can replace it. The 80 % threshold, the two hours and the
+8-circuit cap are choices; the peak-hour requirement (1,761 ERCOT circuits
+against 476 for the reference hour alone) shows the answer depends on the
+hour, and a pass over more hours would raise it further.

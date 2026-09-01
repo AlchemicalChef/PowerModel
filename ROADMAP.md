@@ -20,7 +20,9 @@ reproduced here so the document stands alone.
   14,700 MW/0.1 Hz vs NERC's 923 MW/0.1 Hz obligation; nuclear gets working governors.
   Nadirs are too shallow, UFLS under-fires, cascades settle when they should collapse.
 - **The simulated network is a fragment**: Eastern simulates 27% of its geolocated buses,
-  Western 16.6%, ERCOT 30.6%. One branch in seven is overloaded at rest, and base-case
+  Western 16.6%, ERCOT 30.6%. One branch in seven is overloaded at rest (RESOLVED
+  2026-09-01: capacity inference, REVIEW CAS-30 — zero rated branches over their
+  rating at rest on all three at the peak and reference hours), and base-case
   masking makes 27.6% of ERCOT's 345 kV backbone trip-immune.
 - **Stored EHV parameters came from a dead code version** (exactly 2× today's table; a
   500 kV line carries the same 900 MVA rating as a 345 kV) and can never be corrected
@@ -526,33 +528,39 @@ network the real network**, **is the operating point a real operating point**, *
 failure dynamics real dynamics**. A year of network work moved the first a long way. The
 second is where the model is genuinely broken, and it gates the third.
 
-0. **The reactive substrate now MOVES, and the coverage numbers move with it**
-   (REVIEW CAS-28 → CAS-29, measured 2026-08-23 and 2026-08-31 via
-   `mix grid.census loadability [--controls]`). With fixed plant only, nothing
-   reaches 0.95-1.05 pu at any α and Western holds no α at either band. With
-   `PowerModel.Solver.VoltageControl` — switched capacitor/reactor steps and
-   LTC taps in an outer loop around FDPF, derived by rule, eleven measured
-   anti-hunting rules — the controlled census reads: ERCOT emergency band
-   α 0.02-0.5 / 21,729 MW (was 0.2-0.3 / 13,037) and normal band α 0.15-0.2 /
-   8,691 MW (was none); Western emergency band α 0.05-0.2 / 16,656 MW (was
-   none), normal still none; Eastern emergency band α 0.02-0.3 / 86,317 MW
-   (was 0.02-0.25 / 71,931) and solvable 0.4766 (was 0.4297), normal still
-   none. These are the coverage figures cascade results should be quoted
-   against.
-   Still open, in order: (a) Western's light-load end is ONE topology defect —
-   the St. George 230 kV pocket, 147 buses tied to the interconnection by a
-   single 32 km 69 kV-class line, whose mouth is also Western's α floor bus
-   (CAS-29); the fix is a 138 kV OSM pull around Red Butte, item 2's loop.
-   (b) The cascade runs the loop OPT-IN (`voltage_control: true` on
-   `Cascade.init/3`, positions resumed between segments). Measured both ways
-   2026-09-01 (CAS-29): bit-identical at real demand because the main island
-   has no AC solution there (LIN-13) so the layer is inert; at ERCOT α 0.4 a
-   3 MW spurious UVLS shed becomes `intact`; at α 0.5 the same served load by
-   a different pathway (voltage trips → frequency trips). Stays off until
-   real-demand AC exists; use it for what-if studies inside the controlled
-   window. (c) Placement is
-   rule-derived; a sensitivity pass over peak multiplier, step sizes and the
-   strength guard is owed before "calibrated" is claimed.
+0. **An operating point at real demand exists now — on ERCOT — and the two
+   things that made it are the two things the rest of the roadmap runs on**
+   (REVIEW CAS-28 → CAS-29 → CAS-30, 2026-08-23 → 2026-09-01).
+   *Capacity* (CAS-30): at real demand the load was carried on branches at
+   multiples of their rating with nothing out of service — ERCOT 218 rated
+   branches over 100 % and 22 GW of overload, Eastern 335 / 38 GW, Western
+   135 / 12 GW; 69 kV lines at 300-520 MW, NYC 138 kV at 900 MW per circuit —
+   which is at once why no AC solution existed at real demand and CAS-26's
+   binary contingency regime. `Ingestion.CapacityInference` infers the parallel
+   circuits that flow implies (stored as `inferred_circuits`, folded into the
+   parameters, idempotent, gated by `validate`'s `at_rest_loading`). *Control*
+   (CAS-29): `Solver.VoltageControl`, switched shunts and LTC taps in an outer
+   loop, eleven measured rules, opt-in in the cascade. Together on ERCOT:
+   solvable α 0.6406 → **1.0 (43,457 MW, all of real demand)**, emergency band
+   α 0.2-0.3 → **0.02-0.9 (39,111 MW)**, normal band none → **0.3-0.4
+   (17,383 MW)**; under a cascade the main island solves AC at real demand
+   (`ac_diverged` 50 → 0) and the worst thermal N-1 settles intact instead of
+   exhausting the step budget with 8.5 GW of UFLS. Western: solvable α 0.2109 → 0.4922 (40,989 MW), emergency α 0.05-0.2 → 0.02-0.3 (24,983 MW), normal still none.
+   Eastern: solvable α 0.4766 → 0.8984 (258,490 MW), emergency α 0.02-0.3 → 0.02-0.6 (172,634 MW), normal still none.
+   Still open, in order: (a) Western's next binding element is a 66 kV pocket
+   in the San Bernardino mountains fed only through a chain of 33 kV lines
+   (CAS-30) — impedance, not rating, so the at-rest pass cannot see it; like
+   St. George (CAS-29) it is a missing feed, and the automatable form is an
+   AC-driven loop (floor region → feeding path → infer capacity there), item
+   2's method. (b) The inferred capacity sits at the same class between the
+   same buses; where the real path is a higher class the network is right for
+   flows and wrong for anything reading circuit class — `inferred_circuits > 1`
+   marks every such row for replacement by OSM circuit counts or confirmed
+   lines. (c) Threshold 0.8, the two hours and the 8-circuit cap are choices;
+   the peak-hour requirement (ERCOT 1,761 circuits against 476 for the
+   reference hour) says more hours would ask for more. (d) The control layer
+   stays opt-in in the cascade until re-measured on the inferred network
+   across item 1's external target.
 
 1. **Nothing external has ever scored this model** (Phase 6 item 26, unstarted). Every
    instrument is internal — alpha ceilings, census counts, TV distance, conservation
