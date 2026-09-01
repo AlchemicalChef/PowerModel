@@ -586,14 +586,19 @@ second is where the model is genuinely broken, and it gates the third.
    and six ERCOT bottlenecks — Frontera-S. Mission and Bruni 138 kV among them,
    the market's two most frequent — were overloaded at rest in the raw model
    (222 %, 204 %) and were given circuits by the at-rest pass: real limits
-   read as missing capacity. The plan reorders accordingly: (i) ISO constraint
-   records become an EXCLUSION list for `CapacityInference` (never infer
-   circuits on a reported binding element); (ii) transmission-constrained
-   re-dispatch — a generation shift against ratings on the LODF/PTDF
-   sensitivities — is the missing operating-point mechanism and goes ahead of
-   reactive calibration; (iii) MISO's 16 "no bus at class" yards join the
-   corridor worklist; (iv) the instrument's coverage (31/80 ERCOT, 29/57 MISO
-   elements geocoded) is a target of its own.
+   read as missing capacity. Both reorderings are BUILT and measured (EXT-2):
+   (i) the exclusion list is live — the six ERCOT bottlenecks carry their raw
+   overloads again (Frontera 223 %, Bruni 204 %) at no cost to the ceiling
+   (a thermal overload is not an infeasibility); (ii) `Dispatch.Redispatch`
+   holds them at their limits like the market does (Bruni → 100.0 %, 1,424 MW
+   shifted; Frontera residual at 110 % — the Valley is import-constrained,
+   faithfully), opt-in everywhere until measured under cascades. Still open:
+   the distribution — the median found element loads 21 % and 27 of the
+   model's top-30 are still not real constraints, which points at C1 (CEMS
+   unit-level dispatch) and the instrument's coverage (31/80, 29/57
+   geocoded); (iii) MISO's 16 "no bus at class" yards join the corridor
+   worklist; (iv) `mix power_model.cascade_ccdf` (item 27's OE-417 check) is
+   built, first runs pending.
 
 1. **Nothing external has ever scored this model** (Phase 6 item 26, unstarted). Every
    instrument is internal — alpha ceilings, census counts, TV distance, conservation

@@ -2262,3 +2262,52 @@ at real bottlenecks. It goes ahead of the reactive-layer calibration. (c) The
 of those; its coverage (31/80, 29/57) is itself a target — ERCOT's station
 short names need a proper dictionary, which the ERCOT network model
 publishes.
+
+**EXT-2 (BUILT + MEASURED, 2026-09-01) — transmission-constrained re-dispatch,
+and what the congestion score says about it.** EXT-1's finding was that the
+model's dispatch never asks whether a branch can carry it, so a real limit the
+market operates AT reads as an overload the capacity rule then "fixes".
+`PowerModel.Dispatch.Redispatch.relieve/2` is the missing mechanism: B′
+factorized once, then per iteration the DC flow, the worst overloaded branch,
+its PTDF row in one cached solve (`LODF.sensitivity_batch/2`), and MW moved
+from the units pushing flow onto it hardest to the units relieving it most,
+in equal amounts, until it is at its rating. No costs — feasibility, the
+minimum the real grid does. Pair effectiveness decides the move
+(sensitivities are relative to the slack, whose unit reads zero; the pair
+slack↓ / B↑ is perfectly effective, and the first version excluded it).
+Opt-in in `Cascade.init(constrained_dispatch: true)` and
+`CapacityInference.run(redispatch: true)`; `mix power_model.loadings
+--redispatch` dumps the constrained operating point.
+
+First, the exclusion list alone (migration 20260901140000: both capacity
+passes re-derived with the 34 ISO-reported elements never given circuits):
+with the
+list keyed on HIFLD `source_id` (30 of 34 rows; the first emit predated the
+column and excluded nothing — caught because the re-derivation changed
+nothing, which a working exclusion could not have done), the found binding
+elements sit on inferred capacity **0/23** (was 6/23), and the raw truth
+returns: Frontera-S. Mission reads **223 %** at rest, Bruni **204 %**,
+Seagoville 137 %. The controlled census does NOT move (ERCOT solvable α 1.0,
+emergency 0.02-0.9): a thermal overload is not an infeasibility, so honesty
+here cost nothing. Stored extra circuits: ERCOT 1,761 → 1,749.
+
+Then the constrained operating point (`--redispatch`): 4 iterations,
+**1,424 MW shifted, 2 branches relieved, 2 residual**. Per element:
+**Bruni 204 % → 100.0 %** — at its limit, which is what "binding" means, and
+what ERCOT's market shows 410 times in four days; Seagoville 137 % → 97 %;
+**Frontera 223 % → 110 %, residual** — the shift ran out of effective units,
+and that too is faithful: the Rio Grande Valley is import-constrained, which
+is why it is ERCOT's chronic congestion. Mean found-element loading 45 % →
+35 %; the model's top-30 with both yards among ERCOT's constraint stations:
+1 → 3.
+
+**What is fixed and what is not.** The six known bottlenecks now behave like
+the market's: overloaded at rest, held at their limits by re-dispatch. The
+DISTRIBUTION is still wrong — the median found element loads 21 %, the other
+20 of 23 sit far from binding, and 27 of the model's top-30 are still not
+real constraints. That residual is the operating point itself (BA-fuel
+dispatch; C1's CEMS unit-level dispatch is the next lever) and the
+instrument's coverage (31/80 geocoded). Re-dispatch is opt-in everywhere
+(`constrained_dispatch: true` on `Cascade.init/3`, `--redispatch` on the
+loadings, `redispatch: true` on the capacity pass) until measured under
+cascades.
