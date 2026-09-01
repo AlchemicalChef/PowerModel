@@ -6,6 +6,7 @@ defmodule Mix.Tasks.PowerModel.Loadings do
 
       mix power_model.loadings --interconnection ERCOT --out loadings.csv
       mix power_model.loadings --interconnection Eastern --out e.csv --buses buses.csv --ac
+      mix power_model.loadings --interconnection ERCOT --out c.csv --redispatch
 
   One row per rated branch of the main island at the latest ingested hour
   (`--hour` to choose): DC loading, AC loading when `--ac` (the controlled
@@ -20,12 +21,20 @@ defmodule Mix.Tasks.PowerModel.Loadings do
   require Logger
 
   alias PowerModel.{Demand, Grid, Repo}
+  alias PowerModel.Dispatch.Redispatch
   alias PowerModel.Failure.Cascade
   alias PowerModel.Solver.{DCPowerFlow, Partition, VoltageControl}
 
   @shortdoc "Branch loadings at real demand, to CSV, for the congestion score"
 
-  @switches [interconnection: :string, out: :string, buses: :string, hour: :string, ac: :boolean]
+  @switches [
+    interconnection: :string,
+    out: :string,
+    buses: :string,
+    hour: :string,
+    ac: :boolean,
+    redispatch: :boolean
+  ]
 
   @impl Mix.Task
   def run(argv) do
@@ -52,6 +61,23 @@ defmodule Mix.Tasks.PowerModel.Loadings do
       })
 
     island = Enum.max_by(subs, &length(&1.buses))
+
+    # `--redispatch`: the transmission-constrained operating point (REVIEW
+    # EXT-1) — generation shifted until no rated branch is over its rating.
+    island =
+      if opts[:redispatch] do
+        {isl, rep} = Redispatch.relieve(island)
+
+        Mix.shell().info(
+          "redispatch: #{rep.iterations} iterations, #{round(rep.shifted_mw)} MW shifted, " <>
+            "#{length(rep.relieved)} branches relieved, #{length(rep.residual)} residual (#{rep.stopped})"
+        )
+
+        isl
+      else
+        island
+      end
+
     dc = DCPowerFlow.solve(island, base_mva: 100.0)
 
     ac =
