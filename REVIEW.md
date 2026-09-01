@@ -2437,3 +2437,45 @@ coverage (31/80 ERCOT), the Permian 69 kV through-flow artifacts the
 measured dispatch exposed (branches 84309, 281180, T8927 — 1.9 GW routed
 through subtransmission is a topology error, not congestion), and only then
 the question of flipping `cems` + re-dispatch to default.
+
+**CAS-31 (FIXED + MEASURED, 2026-09-01) — two yard complexes whose 345 kV
+secondaries HIFLD carries as 69 kV.** EXT-4's first honest operating point
+exposed the model's two worst overloads, and neither was congestion: ~2 GW
+crossing North McCamey's yards on a 69 kV jumper at 560 %, and ~1.3 GW
+crossing Eagle Mountain's on a synthetic repair weld at 201 %. OSM says the
+voltage level the flow was crossing at does not exist: LCRA North McCamey is
+345/138 (not HIFLD's 345/69), AEP North McCamey is 138-only, and the Eagle
+Mountain complex is a 345 kV yard beside 138 kV yards with no 69 kV level
+anywhere — both repair lines and both "69 kV" buses there touch nothing
+real. HIFLD's 69s are inferred minimums. The correction (migration
+20260901160000, evidence and priors in
+`osm_corridor_corrections_2026-09-01b.json`) invents no equipment: the
+misclassed secondaries become 138 kV — their existing transformers become
+the real 345/138 banks — the ties are re-parameterised at 138 kV and
+re-pointed to the real 138 kV buses, and McCamey's 69 kV chain hangs off the
+AEP yard's HIFLD-asserted 138/69 transformer. Both capacity passes
+re-derived; ceilings held at 1.0.
+
+**What the fix did and did not do.** The congestion score is unmoved (median
+53 %, the four real constraints unchanged) — removing fiction did not game
+the instrument. The blackout-size tail moved TOWARD the published law:
+N-2 measured-dispatch α = 1.48 → **1.39** on 11 events (OE-417 ≈ 1.31), all
+150 samples settled — the kv fiction was suppressing tail mass. Honestly
+still open: the corrected ties are STILL the top overloads (369 % and
+225 %), now attracting even more through-flow at the lower impedance —
+either a busbar-vs-line rating question (a 0.2–0.5 km intra-complex tie
+rated as an ordinary 138 kV line) or missing parallel 345/138 injection
+elsewhere in the region.
+
+**And the systematic finding underneath.** Chasing the third suspect (T8927,
+1.46 GW through a 138/69 transformer, 5 inferred circuits) found ~1.75 GW of
+Colorado Bend CCGT sitting on a DEAD-END 69 kV bus — EIA-860 records those
+plants' grid interconnection at 138 and 345 kV. Measured against EIA-860's
+grid-voltage column across the fleet: **184 GW of in-service capacity
+(11.7 % Eastern, 21.9 % Western, 26.8 % ERCOT) sits at least a full voltage
+class below its recorded interconnection voltage**, including 4.5 GW plants
+injected at 230 kV instead of 500. The bus mapper attaches plants to a
+yard's lowest level. Under the BA-fuel dispatch this mattered little; under
+measured dispatch every misassigned plant rams real MW through phantom
+transformers. Generator bus assignment by EIA grid voltage is the next
+correction pass.

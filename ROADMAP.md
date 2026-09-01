@@ -605,11 +605,16 @@ second is where the model is genuinely broken, and it gates the third.
    ≥ 100 MW vs OE-417's published ≈ 1.31, P[≥ 10 GW] = 0.7 %, terminations
    settled throughout (one budget exhaustion in the N-1 measured arm, 1/150)
    — EXT-3's "the tail needs the operating point, not more samples" measured
-   TRUE. Still open: the scorer's geocoding coverage (31/80, 29/57), the
-   Permian 69 kV through-flow artifacts the measured dispatch exposed
-   (1.9 GW routed through subtransmission is topology, not congestion), and
-   flipping `cems` + re-dispatch to default once measured under the census
-   and validation.
+   TRUE. Still open: the scorer's geocoding coverage (needs
+   ERCOT's CRR station dictionary; the model's own named yards are merged in
+   already), flipping `cems` + re-dispatch to default once measured under
+   the census and validation, and — the systematic finding under CAS-31 —
+   **generator bus assignment by EIA-860 grid voltage**: 184 GW of capacity
+   (26.8 % of ERCOT's) sits a full class below its recorded interconnection
+   voltage, ramming measured MW through phantom transformers. The two yard
+   complexes CAS-31 corrected still carry their intra-complex ties as the
+   top overloads (369 %/225 %): busbar-vs-line rating semantics, or missing
+   parallel 345/138 injection.
 
 1. **Nothing external has ever scored this model** (Phase 6 item 26, unstarted). Every
    instrument is internal — alpha ceilings, census counts, TV distance, conservation

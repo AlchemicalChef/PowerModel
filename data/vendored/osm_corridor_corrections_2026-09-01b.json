@@ -1,0 +1,35 @@
+{
+  "note": "Attribution + reversibility record for migration 20260901160000 (REVIEW CAS-31). Two ERCOT yard complexes whose 345 kV secondaries HIFLD carries as 69 kV, forcing bulk transfer through 69 kV jumpers — exposed as the model's worst overloads (560 % / 201 %) the moment CEMS measured dispatch put real flow on them (REVIEW EXT-4). OSM shows neither site has the voltage level the flow was crossing at.",
+  "sites": [
+    {
+      "name": "North McCamey (Upton County, TX)",
+      "osm_evidence": [
+        {"lat": 31.1535, "lon": -102.2233, "name": "North McCamey Subsation", "operator": "Lower Colorado River Authority", "voltage": "345000;138000", "source": "data/vendored/osm_substations_2026-08-18.json"},
+        {"lat": 31.1551, "lon": -102.2268, "name": "North McCamey Substation", "operator": "American Electric Power", "voltage": "138000", "source": "data/vendored/osm_substations_2026-08-18.json"},
+        {"lat": 31.1372, "lon": -102.2033, "name": "McCamey Substation", "operator": "American Electric Power", "voltage": "138000;69000;12500", "source": "data/vendored/osm_substations_2026-08-18.json"}
+      ],
+      "hifld_prior": {
+        "substation_301062_NORTH_MCCAMEY": {"voltage_levels": [345, 69]},
+        "bus_67745_69.0kV": {"base_kv": 69.0},
+        "line_312659": {"voltage_kv": 69.0, "to_bus": "67972_69.0kV", "inferred_circuits_at_fix": 3, "loading_under_cems_dispatch_pct": 560},
+        "line_305583": {"from_bus": "67745_69.0kV"}
+      },
+      "correction": "Bus 67745_69.0kV -> 138 kV (the LCRA yard is 345/138; its transformer becomes the real 345/138). Line 312659 (the 0.47 km inter-yard tie) -> 138 kV with re-estimated single-circuit parameters, AEP end re-pointed to 67972_138.0kV. Line 305583 (the 69 kV chain toward McCamey) re-pointed to 67972_69.0kV, so the local 69 kV system hangs off the AEP yard's HIFLD-asserted 138/69 transformer instead of the LCRA bulk yard."
+    },
+    {
+      "name": "Eagle Mountain (Tarrant County, TX)",
+      "osm_evidence": [
+        {"osm": "way 171476905", "lat": 32.9082, "lon": -97.4771, "name": "Eagle Mountain Substation", "voltage": "345000", "fetched": "2026-09-01 overpass-api.de"},
+        {"osm": "way 171476904", "lat": 32.9069, "lon": -97.4785, "name": "Eagle Mountain Substation (138kV)", "voltage": "138000", "fetched": "2026-09-01 overpass-api.de"},
+        {"osm": "way 1354524056", "lat": 32.9082, "lon": -97.4679, "voltage": "138000", "substation": "distribution", "fetched": "2026-09-01 overpass-api.de"}
+      ],
+      "hifld_prior": {
+        "substation_300883_EAGLE_MOUNTAIN": {"voltage_levels": [345, 69]},
+        "bus_67652_69.0kV": {"base_kv": 69.0},
+        "line_repair_weld_65735_68115": {"voltage_kv": 69.0, "to_bus": "69427_69.0kV", "inferred_circuits_at_fix": 5, "loading_under_cems_dispatch_pct": 201},
+        "line_repair_name_65735_71532": {"voltage_kv": 69.0, "to_bus": "71942_69.0kV"}
+      },
+      "correction": "No 69 kV level exists anywhere in the complex (both repair lines and the yards' 69 kV buses touch nothing real). Bus 67652_69.0kV -> 138 kV; both synthetic repair lines -> 138 kV with re-estimated parameters, far ends re-pointed to the real 138 kV buses (69427_138.0kV, 71942_138.0kV). The 69 kV stub buses stay behind their transformers carrying nothing."
+    }
+  ]
+}

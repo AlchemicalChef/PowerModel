@@ -69,6 +69,7 @@ data/vendored/*
 !data/vendored/ehv_corridor_worklist_2026-09-01.csv
 # Same rule as the 2026-08-18 corrections: the attribution + reversibility record.
 !data/vendored/osm_corridor_corrections_2026-09-01.json
+!data/vendored/osm_corridor_corrections_2026-09-01b.json
 # REVIEW EXT-1: ISO binding-constraint records. ERCOT's MIS listing expires in a
 # day, so its flattened pull is not re-fetchable; MISO's is the derived record.
 !data/vendored/ercot_sced_binding_constraints_2026-08-28_09-01.csv
