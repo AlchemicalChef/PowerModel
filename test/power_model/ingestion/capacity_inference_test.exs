@@ -226,4 +226,26 @@ defmodule PowerModel.Ingestion.CapacityInferencePocketTest do
     {:ok, sol} = VoltageControl.solve(fixed, base_mva: 100.0, load_compensation: 0.0)
     assert sol.converged
   end
+
+  test "the cap counts circuits already stored on the row" do
+    # The weak chain already carries the maximum inferred count: nothing may
+    # be added, and the pocket is refused rather than multiplied past the cap.
+    snap =
+      weak_radial()
+      |> update_in([:lines], fn ls -> Enum.map(ls, &Map.put(&1, :inferred_circuits, 8)) end)
+      |> update_in([:transformers], fn ts -> Enum.map(ts, &Map.put(&1, :inferred_circuits, 8)) end)
+
+    {same, report} =
+      CapacityInference.raise_ceiling(snap,
+        alpha_steps: [1.0],
+        target: 1.0,
+        load_compensation: 0.0,
+        dense_nr_max_buses: 25
+      )
+
+    assert report.ceiling == 0.0
+    assert report.circuits == %{}
+    assert report.unfixable != []
+    assert Enum.map(same.lines, & &1.x_pu) == Enum.map(snap.lines, & &1.x_pu)
+  end
 end

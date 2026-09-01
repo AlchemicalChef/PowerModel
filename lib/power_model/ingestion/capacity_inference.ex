@@ -339,9 +339,20 @@ defmodule PowerModel.Ingestion.CapacityInference do
       max_iterations: Keyword.get(opts, :max_iterations, 400)
     ]
 
+    # The cap counts what is already stored on the row plus what this run adds.
+    stored =
+      Map.new(
+        Enum.map(island.lines, &{{:line, &1.id}, Map.get(&1, :inferred_circuits) || 1}) ++
+          Enum.map(
+            island.transformers,
+            &{{:transformer, &1.id}, Map.get(&1, :inferred_circuits) || 1}
+          )
+      )
+
     acc0 = %{
       island: island,
       circuits: %{},
+      stored: stored,
       fixes: [],
       unfixable: [],
       ceiling: 0.0,
@@ -554,8 +565,14 @@ defmodule PowerModel.Ingestion.CapacityInference do
     # of times per pocket.
     forced_so_far = Map.get(acc.forced, deepest, 0)
 
+    # Effective counts for the cap: stored on the row times added by this run.
+    effective =
+      Map.new(path, fn key ->
+        {key, Map.get(acc.stored, key, 1) * Map.get(acc.circuits, key, 1)}
+      end)
+
     {doublings, x_after, forced} =
-      case greedy_doublings(path, x_of, acc.circuits, s_pu, x_path, margin, max_circuits) do
+      case greedy_doublings(path, x_of, effective, s_pu, x_path, margin, max_circuits) do
         {d, x} when d == %{} and path != [] and forced_so_far < @max_forced_per_pocket ->
           # One doubling: a margin just under the current S·X forces exactly
           # the largest-reactance branch to halve.
@@ -563,7 +580,7 @@ defmodule PowerModel.Ingestion.CapacityInference do
             greedy_doublings(
               path,
               x_of,
-              acc.circuits,
+              effective,
               s_pu,
               x_path,
               s_pu * x_path * 0.99,
