@@ -880,6 +880,17 @@ defmodule PowerModel.Demand do
     end)
   end
 
+  @doc "The hour of highest total ingested demand, or nil without demand rows."
+  def peak_demand_hour do
+    Repo.one(
+      from d in BADemandHour,
+        group_by: d.timestamp_utc,
+        order_by: [desc: sum(d.demand_mw)],
+        limit: 1,
+        select: d.timestamp_utc
+    )
+  end
+
   @doc """
   The UTC date with the highest single-hour national demand in the dataset.
   """

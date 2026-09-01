@@ -19,6 +19,9 @@ defmodule PowerModel.Grid.TransmissionLine do
     # `PowerModel.Ingestion.ParameterEstimator` recomputes rows below its own
     # version, so improved parameter tables reach existing rows (REVIEW DAT-18).
     field :params_version, :integer, default: 0
+    # Parallel circuits inferred from at-rest loading (CapacityInference).
+    # The factor is folded into r/x/b and the ratings; 1 means none inferred.
+    field :inferred_circuits, :integer, default: 1
     field :geometry, Geo.PostGIS.Geometry
     field :status, :string, default: "in_service"
     field :source, :string

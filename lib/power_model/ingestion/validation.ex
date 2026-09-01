@@ -85,7 +85,9 @@ defmodule PowerModel.Ingestion.Validation do
   alias PowerModel.Demand.{BADemandHour, BAFuelHour}
   alias PowerModel.Dispatch
   alias PowerModel.Grid
-  alias PowerModel.Ingestion.BusMapper
+  alias PowerModel.Failure.Cascade
+  alias PowerModel.Ingestion.{BusMapper, CapacityInference}
+  alias PowerModel.Solver.Partition
 
   alias PowerModel.Grid.{
     BalancingAuthority,
@@ -146,13 +148,17 @@ defmodule PowerModel.Ingestion.Validation do
   Run every gate. Returns `{:ok, summary}` when no check failed,
   `{:error, summary}` otherwise. Warnings never fail the run.
   """
+  # Fraction of rated branches over 100 % at rest above which the gate fails.
+  @at_rest_fail_fraction 0.005
+
   def run(opts \\ []) do
     checks = [
       hour_completeness(opts),
       egrid_vintage(opts),
       topology_census(opts),
       capacity_and_balance(opts),
-      reactive_study_freshness(opts)
+      reactive_study_freshness(opts),
+      at_rest_loading(opts)
     ]
 
     reports = Enum.map(checks, fn {_tag, report} -> report end)
@@ -1393,6 +1399,104 @@ defmodule PowerModel.Ingestion.Validation do
 
       {:ok, study} ->
         check_study(study, path)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # 6. At-rest loading (CAS-26 / CAS-30)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  How much of each interconnection's main island is over its rating with
+  nothing out of service, at the measured dispatch of `:hour` (default: the
+  latest ingested hour).
+
+  A branch at several times its rating at rest is not an overload — the real
+  grid carries this load — it is capacity the model lacks along that corridor
+  (REVIEW CAS-30), and it is why no AC solution existed at real demand and why
+  contingency response was binary (CAS-26). `CapacityInference.run/1` infers
+  the missing circuits; this check is what says whether it has been run and
+  whether the network has drifted since. Warns on any rated branch over 100 %;
+  fails when more than #{"0.5"} % of rated branches are.
+  """
+  def at_rest_loading(opts \\ []) do
+    if Grid.bus_count() == 0 do
+      report(:at_rest_loading, %{interconnections: %{}, hour: nil}, status: :skipped)
+    else
+      hour = Keyword.get_lazy(opts, :hour, &Demand.latest_demand_hour/0)
+
+      per =
+        Map.new(Repo.all(from(i in Interconnection, order_by: i.name)), fn ic ->
+          snap = Grid.get_grid_snapshot(ic.id, hour: hour)
+
+          if snap.buses == [] do
+            {ic.name, nil}
+          else
+            state = Cascade.init(snap, 100.0, hour: hour)
+
+            {subs, _dead} =
+              Partition.split(%{
+                buses: state.buses,
+                lines: state.lines,
+                transformers: state.transformers,
+                generators: Cascade.dispatched_generators(state),
+                loads: state.loads
+              })
+
+            case subs do
+              [] ->
+                {ic.name, nil}
+
+              _ ->
+                island = Enum.max_by(subs, &length(&1.buses))
+                r = CapacityInference.at_rest_loading(island, limit: 5)
+
+                {ic.name,
+                 %{
+                   rated: r.rated,
+                   over_100: r.over[100],
+                   over_200: r.over[200],
+                   overload_mw: Float.round(r.overload_mw, 1),
+                   worst: r.worst
+                 }}
+            end
+          end
+        end)
+
+      {warnings, failures} =
+        Enum.reduce(per, {[], []}, fn
+          {_name, nil}, acc ->
+            acc
+
+          {name, %{rated: rated, over_100: over, overload_mw: mw}}, {w, f} ->
+            frac = if rated > 0, do: over / rated, else: 0.0
+
+            cond do
+              frac > @at_rest_fail_fraction ->
+                {w,
+                 [
+                   "#{name}: #{over} of #{rated} rated branches over their rating at rest " <>
+                     "(#{Float.round(frac * 100, 2)} %, #{round(mw)} MW of overload) — run " <>
+                     "`CapacityInference.run/1` (REVIEW CAS-30)"
+                   | f
+                 ]}
+
+              over > 0 ->
+                {[
+                   "#{name}: #{over} rated branch(es) over their rating at rest " <>
+                     "(#{round(mw)} MW); the network has drifted since capacity was inferred"
+                   | w
+                 ], f}
+
+              true ->
+                {w, f}
+            end
+        end)
+
+      report(:at_rest_loading, %{interconnections: per, hour: hour && DateTime.to_iso8601(hour)},
+        warnings: Enum.reverse(warnings),
+        failures: Enum.reverse(failures)
+      )
     end
   end
 

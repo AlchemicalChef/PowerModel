@@ -12,6 +12,9 @@ defmodule PowerModel.Grid.Transformer do
     # pass revisits every row below `BusMapper.params_version/0` instead of
     # only filling NULLs, so a corrected recipe can reach existing rows.
     field :params_version, :integer, default: 0
+    # Parallel circuits inferred from at-rest loading (CapacityInference).
+    # The factor is folded into r/x/b and the ratings; 1 means none inferred.
+    field :inferred_circuits, :integer, default: 1
 
     belongs_to :from_bus, PowerModel.Grid.Bus
     belongs_to :to_bus, PowerModel.Grid.Bus
