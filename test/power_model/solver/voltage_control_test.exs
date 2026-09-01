@@ -680,6 +680,26 @@ defmodule PowerModel.Solver.VoltageControlTest do
     end
   end
 
+  describe "solve/2 with :ramp" do
+    test "a case that solves cold is not ramped" do
+      {:ok, sol} = VoltageControl.solve(sagging_case(:high_from), @opts ++ [ramp: true])
+      assert sol.converged
+      assert sol.voltage_control.ramped == false
+    end
+
+    test "a case with no solution at full load is ramped, reports it, and stays unconverged" do
+      # 400 MVAr through 0.17 pu: past the nose at any tap or bank.
+      snap = sagging_case(:high_from, q_mvar: 400.0)
+      {:ok, cold} = VoltageControl.solve(snap, @opts)
+      refute cold.converged
+
+      {:ok, ramped} = VoltageControl.solve(snap, @opts ++ [ramp: [0.2, 0.4]])
+      refute ramped.converged
+      assert ramped.voltage_control.ramped == true
+      assert ramped.voltage_control.ramp_steps >= 1
+    end
+  end
+
   describe "solve/2 without devices" do
     test "is a plain FDPF solve with an empty summary" do
       snap = sagging_case(:high_from)

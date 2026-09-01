@@ -3441,7 +3441,14 @@ defmodule PowerModel.Failure.Cascade do
             _ -> opts
           end
 
-        VoltageControl.solve(snapshot, Keyword.put(opts, :devices, devices))
+        # With controls on, a cold failure is retried as a load-ramp
+        # continuation: heavily loaded islands have solutions a flat start
+        # cannot reach, and this is the only AC attempt the island gets until
+        # something about it changes (`ac_retry?/2`).
+        VoltageControl.solve(
+          snapshot,
+          opts |> Keyword.put(:devices, devices) |> Keyword.put(:ramp, true)
+        )
       else
         FDPF.solve(snapshot, opts)
       end

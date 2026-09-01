@@ -189,6 +189,11 @@ defmodule PowerModel.Solver.VoltageControl do
   # the network is sagging. The option stays for experiments.
   @default_unconverged_rounds 0
 
+  # Load fractions the `:ramp` continuation walks through before the full
+  # snapshot. Each step is a warm-started solve; the last carries into the
+  # real load.
+  @default_ramp [0.5, 0.7, 0.85, 0.95]
+
   @reactor_min_kv 230.0
 
   # Capacitor switching step by class: half the largest bank normally built at
@@ -493,12 +498,89 @@ defmodule PowerModel.Solver.VoltageControl do
       iterate (default #{@default_unconverged_rounds}; see the attribute)
     * `:warm` — warm-start each round from the previous one (default true)
     * `:max_ltc_steps_per_round` — default #{@max_ltc_steps_per_round}
+    * `:ramp` — when the solve from a cold start fails, walk the load up from
+      a fraction of itself (`true` for #{inspect(@default_ramp)}, or a list of
+      fractions), carrying voltages and device positions from each step to
+      the next, and solve the full snapshot last. A continuation, in the
+      numerical sense: heavily loaded cases have solutions a flat start
+      cannot reach (measured on Western at real demand 2026-09-01: the same
+      network solves from α 0.95's state and diverges from flat). Reported
+      as `ramped: true` and `ramp_steps` in the summary. Off by default.
 
   Returns `{:ok, %Solution{}}` with `:voltage_control` set to a summary map:
   rounds run, device counts, MVAr switched in, taps moved, remaining
   violations, why the loop stopped, and the final `:state`.
   """
   def solve(snapshot, opts \\ []) do
+    ramp =
+      case Keyword.get(opts, :ramp) do
+        true -> @default_ramp
+        steps when is_list(steps) -> steps
+        _ -> nil
+      end
+
+    case {solve_once(snapshot, opts), ramp} do
+      {{:ok, %Solution{converged: true} = sol}, _} ->
+        {:ok, sol}
+
+      {result, nil} ->
+        result
+
+      {_failed, steps} ->
+        ramp_solve(snapshot, Keyword.delete(opts, :ramp), steps)
+    end
+  end
+
+  # Continuation in load: solve at each fraction from the previous fraction's
+  # voltages and device positions, then the full snapshot from the last.
+  defp ramp_solve(snapshot, opts, steps) do
+    devices = Keyword.get_lazy(opts, :devices, fn -> devices(snapshot, opts) end)
+    opts = Keyword.put(opts, :devices, devices)
+
+    {carry, taken} =
+      Enum.reduce(steps, {nil, 0}, fn a, {carry, taken} ->
+        case solve_once(scale_load(snapshot, a), with_carry(opts, carry)) do
+          {:ok, %Solution{converged: true} = s} ->
+            {%{state: s.voltage_control.state, warm: s}, taken + 1}
+
+          _ ->
+            {carry, taken}
+        end
+      end)
+
+    case solve_once(snapshot, with_carry(opts, carry)) do
+      {:ok, %Solution{voltage_control: vc} = sol} when is_map(vc) ->
+        {:ok, %{sol | voltage_control: Map.merge(vc, %{ramped: true, ramp_steps: taken})}}
+
+      other ->
+        other
+    end
+  end
+
+  defp with_carry(opts, nil), do: opts
+
+  defp with_carry(opts, %{state: st, warm: w}) do
+    opts |> Keyword.put(:control_state, st) |> Keyword.put(:warm_start, w)
+  end
+
+  @doc "A snapshot with its loads and generator nameplate scaled by `a`. Pure."
+  def scale_load(snapshot, a) do
+    %{
+      snapshot
+      | loads:
+          Enum.map(snapshot.loads, fn l ->
+            l
+            |> Map.put(:p_mw, (Map.get(l, :p_mw) || 0.0) * a)
+            |> Map.put(:q_mvar, (Map.get(l, :q_mvar) || 0.0) * a)
+          end),
+        generators:
+          Enum.map(snapshot.generators, fn g ->
+            Map.put(g, :p_max_mw, (Map.get(g, :p_max_mw) || 0.0) * a)
+          end)
+    }
+  end
+
+  defp solve_once(snapshot, opts) do
     devices = Keyword.get_lazy(opts, :devices, fn -> devices(snapshot, opts) end)
     max_rounds = Keyword.get(opts, :max_rounds, @max_rounds)
 
@@ -516,7 +598,8 @@ defmodule PowerModel.Solver.VoltageControl do
         :shunt_band,
         :unconverged_rounds,
         :warm,
-        :max_ltc_steps_per_round
+        :max_ltc_steps_per_round,
+        :ramp
       ])
 
     state = initial_state(devices, Keyword.get(opts, :control_state), snapshot)
@@ -1083,6 +1166,8 @@ defmodule PowerModel.Solver.VoltageControl do
       rounds: rounds,
       stopped: stopped,
       backoffs: backoffs,
+      ramped: false,
+      ramp_steps: 0,
       devices: length(devices),
       ltc: %{
         count: length(ltcs),
