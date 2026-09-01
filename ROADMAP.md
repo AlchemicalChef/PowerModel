@@ -544,10 +544,13 @@ second is where the model is genuinely broken, and it gates the third.
    single 32 km 69 kV-class line, whose mouth is also Western's α floor bus
    (CAS-29); the fix is a 138 kV OSM pull around Red Butte, item 2's loop.
    (b) The cascade runs the loop OPT-IN (`voltage_control: true` on
-   `Cascade.init/3`, device positions resumed between segments through
-   `record.ac_voltage.control_state`); nothing has been re-measured under
-   cascades with it on, and that measurement — not this census — should
-   decide the default. (c) Placement is
+   `Cascade.init/3`, positions resumed between segments). Measured both ways
+   2026-09-01 (CAS-29): bit-identical at real demand because the main island
+   has no AC solution there (LIN-13) so the layer is inert; at ERCOT α 0.4 a
+   3 MW spurious UVLS shed becomes `intact`; at α 0.5 the same served load by
+   a different pathway (voltage trips → frequency trips). Stays off until
+   real-demand AC exists; use it for what-if studies inside the controlled
+   window. (c) Placement is
    rule-derived; a sensitivity pass over peak multiplier, step sizes and the
    strength guard is owed before "calibrated" is claimed.
 

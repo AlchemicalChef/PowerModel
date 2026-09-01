@@ -1899,3 +1899,39 @@ over those is owed before any of it is called calibrated. Reactor devices
 exist only at ≥ 230 kV, so a 138 kV region with a var surplus at light load has
 nothing to absorb it except the LTC block; that is where the remaining
 light-load normal-band misses sit.
+
+**CAS-29 MEASURED UNDER CASCADES (2026-09-01).** Same snapshot, same initiating
+N-1 (the worst thermal contingency by MW at risk: ERCOT transformer 4547,
+517 % post-outage loading; Western transformer 10433, 477 %), controls off vs
+on, at real demand and at scaled load levels where the AC layer actually
+solves (loads and nameplate × α, proportional dispatch, both arms identical).
+
+| | off | on |
+|---|---|---|
+| ERCOT α 1.0 (43.5 GW) | budget_exhausted / degraded; 8,473 MW UFLS; 46 lines + 5 xfmrs | **identical** outcome and trips; in the two fragments that solve AC, 465 MVAr of stamped caps switched OUT, Vm max 1.335 → 1.036, the two `voltage_violation` events gone |
+| ERCOT α 0.5 (21.7 GW) | settled / degraded; served 16,932 MW; **550 MW UVLS**, 4,246 MW blackout; 82 undervoltage + 14 underfrequency generator trips | settled / degraded; served 16,951 MW; **1 MW UVLS**, 4,777 MW blackout; 0 undervoltage + 96 underfrequency trips |
+| ERCOT α 0.4 (17.4 GW) | settled / **degraded**: 3 MW of UVLS at Vm 0.906 | settled / **intact**: 0 MW, Vm min 0.923, 93 taps + 70 MVAr |
+| Western α 1.0 (83.3 GW) | settled / intact, 7 lines + 2 xfmrs | identical |
+| Western α 0.2, 0.15 | settled / intact in one step (the trip is benign at this load), Vm max 1.126 / 1.127 | identical outcome; Vm max 1.064 / 1.071 with 642 / 737 MVAr of reactor in |
+
+Three readings. (1) At real demand the layer is INERT on the main island —
+FDPF does not converge there (LIN-13), so no device ever gets a converged
+operating point to act on, and the headline cascade numbers are bit-identical
+with it on; it acts only in the small fragments that do solve, and there it
+does the right thing. (2) At a load level the network can carry (ERCOT α 0.4)
+the fixed-plant cascade sheds load through UVLS that a network with switched
+plant would not — `degraded` becomes `intact`. Three megawatts, but the
+mechanism is exactly the one CAS-28 predicted. (3) At ERCOT α 0.5 the served
+load is the same to 0.1 % but the PATHWAY changes: the 550 MW of UVLS and the
+82 generators lost to undervoltage vanish, and the same 96 generators are lost
+to underfrequency instead, with 531 MW more island blackout. The voltage
+pathway was standing in front of a frequency deficit; holding voltage does not
+create the megawatts the island is short. Cost: 1.5-10× wall time on
+AC-solving steps (ERCOT α 0.5: 11 s → 34 s).
+
+**Default decision:** stays OFF. It cannot change a real-demand result until
+the main island has an AC solution at real demand, and the scaled-load
+evidence, while in the right direction, is one contingency on two
+interconnections. Turn it on for what-if studies at loadings inside the
+controlled emergency window; re-decide when item 1's external target (2011
+Southwest, a Western light-load event) is runnable both ways.
