@@ -54,6 +54,22 @@ defmodule PowerModel.Ingestion.CapacityInference do
   reported: that is not a missing parallel circuit but misplaced load or a
   missing corridor, and inferring eight circuits of 69 kV would hide it.
 
+  ## What the rule cannot see, and the exclusion list (REVIEW EXT-1)
+
+  A branch over its rating at rest is one of two things: capacity the model
+  lacks, or a real limit the real grid operates AT — a binding constraint the
+  market manages by re-dispatching generation, which this model's dispatch
+  (placed by balancing authority and fuel, never asked whether a branch can
+  carry it) does not do. The at-rest rule cannot tell them apart; the ISOs'
+  binding-constraint records can. Measured 2026-09-01: ERCOT's two most
+  frequent constraints, Frontera-S. Mission and Bruni 138 kV, read 222 % and
+  204 % in the raw model and had been given three circuits each. So every
+  element an ISO reports as binding (`data/vendored/known_binding_elements_*.csv`,
+  produced by `scripts/score_congestion.py --emit`, keyed on HIFLD
+  `source_id`) is EXCLUDED from both rules: `infer/2` reports it under
+  `:real_limits` instead of giving it circuits, and `raise_ceiling/2` never
+  doubles it. What relieves those branches is re-dispatch, not capacity.
+
   ## The second rule: pockets the at-rest test cannot see (`raise_ceiling/2`)
 
   With the at-rest circuits in, Western's AC still failed at α 0.4 with eleven
@@ -130,13 +146,16 @@ defmodule PowerModel.Ingestion.CapacityInference do
   count (relative to the snapshot as given), and the report lists every
   branch touched.
 
-  Options: `:threshold`, `:max_circuits`, `:passes`, `:base_mva`.
+  Options: `:threshold`, `:max_circuits`, `:passes`, `:base_mva`, `:exclude`
+  (a `MapSet` of `{:line | :transformer, id}` never given circuits; default
+  `known_binding_elements(snapshot)`).
   """
   def infer(snapshot, opts \\ []) do
     threshold = Keyword.get(opts, :threshold, @default_threshold)
     max_circuits = Keyword.get(opts, :max_circuits, @default_max_circuits)
     passes = Keyword.get(opts, :passes, @default_passes)
     base_mva = Keyword.get(opts, :base_mva, @base_mva)
+    exclude = Keyword.get_lazy(opts, :exclude, fn -> known_binding_elements(snapshot) end)
 
     {snapshot, circuits, over_cap, pass_log} =
       Enum.reduce_while(1..passes, {snapshot, %{}, %{}, []}, fn pass,
@@ -147,6 +166,12 @@ defmodule PowerModel.Ingestion.CapacityInference do
           solution.line_flows
           |> Enum.filter(fn {_key, f} -> rated?(f) and f.loading_pct > threshold * 100.0 end)
           |> Map.new(fn {key, f} -> {key, ceil(f.loading_pct / (threshold * 100.0) - 1.0e-9)} end)
+
+        # A reported real limit is not given capacity, however loaded.
+        {real, needs} = Enum.split_with(needs, fn {key, _n} -> MapSet.member?(exclude, key) end)
+
+        over_cap =
+          Enum.reduce(real, over_cap, fn {key, _}, acc -> Map.put_new(acc, key, :real_limit) end)
 
         {apply_now, refused} =
           Enum.split_with(needs, fn {key, n} -> Map.get(circuits, key, 1) * n <= max_circuits end)
@@ -168,13 +193,17 @@ defmodule PowerModel.Ingestion.CapacityInference do
         end
       end)
 
+    {real_limits, over_cap} =
+      Enum.split_with(over_cap, fn {_key, v} -> v == :real_limit end)
+
     report = %{
       threshold: threshold,
       max_circuits: max_circuits,
       branches: map_size(circuits),
       extra_circuits: circuits |> Map.values() |> Enum.map(&(&1 - 1)) |> Enum.sum(),
       circuits: circuits,
-      over_cap: over_cap,
+      over_cap: Map.new(over_cap),
+      real_limits: Enum.map(real_limits, &elem(&1, 0)),
       passes: Enum.reverse(pass_log)
     }
 
@@ -182,6 +211,48 @@ defmodule PowerModel.Ingestion.CapacityInference do
   end
 
   defp rated?(f), do: is_number(f.rating_mva) and f.rating_mva > 0.0
+
+  @known_binding_glob "data/vendored/known_binding_elements_*.csv"
+
+  @doc """
+  The branches an ISO reports as binding, as `{:line | :transformer, id}` keys
+  resolved against this snapshot (lines by HIFLD `source_id`, transformers by
+  row id). Empty when no record is vendored. See the moduledoc.
+  """
+  def known_binding_elements(snapshot, paths \\ Path.wildcard(@known_binding_glob)) do
+    rows =
+      paths
+      |> Enum.flat_map(fn path ->
+        path
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.drop(1)
+        |> Enum.map(&String.split(&1, ","))
+      end)
+
+    by_source_id =
+      Map.new(snapshot.lines, fn l -> {to_string(Map.get(l, :source_id) || ""), l.id} end)
+
+    Enum.reduce(rows, MapSet.new(), fn
+      [_iso, _label, _n, branch_id, source_id | _], acc ->
+        cond do
+          String.starts_with?(branch_id, "T") ->
+            MapSet.put(
+              acc,
+              {:transformer, String.to_integer(String.trim_leading(branch_id, "T"))}
+            )
+
+          source_id != "" and Map.has_key?(by_source_id, source_id) ->
+            MapSet.put(acc, {:line, Map.fetch!(by_source_id, source_id)})
+
+          true ->
+            acc
+        end
+
+      _, acc ->
+        acc
+    end)
+  end
 
   # Multiply a branch's circuit count by n: series impedance / n, shunt and
   # ratings × n.
@@ -353,6 +424,7 @@ defmodule PowerModel.Ingestion.CapacityInference do
       island: island,
       circuits: %{},
       stored: stored,
+      exclude: Keyword.get_lazy(opts, :exclude, fn -> known_binding_elements(island) end),
       fixes: [],
       unfixable: [],
       ceiling: 0.0,

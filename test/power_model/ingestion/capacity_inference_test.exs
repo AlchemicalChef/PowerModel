@@ -108,6 +108,32 @@ defmodule PowerModel.Ingestion.CapacityInferenceTest do
     assert r.by_class == %{138.0 => 1}
   end
 
+  test "a reported real limit is never given circuits, and is reported as one (EXT-1)" do
+    snap = radial(300.0)
+    {same, report} = CapacityInference.infer(snap, exclude: MapSet.new([{:line, 1}]))
+    assert Enum.find(same.lines, &(&1.id == 1)).inferred_circuits == 1
+    assert report.real_limits == [{:line, 1}]
+    assert report.branches == 0
+  end
+
+  test "known_binding_elements/2 resolves a vendored record by HIFLD source_id within the snapshot" do
+    path = Path.join(System.tmp_dir!(), "known_binding_#{System.unique_integer([:positive])}.csv")
+
+    File.write!(path, """
+    iso,label,binding_intervals,branch_id,source_id,kv,inferred_circuits,dc_loading_pct
+    ercot,A-B 138kV,480,999999,hifld-77,138.0,3,74
+    miso,XF X,10,T42,,345.0,1,36
+    ercot,C-D 69kV,5,1,hifld-absent,69.0,1,10
+    """)
+
+    snap =
+      update_in(radial(100.0), [:lines], fn [a, b] -> [Map.put(a, :source_id, "hifld-77"), b] end)
+
+    keys = CapacityInference.known_binding_elements(snap, [path])
+    File.rm!(path)
+    assert keys == MapSet.new([{:line, 1}, {:transformer, 42}])
+  end
+
   test "scaling a transformer multiplies its bank" do
     t = CapacityInference.scale_transformer(%{r_pu: 0.01, x_pu: 0.1, rated_mva: 100.0}, 2)
     assert t.x_pu == 0.05 and t.r_pu == 0.005 and t.rated_mva == 200.0

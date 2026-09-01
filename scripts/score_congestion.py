@@ -66,6 +66,7 @@ def constraints(iso,path):
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--iso',required=True,choices=ISO); ap.add_argument('--loadings',required=True); ap.add_argument('--buses',required=True)
     ap.add_argument('--osm',default='data/vendored/osm_substations_2026-08-18.json'); ap.add_argument('--top',type=int,default=30); ap.add_argument('--quiet',action='store_true')
+    ap.add_argument('--emit',help='append the matched model branches (real binding elements found in the model) to this CSV: iso,label,binding_intervals,branch_id,source_id,kv,inferred_circuits,dc_loading_pct')
     a=ap.parse_args(); cfg=ISO[a.iso]
     byname=load_osm(a.osm,cfg['bbox']); names=list(byname)
     buses={r['id']:(float(r['kv']),float(r['lat']),float(r['lon'])) for r in csv.DictReader(open(a.buses))}
@@ -92,7 +93,7 @@ def main():
                         if best is None or float(t['dc_loading_pct'] or 0)>float(best['dc_loading_pct'] or 0): best=t
                     else: seen.add(nb); fr.append((nb,q,d+1))
         return best
-    items=constraints(a.iso,cfg['file']); total=len(items); located=found=inferred=0; loads=[]
+    items=constraints(a.iso,cfg['file']); total=len(items); located=found=inferred=0; loads=[]; emitted=[]
     for label,x,y,kv,w in items:
         ox,oy=geocode(byname,names,x,kv),geocode(byname,names,y,kv)
         if not ox or not oy:
@@ -105,6 +106,7 @@ def main():
         best=path(sx,sy,kv) if x!=y and not (sx&sy) else max((r for s in sx for (_,r) in adj[s]),key=lambda r:float(r['dc_loading_pct'] or 0),default=None)
         if best:
             found+=1; l=float(best['dc_loading_pct'] or 0); loads.append(l); inferred+=int(best['inferred_circuits'] or 1)>1
+            emitted.append([a.iso,label,w,best['id'],best.get('source_id',''),best['kv'],best['inferred_circuits'],best['dc_loading_pct']])
             if not a.quiet: print(f"  [FOUND ] {label} x{w} -> {best['id']} {best['sub_1']}-{best['sub_2']} {best['kv']}kV dc {best['dc_loading_pct']}% n{best['inferred_circuits']}")
         elif not a.quiet: print(f"  [nopath] {label} x{w}  {ox[0]['name']} / {oy[0]['name']}")
     allloads=sorted((float(r['dc_loading_pct'] or 0) for r in model),reverse=True)
@@ -113,6 +115,13 @@ def main():
     if loads:
         ranks=sorted(pr(v) for v in loads)
         print(f"   model DC loading of those: median {sorted(loads)[len(loads)//2]:.0f}%, mean {sum(loads)/len(loads):.0f}%; median percentile rank {ranks[len(ranks)//2]:.1f}% (0 = most loaded); in model top 5%: {sum(1 for v in ranks if v<5)}/{len(ranks)}; on inferred capacity: {inferred}/{found}")
+    if a.emit:
+        import os
+        new=not os.path.exists(a.emit)
+        with open(a.emit,'a',newline='') as fh:
+            wr=csv.writer(fh)
+            if new: wr.writerow(['iso','label','binding_intervals','branch_id','source_id','kv','inferred_circuits','dc_loading_pct'])
+            wr.writerows(emitted)
     # reverse
     stations=set()
     for label,x,y,kv,w in items:

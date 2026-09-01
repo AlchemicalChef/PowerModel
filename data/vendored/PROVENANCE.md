@@ -200,3 +200,10 @@ model's branch loadings by `scripts/score_congestion.py`.
   41 distinct constraints, mostly interface/path limits (PACE_PATHC_ITC,
   WECC_Path_41, LDWP_IPP_NORTH) — path-flow material for A2, not branch matching.
 - Geocoding bridge: `osm_substations_2026-08-18.json` (named OSM yards).
+
+## known_binding_elements_2026-09-01.csv
+Derived, committed: the real binding elements `scripts/score_congestion.py --emit`
+found in the model (23 ERCOT, 11 MISO), keyed on HIFLD `source_id` (lines) or
+`T<id>` (transformers), with the model's loading and inferred count at the time.
+`CapacityInference` reads every `known_binding_elements_*.csv` and never adds
+capacity on those branches (REVIEW EXT-1). Regenerate after re-pulling ISO records.
