@@ -549,21 +549,24 @@ second is where the model is genuinely broken, and it gates the third.
    Controlled census, capped network (fixed plant → now): ERCOT solvable
    α 0.64 → **1.0 (43,457 MW, all of real demand)**, emergency band 0.2-0.3 →
    **0.02-0.9 (39,111 MW)**, normal none → **0.3-0.4**; Western solvable 0.20 →
-   **0.74 (61,809 MW)**, emergency none → **0.02-0.6 (49,967 MW)**; Eastern
+   **0.99 (82,628 MW)**, emergency none → **0.02-0.75 (62,459 MW)**; Eastern
    solvable 0.43 → **0.99 (285,479 MW)**, emergency 0.02-0.25 → **0.02-0.75
    (215,792 MW)**. Under a
    cascade at real demand ERCOT's main island solves AC (`ac_diverged` 50 → 0)
    and the worst thermal N-1 settles intact instead of exhausting the step
-   budget with 8.5 GW of UFLS; Eastern's main island now solves AC at real
-   demand too (controls + ramp); Western's still runs DC-only (ceiling 0.74).
+   budget with 8.5 GW of UFLS; Eastern's and Western's main islands now solve AC at real
+   demand too (controls + ramp), at 1,005 s and 301 s against 11 s and 14 s.
    Still open, in order: (a) **The refusals are the worklist**
-   (`data/vendored/ehv_corridor_worklist_2026-09-01.csv`, 93 corridors): every
+   (`data/vendored/ehv_corridor_worklist_2026-09-01.csv`, 94 corridors): every
    one is a corridor whose real supply path — usually a higher class — HIFLD
-   does not carry. Plant Vogtle's 230 kV tie carries 14.6 GW at rest because
-   the model has its 500 kV bus with ONE 500 kV line; Western's are ~1 GW
-   regions behind 69/115 kV paths and the St. George pocket. A 500 kV OSM
-   pull at those yards, item 24's method, is the next capacity move; more
-   inference is not. (b) The inferred capacity sits at the same class between
+   does not carry. Two were untied HIFLD records and were corrected from OSM
+   (Vogtle's 500 kV yards; Red Butte's 345/138 — the latter took Western from
+   0.74 to 0.99). Split yards in general are NOT the mechanism (measured:
+   welding every same-class twin within 600 m moves the at-rest overload
+   < 1 %). What is left needs missing yards and lines: Vogtle's 230 kV tie
+   still carries 14.3 GW because Wadley has no 500 kV yard in the model at
+   all (OSM: Vogtle-Wadley 500 kV). A yard is a bus, a transformer and a
+   line — the next Eastern move; more inference is not. (b) The inferred capacity sits at the same class between
    the same buses; right for flows, wrong for anything reading circuit class;
    `inferred_circuits > 1` marks every such row for replacement. (c) Threshold
    0.8, the two hours, the 0.2 radial margin and the 8-circuit cap are

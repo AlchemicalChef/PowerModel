@@ -2140,3 +2140,58 @@ N-1 at real demand is Plant Vogtle's 230 kV tie carrying 14.6 GW at rest
 500 kV. `data/vendored/ehv_corridor_worklist_2026-09-01.csv` lists them with
 coordinates, flow and class, the way the OSM stranded-yard worklist did for
 item 24. That, not more inference, is the next Western and Eastern move.
+
+**Twin yards are not the corridor problem (NEGATIVE, 2026-09-01).** Vogtle and
+Red Butte both turned out to be one physical station carried as two HIFLD
+records the model never ties together — Vogtle's two 500 kV yards 0.6 km apart
+with no branch between them, each with its own 500/230 transformer, so the
+plant's 4.7 GW leaves at 230 kV — and the count of such pairs is large: 1,825 /
+249 / 249 unconnected same-class twins within 1 km at ≥ 138 kV on Eastern /
+ERCOT / Western. DR-4's weld phase (`BusMapper.weld_colocated_buses/1`,
+250 m) already covers the tight ones; what is left inside the main islands at
+250 m is 0 on ERCOT and 2 on Western. So the hypothesis was tested at 600 m,
+in memory, unfolding the stored circuits first: ERCOT's 96 twins cut the
+at-rest overload 22,097 → 21,999 MW (0.4 %) and the circuits the inference
+needs 509 → 506; Western's 396 twins moved the overload the other way
+(12,030 → 12,179 MW) and the circuits 376 → 368. Split yards are a real defect
+and a negligible cause of the corridors. The corridors are missing lines and
+missing higher-class yards, and only OSM evidence names them — which is what
+the worklist is for. Two sites had that evidence in hand and were corrected
+individually (below); the general weld radius was left at 250 m.
+
+**Two sites corrected from OSM evidence (2026-09-01).** Plant Vogtle: the
+model carried two 500 kV yards 0.6 km apart (HIFLD 37107 with the plant's
+4,658 MW and the Thomson Primary 500 kV line; HIFLD 40786 with the West
+McIntosh and Warthen 500 kV lines) with no branch between them, each with its
+own 500/230 kV transformer and the 230 kV yards tied — so the plant and two
+of its three 500 kV circuits reached the third through 230 kV, and line
+109468 carried 14,639 MW at rest. OSM way 863571818 is one "Vogtle 500KV
+Switchyard" whose busbar ways span both HIFLD positions. Red Butte: HIFLD's
+yard 58560 carries 345 and "115" kV; OSM's is 345/138 with no 115 level, and
+the 138 kV yard the model DOES have (63596, 130 m away, three ST GEORGE-RED
+BUTTE 138 kV lines, the double circuit OSM way 173899732 shows) had no path
+to the 345 kV because the 345/138 transformer landed on the mislabelled bus.
+Migration 20260901130000 ties Vogtle's 500 kV yards, reclasses Red Butte's
+bus and line to 138 kV and welds it to the 138 kV yard, then re-runs both
+capacity passes from scratch (`run/0` unfolds every stored count first).
+Record: `data/vendored/osm_corridor_corrections_2026-09-01.json`.
+
+Re-measured on the corrected network (both passes re-derived): **Western's
+controlled ceiling 0.7422 → 0.9922 — 82,628 MW, 99 % of real demand** — and
+its emergency band α 0.02-0.6 → 0.02-0.75 (49,967 → 62,459 MW). One
+transformer landing on the wrong bus was the binding element of an
+interconnection; the pocket loop had been inferring 69 kV circuits around it.
+Under a cascade at real demand Western's worst thermal N-1 now cascades to a
+settled, non-binary outcome — 3 steps, a generator frequency trip, 499 MW of
+UFLS — where before the trip was benign; the ramp solves the main island AC
+(4 AC islands to 2) at 301 s against 13.5 s.
+
+Vogtle was necessary and not sufficient. With its 500 kV yards tied, line
+109468 still carries 14,318 MW at rest (was 14,639) and remains the worst
+Eastern N-1 at 1,280 % post-outage (was 1,615 %): the 230 kV corridor is
+standing in for a 500 kV path the model does not have at all. OSM names it —
+Vogtle-Wadley 500 kV (way 160057254) — and the model's Wadley carries 230,
+130.5 and 115 kV buses and no 500 kV yard. Adding a yard is a bus, a
+transformer and a line; it is the first entry on the worklist that needs
+more than a tie, and the next Eastern move. ERCOT is unchanged by any of
+this (no pockets, no twins at 250 m). Eastern's census is unchanged by the tie (solvable 0.9922 / 285,479 MW, emergency α 0.02-0.75 / 215,792 MW), which is the same finding from the other side.

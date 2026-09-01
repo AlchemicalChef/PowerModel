@@ -156,7 +156,7 @@ St. George pocket, CAS-29). Columns: interconnection, kind, hour_or_alpha,
 type, id_or_path, kv, inferred_circuits, extra_needed, flow_or_load_mw,
 rating_mva_or_buses, loading_pct_or_sx, lat, lon, substations. Produced by
 the session scratch script `worklist.exs` plus two SQL selects over the
-dev database after migrations 20260901100001-120000; regenerate after any
+dev database after migrations 20260901100001-130000 (regenerated after the Vogtle/Red Butte corrections; 94 rows); regenerate after any
 change to those passes. Use: the next OSM pull's target list (as
 `osm_stranded_worklist_2026-08-23.csv` was for item 24), starting with
 Plant Vogtle's 500 kV yard (line 7723, 14.6 GW at rest on its 230 kV tie).
