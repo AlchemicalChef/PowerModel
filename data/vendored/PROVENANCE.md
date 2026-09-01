@@ -173,3 +173,30 @@ Plant Vogtle's 500 kV yard (line 7723, 14.6 GW at rest on its 230 kV tie).
   180 at 115), 102 substations, 23 plants.
 - 712,068 B, sha256 c52fe7967ea7ee49d8ed71688b4c3be18246a9fee7caf9ce64278d60d2ff1241. Unversioned like the other raw pulls; (c) OpenStreetMap
   contributors, ODbL 1.0.
+
+## Real congestion: ISO binding-constraint records (REVIEW EXT-1, 2026-09-01)
+
+External denominators for "is the network the real network": which transmission
+elements actually bind in the ISOs' real-time markets, scored against the
+model's branch loadings by `scripts/score_congestion.py`.
+
+- **ercot_sced_binding_constraints_2026-08-28_09-01.csv** — COMMITTED (gitignore
+  exception): ERCOT MIS report NP6-86-CD "SCED Shadow Prices and Binding
+  Transmission Constraints" (reportTypeId 12302), every 5-minute SCED run the MIS
+  listed on 2026-09-01 (117 csv zips, 12,265 rows, 2026-08-28 00:50 to 2026-09-01 12:05 CPT),
+  flattened. Columns as published (ConstraintName, ContingencyName, ShadowPrice,
+  Limit, Value, ViolatedMW, From/ToStation, From/ToStationkV, ...). Committed
+  because the MIS listing expires after ~1 day; it is not re-fetchable.
+  Station names are ERCOT's internal short names.
+- **miso_rt_binding_constraints_2024-12-25_2025-01-01.csv** — COMMITTED: the eight
+  daily "Binding Constraints Report - Real-Time Market" workbooks from
+  https://docs.misoenergy.org/marketreports/<YYYYMMDD>_rt_bc.xls flattened to one
+  CSV (market_date, flowgate_nerc_id, constraint_id, constraint_name,
+  branch_name, contingency, hour, shadow_price, constraint_description). The raw
+  .xls files are re-fetchable and unversioned; sha256 of each is in the session
+  record (REVIEW EXT-1). Market date 2024-12-31 is the model's reference day.
+- CAISO OASIS PRC_CNSTR RTM 2024-12-01..2025-01-01 (unversioned, re-fetchable via
+  https://oasis.caiso.com/oasisapi/SingleZip?queryname=PRC_CNSTR&market_run_id=RTM):
+  41 distinct constraints, mostly interface/path limits (PACE_PATHC_ITC,
+  WECC_Path_41, LDWP_IPP_NORTH) — path-flow material for A2, not branch matching.
+- Geocoding bridge: `osm_substations_2026-08-18.json` (named OSM yards).

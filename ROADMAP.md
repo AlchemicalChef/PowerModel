@@ -575,6 +575,26 @@ second is where the model is genuinely broken, and it gates the third.
    layer stays opt-in in the cascade until re-measured across item 1's
    external target. (e) The normal band is unreached on Western and Eastern.
 
+0b. **The first external score exists, and it says the congestion is in the
+   wrong place** (REVIEW EXT-1, 2026-09-01). `scripts/score_congestion.py` +
+   `mix power_model.loadings` score the model's branch loadings against the
+   ISOs' real binding constraints (ERCOT SCED, committed because the MIS
+   listing expires; MISO real-time reports for the model's own reference day).
+   Of the real binding elements the model demonstrably contains, it loads them
+   at a median 20 % (ERCOT) and 36 % (MISO) where the market has them at
+   100 % of limit; 1 of its top-30 loaded ERCOT branches is a real constraint;
+   and six ERCOT bottlenecks — Frontera-S. Mission and Bruni 138 kV among them,
+   the market's two most frequent — were overloaded at rest in the raw model
+   (222 %, 204 %) and were given circuits by the at-rest pass: real limits
+   read as missing capacity. The plan reorders accordingly: (i) ISO constraint
+   records become an EXCLUSION list for `CapacityInference` (never infer
+   circuits on a reported binding element); (ii) transmission-constrained
+   re-dispatch — a generation shift against ratings on the LODF/PTDF
+   sensitivities — is the missing operating-point mechanism and goes ahead of
+   reactive calibration; (iii) MISO's 16 "no bus at class" yards join the
+   corridor worklist; (iv) the instrument's coverage (31/80 ERCOT, 29/57 MISO
+   elements geocoded) is a target of its own.
+
 1. **Nothing external has ever scored this model** (Phase 6 item 26, unstarted). Every
    instrument is internal — alpha ceilings, census counts, TV distance, conservation
    residuals — so "more accurate" currently has no denominator. 2011 Southwest is the

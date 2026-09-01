@@ -2195,3 +2195,70 @@ Vogtle-Wadley 500 kV (way 160057254) — and the model's Wadley carries 230,
 transformer and a line; it is the first entry on the worklist that needs
 more than a tie, and the next Eastern move. ERCOT is unchanged by any of
 this (no pockets, no twins at 250 m). Eastern's census is unchanged by the tie (solvable 0.9922 / 285,479 MW, emergency α 0.02-0.75 / 215,792 MW), which is the same finding from the other side.
+
+## External denominators (EXT)
+
+**EXT-1 (MEASURED, HIGH, 2026-09-01) — the model's congestion is not where the
+ISOs' congestion is, and the at-rest capacity inference erased the part that
+was.** The first external score this repo has had. Two real records:
+ERCOT's SCED binding transmission constraints, every 5-minute run the MIS
+listed (2026-08-28 to 09-01, 12,265 rows, 92 distinct constraints; ERCOT's
+listing expires in a day, so the flattened pull is committed), and MISO's
+real-time binding-constraint reports for 2024-12-25 to 2025-01-01 — market
+date 2024-12-31 is the model's reference day — 4,723 rows, 35 binding
+branches, 30 named contingency elements. Method (`scripts/score_congestion.py`,
+model side `mix power_model.loadings`): each real element's stations are
+geocoded through OSM's named yards (ERCOT's are internal short names — SNDSW,
+WAP, STP — matched by stripping suffixes and subsequence), located in the model
+as buses within 1.5 km at the class, and looked for as a path of ≤ 4 branches
+at that class. The instrument's own coverage is the first limit: 31 of 80
+ERCOT elements and 29 of 57 MISO elements geocode at both ends.
+
+| | ERCOT (different dates) | MISO (same day) |
+|---|---|---|
+| real elements geocoded both ends | 31 / 80 | 29 / 57 |
+| exist in the model | **23 (74 %)** | **11 (38 %)**; 16 yards absent at class |
+| model DC loading of those, median | **20 %** (real: at 100 % of limit) | **36 %** |
+| percentile rank among all model branches, median | 22.5 % | 3.8 % |
+| in the model's top 5 % | 6 / 23 | 6 / 11 |
+| on inferred capacity (n > 1) | **6 / 21 lines** | 0 / 11 |
+| reverse: model's top-30 loaded branches with both yards among real constraint stations | **1 / 23** | 0 / 7 |
+
+Three readings. (1) *Existence is decent on ERCOT and poor on MISO*: 16 of
+29 located MISO elements have no model bus at the class within 1.5 km — the
+"nobus" class is missing yards (CANADIAN RIVER 345, WATSEKA 138, CRANDALL
+345, WILTON CENTER 765), worklist material of the Wadley kind. (2) *Loading is
+wrong almost everywhere*: the elements that bind at 100 % of their limit in
+the real market sit at a median 20 % (ERCOT) and 36 % (MISO) in the model,
+and the model's own most-loaded branches — Exxon-Baytown 138, Channelview-
+Greens Bayou 345, Battle Creek-Argenta 345, Monticello-Sherburne 345 at
+70-77 % — appear in neither ISO's list. The model concentrates flow on EHV
+corridors and industrial ties; reality binds on specific 69/138/161 kV lines
+and 345/115 transformers. (3) *The inference erased the part the model got
+right.* Six of the 21 ERCOT lines found sit on inferred capacity, and their
+single-circuit-equivalent loadings — the loading the model had BEFORE the
+at-rest pass gave them circuits — are 222 % (Frontera-S. Mission 138 kV,
+ERCOT's most frequent constraint, 480 binding intervals), 204 % (Bruni 138,
+410), 138 % (Seagoville 138), 90 %, 88 %, 66 %. The raw network was overloaded
+at rest exactly where ERCOT's market is congested; CAS-30's rule read that as
+missing capacity and gave them 2-3 circuits. It was not missing capacity. It
+was a real transmission constraint that the real market manages by
+re-dispatching generation, which this model has no mechanism for: its
+dispatch is placed by BA and fuel and never asked whether a branch can carry
+it. A branch over its rating at rest is therefore one of two things — capacity
+the model lacks, or a real limit the real grid operates at — and the at-rest
+pass cannot tell them apart. The ISO records can.
+
+**What this changes in the plan.** (a) `CapacityInference` must not add
+circuits on branches an ISO reports as binding: the vendored constraint
+records become an exclusion list with provenance, and the six ERCOT branches
+are unfolded. (b) The missing operating-point mechanism is
+transmission-constrained re-dispatch — a generation shift against branch
+ratings (the repo's LODF/PTDF machinery is the sensitivity it needs; the
+economics ROADMAP's salvage note rejected are not required) — which is what
+would reproduce real binding patterns AND remove the need to infer capacity
+at real bottlenecks. It goes ahead of the reactive-layer calibration. (c) The
+"nobus" yards join the corridor worklist. (d) The score is re-run after each
+of those; its coverage (31/80, 29/57) is itself a target — ERCOT's station
+short names need a proper dictionary, which the ERCOT network model
+publishes.
