@@ -37,7 +37,9 @@ primary_region = "ord"
       X-Forwarded-Proto = "https"
 
 [[vm]]
-  # Power-flow solves on the 20k-bus network need real headroom
-  memory = "2gb"
+  # Power-flow solves on the 17.5k-bus Western island peaked ~1.9 GB RSS and
+  # were OOM-killed at 2 GB (measured 2026-09-02); 4 GB holds the cascade
+  # demo with headroom.
+  memory = "4gb"
   cpu_kind = "shared"
   cpus = 2
