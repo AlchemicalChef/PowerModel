@@ -20,6 +20,13 @@ defmodule Mix.Tasks.PowerModel.CascadeCcdf do
   operating point (`Cascade.init(constrained_dispatch: true)`); `--cems` pins
   the fossil fleet to its measured CEMS operation (ROADMAP C1);
   `--voltage-control` turns the reactive layer on. `--seed` fixes the draw.
+
+  `--max-steps` deepens the per-event step budget (default 50). The cascade
+  trips ONE component per step, so a genuinely settling sequence longer than
+  the budget is otherwise recorded at its truncated size: the CAS-33 run's
+  15 `budget_exhausted` doubles turned out to be collapses recorded at a
+  30th of their settled size (REVIEW CAS-34). For distribution work use a
+  budget deep enough that no sample exhausts it.
   """
 
   use Mix.Task
@@ -41,7 +48,8 @@ defmodule Mix.Tasks.PowerModel.CascadeCcdf do
     cems: :boolean,
     voltage_control: :boolean,
     seed: :integer,
-    xmin: :float
+    xmin: :float,
+    max_steps: :integer
   ]
 
   @impl Mix.Task
@@ -64,7 +72,8 @@ defmodule Mix.Tasks.PowerModel.CascadeCcdf do
       [hour: hour] ++
         if(opts[:constrained], do: [constrained_dispatch: true], else: []) ++
         if(opts[:cems], do: [cems: true], else: []) ++
-        if(opts[:voltage_control], do: [voltage_control: true], else: [])
+        if(opts[:voltage_control], do: [voltage_control: true], else: []) ++
+        if(opts[:max_steps], do: [max_steps: opts[:max_steps]], else: [])
 
     base = Cascade.init(snap, 100.0, init_opts)
     candidates = rated_branches(base)

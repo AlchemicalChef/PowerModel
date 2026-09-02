@@ -365,7 +365,14 @@ defmodule PowerModel.Failure.Cascade do
     # through the control loop, resuming the positions its previous segment
     # settled at (`record.ac_voltage.control_state`).
     voltage_control: false,
-    voltage_devices: []
+    voltage_devices: [],
+    # Per-cascade-event step budget (the `:budget_exhausted` kill-switch).
+    # Overridable at init (`max_steps:`) because the loop trips ONE component
+    # per step — the earliest relay — so a long but genuinely settling
+    # sequence needs a budget at least as deep as its trip count, and the
+    # CCDF instrument has to be able to tell "still propagating at 50" from
+    # "never settles" (REVIEW CAS-34).
+    max_steps: @max_steps
   ]
 
   @doc """
@@ -381,6 +388,10 @@ defmodule PowerModel.Failure.Cascade do
       per-island load-following rule below and says so in the log.
     * `:fuel_totals` — `%{ba_id => %{fuel => mw}}` passed straight through to
       `PowerModel.Dispatch`, which then reads nothing from the database.
+    * `:max_steps` — per-cascade-event step budget (default 50). One step
+      trips one component, so this bounds the length of a trip SEQUENCE, not
+      its size; raise it to distinguish a long settling cascade from a
+      runaway (`:budget_exhausted` marks the truncation either way).
 
   The fallback `dispatch` map is seeded per island from each generator's share
   of island capacity, capped so the slack bus keeps a little headroom.
@@ -497,7 +508,8 @@ defmodule PowerModel.Failure.Cascade do
       voltage_control: voltage_control,
       voltage_devices: voltage_devices,
       termination: nil,
-      frequency_nadir_hz: @nominal_frequency_hz
+      frequency_nadir_hz: @nominal_frequency_hz,
+      max_steps: Keyword.get(opts, :max_steps, @max_steps)
     }
   end
 
@@ -1605,12 +1617,13 @@ defmodule PowerModel.Failure.Cascade do
   # Timed cascade loop
   # ---------------------------------------------------------------------------
 
-  defp do_cascade(%{step: step} = state, step_results, _callback) when step >= @max_steps do
+  defp do_cascade(%{step: step, max_steps: max_steps} = state, step_results, _callback)
+       when step >= max_steps do
     # The per-cascade step budget ran out with trips still pending. This is a
     # truncated, NOT settled, cascade: mark it loudly so callers never present
     # the final state as a stable equilibrium.
     Logger.warning(
-      "cascade step budget exhausted at step #{state.step} (max #{@max_steps}); " <>
+      "cascade step budget exhausted at step #{state.step} (max #{state.max_steps}); " <>
         "terminating cascade as unstable"
     )
 
@@ -1619,7 +1632,7 @@ defmodule PowerModel.Failure.Cascade do
       component_type: "cascade",
       component_id: 0,
       failure_cause: "max_steps_exhausted",
-      details: %{max_steps: @max_steps, simulated_time: state.simulated_time}
+      details: %{max_steps: state.max_steps, simulated_time: state.simulated_time}
     }
 
     # The budget clause emits no step of its own — it fires INSTEAD of a step —

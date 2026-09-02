@@ -1512,6 +1512,26 @@ defmodule PowerModel.Failure.CascadeTest do
       assert event.component_type == "cascade"
       assert event.details.max_steps == 50
     end
+
+    test "max_steps: at init deepens the budget (CAS-34)" do
+      state = Cascade.init(three_bus_snapshot(), 100.0, max_steps: 200)
+      assert state.max_steps == 200
+
+      # A run already past the DEFAULT budget keeps going under the deeper
+      # one: no max_steps_exhausted event, because the healthy network
+      # settles before 200.
+      {final_state, _} = Cascade.run_cascade(%{state | step: 50})
+      assert final_state.termination != :budget_exhausted
+
+      # And the deeper budget still exhausts loudly when actually consumed.
+      {exhausted_state, _} = Cascade.run_cascade(%{state | step: 200})
+      assert exhausted_state.termination == :budget_exhausted
+
+      assert [event] =
+               Enum.filter(exhausted_state.events, &(&1.failure_cause == "max_steps_exhausted"))
+
+      assert event.details.max_steps == 200
+    end
   end
 
   # ===========================================================================

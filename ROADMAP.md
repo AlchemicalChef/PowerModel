@@ -601,12 +601,24 @@ second is where the model is genuinely broken, and it gates the third.
    29 % → 62 % (rank 2.8 %, reverse 0 → 7/30) against a season-matched July
    constraint week plus its exclusion rows (migration 20260901150000); (v)
    `mix power_model.cascade_ccdf` at the peak hour under measured dispatch
-   found the blackout-size tail, and at the corrected state it MATCHES the
-   national record: 500 N-2 doubles give α = 1.31 on 42 events ≥ 100 MW —
-   OE-417's published exponent, within mutual error bars — with q99 at
-   20 GW and P[≥ 10 GW] = 1.6 % (CAS-33). The asterisk: 15/500 doubles
-   exhaust the step budget — CAS-26 closed at N-1, leaks 3 % at stressed
-   N-2. Generator bus assignment by EIA-860 grid
+   found the blackout-size tail, and at the corrected state it is consistent
+   with the national record: 500 N-2 doubles give α = 1.27 ± 0.04 on 42
+   events ≥ 100 MW against OE-417's published 1.31 ± 0.08 — within mutual
+   error bars — with q99 at 47.6 GW, P[≥ 10 GW] = 2.8 %, and a
+   characteristic-size cluster of 14 events at 28–50 GW (the finite-size
+   cutoff of a 77 GW system; the largest event that was never truncated is
+   4.7 GW). CAS-33's α = 1.31 headline was fit on
+   truncated sizes: its 15 "budget-exhausted" doubles were settling
+   collapses clipped by the 50-step budget at up to a 30th of their size
+   (CAS-34; `--max-steps` deepens the budget). With the budget deep enough,
+   ALL 500 doubles settle — CAS-26 is closed at stressed N-2 too; nothing
+   runs away. The caveat that replaces the asterisk: the same 500 doubles
+   from the security-constrained point give 14 events ≥ 100 MW, q99 =
+   1.34 GW, zero collapses — the 28–50 GW cluster belongs to the
+   unconstrained operating point, not the topology, and the model brackets
+   OE-417 between its two operating points. Mid-cascade corrective
+   re-dispatch (SCED acting between relay trips) is the mechanism that
+   would let ONE point produce both regimes honestly (CAS-34). Generator bus assignment by EIA-860 grid
    voltage is DONE (CAS-32: 1,014 plants / 162 GW re-pointed;
    `grid_voltage_kv` on every generator; evidence replaces the size floor),
    and the capacity passes now derive at the measured operating point with

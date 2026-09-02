@@ -2614,3 +2614,57 @@ samples are the next cascade-dynamics worklist.
 bus; the scorer's ERCOT short-name wall; validation's at-rest gate still
 dispatches BA-fuel; sim-side `cems`/`constrained_dispatch` defaults for
 cascades and the census once the CCDF at scale is read.
+
+**CAS-34 (FIXED + MEASURED, 2026-09-02) — the 15 budget-exhausted doubles
+were truncated collapses, and the collapse belongs to the operating point,
+not the network.** CAS-33's asterisk read the 15/500 `budget_exhausted` N-2
+doubles as CAS-26 "leaking at stressed N-2" — a runaway mode. Replaying
+them with the budget deepened (`Cascade.init` now takes `max_steps:`,
+`cascade_ccdf` takes `--max-steps`) shows the opposite: none oscillate
+(zero repeat trips) and none run away — ALL FIFTEEN SETTLE, at 141–171
+steps, having lost 4.7–49.7 GW. Sample 65 recorded 1,667 MW at truncation
+and settles at 47,607 MW; sample 5 recorded 19,951 MW and settles at
+49,704 MW. The mechanism is a one-line-per-step thermal grind — the loop
+trips the single earliest relay each step, so the 50-step budget could only
+ever clear 50 elements of a ~165-element sequence. And the grind is FAST:
+sample 65's ~165 steps span 12.9 simulated minutes (~5 s per trip — heavy
+overloads, not the IEC curve's mild-overload knee), the timescale of 2003's
+fast phase, inside which operator action is marginal.
+
+**The amended distribution.** Settled samples are budget-invariant, so the
+15 deep rows splice exactly into the CAS-33 ensemble: **α = 1.27 ± 0.04**
+on the same 42 events ≥ 100 MW (was 1.31, fit on truncated sizes; OE-417
+publishes 1.31 ± 0.08 — still within mutual error bars, but the two-decimal
+coincidence is withdrawn). q99 moves 20 → 47.6 GW, P[≥ 10 GW] = 2.8 %, and
+14 events cluster at 28–50 GW — the finite-size cutoff of a 77 GW system;
+the largest event that was never truncated is 4.7 GW. Terminations: 500/500
+settled. CAS-26 is closed at stressed N-2 as well — the "3 % leak" was the
+budget clipping settling cascades, not a runaway regime.
+
+**Where the collapses live: the operating point.** The same 15 pairs from
+the security-constrained operating point (`--constrained`, same deep
+budget, same hour): 11 of 15 fully intact at 0.0 MW, 4 degraded at
+0.03–4.1 GW, ZERO collapsed. And the full paired ensemble — same seed,
+same 500 doubles, peak hour, constrained: 14 events ≥ 100 MW (was 42),
+q99 = 1.34 GW (was 47.6), largest event 4.1 GW, P[≥ 10 GW] = 0, α = 1.46
+on n = 14 (too few to lean on), and 0/500 samples needed more than 50
+steps — the budget question does not even arise from the secured point.
+The 46–50 GW avalanches are a property of the unconstrained at-rest
+dispatch — the point CAS-26 has always said is overloaded — not of the
+topology. The model now brackets the record from both sides: the
+over-stressed point reproduces OE-417's exponent but with a no-operator
+collapse cluster the record does not contain; the SCED-like point
+under-propagates the tail the record plainly has. Reality — a grid that
+runs secured most hours and gets caught off its point some hours — lives
+between them, which is the honest statement of where this instrument
+stands. (Bonus datapoint from a mis-aimed run: the winter-night
+constrained point gives q99 = 64 MW — a third point on the same curve.
+And the constrained peak point drops the main-island FDPF mismatch from
+2.9 pu to 0.014 pu — nearly AC-solvable, worth a solver probe.)
+
+**Open.** Mid-cascade corrective re-dispatch — SCED acting between relay
+trips — is the mechanism that would let one operating point produce both
+regimes honestly, now the top cascade-dynamics lever; the FDPF iteration
+probe at the constrained point; the two topology gaps (Permian 69 kV pair,
+Eagle Mountain weld) and Colorado Bend II's 345 bus; the scorer's ERCOT
+short-name wall; validation's at-rest gate.
