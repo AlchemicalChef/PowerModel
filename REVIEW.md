@@ -2547,9 +2547,10 @@ Re-dispatch-before-inference is therefore now the derivation DEFAULT
 (`redispatch: false` to opt out): its cost measured under a minute of
 shifting even on Eastern. ERCOT's ceiling under it is confirmed at 1.0; the
 Eastern/Western re-derivation under the new default was still in its ceiling
-pass when this entry landed (its infer pass completed clean), so a fresh
-replay of the migration chain plus the EIA download converges on the dev
-state once that pass finishes.
+pass when this entry landed; it has since confirmed — Eastern 1.0, Western
+1.0 (400 extra circuits over 84 branches, one unfixable pocket) — so a
+fresh replay of the migration chain plus the EIA download reproduces the
+dev state.
 
 **Open, deliberately.** Validation's at-rest gate still dispatches
 BA-fuel; boundary UTC hours the vendored CEMS day only partly covers pin
