@@ -197,6 +197,7 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
       end
 
       plant_coords = build_plant_coords(plant_path)
+      plant_grid_kv = build_plant_grid_voltage(plant_path)
 
       # Seasonal over-capability is tallied across Flow's parallel stages.
       # Counters, not log lines, are the authoritative count: a burst of
@@ -213,7 +214,7 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
         row, headers -> {[Enum.zip(headers, row) |> Map.new()], headers}
       end)
       |> Flow.from_enumerable(max_demand: 200)
-      |> Flow.map(&parse_generator(&1, plant_coords, seasonal_excess))
+      |> Flow.map(&parse_generator(&1, plant_coords, plant_grid_kv, seasonal_excess))
       |> Flow.filter(&(&1 != nil))
       |> Flow.map(&insert_generator/1)
       |> Flow.run()
@@ -248,7 +249,61 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
     end)
   end
 
-  defp parse_generator(row, plant_coords, seasonal_excess) do
+  # Plant "Grid Voltage (kV)": the primary column only — Grid Voltage 2/3 are
+  # rarely filled, and when they are, a multi-POI plant's floor should not be
+  # forced to its highest yard. Entries are operator-reported and sometimes a
+  # one-off value (256 for a 345 kV yard); the placement floor tolerates that
+  # with its 0.7x class margin rather than snapping here.
+  defp build_plant_grid_voltage(plant_path) do
+    plant_path
+    |> File.stream!([:trim_bom])
+    |> EIA860Parser.parse_stream(skip_headers: false)
+    |> Stream.transform(nil, fn
+      row, nil -> {[], row}
+      row, headers -> {[Enum.zip(headers, row) |> Map.new()], headers}
+    end)
+    |> Enum.reduce(%{}, fn row, acc ->
+      plant_code = Map.get(row, "Plant Code")
+      kv = parse_float(Map.get(row, "Grid Voltage (kV)"))
+
+      if plant_code && kv && kv > 0 do
+        Map.put(acc, to_string(plant_code), kv)
+      else
+        acc
+      end
+    end)
+  end
+
+  @doc """
+  Backfill `grid_voltage_kv` on existing generators from the vendored EIA-860
+  plant file (the ingest sets it for new rows). Returns `{plants, generators}`
+  updated, or `{:error, :no_plant_file}`; a no-op on a machine without the
+  data files, so the data migration that calls this stays runnable anywhere.
+  """
+  def backfill_grid_voltage(path \\ "data") do
+    case find_file(path, @plant_file_patterns) do
+      nil ->
+        {:error, :no_plant_file}
+
+      plant_path ->
+        grid = build_plant_grid_voltage(plant_path)
+
+        counts =
+          for {plant_id, kv} <- grid do
+            {n, _} =
+              from(g in PowerModel.Grid.Generator,
+                where: g.eia_plant_id == ^plant_id and is_nil(g.grid_voltage_kv)
+              )
+              |> PowerModel.Repo.update_all(set: [grid_voltage_kv: kv])
+
+            n
+          end
+
+        {map_size(grid), Enum.sum(counts)}
+    end
+  end
+
+  defp parse_generator(row, plant_coords, plant_grid_kv, seasonal_excess) do
     try do
       plant_id = Map.get(row, "Plant Code") || Map.get(row, "Plant ID")
 
@@ -289,6 +344,7 @@ defmodule PowerModel.Ingestion.EIA.Form860 do
             summer_capacity(row, nameplate, plant_id, generator_id, seasonal_excess),
           winter_capacity_mw: winter_capacity(row, nameplate, seasonal_excess),
           coordinates: coords,
+          grid_voltage_kv: Map.get(plant_grid_kv, to_string(plant_id)),
           status: parse_status(Map.get(row, "Status") || Map.get(row, "Operating Status")),
           sector: sector,
           utility_scale: utility_scale?(sector),

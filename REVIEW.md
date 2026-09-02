@@ -2394,7 +2394,7 @@ appears: median **29 % → 48 %**, top-5 % membership 14 → 15 of 34.
 **The lesson of EXT-1 recurred and was closed the same day.** 12 of the 34
 July MISO elements sat on inferred capacity — the exclusion list only knew
 the winter week, so the at-rest pass had "fixed" the July constraints'
-real limits. The July matches (58 rows, both ISOs) are now
+real limits. The July matches (57 rows, both ISOs) are now
 `known_binding_elements_2026-09-01_jul.csv` and both capacity passes were
 re-derived (migration 20260901150000; ceilings stayed at 1.0, one extra
 circuit in Eastern — honesty again cost nothing). Post-derivation the MISO
@@ -2479,3 +2479,81 @@ yard's lowest level. Under the BA-fuel dispatch this mattered little; under
 measured dispatch every misassigned plant rams real MW through phantom
 transformers. Generator bus assignment by EIA grid voltage is the next
 correction pass.
+
+**CAS-32 (FIXED + MEASURED, 2026-09-01) — generator bus assignment by
+EIA-860 grid voltage, and what re-deriving at the honest operating point
+taught about the at-rest rule.** CAS-31's systematic finding, closed:
+EIA-860's plant-level "Grid Voltage (kV)" — where each plant actually
+interconnects — said 184 GW of in-service capacity sat at least a full
+class below it, because the bus mapper attached plants to a yard's lowest
+level. The column now rides on every generator (`grid_voltage_kv`; Form860
+sets it at ingest; migrations 20260901170000/170001 backfilled 15,983
+plants / 26,854 generators — NOTE the plant file is a downloaded input, not
+committed, so on a checkout without it the data migration no-ops and the
+backfill belongs to the next ingest). The placement floor takes the value
+as evidence that REPLACES the size heuristic, not merely raises it: the
+first pass ran with max(size, evidence) semantics and stranded Colorado
+Bend I — 608 MW recorded at 138 kV, size floor 230, no 230 kV bus within
+reach — on its dead-end 69 kV bus; under replace semantics it landed on the
+138 kV bus 0 m away. `remap_stranded_generators/1` (unchanged, still
+strict-improvement-only) moved **1,014 plants, 2,025 generators, 162 GW**
+of ~12,880 examined: Vogtle's 4,530 MW back at 500 kV, Crystal River at
+500, Colorado Bend I at 138. Colorado Bend II (1,143 MW, recorded 345)
+stays honestly stranded — no 345 kV bus exists within the search radius —
+and joins the worklist. Ceilings held at 1.0 through every re-derivation.
+
+**Honesty about the congestion score.** The re-map SOFTENED it, and partly
+should have: Bruni's 193 % organic overload fell to 31 % — it was largely a
+plant-misplacement artifact, right for the wrong reason (ERCOT's actual
+Bruni record is BRUNI_69_1, a ~35 MVA 69 kV element; the scorer had matched
+the 138 kV line — a matching caveat now on record). Of EXT-4's four organic
+real-constraint overloads, two survive the corrections: Seagoville (191 %)
+and Frontera (172 %). And the mirror defect is now measured: **547 plants /
+144 GW sit ABOVE 1.45x their recorded class, 302 of them (121.6 GW) with an
+in-class bus within 3 km** — injection attributed too high softens
+subtransmission stress the same way attribution too low inflamed it. The
+floor only pushes up; a class CEILING (place AT the recorded level when a
+bus exists there) is the follow-up pass, and it also converges the ≤ 157
+plants the max-semantics first pass may have over-moved.
+
+**The derivation-regime experiment.** Moving 162 GW exposed that the
+capacity passes still derived at the BA-fuel operating point while every
+instrument measures at the CEMS one: two Permian 69 kV lines lost their
+5 inferred circuits (BA-fuel at-rest flows < 80 % where measured flows
+carry 750 MW) and lit up at 646 %. So the passes now dispatch with
+`cems: true` by default — and the first CEMS-at-rest derivation taught the
+next lesson: the ERCOT score's median fell to 41 % and the N-2 tail thinned
+to 8 events, because the at-rest rule reads the measured stress AROUND real
+constraints as missing capacity and inflates their parallel paths, which no
+exclusion list can guard. The counter is EXT-2's own pipeline, re-dispatch
+BEFORE inference ("only what a generation shift cannot relieve is missing
+capacity"): derived that way, ERCOT recovers to median 46 %, mean 58 %,
+**9/24 found elements in the model's top 5 % — the best yet** — at an
+unchanged ceiling, and the cap-refused would-need warnings (9, 9 and 16
+circuits on the Permian pair and the Eagle Mountain tie) correctly classify
+them as topology gaps, not capacity. N-2 measured-dispatch CCDF at this
+state: 5 of 150 doubles reach 100 MW — below the 10-event fit floor — while
+q99 GROWS to 2.26 GW, the largest of any state measured tonight. Across the
+corrected states the count sits at 5-8 of 150 against CAS-31's 11, so part
+of the α = 1.39 fit was borrowed from misplacement stress; the corrected
+model keeps gigawatt events and needs a larger ensemble (500+ doubles) for
+an exponent it can stand behind. MISO, final state with the model's named yards in the
+geocoder: 40 found elements (was 34), median 54 %, rank 4.7 %, 21/40 in the
+top 5 %, reverse direction 8/30 — and 2 of the 6 newly found elements sit
+on inferred capacity, which is the coverage loop asking for its next
+emit-exclude-re-derive round.
+
+Re-dispatch-before-inference is therefore now the derivation DEFAULT
+(`redispatch: false` to opt out): its cost measured under a minute of
+shifting even on Eastern. ERCOT's ceiling under it is confirmed at 1.0; the
+Eastern/Western re-derivation under the new default was still in its ceiling
+pass when this entry landed (its infer pass completed clean), so a fresh
+replay of the migration chain plus the EIA download converges on the dev
+state once that pass finishes.
+
+**Open, deliberately.** Validation's at-rest gate still dispatches
+BA-fuel; boundary UTC hours the vendored CEMS day only partly covers pin
+per-facility silently; steam-only CEMS units (blank gross, nonzero
+operating time) read as OFF and could wrongly idle a cogeneration host's
+electric units. All small today, all recorded here so none of them has to
+be rediscovered.

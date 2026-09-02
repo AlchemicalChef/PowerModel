@@ -367,6 +367,7 @@ defmodule PowerModel.Ingestion.BusMapper do
 
     context = placement_context()
     plant_mw = plant_capacity_index()
+    grid_kv_index = plant_grid_voltage_index()
 
     {assignments, synthetic, stats} =
       generators
@@ -377,7 +378,7 @@ defmodule PowerModel.Ingestion.BusMapper do
         anchor = Enum.min_by(units, & &1.id)
         mw = Map.get(plant_mw, key) || plant_group_mw(units)
 
-        case place_plant(context, anchor, mw) do
+        case place_plant(context, anchor, mw, [], Map.get(grid_kv_index, key)) do
           {bus_id, rule} ->
             {Enum.map(units, &{&1.id, bus_id}) ++ assigned, unassigned, bump(stats, rule)}
 
@@ -417,6 +418,7 @@ defmodule PowerModel.Ingestion.BusMapper do
     capacity = context.capacity
     plant_mw = plant_capacity_index()
     bus_kv = bus_voltage_index()
+    grid_kv_index = plant_grid_voltage_index()
 
     generators =
       from(g in Generator,
@@ -442,11 +444,14 @@ defmodule PowerModel.Ingestion.BusMapper do
         mw = Map.get(plant_mw, key) || plant_group_mw(units)
         anchor = Enum.min_by(units, & &1.id)
         current = Enum.map(units, & &1.bus_id) |> Enum.uniq()
+        grid_kv = Map.get(grid_kv_index, key)
 
-        with true <- Enum.any?(current, &stranded_placement?(&1, mw, capacity, bus_kv)),
-             {bus_id, _rule} <- place_plant(context, anchor, mw, anchors(context.index, current)),
+        with true <-
+               Enum.any?(current, &stranded_placement?(&1, mw, capacity, bus_kv, grid_kv)),
+             {bus_id, _rule} <-
+               place_plant(context, anchor, mw, anchors(context.index, current), grid_kv),
              false <- current == [bus_id],
-             true <- improvement?(bus_id, current, mw, capacity, bus_kv) do
+             true <- improvement?(bus_id, current, mw, capacity, bus_kv, grid_kv) do
           {Enum.map(units, &{&1.id, bus_id}) ++ moves, count + 1, mw_total + mw}
         else
           _ -> {moves, count, mw_total}
@@ -478,8 +483,8 @@ defmodule PowerModel.Ingestion.BusMapper do
   # corridor's two wind farms inject has nowhere to go except along 48 km of
   # 69 kV conductor, at 95 degrees. Both plants have a 138 kV bus in their own
   # yard, 0 m away, on the far side of the bank they are wrongly under.
-  defp stranded_placement?(bus_id, plant_mw, capacity, bus_kv) do
-    case plant_voltage_floor(plant_mw) do
+  defp stranded_placement?(bus_id, plant_mw, capacity, bus_kv, grid_kv) do
+    case plant_voltage_floor(plant_mw, grid_kv) do
       nil ->
         false
 
@@ -492,8 +497,8 @@ defmodule PowerModel.Ingestion.BusMapper do
   # Only a strict gain justifies moving a plant: the new bus clears a floor
   # none of the current ones do, or it can carry the plant where none of them
   # can. Anything else is churn.
-  defp improvement?(bus_id, current, plant_mw, capacity, bus_kv) do
-    floor_kv = plant_voltage_floor(plant_mw) || 0.0
+  defp improvement?(bus_id, current, plant_mw, capacity, bus_kv, grid_kv) do
+    floor_kv = plant_voltage_floor(plant_mw, grid_kv) || 0.0
     needed = @stranding_headroom * plant_mw
 
     clears_floor? = Map.get(bus_kv, bus_id, 0.0) >= floor_kv
@@ -535,8 +540,25 @@ defmodule PowerModel.Ingestion.BusMapper do
   @doc """
   The voltage floor a plant of `p_mw` must be placed at or above, or nil when
   no floor applies. See `map_generators_to_buses/0`.
+
+  `grid_kv` is EIA-860's recorded interconnection voltage (CAS-32): where the
+  size heuristic infers, the measurement testifies, so a known grid voltage
+  REPLACES the size floor in either direction — a 608 MW plant recorded at
+  138 kV must be allowed to land on the 138 kV bus in its own yard, which a
+  max() with the size heuristic's 230 kV floor forbade, stranding it at
+  69 kV instead (Colorado Bend). The 0.7x margin classes the value rather
+  than matching it exactly — operator-reported entries are sometimes one-off
+  (256 for a 345 kV yard) — and the connected-branch capacity half of the
+  stranding rule still forces a move when the recorded level cannot
+  evacuate the nameplate.
   """
-  def plant_voltage_floor(p_mw) when is_number(p_mw) do
+  def plant_voltage_floor(p_mw, grid_kv \\ nil)
+
+  def plant_voltage_floor(_p_mw, grid_kv) when is_number(grid_kv) and grid_kv >= 60 do
+    0.7 * grid_kv
+  end
+
+  def plant_voltage_floor(p_mw, _grid_kv) when is_number(p_mw) do
     cond do
       p_mw > @gen_ehv_plant_mw -> @gen_ehv_floor_kv
       p_mw > @gen_hv_plant_mw -> @gen_hv_floor_kv
@@ -544,7 +566,20 @@ defmodule PowerModel.Ingestion.BusMapper do
     end
   end
 
-  def plant_voltage_floor(_), do: nil
+  def plant_voltage_floor(_, _), do: nil
+
+  # {:plant, id} => the plant's EIA-860 grid voltage, for the placement floor.
+  # min over units: a multi-row plant with disagreeing values gets the
+  # conservative floor.
+  defp plant_grid_voltage_index do
+    from(g in Generator,
+      where: not is_nil(g.grid_voltage_kv) and not is_nil(g.eia_plant_id),
+      group_by: g.eia_plant_id,
+      select: {g.eia_plant_id, min(g.grid_voltage_kv)}
+    )
+    |> Repo.all()
+    |> Map.new(fn {id, kv} -> {{:plant, id}, kv} end)
+  end
 
   @doc "Branch-rating headroom a bus needs to count as able to evacuate a plant."
   def stranding_headroom, do: @stranding_headroom
@@ -632,11 +667,11 @@ defmodule PowerModel.Ingestion.BusMapper do
 
   # {bus_id, rule} or nil. `rule` names which arm placed the plant so the
   # census in the log can separate a clean placement from a fallback.
-  defp place_plant(context, anchor, plant_mw, extra_anchors \\ []) do
+  defp place_plant(context, anchor, plant_mw, extra_anchors, grid_kv) do
     radius_km = @gen_match_radius_m / 1000.0
     lin8 = nearest_in_grid(context.grid, anchor.lon, anchor.lat, radius_km, nil)
 
-    case plant_voltage_floor(plant_mw) do
+    case plant_voltage_floor(plant_mw, grid_kv) do
       nil ->
         # LIN-8 untouched: any level, lowest one at the nearest yard.
         with {bus_id, _key} <- lin8, do: {bus_id, :small_unit}

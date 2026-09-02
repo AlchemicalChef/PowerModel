@@ -231,7 +231,7 @@ reference day), same source and flattening as the winter week above; 4,725
 rows. Pulled 2026-09-01 (re-fetchable). The season-matched record set for the
 EXT-4 congestion score — the winter week scores a July operating point as
 season mismatch, not signal — and the source of the July rows in
-`known_binding_elements_2026-09-01_jul.csv` (both ISOs, 58 rows, emitted by
+`known_binding_elements_2026-09-01_jul.csv` (both ISOs, 57 rows, emitted by
 `scripts/score_congestion.py --emit` from the CEMS-dispatch loadings; the
 capacity passes were re-derived after it landed, because 12 of its 34 MISO
 elements had been given inferred circuits by passes that only knew the

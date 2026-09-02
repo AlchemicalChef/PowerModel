@@ -82,6 +82,30 @@ defmodule PowerModel.Ingestion.BusMapperPlacementTest do
       assert BusMapper.plant_voltage_floor(500.1) == 230.0
       assert BusMapper.plant_voltage_floor(nil) == nil
     end
+
+    test "EIA-860 grid voltage replaces the size floor (CAS-32)" do
+      # Colorado Bend II: 1,142 MW recorded at 345 kV. The size heuristic
+      # alone says 230; the measurement says 345-class (0.7x margin).
+      assert BusMapper.plant_voltage_floor(1142.0, 345.0) == 241.49999999999997
+
+      # A small plant with a recorded 138 kV interconnection gets a floor the
+      # size heuristic would never give it.
+      assert BusMapper.plant_voltage_floor(50.0, 138.0) == 96.6
+
+      # And in the OTHER direction: Colorado Bend I, 608 MW recorded at
+      # 138 kV. The size heuristic said 230, no 230 kV bus exists near the
+      # yard, and a max() of the two stranded it on 69 kV — the measurement
+      # must win so the plant can land on the 138 kV bus 0 m away.
+      assert BusMapper.plant_voltage_floor(608.0, 138.0) == 96.6
+
+      # Paperwork quirks (256 for a 345 kV yard) class rather than match.
+      assert BusMapper.plant_voltage_floor(600.0, 256.0) == 179.2
+
+      # Sub-transmission records and nil leave the heuristic alone.
+      assert BusMapper.plant_voltage_floor(50.0, 12.5) == nil
+      assert BusMapper.plant_voltage_floor(50.0, nil) == nil
+      assert BusMapper.plant_voltage_floor(600.0, nil) == 230.0
+    end
   end
 
   describe "generator placement" do

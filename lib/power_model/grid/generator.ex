@@ -21,6 +21,9 @@ defmodule PowerModel.Grid.Generator do
     field :q_max_mvar, :float
     field :q_min_mvar, :float
     field :capacity_factor, :float
+    # EIA-860 plant "Grid Voltage (kV)": where the plant actually
+    # interconnects. Evidence for the placement floor (CAS-32).
+    field :grid_voltage_kv, :float
     field :coordinates, Geo.PostGIS.Geometry
     field :status, :string, default: "in_service"
     # EIA-860 "Sector Name", stored raw: one of Electric Utility, IPP Non-CHP,

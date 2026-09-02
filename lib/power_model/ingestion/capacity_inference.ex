@@ -814,11 +814,23 @@ defmodule PowerModel.Ingestion.CapacityInference do
   The operating point is the measured dispatch at each hour in `:hours`
   (default: the peak demand hour in the ingested record and the latest one —
   the capacity a grid is built for, and the hour everything else here is
-  measured at); a branch gets the largest count any hour asks for. With
-  `redispatch: true` the dispatch is first shifted until no overload a
-  generation shift can relieve remains (`Dispatch.Redispatch`), so only what
+  measured at), with the fossil fleet pinned to its measured CEMS operation
+  wherever the vendored day covers the hour (`cems: false` to opt out; hours
+  outside the vendored day degrade to the BA-fuel merit fill on their own).
+  Deriving capacity at one operating point and simulating at another let the
+  passes unfold circuits the measured flows need (CAS-32's re-map exposed
+  this: two Permian 69 kV lines lost their 5 inferred circuits because the
+  BA-fuel at-rest flows stayed under 80 % where the measured flows carry
+  750 MW); a branch gets the largest count any hour asks for. The dispatch
+  is then shifted until no overload a generation shift can relieve remains
+  (`Dispatch.Redispatch`; `redispatch: false` to opt out), so only what
   re-dispatch cannot fix is read as missing capacity — the distinction EXT-1
-  showed the at-rest rule needs. The pass first UNFOLDS the circuits a
+  showed the at-rest rule needs, made the DEFAULT once CAS-32 measured what
+  skipping it costs: at the measured operating point the at-rest rule reads
+  the stress AROUND real constraints as missing capacity and inflates their
+  parallel paths, which no exclusion list can guard (ERCOT's found-element
+  median fell 46 % → 41 % without it, and the shift costs under a minute
+  even on Eastern). The pass first UNFOLDS the circuits a
   previous run stored, so it is idempotent and can be re-run after any change
   to the network.
 
@@ -853,7 +865,7 @@ defmodule PowerModel.Ingestion.CapacityInference do
     requirements =
       Enum.reduce(hours, %{}, fn hour, acc ->
         snap = Grid.get_grid_snapshot(ic.id, hour: hour)
-        state = Cascade.init(snap, @base_mva, hour: hour)
+        state = Cascade.init(snap, @base_mva, hour: hour, cems: Keyword.get(opts, :cems, true))
 
         {subs, _dead} =
           Partition.split(%{
@@ -868,7 +880,7 @@ defmodule PowerModel.Ingestion.CapacityInference do
           # `redispatch: true` — relieve every overload a generation shift
           # can before reading what is left as missing capacity (EXT-1).
           island =
-            if Keyword.get(opts, :redispatch, false) == true,
+            if Keyword.get(opts, :redispatch, true) == true,
               do:
                 island |> PowerModel.Dispatch.Redispatch.relieve(base_mva: @base_mva) |> elem(0),
               else: island
@@ -1031,7 +1043,7 @@ defmodule PowerModel.Ingestion.CapacityInference do
 
     Map.new(interconnections, fn ic ->
       snap = Grid.get_grid_snapshot(ic.id, hour: hour)
-      state = Cascade.init(snap, @base_mva, hour: hour)
+      state = Cascade.init(snap, @base_mva, hour: hour, cems: Keyword.get(opts, :cems, true))
 
       {subs, _dead} =
         Partition.split(%{

@@ -63,6 +63,13 @@ defmodule PowerModel.Repo.Migrations.CorrectNorthMccameyAndEagleMountain do
     reparam("repair_name_65735_71532", 69.0)
     repoint("repair_name_65735_71532", :to_bus_id, "71942_69.0kV")
 
+    # reparam stamps 'osm_corridor' as the voltage source; a reverted line is
+    # back on its ingest-time value, so the stamp comes off too.
+    execute """
+    update transmission_lines set voltage_source = null
+     where source_id in ('312659','repair_weld_65735_68115','repair_name_65735_71532')
+    """
+
     # Circuits were inferred against the corrected topology; unfold them the
     # way 20260901130000's down does, so a re-run starts clean.
     execute """
