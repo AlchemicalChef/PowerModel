@@ -236,3 +236,11 @@ season mismatch, not signal — and the source of the July rows in
 capacity passes were re-derived after it landed, because 12 of its 34 MISO
 elements had been given inferred circuits by passes that only knew the
 winter list).
+
+## known_binding_elements_2026-09-01_r2.csv
+Derived, committed: round 2 of the exclusion loop (REVIEW CAS-33). Emitted by
+`scripts/score_congestion.py --emit` from the CAS-32-state loadings with the
+model's named yards merged into the geocoder (`--stations`): 40 MISO (July
+week) + 24 ERCOT matches, 64 rows, 60 with source_ids. Two of the six
+newly-found MISO elements had been given inferred circuits by passes that
+predated their discovery — the coverage loop closing again, as designed.

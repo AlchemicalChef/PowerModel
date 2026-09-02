@@ -484,12 +484,15 @@ defmodule PowerModel.Ingestion.BusMapper do
   # 69 kV conductor, at 95 degrees. Both plants have a 138 kV bus in their own
   # yard, 0 m away, on the far side of the bank they are wrongly under.
   defp stranded_placement?(bus_id, plant_mw, capacity, bus_kv, grid_kv) do
-    case plant_voltage_floor(plant_mw, grid_kv) do
-      nil ->
+    case plant_voltage_band(plant_mw, grid_kv) do
+      {nil, _} ->
         false
 
-      floor_kv ->
-        Map.get(bus_kv, bus_id, 0.0) < floor_kv or
+      {floor_kv, ceiling_kv} ->
+        kv = Map.get(bus_kv, bus_id, 0.0)
+
+        kv < floor_kv or
+          (is_number(ceiling_kv) and kv > ceiling_kv) or
           Map.get(capacity, bus_id, 0.0) < @stranding_headroom * plant_mw
     end
   end
@@ -498,8 +501,14 @@ defmodule PowerModel.Ingestion.BusMapper do
   # none of the current ones do, or it can carry the plant where none of them
   # can. Anything else is churn.
   defp improvement?(bus_id, current, plant_mw, capacity, bus_kv, grid_kv) do
-    floor_kv = plant_voltage_floor(plant_mw, grid_kv) || 0.0
+    {floor_kv, ceiling_kv} = plant_voltage_band(plant_mw, grid_kv)
+    floor_kv = floor_kv || 0.0
     needed = @stranding_headroom * plant_mw
+
+    in_class? = fn id ->
+      kv = Map.get(bus_kv, id, 0.0)
+      kv >= floor_kv and (ceiling_kv == nil or kv <= ceiling_kv)
+    end
 
     clears_floor? = Map.get(bus_kv, bus_id, 0.0) >= floor_kv
     carries? = Map.get(capacity, bus_id, 0.0) >= needed
@@ -507,7 +516,8 @@ defmodule PowerModel.Ingestion.BusMapper do
     current_clears? = Enum.any?(current, &(Map.get(bus_kv, &1, 0.0) >= floor_kv))
     current_carries? = Enum.any?(current, &(Map.get(capacity, &1, 0.0) >= needed))
 
-    (clears_floor? and not current_clears?) or (carries? and not current_carries?)
+    (clears_floor? and not current_clears?) or (carries? and not current_carries?) or
+      (in_class?.(bus_id) and carries? and not Enum.any?(current, in_class?))
   end
 
   defp bus_voltage_index do
@@ -567,6 +577,25 @@ defmodule PowerModel.Ingestion.BusMapper do
   end
 
   def plant_voltage_floor(_, _), do: nil
+
+  @doc """
+  The voltage BAND a plant belongs in: `{floor_kv, ceiling_kv}`.
+
+  The ceiling exists only when EIA-860 recorded the interconnection voltage
+  (CAS-33): a measured POI class bounds placement from BOTH sides — 121.6 GW
+  sat a full class ABOVE its recorded level after CAS-32, injecting at EHV
+  what really enters at subtransmission, which softens exactly the stress
+  the congestion score measures. The size heuristic keeps no ceiling: it is
+  a lower-bound argument only. Same 0.7x/1.45x class margins as the floor,
+  so one-off paperwork values cannot strand or evict a plant.
+  """
+  @spec plant_voltage_band(number() | nil, number() | nil) ::
+          {number() | nil, number() | nil}
+  def plant_voltage_band(_p_mw, grid_kv) when is_number(grid_kv) and grid_kv >= 60 do
+    {0.7 * grid_kv, 1.45 * grid_kv}
+  end
+
+  def plant_voltage_band(p_mw, _grid_kv), do: {plant_voltage_floor(p_mw), nil}
 
   # {:plant, id} => the plant's EIA-860 grid voltage, for the placement floor.
   # min over units: a multi-row plant with disagreeing values gets the
@@ -671,12 +700,12 @@ defmodule PowerModel.Ingestion.BusMapper do
     radius_km = @gen_match_radius_m / 1000.0
     lin8 = nearest_in_grid(context.grid, anchor.lon, anchor.lat, radius_km, nil)
 
-    case plant_voltage_floor(plant_mw, grid_kv) do
-      nil ->
+    case plant_voltage_band(plant_mw, grid_kv) do
+      {nil, _} ->
         # LIN-8 untouched: any level, lowest one at the nearest yard.
         with {bus_id, _key} <- lin8, do: {bus_id, :small_unit}
 
-      floor_kv ->
+      {floor_kv, ceiling_kv} ->
         needed = @stranding_headroom * plant_mw
         wide_km = @gen_hv_search_radius_m / 1000.0
         points = Enum.uniq([anchor | extra_anchors])
@@ -698,7 +727,7 @@ defmodule PowerModel.Ingestion.BusMapper do
         attempts
         |> Enum.find_value(fn {point, km, rule} ->
           with {bus_id, _key} <-
-                 nearest_plant_bus(context, point, km, floor_kv, needed, home),
+                 nearest_plant_bus(context, point, km, floor_kv, ceiling_kv, needed, home),
                do: {bus_id, rule}
         end)
         |> case do
@@ -710,7 +739,7 @@ defmodule PowerModel.Ingestion.BusMapper do
 
   # Nearest grid member at or above `min_kv` inside `home`, ranked capacity
   # first. See `map_generators_to_buses/0` for why that order.
-  defp nearest_plant_bus(context, anchor, radius_km, min_kv, needed_mva, home) do
+  defp nearest_plant_bus(context, anchor, radius_km, min_kv, ceiling_kv, needed_mva, home) do
     %{lon: lon, lat: lat} = anchor
 
     context.grid
@@ -723,11 +752,17 @@ defmodule PowerModel.Ingestion.BusMapper do
              same_system?(context, id, home) do
           short = if Map.get(context.capacity, id, 0.0) >= needed_mva, do: 0, else: 1
 
+          # Above the plant's recorded class (CAS-33): eligible — a yard with
+          # no in-class bus still gets the plant — but every in-class bus
+          # outranks it.
+          above = if is_number(ceiling_kv) and base_kv > ceiling_kv, do: 1, else: 0
+
           # Distance is bucketed to the kilometre before capacity gets a vote,
           # so a bus in the plant's OWN yard can never lose to a fatter one
           # twenty kilometres away; inside a bucket the bus that can carry the
-          # plant wins, and then the lowest adequate level.
-          key = {trunc(distance / @same_site_km), short, base_kv, distance, id}
+          # plant wins, then the recorded class, and then the lowest adequate
+          # level.
+          key = {trunc(distance / @same_site_km), short, above, base_kv, distance, id}
 
           if acc == nil or key < elem(acc, 1), do: {id, key}, else: acc
         else

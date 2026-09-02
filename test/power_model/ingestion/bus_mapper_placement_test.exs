@@ -211,6 +211,79 @@ defmodule PowerModel.Ingestion.BusMapperPlacementTest do
     end
   end
 
+  describe "class ceiling (CAS-33)" do
+    test "the band exists only when the interconnection voltage was recorded" do
+      assert BusMapper.plant_voltage_band(400.0, 138.0) == {96.6, 200.1}
+      assert BusMapper.plant_voltage_band(600.0, nil) == {230.0, nil}
+      assert BusMapper.plant_voltage_band(50.0, nil) == {nil, nil}
+      assert BusMapper.plant_voltage_band(50.0, 12.5) == {nil, nil}
+    end
+
+    test "a plant above its recorded class moves down to the in-class bus" do
+      sub = substation("HIGH SIT", -90.0, 35.0, [345.0, 138.0])
+      far = substation("FAR END", -90.02, 35.0, [345.0, 138.0])
+      BusMapper.create_substation_buses()
+
+      connect(bus_of(sub, 138.0), bus_of(far, 138.0), "mid", 900.0)
+      connect(bus_of(sub, 345.0), bus_of(far, 345.0), "ehv", 900.0)
+
+      gen =
+        generator(%{
+          p_max_mw: 400.0,
+          eia_plant_id: "70001",
+          grid_voltage_kv: 138.0,
+          bus_id: bus_of(sub, 345.0).id,
+          coordinates: point(-90.0, 35.0)
+        })
+
+      summary = BusMapper.remap_stranded_generators()
+
+      assert summary.plants == 1
+      assert Repo.get!(Generator, gen.id).bus_id == bus_of(sub, 138.0).id
+    end
+
+    test "with no in-class bus anywhere, the plant stays where it is" do
+      sub = substation("EHV ONLY", -90.0, 35.0, [345.0])
+      far = substation("EHV FAR", -90.02, 35.0, [345.0])
+      BusMapper.create_substation_buses()
+      connect(bus_of(sub, 345.0), bus_of(far, 345.0), "ehv", 900.0)
+
+      gen =
+        generator(%{
+          p_max_mw: 400.0,
+          eia_plant_id: "70002",
+          grid_voltage_kv: 138.0,
+          bus_id: bus_of(sub, 345.0).id,
+          coordinates: point(-90.0, 35.0)
+        })
+
+      assert BusMapper.remap_stranded_generators().plants == 0
+      assert Repo.get!(Generator, gen.id).bus_id == bus_of(sub, 345.0).id
+    end
+
+    test "a down-move never trades away the ability to evacuate the plant" do
+      sub = substation("THIN LOW", -90.0, 35.0, [345.0, 138.0])
+      far = substation("THIN FAR", -90.02, 35.0, [345.0, 138.0])
+      BusMapper.create_substation_buses()
+
+      # The in-class 138 bus carries only 60 MVA; the plant needs 480.
+      connect(bus_of(sub, 138.0), bus_of(far, 138.0), "mid", 60.0)
+      connect(bus_of(sub, 345.0), bus_of(far, 345.0), "ehv", 900.0)
+
+      gen =
+        generator(%{
+          p_max_mw: 400.0,
+          eia_plant_id: "70003",
+          grid_voltage_kv: 138.0,
+          bus_id: bus_of(sub, 345.0).id,
+          coordinates: point(-90.0, 35.0)
+        })
+
+      assert BusMapper.remap_stranded_generators().plants == 0
+      assert Repo.get!(Generator, gen.id).bus_id == bus_of(sub, 345.0).id
+    end
+  end
+
   describe "remap_stranded_generators/1" do
     setup do
       sub = substation("STRANDED", -90.0, 35.0, [230.0, 33.0])

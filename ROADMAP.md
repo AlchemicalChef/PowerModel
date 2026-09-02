@@ -601,11 +601,12 @@ second is where the model is genuinely broken, and it gates the third.
    29 % → 62 % (rank 2.8 %, reverse 0 → 7/30) against a season-matched July
    constraint week plus its exclusion rows (migration 20260901150000); (v)
    `mix power_model.cascade_ccdf` at the peak hour under measured dispatch
-   found the FIRST fittable blackout-size tail: N-2, α = 1.48 on 10 events
-   ≥ 100 MW vs OE-417's published ≈ 1.31, P[≥ 10 GW] = 0.7 %, terminations
-   settled throughout (one budget exhaustion in the N-1 measured arm, 1/150)
-   — EXT-3's "the tail needs the operating point, not more samples" measured
-   TRUE. Generator bus assignment by EIA-860 grid
+   found the blackout-size tail, and at the corrected state it MATCHES the
+   national record: 500 N-2 doubles give α = 1.31 on 42 events ≥ 100 MW —
+   OE-417's published exponent, within mutual error bars — with q99 at
+   20 GW and P[≥ 10 GW] = 1.6 % (CAS-33). The asterisk: 15/500 doubles
+   exhaust the step budget — CAS-26 closed at N-1, leaks 3 % at stressed
+   N-2. Generator bus assignment by EIA-860 grid
    voltage is DONE (CAS-32: 1,014 plants / 162 GW re-pointed;
    `grid_voltage_kv` on every generator; evidence replaces the size floor),
    and the capacity passes now derive at the measured operating point with

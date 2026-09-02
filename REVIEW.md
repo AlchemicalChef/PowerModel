@@ -2558,3 +2558,59 @@ per-facility silently; steam-only CEMS units (blank gross, nonzero
 operating time) read as OFF and could wrongly idle a cogeneration host's
 electric units. All small today, all recorded here so none of them has to
 be rediscovered.
+
+**CAS-33 (FIXED + MEASURED, 2026-09-01) — the class ceiling, and round 2 of
+the exclusion loop.** CAS-32's floor only pushed plants UP, and its audit
+measured the mirror defect: 302 plants / 121.6 GW sitting a full class ABOVE
+their EIA-860-recorded interconnection with an in-class bus within 3 km —
+injection attributed at EHV that really enters at subtransmission, which
+softens exactly the stress the congestion score measures.
+`plant_voltage_band/2` now bounds placement from BOTH sides (same 0.7x/1.45x
+class margins; the size heuristic keeps no ceiling — it is a lower-bound
+argument only), the candidate ranking prefers in-class buses with capacity
+still dominating, and the re-map moves an above-class plant down only onto
+an in-class bus that can evacuate its nameplate. **201 plants — 837
+generators, 93.8 GW — moved down**; the 101 that stayed had no in-class bus
+that could carry them, which is the conservative gate working, not a gap.
+The same migration (20260901180000) carried round 2 of the exclusion loop:
+the geocoder's station source had found 6 more MISO binding elements, 2
+already "fixed" with inferred circuits, so their emitted matches
+(`known_binding_elements_2026-09-01_r2.csv`, 64 rows) joined the glob
+before the single re-derivation. Ceilings held at 1.0 everywhere (Western
+absorbed the down-moves with 228 extra circuits over 52 branches, one
+unfixable pocket).
+
+**Measured.** The congestion score is STABLE through a 94 GW placement
+change — ERCOT median 45 % plain, 48 % at the constrained operating point
+(rank 13.6 %, 9/24 in the top 5 %); MISO median 54 %, 18/40 in the top 5 %,
+and **0/40 found elements on inferred capacity** — the coverage loop closed
+its second round exactly as designed. What DID move is the honest part: the
+plain-dispatch overload census grew from 8 to 50 branches, because 94 GW
+now stresses the subtransmission it actually enters at, and the market-like
+re-dispatch absorbs that back down to 23 (8.1 GW shifted) — the same
+division of labour the real grid uses. Seagoville (216 %) and Frontera
+(172 %) remain the residual binding pair through every state; the Eagle
+Mountain weld reads 289 % constrained and the Permian 69 kV pair sits
+cap-refused at 646 % — the same two topology gaps, now carrying more of the
+story and still at the top of the worklist. One ERCOT found element drifted
+back onto inferred capacity (1/24) — match drift between emit rounds, the
+loop's next iteration catches it.
+
+**The 500-double CCDF: the tail matches the national record.** The ensemble
+this instrument has been asking for since EXT-3: 500 random N-2 doubles,
+seed 7, peak hour, measured dispatch, at the corrected state. 42 events
+reach 100 MW and the MLE tail exponent is **α = 1.31 — the OE-417 published
+value** (α ≈ 1.31 ± 0.08; ours carries ≈ ±0.05 at n = 42, so
+"indistinguishable", not "exact" — the two-decimal coincidence is luck).
+The distribution reaches 20 GW (q99), P[≥ 10 GW] = 1.6 %, 359/500 fully
+intact. After a day of corrections each of which THINNED a tail that had
+been borrowing from artifacts, the honest network with the honest operating
+point produces the real one. The asterisk, kept visible: 15 of 500 doubles
+exhausted the step budget — 3 % of pairs still run away rather than settle,
+so CAS-26's closure holds at N-1 and leaks at stressed N-2; those 15
+samples are the next cascade-dynamics worklist.
+
+**Open.** The two topology gaps above; Colorado Bend II's missing 345 kV
+bus; the scorer's ERCOT short-name wall; validation's at-rest gate still
+dispatches BA-fuel; sim-side `cems`/`constrained_dispatch` defaults for
+cascades and the census once the CCDF at scale is read.
