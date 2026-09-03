@@ -2644,8 +2644,13 @@ budget clipping settling cascades, not a runaway regime.
 **Where the collapses live: the operating point.** The same 15 pairs from
 the security-constrained operating point (`--constrained`, same deep
 budget, same hour): 11 of 15 fully intact at 0.0 MW, 4 degraded at
-0.03–4.1 GW, ZERO collapsed. And the full paired ensemble — same seed,
-same 500 doubles, peak hour, constrained: 14 events ≥ 100 MW (was 42),
+0.03–4.1 GW, ZERO collapsed. And the full ensemble — same seed, peak hour,
+constrained (recorded here as "the same 500 doubles"; CAS-35 found that
+claim false — `Enum.take_random` picks by POSITION and the candidate list
+followed unstable DB row order, so the two runs drew overlapping but not
+identical pairs; the 15-pair comparison above was ID-addressed and IS
+paired, and the ensemble comparison stands as distributional):
+14 events ≥ 100 MW (was 42),
 q99 = 1.34 GW (was 47.6), largest event 4.1 GW, P[≥ 10 GW] = 0, α = 1.46
 on n = 14 (too few to lean on), and 0/500 samples needed more than 50
 steps — the budget question does not even arise from the secured point.
@@ -2668,3 +2673,93 @@ regimes honestly, now the top cascade-dynamics lever; the FDPF iteration
 probe at the constrained point; the two topology gaps (Permian 69 kV pair,
 Eagle Mountain weld) and Colorado Bend II's 345 bus; the scorer's ERCOT
 short-name wall; validation's at-rest gate.
+
+**CAS-35 (BUILT + MEASURED, 2026-09-03) — the operator between the trips.**
+CAS-34 left the model bracketing OE-417 between two operating points it
+never mixes: the unconstrained at-rest dispatch (right exponent, plus a
+28–50 GW no-operator collapse cluster the record does not contain) and the
+SCED-secured point (no tail at all). The missing mechanism was the dispatch
+acting DURING the event: ERCOT's SCED issues base points every 300 s, and a
+cascade whose next relay needs longer than that meets an operator before it
+meets the trip. `Cascade.init(sced_interval_s: 300)` (`--sced` on
+`cascade_ccdf`) arms exactly that: the relay race and the dispatch cadence
+run on one clock; when the interval boundary lands first, every asserted
+relay integrates duty only up to the boundary (`advance_relay_timers/3`
+returns `:capped`) and a ramp-limited `Dispatch.Redispatch.relieve/2` runs
+per threatened island on the ACTIVE topology at the CURRENT operating
+point — each unit bounded to `secondary_ramp_mw_per_min × interval` from
+where it sits, offline units held offline (nothing starts in five
+minutes), trip-immune base-case artifacts masked so the worst-first relief
+loop cannot spend its ramp on branches that cannot trip. CEMS pins are
+deliberately not honoured mid-event: pins define the measured point the
+event started FROM, and moving units off schedule is the entire mechanism.
+
+**Measured on the 15 CAS-34 collapses** (ID-addressed, so genuinely
+paired): five fully arrested at 0.0 MW, six held to 1.7–3.9 GW, four
+remain at 19.5–23.9 GW. Sample 65's digest is the mechanism in one line:
+its fast phase (steps 1–18, 1.7 GW) is bit-identical to the no-operator
+run, then ONE corrective action at t = 300 s replaces the 140 line trips
+that followed it — 1,667 MW instead of 47,607, and 1,667 is exactly its
+CAS-33 truncated value, because the 50-step budget had been accidentally
+acting as a crude operator stand-in. The four that stay big are fast
+collapses that complete inside the first dispatch window, which is the
+physically correct division of labour: the operator kills the multi-hour
+grind, not the avalanche — and ~20 GW fast events are what the record
+actually contains (ERCOT shed ~20 GW in February 2021).
+
+**The paired ensemble.** With the draw fixed (below), the same 500 N-2
+doubles ran through both arms — pair identity 500/500. Without the
+operator: α = 1.25 on 49 events ≥ 100 MW, q99 = 47.6 GW, 19 events at
+25–50 GW, 9 collapsed. With the operator, same pairs, same operating
+point: **α = 1.35 on 36 events, q99 = 4.2 GW, ZERO events ≥ 25 GW, zero
+collapsed**, P[≥ 10 GW] = 0.4 % (two fast avalanches), 500/500 settled.
+Pair-level: 12 collapses arrested to < 1 MW, 15 halved or better, one pair
+132 MW worse on a 4.1 GW event (trip-order noise, checked — not
+backfire). An earlier draw of the SCED arm gave α = 1.33 on 38 — the
+exponent is stable across draws. **OE-417's published 1.31 ± 0.08 sits
+BETWEEN the two arms of one operating point** — 1.25 with nobody at the
+desk, 1.35 with an operator who never misses a five-minute window — which
+is where a record made of real events, each with its operator in some
+state of catching up, should sit. The bracket CAS-34 built from two
+operating points is now a bracket built from one point and one honest
+mechanism.
+
+**Three defects the instrument surfaced while doing it.** (1) The "same
+seed, same doubles" pairing every ensemble comparison assumed was FALSE:
+`Enum.take_random/2` picks by position and `rated_branches` followed the
+snapshot's DB row order, which Postgres does not keep stable — the runs
+drew overlapping but different pair sets (CAS-34's ensemble text corrected
+in place; its 15-pair comparison was ID-addressed and stands). The
+candidate list is now sorted and ALL picks are drawn before any cascade
+runs, so the draw depends on nothing but the seed. (2)
+`Redispatch.relieve/2`'s `shifted_mw` sums movement per iteration — sixty
+thrashing iterations once reported "275 GW shifted" on a 77 GW system; the
+corrective event now records NET megawatts moved (half the total |Δ|).
+(3) The zero-shift boundaries are honest — `:ineffective` means no
+generator pair straddles the overload at ≥ 5 % effectiveness — but they
+expose the operator model's missing second tool: post-contingency load
+shed / RAS. Generation shift is the only move this operator has.
+
+**The N-1 that fell out of it.** Chasing the one collapse the operator
+could not touch found that its pair's SECOND line was irrelevant:
+**line 79731 alone — 138 kV, 224 MVA, a degree-2 series segment near
+Trinidad, TX (32.35 N, −96.2 W) — collapses 47.5 GW at the plain
+operating point** (replayed solo: 47,527 MW over 157 steps and 48.6
+simulated minutes), and nine consecutive dispatch windows
+cannot relieve it (no straddling generation; the through-path is severed
+and the redistribution grinds through the same pocket lines — 76780,
+84814, 83620 — that every big cascade in this ensemble transits). EXT-3's
+"CAS-26 is closed on ERCOT at N-1" was measured under the 50-step budget
+at the pre-CAS-32 topology; at the current state at least one N-1 settles
+at collapse size. A series 138 kV segment whose loss takes two-thirds of
+ERCOT is Permian-class evidence of backbone flow routed through
+subtransmission — the corridor around it joins the Permian pair and the
+Eagle Mountain weld at the top of the topology worklist, and the N-1
+closure claim needs re-measuring with a deep budget.
+
+**Open.** The Trinidad-corridor pocket (new, top); deep-budget N-1 sweep to
+re-measure the CAS-26 closure claim; whether `--sced` joins `--cems` as
+the demo/census default; an emergency-load-shed operator action for
+pockets generation shift cannot reach; the FDPF probe at the constrained
+point (0.014 pu); Permian pair, Eagle Mountain weld, Colorado Bend II's
+345 bus; scorer short-name wall; validation's at-rest gate.

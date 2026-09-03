@@ -1513,6 +1513,27 @@ defmodule PowerModel.Failure.CascadeTest do
       assert event.details.max_steps == 50
     end
 
+    test "a finite relay slower than the cap comes back :capped with partial duty (CAS-35)" do
+      overload = %{
+        component_type: "transmission_line",
+        component_id: 9,
+        failure_cause: "thermal_overload",
+        details: %{},
+        trip_time_s: 100.0
+      }
+
+      assert {:capped, 30.0, duty} = Cascade.advance_relay_timers([overload], %{}, 30.0)
+      assert_in_delta duty[{"thermal_overload", "transmission_line", 9}], 0.3, 1.0e-9
+
+      # A relay that finishes at or before the cap still wins the race.
+      assert {trip, 100.0, _} = Cascade.advance_relay_timers([overload], %{}, 100.0)
+      assert trip.component_id == 9
+
+      # No cap is the pre-CAS-35 behaviour, unchanged.
+      assert {trip, 100.0, _} = Cascade.advance_relay_timers([overload], %{})
+      assert trip.component_id == 9
+    end
+
     test "max_steps: at init deepens the budget (CAS-34)" do
       state = Cascade.init(three_bus_snapshot(), 100.0, max_steps: 200)
       assert state.max_steps == 200
@@ -1531,6 +1552,65 @@ defmodule PowerModel.Failure.CascadeTest do
                Enum.filter(exhausted_state.events, &(&1.failure_cause == "max_steps_exhausted"))
 
       assert event.details.max_steps == 200
+    end
+  end
+
+  # ===========================================================================
+  # Mid-cascade corrective re-dispatch (CAS-35)
+  # ===========================================================================
+
+  describe "mid-cascade corrective re-dispatch" do
+    # Two parallel 1-3 lines sized so that losing one leaves the survivor
+    # just past its rate-C pickup — a relay that needs minutes — while a
+    # second unit at bus 2 has the ramp to relieve it inside one dispatch
+    # interval (8 %/min of 300 MW nameplate).
+    defp sced_snapshot do
+      buses = [bus(1, bus_type: 3), bus(2), bus(3)]
+
+      lines = [
+        line(1, 1, 3, rating_a_mva: 53.9, x_pu: 0.1),
+        line(2, 1, 3, rating_a_mva: 53.9, x_pu: 0.1),
+        line(3, 2, 3, rating_a_mva: 300.0, x_pu: 0.1)
+      ]
+
+      gens = [generator(1, 1, p_max_mw: 300.0), generator(2, 2, p_max_mw: 300.0)]
+      loads = [load(1, 3, p_mw: 150.0)]
+      make_snapshot(buses, lines, [], gens, loads)
+    end
+
+    test "the operator relieves a slow overload before its relay finishes" do
+      # Without the operator: the surviving parallel line trips.
+      no_op = Cascade.init(sced_snapshot())
+      {no_op_final, _} = Cascade.trip_line(no_op, 2)
+
+      assert Enum.any?(
+               no_op_final.events,
+               &(&1.failure_cause in ["thermal_overload", "conductor_thermal"] and
+                   &1.component_id == 1)
+             ),
+             "precondition: without SCED the survivor must trip " <>
+               "(dispatch #{inspect(no_op.dispatch)}, events #{inspect(no_op_final.events)})"
+
+      # With a 60 s dispatch interval the boundary lands well before the
+      # relay, and the ramp budget covers the shift: the line never trips.
+      sced = Cascade.init(sced_snapshot(), 100.0, sced_interval_s: 60)
+      {sced_final, _} = Cascade.trip_line(sced, 2)
+
+      assert sced_final.termination == :settled
+
+      redispatches =
+        Enum.filter(sced_final.events, &(&1.failure_cause == "corrective_redispatch"))
+
+      assert redispatches != []
+      assert Enum.any?(redispatches, &(&1.details.shifted_mw > 0.0))
+
+      refute Enum.any?(
+               sced_final.events,
+               &(&1.failure_cause in ["thermal_overload", "conductor_thermal"] and
+                   &1.component_id == 1)
+             )
+
+      assert sced_final.blackout_load_mw == 0.0
     end
   end
 

@@ -612,13 +612,22 @@ second is where the model is genuinely broken, and it gates the third.
    collapses clipped by the 50-step budget at up to a 30th of their size
    (CAS-34; `--max-steps` deepens the budget). With the budget deep enough,
    ALL 500 doubles settle — CAS-26 is closed at stressed N-2 too; nothing
-   runs away. The caveat that replaces the asterisk: the same 500 doubles
-   from the security-constrained point give 14 events ≥ 100 MW, q99 =
-   1.34 GW, zero collapses — the 28–50 GW cluster belongs to the
-   unconstrained operating point, not the topology, and the model brackets
-   OE-417 between its two operating points. Mid-cascade corrective
-   re-dispatch (SCED acting between relay trips) is the mechanism that
-   would let ONE point produce both regimes honestly (CAS-34). Generator bus assignment by EIA-860 grid
+   runs away. The 28–50 GW cluster belongs to the unconstrained operating
+   point, not the topology (from the security-constrained point the same
+   pairs give zero collapses, CAS-34) — and mid-cascade corrective
+   re-dispatch is now BUILT (CAS-35: `Cascade.init(sced_interval_s: 300)`
+   / `--sced`, ramp-limited relief at every SCED boundary the relays leave
+   open). The paired ensemble — draw fixed so both arms run the SAME 500
+   doubles — gives α = 1.25 on 49 events with nobody at the desk and
+   α = 1.35 on 36 events with the operator armed, **OE-417's 1.31 ± 0.08
+   between them**, q99 47.6 → 4.2 GW, 19 → 0 events ≥ 25 GW, 12 collapses
+   arrested to zero: the operator kills the multi-hour grind and cannot
+   touch the fast avalanche, which is the correct division. The new
+   asterisk: line 79731 — a 138 kV series segment near Trinidad, TX —
+   collapses 47.5 GW as an N-1, immune to generation shift (no straddling
+   units): Permian-class evidence of backbone flow routed through
+   subtransmission, now the top topology item, and EXT-3's "closed at N-1"
+   claim needs re-measuring at depth. Generator bus assignment by EIA-860 grid
    voltage is DONE (CAS-32: 1,014 plants / 162 GW re-pointed;
    `grid_voltage_kv` on every generator; evidence replaces the size floor),
    and the capacity passes now derive at the measured operating point with

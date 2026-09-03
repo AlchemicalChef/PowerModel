@@ -372,7 +372,17 @@ defmodule PowerModel.Failure.Cascade do
     # sequence needs a budget at least as deep as its trip count, and the
     # CCDF instrument has to be able to tell "still propagating at 50" from
     # "never settles" (REVIEW CAS-34).
-    max_steps: @max_steps
+    max_steps: @max_steps,
+    # Mid-cascade corrective re-dispatch (REVIEW CAS-35): every
+    # `sced_interval_s` of cascade clock, the operator gets the move a
+    # security-constrained dispatch would actually make — a ramp-limited
+    # generation shift against the overloads whose relays are still timing.
+    # `nil` (the default) is the pre-CAS-35 model: relay physics only, no
+    # operator between trips. `sced_at_s` is the clock time of the last
+    # corrective action; the operating point itself counts as one, so the
+    # first mid-cascade action comes an interval after the initiating event.
+    sced_interval_s: nil,
+    sced_at_s: 0.0
   ]
 
   @doc """
@@ -392,6 +402,16 @@ defmodule PowerModel.Failure.Cascade do
       trips one component, so this bounds the length of a trip SEQUENCE, not
       its size; raise it to distinguish a long settling cascade from a
       runaway (`:budget_exhausted` marks the truncation either way).
+    * `:sced_interval_s` — turn on mid-cascade corrective re-dispatch at
+      this cadence of the cascade clock (ERCOT's SCED runs every 300 s).
+      When the next interval boundary lands before the earliest relay
+      finishes timing, the dispatch acts first: a ramp-limited
+      `Dispatch.Redispatch.relieve/2` per threatened island, each unit
+      bounded to `secondary_ramp_mw_per_min × interval` from where it sits,
+      offline units held offline (no five-minute starts). Relay duty
+      integrates only up to the boundary — a relieved relay resets the same
+      way it always has, by its overload clearing. Default `nil`: no
+      operator between trips.
 
   The fallback `dispatch` map is seeded per island from each generator's share
   of island capacity, capped so the slack bus keeps a little headroom.
@@ -509,7 +529,12 @@ defmodule PowerModel.Failure.Cascade do
       voltage_devices: voltage_devices,
       termination: nil,
       frequency_nadir_hz: @nominal_frequency_hz,
-      max_steps: Keyword.get(opts, :max_steps, @max_steps)
+      max_steps: Keyword.get(opts, :max_steps, @max_steps),
+      sced_interval_s:
+        case Keyword.get(opts, :sced_interval_s) do
+          s when is_number(s) and s > 0 -> s * 1.0
+          _ -> nil
+        end
     }
   end
 
@@ -1298,7 +1323,11 @@ defmodule PowerModel.Failure.Cascade do
         stable: false,
         termination: nil,
         frequency_nadir_hz: current_frequency_floor_hz(records),
-        island_states: records
+        island_states: records,
+        # The SCED cadence is measured on the cascade clock, which just
+        # rebased; the accepted trip is an event the dispatch has NOT yet
+        # answered, so its first corrective window opens an interval from now.
+        sced_at_s: 0.0
     }
   end
 
@@ -1781,14 +1810,32 @@ defmodule PowerModel.Failure.Cascade do
 
       # For thermal/zone3 overloads: trip ONLY the first relay to finish timing.
       # Every asserted relay integrates its own fraction of operating progress
-      # over the common wall-clock advance.
-      {tripped_component, time_advance_s, relay_duty} =
+      # over the common wall-clock advance — truncated at the next corrective-
+      # dispatch boundary when one is armed (REVIEW CAS-35), because the relay
+      # race and the dispatch cadence run on the same clock and whichever
+      # finishes first acts first.
+      sced_cap_s =
+        case state.sced_interval_s do
+          interval when is_number(interval) ->
+            max(state.sced_at_s + interval - state.simulated_time, 0.0)
+
+          _ ->
+            :infinity
+        end
+
+      {relay_outcome, time_advance_s, relay_duty} =
         if island_solve_failed? do
           # A failed numerical solve is terminal for this run; do not advance
           # protection from the incomplete set of island solutions.
           {nil, 0.0, %{}}
         else
-          advance_relay_timers(timed_overloads, reset_thermal_duty(state.relay_duty))
+          advance_relay_timers(timed_overloads, reset_thermal_duty(state.relay_duty), sced_cap_s)
+        end
+
+      {tripped_component, sced_preempted?} =
+        case relay_outcome do
+          :capped -> {nil, true}
+          other -> {other, false}
         end
 
       state = %{state | relay_duty: relay_duty}
@@ -1799,7 +1846,15 @@ defmodule PowerModel.Failure.Cascade do
       # an island swinging while a relay times is one 30 s stretch of real
       # time, not two — and thermal duty still accrues over its own advance
       # alone, so relay timing is unchanged by the frequency clock.
-      relay_advance_s = if tripped_component, do: time_advance_s, else: 0.0
+      relay_advance_s =
+        cond do
+          tripped_component != nil -> time_advance_s
+          # A capped advance is real elapsed time: the relays integrated duty
+          # up to the dispatch boundary, so the wall clock walks there too.
+          sced_preempted? -> time_advance_s
+          true -> 0.0
+        end
+
       step_advance_s = max(relay_advance_s, island_step.frequency_advance_s)
       state = %{state | simulated_time: state.simulated_time + step_advance_s}
 
@@ -1819,6 +1874,10 @@ defmodule PowerModel.Failure.Cascade do
       termination =
         cond do
           island_solve_failed? -> :solve_failed
+          # A capped step tripped nothing, but relays are still timing: the
+          # dispatch acts and the loop continues. Calling this settled would
+          # hand the operator's window to the report as an equilibrium.
+          sced_preempted? -> nil
           Enum.empty?(thermal_trips) and Enum.empty?(non_thermal_trips) -> :settled
           true -> nil
         end
@@ -1855,6 +1914,15 @@ defmodule PowerModel.Failure.Cascade do
 
           # Redispatch after trip (cover any generation/load imbalance)
           state = maybe_redispatch_after_trip(state)
+
+          # The dispatch interval landed before the earliest relay: the
+          # operator moves generation against the overloads still timing
+          # (REVIEW CAS-35). Runs on the ACTIVE topology this step solved —
+          # a preempted step tripped no branch, so it is still current.
+          state =
+            if sced_preempted?,
+              do: corrective_redispatch(state, islands, active_lines, active_xfmrs, timed_overloads),
+              else: state
 
           do_cascade(state, step_results, callback)
       end
@@ -2027,6 +2095,146 @@ defmodule PowerModel.Failure.Cascade do
         end
       end
     end)
+  end
+
+  # Mid-cascade corrective re-dispatch (REVIEW CAS-35): the move a
+  # security-constrained dispatch makes when its interval boundary lands
+  # before the earliest relay finishes. Per island that contains a timing
+  # overload, `Dispatch.Redispatch.relieve/2` runs on the ACTIVE topology at
+  # the CURRENT operating point, with each unit's floor and ceiling shrunk to
+  # what it can actually ramp inside one interval
+  # (`Frequency.secondary_ramp_mw_per_min × interval`); offline units stay
+  # offline — nothing starts in five minutes. Branches in `base_overloaded`
+  # have their ratings blanked in the sub-snapshot: they are trip-immune
+  # dispatch artifacts, and letting the worst-first relief loop chase them
+  # would spend the whole ramp budget on branches that cannot trip.
+  #
+  # The shift lands on `state.dispatch` at the boundary — the quasi-steady
+  # approximation every other dispatch action here already makes. CEMS pins
+  # are deliberately NOT honoured: the pins define the measured operating
+  # point the event started from, and an operator answering an emergency
+  # moves units off their schedule, which is the entire mechanism.
+  defp corrective_redispatch(state, islands, active_lines, active_xfmrs, timed_overloads) do
+    interval = state.sced_interval_s
+
+    over_keys =
+      MapSet.new(timed_overloads, fn t ->
+        type = if t.component_type == "transformer", do: :transformer, else: :line
+        {type, t.component_id}
+      end)
+
+    active_gens = Enum.reject(state.generators, &MapSet.member?(state.tripped_generators, &1.id))
+
+    {dispatch, shifted_mw, islands_acted} =
+      Enum.reduce(islands, {state.dispatch, 0.0, 0}, fn island, {dispatch, total, acted} ->
+        lines = branches_within(active_lines, island)
+        xfmrs = branches_within(active_xfmrs, island)
+
+        threatened? =
+          Enum.any?(lines, &MapSet.member?(over_keys, {:line, &1.id})) or
+            Enum.any?(xfmrs, &MapSet.member?(over_keys, {:transformer, &1.id}))
+
+        gens = Enum.filter(active_gens, &MapSet.member?(island, &1.bus_id))
+
+        if not threatened? or gens == [] do
+          {dispatch, total, acted}
+        else
+          shaped =
+            Enum.map(gens, fn g ->
+              d = Map.get(dispatch, g.id, 0.0)
+
+              ramp_mw =
+                if d > 0.0,
+                  do: Frequency.secondary_ramp_mw_per_min(g) * interval / 60.0,
+                  else: 0.0
+
+              %{g | p_max_mw: d, capacity_factor: 1.0}
+              |> Map.put(:p_dispatch_mw, d)
+              |> Map.put(:p_nameplate_mw, min(g.p_max_mw, d + ramp_mw))
+              |> Map.put(:p_min_mw, max(d - ramp_mw, 0.0))
+            end)
+
+          sub = %{
+            buses: Enum.filter(state.buses, &MapSet.member?(island, &1.id)),
+            lines: Enum.map(lines, &mask_base_overloaded(&1, :line, state.base_overloaded)),
+            transformers:
+              Enum.map(xfmrs, &mask_base_overloaded(&1, :transformer, state.base_overloaded)),
+            generators: shaped,
+            loads: Enum.filter(state.loads, &MapSet.member?(island, &1.bus_id)),
+            dc_ties: state.dc_ties
+          }
+
+          {relieved, report} =
+            PowerModel.Dispatch.Redispatch.relieve(sub, base_mva: state.base_mva)
+
+          # `report.shifted_mw` sums movement per ITERATION — sixty thrashing
+          # iterations once reported 275 GW of "shift" on a 77 GW system.
+          # The event records the NET megawatts that changed hands instead:
+          # half the total |Δ|, since every MW down is matched by one up.
+          net_mw =
+            Enum.reduce(relieved.generators, 0.0, fn g, acc ->
+              acc + abs((g.p_max_mw || 0.0) - Map.get(dispatch, g.id, 0.0))
+            end) / 2.0
+
+          if net_mw > 0.0 do
+            Logger.info(
+              "corrective re-dispatch at t=#{Float.round(state.simulated_time, 1)}s: " <>
+                "island of #{MapSet.size(island)} buses, #{round(net_mw)} MW moved " <>
+                "over #{report.iterations} iterations, #{length(report.relieved)} relieved, " <>
+                "#{length(report.residual)} residual (#{report.stopped})"
+            )
+          end
+
+          dispatch =
+            Enum.reduce(relieved.generators, dispatch, fn g, d ->
+              Map.put(d, g.id, g.p_max_mw)
+            end)
+
+          {dispatch, total + net_mw, acted + 1}
+        end
+      end)
+
+    event = %{
+      step: state.step,
+      component_type: "cascade",
+      component_id: 0,
+      failure_cause: "corrective_redispatch",
+      details: %{
+        shifted_mw: shifted_mw,
+        islands: islands_acted,
+        at_s: state.simulated_time,
+        interval_s: interval
+      }
+    }
+
+    %{
+      state
+      | dispatch: dispatch,
+        sced_at_s: state.simulated_time,
+        events: [event | state.events]
+    }
+  end
+
+  defp branches_within(branches, island) do
+    Enum.filter(
+      branches,
+      &(MapSet.member?(island, &1.from_bus_id) and MapSet.member?(island, &1.to_bus_id))
+    )
+  end
+
+  # An unrated branch never registers as overloaded (`Ratings.branch_ratings/1`
+  # yields `{nil, nil, nil}`), which is exactly the immunity `base_overloaded`
+  # already grants these branches on the trip side.
+  defp mask_base_overloaded(branch, type, base_overloaded) do
+    if MapSet.member?(base_overloaded, {type, branch.id}) do
+      branch
+      |> Map.put(:rating_a_mva, nil)
+      |> Map.put(:rating_b_mva, nil)
+      |> Map.put(:rating_c_mva, nil)
+      |> Map.put(:rated_mva, nil)
+    else
+      branch
+    end
   end
 
   # Re-detect islands and carry each one's frequency record across whatever
@@ -3786,12 +3994,19 @@ defmodule PowerModel.Failure.Cascade do
   # the duty it had accrued and tripped LATER than standing still would have —
   # zone 3 at 0.9 duty plus a zone 2 restart took 1.75 s where a static zone 3
   # fault took 1.50 s (REVIEW CAS-23).
+  # With a finite `cap_s` (the next corrective-dispatch boundary, REVIEW
+  # CAS-35), the advance is truncated there: when even the fastest relay
+  # needs longer than the cap, every asserted relay integrates `cap_s` of
+  # duty and `:capped` comes back in the trip slot — the wall clock reached
+  # the boundary with relays still timing, which is exactly the window the
+  # dispatch is entitled to act in. A relay that would finish AT or before
+  # the cap still wins the race: the trip was already committed.
   @doc false
-  def advance_relay_timers(timed_overloads, relay_duty)
+  def advance_relay_timers(timed_overloads, relay_duty, cap_s \\ :infinity)
 
-  def advance_relay_timers([], _relay_duty), do: {nil, 0.0, %{}}
+  def advance_relay_timers([], _relay_duty, _cap_s), do: {nil, 0.0, %{}}
 
-  def advance_relay_timers(timed_overloads, relay_duty) do
+  def advance_relay_timers(timed_overloads, relay_duty, cap_s) do
     asserted = Enum.map(timed_overloads, &assert_relay(&1, relay_duty))
 
     case Enum.reject(asserted, &(&1.remaining == :infinity)) do
@@ -3800,24 +4015,34 @@ defmodule PowerModel.Failure.Cascade do
 
       finite ->
         fastest = Enum.min_by(finite, & &1.remaining)
-        time_advance_s = fastest.remaining
 
-        advanced_duty =
-          Map.new(asserted, fn relay ->
-            {relay.key, accrue_relay_duty(relay.duty, time_advance_s, relay.trip.trip_time_s)}
-          end)
+        if cap_s != :infinity and fastest.remaining > cap_s do
+          advanced_duty =
+            Map.new(asserted, fn relay ->
+              {relay.key, accrue_relay_duty(relay.duty, cap_s, relay.trip.trip_time_s)}
+            end)
 
-        if relay_operated?(Map.fetch!(advanced_duty, fastest.key)) do
-          retained_duty = drop_tripped_relay_duty(advanced_duty, fastest.trip)
-
-          trip =
-            fastest.trip
-            |> Map.delete(:trip_time_s)
-            |> note_operating_zone(fastest.zone)
-
-          {trip, time_advance_s, retained_duty}
+          {:capped, cap_s * 1.0, advanced_duty}
         else
-          {nil, time_advance_s, advanced_duty}
+          time_advance_s = fastest.remaining
+
+          advanced_duty =
+            Map.new(asserted, fn relay ->
+              {relay.key, accrue_relay_duty(relay.duty, time_advance_s, relay.trip.trip_time_s)}
+            end)
+
+          if relay_operated?(Map.fetch!(advanced_duty, fastest.key)) do
+            retained_duty = drop_tripped_relay_duty(advanced_duty, fastest.trip)
+
+            trip =
+              fastest.trip
+              |> Map.delete(:trip_time_s)
+              |> note_operating_zone(fastest.zone)
+
+            {trip, time_advance_s, retained_duty}
+          else
+            {nil, time_advance_s, advanced_duty}
+          end
         end
     end
   end

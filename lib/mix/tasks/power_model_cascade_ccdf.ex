@@ -27,6 +27,12 @@ defmodule Mix.Tasks.PowerModel.CascadeCcdf do
   15 `budget_exhausted` doubles turned out to be collapses recorded at a
   30th of their settled size (REVIEW CAS-34). For distribution work use a
   budget deep enough that no sample exhausts it.
+
+  `--sced` puts the operator in the loop (REVIEW CAS-35): every 300 s of
+  cascade clock (`--sced-interval` to change it), a ramp-limited corrective
+  re-dispatch runs against the overloads whose relays are still timing —
+  the move ERCOT's SCED actually makes between trips. Without it, a cascade
+  slower than the dispatch interval propagates as if nobody re-dispatched.
   """
 
   use Mix.Task
@@ -49,7 +55,9 @@ defmodule Mix.Tasks.PowerModel.CascadeCcdf do
     voltage_control: :boolean,
     seed: :integer,
     xmin: :float,
-    max_steps: :integer
+    max_steps: :integer,
+    sced: :boolean,
+    sced_interval: :integer
   ]
 
   @impl Mix.Task
@@ -73,7 +81,11 @@ defmodule Mix.Tasks.PowerModel.CascadeCcdf do
         if(opts[:constrained], do: [constrained_dispatch: true], else: []) ++
         if(opts[:cems], do: [cems: true], else: []) ++
         if(opts[:voltage_control], do: [voltage_control: true], else: []) ++
-        if(opts[:max_steps], do: [max_steps: opts[:max_steps]], else: [])
+        if(opts[:max_steps], do: [max_steps: opts[:max_steps]], else: []) ++
+        if(opts[:sced] || opts[:sced_interval],
+          do: [sced_interval_s: opts[:sced_interval] || 300],
+          else: []
+        )
 
     base = Cascade.init(snap, 100.0, init_opts)
     candidates = rated_branches(base)
@@ -83,11 +95,14 @@ defmodule Mix.Tasks.PowerModel.CascadeCcdf do
         if(opts[:constrained], do: " from the constrained operating point", else: "")
     )
 
-    rows =
-      for i <- 1..samples do
-        picks =
-          if opts[:n2], do: Enum.take_random(candidates, 2), else: Enum.take_random(candidates, 1)
+    # ALL picks are drawn before any cascade runs: the draw then depends only
+    # on the seed and the (sorted) candidate list, never on how much
+    # randomness — or anything else — a cascade consumes between samples.
+    count = if opts[:n2], do: 2, else: 1
+    all_picks = for _ <- 1..samples, do: Enum.take_random(candidates, count)
 
+    rows =
+      for {picks, i} <- Enum.with_index(all_picks, 1) do
         t0 = System.monotonic_time(:millisecond)
         {state, steps} = run_event(base, picks)
         b = Cascade.balance(state)
@@ -115,6 +130,10 @@ defmodule Mix.Tasks.PowerModel.CascadeCcdf do
     report(rows, xmin, base)
   end
 
+  # Sorted, because the snapshot's DB row order is not stable across runs and
+  # `Enum.take_random/2` picks by POSITION: two runs with the same seed drew
+  # different pairs whenever Postgres returned the rows differently, which
+  # silently broke every "same seed, same doubles" comparison (REVIEW CAS-35).
   defp rated_branches(state) do
     lines =
       state.lines
@@ -126,7 +145,7 @@ defmodule Mix.Tasks.PowerModel.CascadeCcdf do
       |> Enum.filter(&(is_number(&1.rated_mva) and &1.rated_mva > 0))
       |> Enum.map(&{:transformer, &1.id})
 
-    lines ++ xfmrs
+    Enum.sort(lines ++ xfmrs)
   end
 
   # Trip the first element through the public entry point (it runs the

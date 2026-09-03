@@ -117,6 +117,9 @@ defmodule PowerModelWeb.GridLive.AffectedList do
   defp cause_class("btm_voltage_trip"), do: "cause-der"
 
   defp cause_class("manual_trip"), do: "cause-manual"
+  # The operator's move, not a failure: mid-cascade corrective re-dispatch
+  # (REVIEW CAS-35) draws in the manual colour because both are human acts.
+  defp cause_class("corrective_redispatch"), do: "cause-manual"
 
   defp cause_class("island_blackout"), do: "cause-blackout"
   defp cause_class("power_loss"), do: "cause-blackout"
